@@ -5,8 +5,12 @@
 지정된 별도 Task에서만 구현한다. Task C3는 Deterministic Secret Scanner Gate를,
 Task C4는 Hooks / Permissions Enforcement(Core Command Safety Gate,
 `src/safe-executor.ts`의 `coreCommandSafetyGate` — 자세한 내용은 `.claude/CLAUDE.md`
-보안 섹션 참고)를 구현했다. Notification Service / Dashboard / Dependency Scanner /
-MCP Resolver는 아직 시작하지 않았다.
+보안 섹션 참고)를, Task C5는 Deterministic Dependency / Supply-chain Scanner Gate
+(`src/dependency-scanner.ts`)를, Task D1은 Capability Discovery & MCP Resolver의
+Core Design/Foundation(`src/capability-resolver.ts` — 데이터 모델 + candidate 평가/
+랭킹 + risk/approval 판정, 자세한 내용은 `.claude/CLAUDE.md` 참고)을 구현했다. D1은
+실제 외부 MCP 설치/실행을 하지 않는다 — Notification Service / Dashboard / 실제 MCP
+설치·활성화 / Browser Worker / Agent Router는 아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -43,7 +47,7 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 
 ## 아직 시작하지 않은 것
 
-- Dependency Scanner
 - Notification Service
 - Dashboard
-- MCP Resolver
+- 실제 MCP 서버 설치/다운로드/활성화(D1은 Discovery/Resolver의 Core 데이터 모델·판정
+  로직만 구현했다 — 실제 활성화 실행 경로/Browser Worker/Agent Router는 없음)

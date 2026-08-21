@@ -64,6 +64,27 @@ Claude Worker 세션 운영, GPT Reviewer 전달 범위, context 관리 원칙�
 (commit 직전 dependency 변경 검사), 그리고 명령 실행 permission(`policy.allowedCommands`)은
 project 소유이되 Core Command Safety Gate 위에서만 동작한다.
 
+## Capability Discovery & MCP Resolver — Core Design/Foundation
+
+`src/capability-resolver.ts`(Phase D Task D1)는 새 프로젝트의 requirement에서 필요한
+외부 capability를 구조화하고(`CapabilityRequirement`/`classifyRequirementDomain`),
+MCP 서버/공식 API/SDK/CLI 등 구현 후보(`CapabilityCandidate`)를 deterministic 규칙만으로
+평가·랭킹(`evaluateCandidate`/`rankCandidates`/`compareCandidates`)하는 기반이다. 이
+Task는 **실제 외부 MCP를 설치/다운로드/실행하지 않는다** — Browser Worker/Agent
+Router/Dashboard도 아직 시작하지 않았다. 외부 candidate catalog 조회는
+`CandidateSource`(dependency-scanner.ts의 `VulnerabilityAuditSource`와 동일한 주입형
+seam) 하나로 추상화돼 있고, `resolveCapability()`는 그 조회가 실패하면(`ok:false`)
+근거 없이 아무 candidate도 자동 선택하지 않는다(`SOURCE_UNAVAILABLE`).
+
+Core hard rule: `candidate.requiresSecret === true`이거나 `actionTags`에
+`CORE_ALWAYS_HUMAN_APPROVAL_TAGS`(production DB write/배포/live trading·brokerage/
+결제·금융 transaction/고위험 외부 action) 중 하나라도 있으면 `evaluateCandidate()`는
+무조건 `HUMAN_APPROVAL_REQUIRED`로 판정한다 — `CapabilityResolverPolicy`는 이 목록에
+항목을 **추가**만 할 수 있을 뿐(`additionalAlwaysHumanApprovalTags`), 대체/약화시킬
+필드 자체가 타입에 없다. 이 판정은 승인 여부를 나타내는 분류값일 뿐이며, 이 모듈
+자체는 Safe Executor/Secret Scanner/Core Command Safety Gate/Dependency Scanner를
+전혀 우회하지 않는다(그 네 게이트 앞단에서 "무엇을 쓸지" 구조화만 한다).
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은
