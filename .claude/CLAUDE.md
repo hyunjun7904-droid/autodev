@@ -145,6 +145,34 @@ fetch로 얻은 evidence는 곧바로 신뢰되지 않는다 — `discoverTruste
 이미 강제하는 것과 동일하게 `HUMAN_REVIEW_REQUIRED`로 처리된다 — 이 adapter 계층은 그
 판정을 약화시킬 방법이 없다.
 
+`src/discovery-orchestrator.ts`(Phase D Task D4, Official Source Catalog & Discovery
+Orchestration)는 D1+D2+D3를 하나의 흐름으로 배선한다: `CapabilityRequirement` →
+(이 파일) `SourceCatalog`에서 관련 있는 `status:"active"` entry만 선택
+(`selectRelevantSources` — domain은 D1의 `classifyRequirementDomain()`을 그대로
+재사용) → 그 entry들만 D3(`createAsyncEvidenceSource`/`combineAsyncEvidenceSources`)로
+조회 → D3의 `discoverTrustedCandidatesAsync()`가 D2의 판정에 그대로 위임. **평가/랭킹/
+충돌/staleness/승인 판정 로직은 이 파일에 전혀 없다** — D1/D2/D3 파일도 이 Task에서
+바꾸지 않았다(D3에 기존 로컬 `KNOWN_CAPABILITY_TYPES`/`KNOWN_EVIDENCE_SOURCE_TYPES`를
+`export`로 바꾼 것만 추가 — D2의 `KNOWN_ACTION_TAGS` export와 동일한 순수 추가 패턴).
+결과는 D2의 4개 상태를 그대로 1:1 매핑한 4개 상태(`SELECTED`/`HUMAN_REVIEW_REQUIRED`/
+`NO_TRUSTED_CANDIDATE`/`SOURCE_UNAVAILABLE`)로만 나온다.
+
+Core hard rule — **"알 수 없는 source 자동 호출 금지"**: `discoverCapability()`가 실제로
+호출하는 URL은 오직 catalog entry의 고정 `endpointUrl`뿐이다 — `requirement`의 내용
+(사람이 입력한 자유 텍스트, 조작 가능하다고 가정)으로부터 어떤 URL도 만들지 않는다.
+관련 있는 catalog entry가 하나도 없으면(예: 그 capability domain을 다루는 source가
+등록돼 있지 않음) 어떤 source도 호출하지 않고 즉시 `NO_TRUSTED_CANDIDATE`를 반환한다.
+`CatalogSourceEntry`의 `allowedHosts`는 D3에 그대로 넘어가는 `canonicalHost` 하나뿐이라
+"Source Catalog 밖 endpoint"는 애초에 조회 대상이 될 수 없다.
+
+Core hard rule — **"공식 여부를 임의 문자열만으로 결정하지 않는다"**: `officialBasis`
+(사람이 읽는 근거 설명)는 그 자체로 신뢰를 만들지 않는다 — `maxOfficiality:"official"`
+entry는 `officialBasis`가 비어있거나 10자 미만이면 `validateSourceCatalog()`가 즉시
+throw하고(placeholder 방지), 실제 official 상한은 D3의 구조적 검증(https 전용/
+allowedHosts/localhost·private·metadata host 차단, `validateSourceAdapterConfig`+
+`validateSourceUrl` 그대로 재사용 — SSRF 로직 복제 없음)을 그대로 통과해야만 catalog에
+등록될 수 있다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은

@@ -23,6 +23,7 @@
     "test:capability-resolver": "npm run build && node dist/capability-resolver-tests.js",
     "test:candidate-evidence": "npm run build && node dist/candidate-evidence-tests.js",
     "test:source-adapter": "npm run build && node dist/source-adapter-tests.js",
+    "test:discovery-orchestrator": "npm run build && node dist/discovery-orchestrator-tests.js",
     "test:git-changes": "npm run build && node dist/git-changes-tests.js",
     "test:project-context": "npm run build && node dist/project-context-tests.js",
     "test:project-manifest": "npm run build && node dist/project-manifest-tests.js",

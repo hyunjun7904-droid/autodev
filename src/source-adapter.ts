@@ -233,7 +233,9 @@ interface RawCandidateMetadata {
   alternatives?: string[];
 }
 
-const KNOWN_CAPABILITY_TYPES: ReadonlySet<CapabilityType> = new Set(["mcp_server", "official_api", "sdk", "cli", "other"]);
+/** discovery-orchestrator.ts(Phase D Task D4)의 catalog entry 검증도 이 하나의 출처를
+ *  재사용한다(목록 복제 금지). */
+export const KNOWN_CAPABILITY_TYPES: ReadonlySet<CapabilityType> = new Set(["mcp_server", "official_api", "sdk", "cli", "other"]);
 const KNOWN_MAINTENANCE_STATUSES: ReadonlySet<MaintenanceStatus> = new Set([
   "actively_maintained",
   "maintained",
@@ -242,7 +244,7 @@ const KNOWN_MAINTENANCE_STATUSES: ReadonlySet<MaintenanceStatus> = new Set([
   "unknown",
 ]);
 const KNOWN_COST_RISKS: ReadonlySet<CostRisk> = new Set(["none", "possible", "certain"]);
-const KNOWN_EVIDENCE_SOURCE_TYPES: ReadonlySet<EvidenceSourceType> = new Set([
+export const KNOWN_EVIDENCE_SOURCE_TYPES: ReadonlySet<EvidenceSourceType> = new Set([
   "official_vendor_doc",
   "official_repository",
   "official_sdk_or_registry_metadata",
