@@ -17,10 +17,13 @@ official을 자기 주장만으로 확정 못함" 설계)를, Task D4는 D1+D2+D
 흐름으로 배선하는 Official Source Catalog & Discovery Orchestration
 (`src/discovery-orchestrator.ts` — 프로젝트에 하드코딩되지 않는 범용 SourceCatalog
 구조, requirement→관련 있는 active source만 선택→D3 조회→D2 판정까지 한 함수
-(`discoverCapability`)로 연결, 새 평가 로직 없이 D1/D2/D3 재사용만, 자세한 내용은
-`.claude/CLAUDE.md` 참고)을 구현했다. D1/D2/D3/D4 모두 실제 외부 MCP 설치/실행을
-하지 않는다 — Notification Service / Dashboard / 실제 MCP 설치·활성화 / Browser
-Worker / Agent Router는 아직 시작하지 않았다.
+(`discoverCapability`)로 연결, 새 평가 로직 없이 D1/D2/D3 재사용만)를, Task D5는 실제로
+존재/유지되는 공식 source 3건(GitHub REST API 하나로 통합 — Anthropic 공식 TypeScript
+SDK/MCP 공식 reference servers/Puppeteer 공식 저장소, 2026-08-21 확인)을 bootstrap한
+Real Official Source Catalog(`src/real-source-catalog.ts`, 자세한 내용은
+`.claude/CLAUDE.md` 참고)를 구현했다. D1~D5 모두 실제 외부 MCP 설치/실행을 하지 않는다
+— Notification Service / Dashboard / 실제 MCP 설치·활성화 / Browser Worker / Agent
+Router는 아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -59,11 +62,14 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 
 - Notification Service
 - Dashboard
-- 실제 MCP 서버 설치/다운로드/활성화(D1/D2/D3/D4는 Discovery/Resolver/Evidence/Source
-  Adapter/Orchestration의 Core 데이터 모델·판정·조회·배선 로직만 구현했다 — 실제
-  활성화 실행 경로, Browser Worker, Agent Router는 없음)
+- 실제 MCP 서버 설치/다운로드/활성화(D1~D5는 Discovery/Resolver/Evidence/Source
+  Adapter/Orchestration/Catalog Bootstrap의 Core 데이터 모델·판정·조회·배선·실제
+  catalog 등록까지만 구현했다 — 실제 활성화 실행 경로, Browser Worker, Agent Router는
+  없음)
 - production credential을 실제로 사용하는 evidence/candidate 조회
-- 특정 vendor(예: 실제 MCP registry, npm registry, GitHub API)를 대상으로 한
-  실제 SourceCatalog 데이터/SourceAdapterConfig 인스턴스 등록(D4는 범용 catalog
-  구조/orchestrator만 구현했고, 실제 vendor entry는 테스트 fixture 외에 아직 어디에도
-  등록돼 있지 않다)
+- npm registry 기반 evidence source(D5에서 이번 세션의 조회 도구로 `time.modified` 필드
+  존재를 신뢰성 있게 재확인하지 못해 의도적으로 제외했다 — 필요해지면 별도 Task에서
+  공식 문서를 다시 확인하고 등록한다)
+- MCP/API-SDK/CLI 외의 다른 capability domain(payment_or_financial/deployment/
+  communication/storage 등)을 위한 real catalog entry(D5는 대표적인 3건만 최소
+  bootstrap했다 — "많이 등록하지 않는다" 원칙)

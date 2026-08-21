@@ -11,7 +11,7 @@ import {
   KNOWN_CAPABILITY_TYPES,
   KNOWN_EVIDENCE_SOURCE_TYPES,
 } from "./source-adapter";
-import type { SourceAdapterConfig, HttpFetch, AsyncEvidenceSource } from "./source-adapter";
+import type { SourceAdapterConfig, HttpFetch, AsyncEvidenceSource, RawResponseMapper } from "./source-adapter";
 
 // Official Source Catalog & Discovery Orchestration — Phase D Task D4.
 //
@@ -74,6 +74,12 @@ export interface CatalogSourceEntry {
   status: SourceCatalogStatus;
   timeoutMs: number;
   maxBodyBytes: number;
+  /** 이 source의 실제 응답이 우리 내부 evidence 스키마와 다를 때(예: 실제 vendor의 REST
+   *  API를 그대로 쓰는 경우) D3의 SourceAdapterConfig.responseMapper로 그대로 전달된다 —
+   *  순수 데이터 재구성일 뿐 신뢰/보안 판정에는 관여하지 않는다(§ source-adapter.ts의
+   *  RawResponseMapper 설명). 지정하지 않으면(기존 동작과 완전히 동일) 응답을 그대로
+   *  스키마 검증에 넘긴다. */
+  responseMapper?: RawResponseMapper;
 }
 
 export type SourceCatalog = readonly CatalogSourceEntry[];
@@ -106,6 +112,7 @@ function toSourceAdapterConfig(entry: CatalogSourceEntry): SourceAdapterConfig {
     allowedHosts: [entry.canonicalHost],
     timeoutMs: entry.timeoutMs,
     maxBodyBytes: entry.maxBodyBytes,
+    responseMapper: entry.responseMapper,
   };
 }
 

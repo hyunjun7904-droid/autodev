@@ -173,6 +173,36 @@ allowedHosts/localhost·private·metadata host 차단, `validateSourceAdapterCon
 `validateSourceUrl` 그대로 재사용 — SSRF 로직 복제 없음)을 그대로 통과해야만 catalog에
 등록될 수 있다.
 
+`src/real-source-catalog.ts`(Phase D Task D5, Real Official Source Catalog Bootstrap)는
+D1~D4 구조를 그대로 쓰는 실제 공식 catalog 3건을 등록한다 — 전부 GitHub REST API
+(`api.github.com`, 공식 문서로 필드 확인·public repo는 인증 없이 조회 가능함을 확인)
+하나의 실제 vendor 통합만 쓴다: `anthropics/anthropic-sdk-typescript`(Anthropic 공식
+조직 소유, npm의 `@anthropic-ai/sdk` `repository.url`이 가리킴), 
+`modelcontextprotocol/servers`(MCP 공식 문서 사이트가 소개하는 프로토콜의 Anthropic
+관리 reference server 저장소), `puppeteer/puppeteer`(Chrome DevTools 계보 공식 조직).
+세 값 모두 2026-08-21에 실제 GitHub API를 직접 조회해 확인했다 — npm registry 기반
+evidence는 이 세션의 조회 도구로 `time.modified` 필드 존재를 신뢰성 있게 재확인하지
+못해 등록하지 않았다("오래됐거나 공식 여부가 불명확하면 등록하지 말고 보고한다" 원칙
+적용).
+
+D3에 `SourceAdapterConfig.responseMapper?: RawResponseMapper`(응답을 JSON.parse 직후·
+스키마 검증 직전에 순수 재구성하는 훅, 실패 시 malformed response로 처리)를, D4의
+`CatalogSourceEntry`에 동일한 필드를 추가했다 — 둘 다 optional field 추가뿐이라
+기존 47/34개 테스트가 수정 없이 그대로 통과한다. `createGithubRepoResponseMapper()`
+(`real-source-catalog.ts`)가 GitHub의 `full_name`/`archived`/`pushed_at`/
+`license.spdx_id`/`stargazers_count` 같은 실제 응답 필드만 근거로 evidence를 조립한다
+— `official`/`sourceType`/`sourceRef`/`evidenceTimestamp`에는 전혀 관여하지 않으며
+(그 넷은 여전히 config/fetch 메타데이터로만 채워짐), `license.spdx_id==="NOASSERTION"`
+이면 추측하지 않고 생략하고, `archived`처럼 필수 필드가 없으면 throw해 malformed
+response로 처리된다.
+
+실제 네트워크로 이 catalog를 검증하는 `real-source-catalog-smoke-test.ts`는
+`smoke-test`/`gpt-smoke-test`와 동일하게 `test:` 접두사가 없는 별도 스크립트다 —
+Task 완료 전 필수 전체 회귀(`npm run test:*`)에는 포함되지 않는다(외부 API 장애가
+deterministic 회귀를 불안정하게 만들지 않기 위함). `real-source-catalog-tests.ts`
+(전체 회귀에 포함됨)는 실제 네트워크를 전혀 쓰지 않고, 2026-08-21에 확인한 실제 응답을
+그대로 스냅샷한 fixture로 매퍼/catalog/discoverCapability를 검증한다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은

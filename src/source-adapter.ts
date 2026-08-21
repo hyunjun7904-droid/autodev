@@ -353,6 +353,18 @@ function parseRawCandidateMetadataList(json: unknown): { ok: true; data: RawCand
 // 벤더 구현 금지").
 // =========================================================
 
+/**
+ * 실제 vendor가 우리 내부 스키마({candidates:[...]})와 다른 형식으로 응답할 때(예: GitHub
+ * REST API의 repo 메타데이터), JSON.parse 직후·스키마 검증 직전에 한 번 순수하게 재구성하는
+ * 훅(Phase D Task D5 — Real Official Source Catalog Bootstrap). requirement는 capabilityId를
+ * 채워 넣는 용도로만 쓴다. 이 함수는 official/sourceType/sourceRef/evidenceTimestamp에
+ * 절대 관여하지 않는다 — 그 네 값은 여전히 fetchEvidenceFromOfficialJsonSource가 config와
+ * fetch 메타데이터로만 채운다(§ 아래). 신뢰/보안 판정 로직이 아니라 순수 데이터 재구성이므로
+ * D2/D1의 평가 로직을 전혀 건드리지 않는다 — 잘못된 형식이면 그냥 throw하면 된다(malformed
+ * response로 처리됨, fail-open 없음).
+ */
+export type RawResponseMapper = (raw: unknown, requirement: CapabilityRequirement) => unknown;
+
 export interface SourceAdapterConfig {
   /** 이 adapter의 고유 식별자(로그/에러 메시지에 표시). */
   id: string;
@@ -368,6 +380,8 @@ export interface SourceAdapterConfig {
   allowedHosts: string[];
   timeoutMs: number;
   maxBodyBytes: number;
+  /** 지정하지 않으면(기존 동작과 완전히 동일) 응답을 그대로 스키마 검증에 넘긴다. */
+  responseMapper?: RawResponseMapper;
 }
 
 export function validateSourceAdapterConfig(config: SourceAdapterConfig): void {
@@ -393,8 +407,9 @@ export function validateSourceAdapterConfig(config: SourceAdapterConfig): void {
  * (1) validateSourceUrl — https/no-userinfo/private·metadata 차단/allowedHosts 확인.
  * (2) httpFetch — timeout/redirect 거부/response size 제한을 강제하는 seam(기본값
  *     nodeHttpFetch, 테스트는 fixture 주입).
- * (3) JSON 파싱 + parseRawCandidateMetadataList — 스키마 밖 필드(예: 자칭 "official")는
- *     아예 읽지 않는다.
+ * (3) JSON 파싱 → config.responseMapper가 있으면 순수 재구성(§ RawResponseMapper, 실패 시
+ *     malformed response로 처리) → parseRawCandidateMetadataList — 스키마 밖 필드(예: 자칭
+ *     "official")는 아예 읽지 않는다.
  * (4) evidence 조립 — official/sourceType/sourceRef/evidenceTimestamp는 전부 config와
  *     fetch 메타데이터(finalUrl/현재 시각)에서만 채운다(응답 바디 값 사용 안 함).
  * 이 함수가 반환하는 evidence는 아직 "신뢰됐다"는 뜻이 아니다 — 호출부가 반드시
@@ -424,7 +439,17 @@ export async function fetchEvidenceFromOfficialJsonSource(
     return { ok: false, reason: `[${config.id}] 응답이 유효한 JSON이 아닙니다(malformed response).` };
   }
 
-  const parsed = parseRawCandidateMetadataList(json);
+  let mapped: unknown = json;
+  if (config.responseMapper) {
+    try {
+      mapped = config.responseMapper(json, requirement);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `[${config.id}] 응답 변환(responseMapper) 실패(malformed response): ${message}` };
+    }
+  }
+
+  const parsed = parseRawCandidateMetadataList(mapped);
   if (!parsed.ok) {
     return { ok: false, reason: `[${config.id}] 응답 스키마가 올바르지 않습니다: ${parsed.reason}` };
   }
@@ -455,7 +480,6 @@ export async function fetchEvidenceFromOfficialJsonSource(
     actionTags: raw.actionTags,
   }));
 
-  void requirement; // 현재 스키마는 endpointUrl이 이미 requirement 전용으로 구성됐다고 가정한다 — 향후 endpoint를 requirement로부터 동적으로 만드는 확장 지점을 위해 시그니처에 남겨둔다.
   return { ok: true, evidence };
 }
 
