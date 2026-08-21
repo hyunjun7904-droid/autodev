@@ -22,11 +22,22 @@ Claude Worker 세션 운영, GPT Reviewer 전달 범위, context 관리 원칙�
   판정하고, 발견 시 `performTaskCheckpoint`가 git add조차 실행하기 전에 BLOCK한다.
   AI 판단에 의존하지 않으며, 어떤 policy/옵션도 받지 않아 프로젝트가 우회할 수 없다.
   자세한 구조는 `src/secret-scanner.ts` 상단 주석 참고.
+- **Core Command Safety Gate**(`src/safe-executor.ts`의 `coreCommandSafetyGate`, Phase C
+  Task C4 — Hooks / Permissions Enforcement) — RUN_COMMAND가 `validateCommand()`로
+  `policy.allowedCommands`(project 소유 exact-match allow-list)를 확인하기 *전에* 항상
+  먼저 적용되는 PreToolUse 성격의 Core hard rule이다. (1) git은 read-only로 명시적으로
+  확인된 서브커맨드(status/diff/log/show 등, `stash list`/`branch --list` 같은 세부
+  read-only 형태 포함)만 통과하고 그 외(reset/clean/rebase/push/checkout/restore/commit/
+  stash push·pop·drop 등)는 project policy의 allowedCommands에 그 조합이 들어있어도 항상
+  BLOCK한다. (2) 명령 인자가 ENV_FILE_PATTERNS/SECRET_NAME_PATTERNS(단일 출처, path 검증과
+  동일한 상수)에 매칭되면 git이 아닌 명령이라도 BLOCK한다. 이 함수는 ProjectExecutionPolicy를
+  인자로 받지 않으므로 어떤 프로젝트도 이 판정을 약화시킬 방법이 없다.
 - 실제 secret 원문은 console / log / error / GPT review prompt / Claude feedback /
   audit output 어디에도 노출하지 않는다 — 탐지 보고에는 파일/위치/탐지 종류만 담는다.
 
-두 모듈의 책임은 명확히 분리된다: Safe Executor는 접근 범위, Secret Scanner는 commit
-직전 내용 검사.
+세 모듈의 책임은 명확히 분리된다: Safe Executor(경로 접근 범위 + 명령 실행 자체의 Core
+안전 게이트), Secret Scanner(commit 직전 내용 검사), 그리고 명령 실행 permission
+(`policy.allowedCommands`)은 project 소유이되 Core Command Safety Gate 위에서만 동작한다.
 
 ## 향후 운영 요구사항 (미구현)
 

@@ -8,6 +8,7 @@ import {
   validateWritePath,
   validateCommand,
   configureSafeExecutor,
+  coreCommandSafetyGate,
   PROJECT_ROOT,
 } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
@@ -50,6 +51,74 @@ const FIXTURE_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedWritePrefixes: ["src/", "tests/"],
   allowedCommands: [{ cwd: "root", command: "node", args: ["--version"] }],
 };
+
+// Phase C Task C4(Hooks / Permissions Enforcement) — Core Command Safety Gate가
+// policy.allowedCommands에 무엇이 들어있든(악의적/실수로 destructive git 조합이 들어있어도)
+// 절대 약화되지 않는다는 것을 직접 증명한다. 기존 REALISTIC_EXECUTION_POLICY는 애초에
+// destructive git 명령을 allow-list에 넣지 않았으므로 지금까지의 테스트는 "policy가 그냥
+// 안 넣었을 뿐"이라는 우연한 안전과 "Core가 강제로 막는다"는 보장을 구분하지 못했다 —
+// 이 시나리오는 그 둘을 명확히 구분한다.
+const POLICY_WITH_DESTRUCTIVE_GIT_IN_ALLOWLIST: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["web/"],
+  allowedWritePrefixes: ["web/"],
+  allowedCommands: [
+    // 이 프로젝트 정책이 실수로(또는 악의적으로) destructive git 조합을 allow-list에
+    // 명시적으로 넣었다고 가정한다 — Core Command Safety Gate는 이런 policy 내용과 무관하게
+    // 항상 먼저 적용되어야 한다.
+    { cwd: "root", command: "git", args: ["reset", "--hard"] },
+    { cwd: "root", command: "git", args: ["clean", "-fd"] },
+    { cwd: "root", command: "git", args: ["push", "--force"] },
+    { cwd: "root", command: "git", args: ["rebase", "-i", "HEAD~3"] },
+    { cwd: "root", command: "git", args: ["stash", "drop"] },
+    { cwd: "root", command: "git", args: ["stash"] },
+    { cwd: "root", command: "git", args: ["checkout", "--", "."] },
+    { cwd: "root", command: "git", args: ["commit", "-m", "x"] },
+    // read-only 서브커맨드도 함께 등록해 "Core gate가 read-only까지 과잉 차단하지 않는다"는
+    // 것도 같은 시나리오에서 증명한다.
+    { cwd: "root", command: "git", args: ["stash", "list"] },
+    { cwd: "root", command: "git", args: ["branch", "--list"] },
+    // secret/env를 참조하는 명령도 명시적으로 allow-list에 넣었다고 가정한다.
+    { cwd: "root", command: "cat", args: ["web/.env"] },
+  ],
+};
+
+function scenarioProjectPolicyCannotWeakenCommandSafetyGate(isolatedRealisticRoot: string): void {
+  const root = mkdtempSync(join(tmpdir(), "safe-executor-gate-override-"));
+  try {
+    mkdirSync(join(root, "web"), { recursive: true });
+    configureSafeExecutor(root, POLICY_WITH_DESTRUCTIVE_GIT_IN_ALLOWLIST);
+
+    check("[C4-1] allow-list에 있어도 git reset --hard → BLOCK(Core gate)", !validateCommand("git", ["reset", "--hard"], "root").ok);
+    check("[C4-2] allow-list에 있어도 git clean -fd → BLOCK(Core gate)", !validateCommand("git", ["clean", "-fd"], "root").ok);
+    check("[C4-3] allow-list에 있어도 git push --force → BLOCK(Core gate)", !validateCommand("git", ["push", "--force"], "root").ok);
+    check(
+      "[C4-4] allow-list에 있어도 git rebase -i → BLOCK(Core gate)",
+      !validateCommand("git", ["rebase", "-i", "HEAD~3"], "root").ok
+    );
+    check("[C4-5] allow-list에 있어도 git stash drop → BLOCK(Core gate)", !validateCommand("git", ["stash", "drop"], "root").ok);
+    check("[C4-6] allow-list에 있어도 인자 없는 git stash → BLOCK(Core gate, push와 동일)", !validateCommand("git", ["stash"], "root").ok);
+    check(
+      "[C4-7] allow-list에 있어도 git checkout -- . → BLOCK(Core gate, working tree 변경 삭제)",
+      !validateCommand("git", ["checkout", "--", "."], "root").ok
+    );
+    check("[C4-8] allow-list에 있어도 git commit → BLOCK(Core gate, checkpoint.ts만 commit 가능)", !validateCommand("git", ["commit", "-m", "x"], "root").ok);
+    check(
+      "[C4-9] allow-list에 있어도 cat web/.env → BLOCK(Core gate, secret/env 인자)",
+      !validateCommand("cat", ["web/.env"], "root").ok
+    );
+
+    // read-only는 여전히 통과(과잉 차단 아님) — allow-list에도 있고 Core gate도 read-only로
+    // 판정하는 경우에만 최종 ALLOW.
+    check("[C4-10] git stash list → ALLOW(read-only, Core gate 통과 + allow-list 일치)", validateCommand("git", ["stash", "list"], "root").ok);
+    check(
+      "[C4-11] git branch --list → ALLOW(read-only, Core gate 통과 + allow-list 일치)",
+      validateCommand("git", ["branch", "--list"], "root").ok
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
+  }
+}
 
 function scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot: string): void {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "safe-executor-fixture-policy-"));
@@ -214,6 +283,51 @@ async function main(): Promise<void> {
   // 실제로 안전한 명령 하나만 진짜 실행해 RUN_COMMAND 경로 자체도 검증한다.
   const runResult = await validateAndExecute({ type: "RUN_COMMAND", command: "git", args: ["status", "--short"], cwd: "root" });
   check("RUN_COMMAND 실제 실행(git status --short) 성공", runResult.ok);
+
+  // ---- Phase C Task C4 — Core Command Safety Gate 단위 테스트(coreCommandSafetyGate 직접
+  // 호출, ProjectExecutionPolicy/allow-list와 완전히 무관하게 순수 판정만 검증) ----
+  check("coreCommandSafetyGate: git status → ALLOW", coreCommandSafetyGate("git", ["status"]).ok);
+  check("coreCommandSafetyGate: git.exe status → ALLOW(실행파일 확장자 무관)", coreCommandSafetyGate("git.exe", ["status"]).ok);
+  check("coreCommandSafetyGate: git stash list → ALLOW(read-only)", coreCommandSafetyGate("git", ["stash", "list"]).ok);
+  check("coreCommandSafetyGate: git stash show → ALLOW(read-only)", coreCommandSafetyGate("git", ["stash", "show"]).ok);
+  check(
+    "coreCommandSafetyGate: git stash list를 단순 'stash' 문자열 매칭으로 잘못 차단하지 않음",
+    coreCommandSafetyGate("git", ["stash", "list"]).ok === true
+  );
+  check("coreCommandSafetyGate: 인자 없는 git stash → BLOCK(push와 동일, mutating)", !coreCommandSafetyGate("git", ["stash"]).ok);
+  check("coreCommandSafetyGate: git stash push → BLOCK", !coreCommandSafetyGate("git", ["stash", "push"]).ok);
+  check("coreCommandSafetyGate: git stash pop → BLOCK", !coreCommandSafetyGate("git", ["stash", "pop"]).ok);
+  check("coreCommandSafetyGate: git stash drop → BLOCK", !coreCommandSafetyGate("git", ["stash", "drop"]).ok);
+  check("coreCommandSafetyGate: git stash clear → BLOCK", !coreCommandSafetyGate("git", ["stash", "clear"]).ok);
+  check("coreCommandSafetyGate: git reset --hard → BLOCK", !coreCommandSafetyGate("git", ["reset", "--hard"]).ok);
+  check("coreCommandSafetyGate: git reset(인자 없음) → BLOCK", !coreCommandSafetyGate("git", ["reset"]).ok);
+  check("coreCommandSafetyGate: git clean -fd → BLOCK", !coreCommandSafetyGate("git", ["clean", "-fd"]).ok);
+  check("coreCommandSafetyGate: git rebase -i → BLOCK", !coreCommandSafetyGate("git", ["rebase", "-i", "HEAD~3"]).ok);
+  check("coreCommandSafetyGate: git push → BLOCK", !coreCommandSafetyGate("git", ["push"]).ok);
+  check("coreCommandSafetyGate: git push --force → BLOCK", !coreCommandSafetyGate("git", ["push", "--force"]).ok);
+  check("coreCommandSafetyGate: git checkout -- . → BLOCK", !coreCommandSafetyGate("git", ["checkout", "--", "."]).ok);
+  check("coreCommandSafetyGate: git restore . → BLOCK", !coreCommandSafetyGate("git", ["restore", "."]).ok);
+  check("coreCommandSafetyGate: git branch -D feature-x → BLOCK", !coreCommandSafetyGate("git", ["branch", "-D", "feature-x"]).ok);
+  check("coreCommandSafetyGate: git branch --list → ALLOW(read-only)", coreCommandSafetyGate("git", ["branch", "--list"]).ok);
+  check("coreCommandSafetyGate: git remote -v → ALLOW(read-only)", coreCommandSafetyGate("git", ["remote", "-v"]).ok);
+  check("coreCommandSafetyGate: git remote add origin x → BLOCK", !coreCommandSafetyGate("git", ["remote", "add", "origin", "x"]).ok);
+  check("coreCommandSafetyGate: git commit → BLOCK", !coreCommandSafetyGate("git", ["commit", "-m", "x"]).ok);
+  check("coreCommandSafetyGate: git config user.email → BLOCK", !coreCommandSafetyGate("git", ["config", "user.email", "x"]).ok);
+  check(
+    "coreCommandSafetyGate: 명령 인자에 .env 파일 → BLOCK(git 아닌 명령도 적용)",
+    !coreCommandSafetyGate("cat", ["web/.env"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: 명령 인자에 secret 이름 패턴 파일 → BLOCK",
+    !coreCommandSafetyGate("cat", ["web/lib/my-secret-key.ts"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: 관계없는 인자 → ALLOW(과잉 차단 아님)",
+    coreCommandSafetyGate("node", ["--version"]).ok
+  );
+
+  // ---- Phase C Task C4 — project policy가 Core Command Safety Gate를 약화할 수 없음을 증명 ----
+  scenarioProjectPolicyCannotWeakenCommandSafetyGate(isolatedRealisticRoot);
 
   // ---- Phase B Task B1 — Fixture 프로젝트 정책 범용성 증명(§ 요구사항 8) ----
   scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot);

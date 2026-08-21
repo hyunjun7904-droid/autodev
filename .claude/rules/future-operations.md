@@ -2,9 +2,11 @@
 
 이 문서는 Phase C Task C3에서 함께 기록하기로 한 장기 설계 요구사항이다. **이 문서에
 적혀 있다는 사실 자체가 구현 승인을 의미하지 않는다.** 아래 항목은 각각 명시적으로
-지정된 별도 Task에서만 구현한다. 이번 Task(C3)는 Deterministic Secret Scanner
-Gate만 구현했고, Notification Service / Dashboard / Hooks·Permissions / Dependency
-Scanner / MCP Resolver는 시작하지 않았다.
+지정된 별도 Task에서만 구현한다. Task C3는 Deterministic Secret Scanner Gate를,
+Task C4는 Hooks / Permissions Enforcement(Core Command Safety Gate,
+`src/safe-executor.ts`의 `coreCommandSafetyGate` — 자세한 내용은 `.claude/CLAUDE.md`
+보안 섹션 참고)를 구현했다. Notification Service / Dashboard / Dependency Scanner /
+MCP Resolver는 아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -39,9 +41,8 @@ Scanner / MCP Resolver는 시작하지 않았다.
 Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 자동 승인해서는
 안 된다.** 재알림은 사람에게 다시 알리는 것이지, 시스템이 대신 승인하는 것이 아니다.
 
-## 이번 Task(C3)에서 시작하지 않는 것
+## 아직 시작하지 않은 것
 
-- Hooks / Permissions
 - Dependency Scanner
 - Notification Service
 - Dashboard

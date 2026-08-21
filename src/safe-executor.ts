@@ -107,6 +107,104 @@ export const DENY_PATH_PATTERNS: RegExp[] = [
 ];
 export const SECRET_NAME_PATTERNS: RegExp[] = [/secret/i, /token/i, /credential/i, /api[-_]?key/i, /\.pem$/i, /id_rsa/i];
 
+// =========================================================
+// Command Safety Gate — Phase C Task C4(Hooks / Permissions Enforcement) — Core hard rule.
+// =========================================================
+// Claude Developer는 built-in Bash가 없다(claude-developer.ts, 항상 --tools ""). RUN_COMMAND
+// action은 오직 이 Safe Executor의 validateCommand()를 거쳐서만 실행된다 — 이 파일이 사실상
+// Claude의 유일한 명령 실행 경로에 대한 PreToolUse Hook이다.
+//
+// 지금까지 validateCommand()는 policy.allowedCommands(정확한 command+args+cwd 조합
+// allow-list)만으로 명령을 걸렀다. 문제는 그 allow-list 자체가 project policy 소유
+// 데이터라는 점이다 — project config(JSON, project-adapter-loader.ts가 읽는 데이터 파일)가
+// allowedCommands에 `git reset --hard`/`git push --force`/`git clean -fd` 같은 조합을 넣으면
+// 지금까지는 그대로 실행됐다. DENY_PATH_PATTERNS/SECRET_NAME_PATTERNS가 path 접근에서 어떤
+// project policy도 약화할 수 없는 Core hard rule인 것과 마찬가지로, 명령 실행에도 동일한
+// 성격의 Core hard rule이 필요하다 — 아래 게이트는 policy.allowedCommands 확인보다 먼저,
+// 그리고 그것과 무관하게 항상 적용된다. 이 게이트 함수들은 ProjectExecutionPolicy를 인자로
+// 받지 않는다(시그니처 자체에 약화/우회 옵션이 없다).
+//
+// git 서브커맨드 판정은 deny-list가 아니라 allow-list다(이 파일 전체의 설계 원칙과 동일) —
+// git은 서브커맨드가 매우 많고 위험한 조합을 전부 나열하는 deny-list는 구조적으로 빠짐이
+// 생기기 쉽다. 대신 "read-only로 알려진 서브커맨드(+세부 인자)"만 명시적으로 허용하고, 그
+// 목록에 없는 모든 git 서브커맨드(reset/clean/rebase/push/checkout/restore/commit/add/rm/
+// mv/merge/cherry-pick/revert/stash push·pop·drop·clear/branch -d·-D 등)는 전부 거부한다 —
+// "이 목록에 없으므로 read-only임을 증명하지 못했다"는 곧 차단이다(fail-open 금지).
+//
+// `git stash`는 특히 주의가 필요하다 — `git stash list`/`git stash show`는 읽기 전용이지만
+// 인자 없는 `git stash`(push와 동일)나 `git stash push`/`pop`/`drop`/`clear`/`apply`는 working
+// tree/stash 목록을 바꾼다. 서브커맨드 문자열만 보고 "stash가 포함되면 차단"처럼 단순
+// 매칭하면 `git stash list`까지 잘못 차단된다 — branch/tag/remote/reflog처럼 읽기/쓰기 형태가
+// 섞인 서브커맨드도 마찬가지라 첫 세부 인자까지 확인한다.
+function isGitExecutable(command: string): boolean {
+  return /^git(\.exe)?$/i.test(command.trim());
+}
+
+const GIT_READ_ONLY_NO_SUBARG_CHECK: ReadonlySet<string> = new Set([
+  "status", "diff", "log", "show", "blame", "rev-parse", "describe",
+  "ls-files", "ls-tree", "cat-file", "shortlog", "help", "version",
+]);
+
+// 서브커맨드별로 "이 세부 첫 인자까지는 read-only"로 허용하는 목록. 정의되지 않은 서브커맨드는
+// (위 GIT_READ_ONLY_NO_SUBARG_CHECK에도 없다면) 전부 거부된다.
+const GIT_READ_ONLY_FIRST_ARG: Readonly<Record<string, ReadonlySet<string>>> = {
+  stash: new Set(["list", "show"]),
+  branch: new Set(["-v", "-vv", "-a", "-r", "--list", "-l"]),
+  tag: new Set(["-l", "--list"]),
+  remote: new Set(["-v", "show", "get-url"]),
+  reflog: new Set(["show"]),
+};
+
+/**
+ * git 명령이 read-only(정보 조회만 하고 repo/working tree 상태를 바꾸지 않음)인지 판정한다.
+ * false는 "이 allow-list로 read-only임을 증명하지 못했다"는 뜻이며, mutating으로 간주해
+ * 차단한다.
+ */
+function isReadOnlyGitInvocation(args: string[]): boolean {
+  if (args.length === 0) return false; // 인자 없는 "git" 자체는 허용하지 않는다(불필요).
+  const [sub, ...rest] = args;
+  if (sub.startsWith("-")) return false; // 전역 옵션이 서브커맨드 앞에 오는 형태는 허용하지 않는다.
+  if (GIT_READ_ONLY_NO_SUBARG_CHECK.has(sub)) return true;
+  const allowedFirstArgs = GIT_READ_ONLY_FIRST_ARG[sub];
+  if (!allowedFirstArgs) return false;
+  if (rest.length === 0) return false; // 예: 인자 없는 "git stash"는 push와 동일(mutating).
+  return allowedFirstArgs.has(rest[0]);
+}
+
+/**
+ * RUN_COMMAND의 Core Command Safety Gate — validateCommand()가 policy.allowedCommands를
+ * 확인하기 전에 항상 먼저 통과해야 한다.
+ *   1) 대상이 git이면 read-only 서브커맨드가 아닌 한 무조건 거부(위 설명).
+ *   2) 명령 인자 중 하나라도 ENV_FILE_PATTERNS/SECRET_NAME_PATTERNS(이 파일의 단일 출처,
+ *      secret-scanner.ts와 동일한 상수를 재사용 — 목록을 복제하지 않는다)에 매칭되면 거부한다
+ *      — "cat web/.env", "powershell Get-Content web/.env.local" 같은 경로 기반 secret/env
+ *      접근을 명령 인자 레벨에서 막는다. 이 목적은 secret-scanner.ts(Phase C Task C3, commit
+ *      대상 파일 "내용"을 검사)와 겹치지 않는다 — 여기는 "명령 실행 인자"가 secret/env
+ *      파일을 가리키는지만 본다(책임 분리).
+ * 어떤 ProjectExecutionPolicy도 이 함수의 동작을 바꿀 방법이 없다(인자로 policy를 받지
+ * 않음).
+ */
+export function coreCommandSafetyGate(command: string, args: string[]): { ok: boolean; reason?: string } {
+  if (isGitExecutable(command) && !isReadOnlyGitInvocation(args)) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: read-only로 확인되지 않은 git 서브커맨드는 어떤 프로젝트 정책으로도 " +
+        "허용되지 않습니다(reset/clean/rebase/push/checkout/restore/commit/stash push·pop·drop 등).",
+    };
+  }
+  for (const raw of args) {
+    const a = raw.split("\\").join("/");
+    if (ENV_FILE_PATTERNS.some((p) => p.test(a))) {
+      return { ok: false, reason: "Core Command Safety Gate: 명령 인자가 .env 계열 파일을 참조합니다." };
+    }
+    if (SECRET_NAME_PATTERNS.some((p) => p.test(a))) {
+      return { ok: false, reason: "Core Command Safety Gate: 명령 인자가 secret/key/token 이름 패턴을 참조합니다." };
+    }
+  }
+  return { ok: true };
+}
+
 export interface ResolveOk {
   ok: true;
   abs: string;
@@ -214,6 +312,8 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
   }
 
   function validateCommand(command: string, args: string[], cwd: string): { ok: boolean; reason?: string } {
+    const gate = coreCommandSafetyGate(command, args);
+    if (!gate.ok) return gate;
     const match = policy.allowedCommands.find(
       (c) =>
         c.cwd === cwd &&
