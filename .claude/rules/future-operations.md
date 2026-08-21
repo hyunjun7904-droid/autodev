@@ -35,9 +35,14 @@ playwright install chromium`(공식 CLI, Chromium만)으로 실제 브라우저�
 EXTRACT_TEXT/FIND→안전 클릭 실제 DOM 변경 확인→download/password 클릭이 Preflight로
 사전 거부됨→SCREENSHOT→dispose) 11/11 PASS를 확인했고, Playwright의 optional
 transitive dependency `fsevents@2.3.2`가 C5에서 `install-script-new-dependency`
-(human_review)로 정확히 분류됨을 재확인했다(scanner 규칙 변경 없음) — 자세한 내용은
-`.claude/CLAUDE.md` 참고. D1~E2.1 모두 실제 외부 MCP 설치/실행을 하지 않는다 —
-Notification Service / Dashboard / Agent Router는 아직 시작하지 않았다.
+(human_review)로 정확히 분류됨을 재확인했다(scanner 규칙 변경 없음). Task F1은 AutoDev가
+Task 성격에 따라 필요한 전문 Agent만 선택하는 Core Agent Registry & Deterministic
+Router(`src/agent-registry.ts` — 초기 6개 role(planner/research/developer/qa/
+reviewer/security), developer 외 canWriteCode 금지 Core hard rule, taskType별
+정적 워크플로+dependency 표현, LLM을 전혀 호출하지 않는 순수 함수 `routeTask()`,
+자세한 내용은 `.claude/CLAUDE.md` 참고)를 구현했다. D1~F1 모두 실제 외부 MCP 설치/
+실행이나 실제 병렬 Agent 실행을 하지 않는다 — Notification Service / Dashboard는
+아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -97,3 +102,11 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
   대상으로 한 자동조작은 여전히 하지 않았다
 - 멀티 페이지(popup에서의 추가 action) 워크플로 — E2는 popup을 검증 후 항상 즉시 닫을
   뿐, popup 페이지에서 추가 action을 실행하는 기능은 구현하지 않았다
+- 실제 병렬 Agent 실행, Agent-to-Agent 대화, Agent가 임의로 새 Agent를 생성하는 기능
+  (F1은 `routeTask()`가 "무엇이 필요한지" 계획만 반환하는 순수 함수 기반만 구현했다 —
+  실제 실행 배선은 다음 Task)
+- Agent Router를 실제 orchestrator.ts/autodev.ts 파이프라인에 연결하는 작업(F1은
+  agent-registry.ts를 독립 모듈로만 추가했고, 기존 실행 경로(claude-developer.ts/
+  gpt-reviewer.ts/orchestrator.ts)는 전혀 수정하지 않았다)
+- 토큰 사용량 실측 Dashboard(F1은 "필요한 Agent만 선택"이라는 구조적 절감만 구현했고,
+  실제 토큰 측정/표시는 하지 않았다)

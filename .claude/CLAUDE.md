@@ -295,6 +295,41 @@ Playwright 설치로 유입된 `fsevents@2.3.2`(macOS 전용 optional, Windows�
 직접 실행해 재확인했다 — BLOCK도 조용한 PASS도 아니며, 이는 예상된 정상 동작이라
 scanner 규칙은 변경하지 않았다.
 
+`src/agent-registry.ts`(Phase F Task F1, Core Agent Registry & Deterministic Router
+Foundation)는 AutoDev가 Task 성격에 따라 필요한 전문 Agent만 선택하는 기반이다. 초기
+`CORE_AGENT_REGISTRY`는 6개 역할(`planner`/`research`/`developer`/`qa`/`reviewer`/
+`security`)만 정의하며, `validateAgentDefinition()`이 **developer 외 어떤 role도
+`canWriteCode:true`를 가질 수 없다는 Core hard rule을 강제한다**(어떤 policy로도
+우회 불가 — 이 검증 함수는 policy를 인자로 받지 않는다). `Safe Executor`/`Secret
+Scanner`/`Dependency Scanner`/`Git checkpoint`/`state persistence`는 Agent가 아니라
+Core deterministic service로 남는다 — Registry에 그것들을 위한 role이 아예 없고,
+`classifyTaskType()`의 `"deterministic_only"` 분류(Core service 이름을 직접 언급하는
+task 텍스트에 반응)는 항상 빈 routing 계획(agent 0개)을 반환해 이 경계를 구조적으로
+지킨다.
+
+`routeTask(input, registry?, policy?)`는 LLM을 전혀 호출하지 않는 순수 함수다 —
+동일 입력에는 항상 동일한 `RoutingPlan`을 반환한다("동일 입력 → 동일 routing").
+taskType별 정적 워크플로(`buildRolePlan`)가 필요한 role과 그 의존성
+(`RoutingStep.dependsOn`)을 결정한다: `code_implementation`은
+developer→qa→reviewer(단, `hasFixedRequiredTests:true`면 qa를 빼 "단순 deterministic
+test 실행에 LLM Agent를 낭비하지 않는다"를 만족), `external_capability_research`는
+research→security, `architecture_design`은 planner(+"외부/공식 문서" 언급이 있을 때만
+research 추가), `security_review`는 security만. 최종 순서는 `AgentDefinition.priority`
+오름차순으로 정렬해 deterministic ordering을 보장한다. `requiresHumanApproval`은
+`policy.ts`의 `classifyTaskRisk`/`requiresHumanApproval`을 그대로 재사용한 결과다(새
+위험 분류 로직을 만들지 않음) — 기존 `orchestrator.ts`의 고위험 작업 즉시 중지 게이트는
+이 Task에서 건드리지 않았다.
+
+`AgentRouterPolicy`는 D1~E2와 동일한 설계로 `additionalRequiredAgentsByTaskType`
+(registry에 실제 존재하는 agent id만 허용, `validateAgentRouterPolicy`가 검증)를 통해
+agent를 **추가**만 할 수 있다 — `CORE_AGENT_REGISTRY`의 어떤 `AgentDefinition`도 이
+policy로 patch되는 코드 경로 자체가 없으므로 Core 권한(canWriteCode/canUseNetwork/
+canRequestHumanApproval/riskLevel)을 확대할 방법이 없다. 이 Task는 실제 병렬 Agent
+실행, Agent 간 자유 대화, Agent의 임의 신규 Agent 생성을 구현하지 않았다 —
+`routeTask()`는 "무엇이 필요한지" 계획만 반환하며, 실제 실행 배선(developer→
+claude-developer.ts, reviewer→gpt-reviewer.ts 등 기존 Core 경로 그대로)은 이 Task
+범위 밖이다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은
