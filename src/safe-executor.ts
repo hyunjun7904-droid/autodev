@@ -185,13 +185,34 @@ const GIT_READ_ONLY_FIRST_ARG: Readonly<Record<string, ReadonlySet<string>>> = {
 // spawnSync로 stdout을 직접 캡처한다) blocklist를 서브커맨드별로 나누지 않고 모든 read-only
 // git 호출에 공통으로 적용한다 — 전체 git 옵션 parser를 새로 만들지 않고, 문서로 확인된
 // 위험 옵션만 최소한으로 막는다.
+//
+// Phase C Task C4.2 — Git option split-form hardening.
+//
+// git의 long option은(값을 받는 옵션이라면) "--option=value"와 "--option value"(값이 다음
+// argv에 오는 분리형) 둘 다 지원하는 것이 일반적이다(parse-options). 위 옵션 중 값을 받는
+// 것은 --output(<file>)과 --contents(<file>) 둘뿐이다(--ext-diff/--textconv/--filters/
+// --paginate는 값을 받지 않는 순수 스위치라 분리형 자체가 존재하지 않는다). --output은
+// 이미 `(=.*)?`로 "--output"(값이 다음 argv에 오는 분리형의 플래그 자체) / "--output=value"
+// 둘 다 매칭했었다 — 이 패턴은 옵션 뒤에 오는 값이 정확히 무엇이든(어떤 경로든) 상관없이
+// 플래그 자체의 존재만으로 차단하므로, 값이 같은 토큰에 있든(등호형) 다음 argv 토큰에
+// 있든(분리형) 항상 차단된다. 반면 --contents=<file>은 등호형만 매칭했다 — 분리형
+// "--contents <file>"은 그 자리의 인자가 정확히 "--contents"(등호도 값도 없음)이므로
+// `/^--contents=/`(등호 필수)에 매칭되지 않아 그대로 통과했다(실제 우회 가능했던 gap). 값이
+// 붙는 옵션의 안전한 패턴은 항상 --output처럼 "값 부분을 선택(optional)"으로 둬서 등호형·
+// 분리형·값 없는 나열형(git이 값 누락으로 에러를 낼 뿐인 경우 포함) 모두를 플래그 자체
+// 하나로 포괄해야 한다 — "다음 argv가 무엇인지"를 따로 들여다볼 필요가 없다(그 값 내용은
+// 차단 여부와 무관하다). 참고: git의 long option은 모호하지 않은 접두사 축약(예: 문맥에 따라
+// "--cont"가 "--contents"로 해석되는 경우)도 허용할 수 있는데, 이는 서브커맨드마다 실제
+// 정의된 전체 옵션 집합을 알아야만 판정 가능한 문제라 여기서 다루지 않는다(요구사항: 전체
+// git 옵션 parser를 새로 만들지 않는다) — 이 게이트가 다루는 것은 "정식 옵션명의 등호형/
+// 분리형 두 표현"까지다.
 const GIT_DANGEROUS_OPTION_PATTERNS: RegExp[] = [
   /^--output(=.*)?$/,
   /^--ext-diff$/,
   /^--textconv$/,
   /^--filters$/,
   /^--paginate$/,
-  /^--contents=/,
+  /^--contents(=.*)?$/,
 ];
 
 /**

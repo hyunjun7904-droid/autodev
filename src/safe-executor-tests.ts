@@ -186,6 +186,56 @@ function scenarioProjectPolicyCannotBypassGateViaDangerousOptions(isolatedRealis
   }
 }
 
+// Phase C Task C4.2 — project policy가 정확한 split-form 인자 조합(값이 등호 없이 다음
+// argv 토큰에 오는 형태)을 allowedCommands에 그대로 넣어도 Core Command Safety Gate가
+// 여전히 차단함을 증명한다. scenarioProjectPolicyCannotBypassGateViaDangerousOptions(C4.1)는
+// equals-form(예: "--output=evil.txt")만 다뤘다 — 이 시나리오는 그 형제 우회(split-form)를
+// 다룬다.
+const POLICY_WITH_SPLIT_FORM_DANGEROUS_OPTIONS_IN_ALLOWLIST: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["web/"],
+  allowedWritePrefixes: ["web/"],
+  allowedCommands: [
+    { cwd: "root", command: "git", args: ["diff", "--output", "evil.txt"] },
+    { cwd: "root", command: "git", args: ["show", "--output", "evil.txt", "HEAD"] },
+    { cwd: "root", command: "git", args: ["log", "--output", "evil.txt"] },
+    { cwd: "root", command: "git", args: ["blame", "--contents", "evil.txt", "README.md"] },
+    // 대조군 — 옵션 없는 진짜 read-only는 여전히 허용돼야 한다.
+    { cwd: "root", command: "git", args: ["blame", "README.md"] },
+  ],
+};
+
+function scenarioProjectPolicyCannotBypassGateViaSplitFormOptions(isolatedRealisticRoot: string): void {
+  const root = mkdtempSync(join(tmpdir(), "safe-executor-gate-splitform-override-"));
+  try {
+    mkdirSync(join(root, "web"), { recursive: true });
+    configureSafeExecutor(root, POLICY_WITH_SPLIT_FORM_DANGEROUS_OPTIONS_IN_ALLOWLIST);
+
+    check(
+      "[C4.2-1] allow-list에 있어도 git diff --output evil.txt(split-form) → BLOCK(Core gate)",
+      !validateCommand("git", ["diff", "--output", "evil.txt"], "root").ok
+    );
+    check(
+      "[C4.2-2] allow-list에 있어도 git show --output evil.txt HEAD(split-form) → BLOCK(Core gate)",
+      !validateCommand("git", ["show", "--output", "evil.txt", "HEAD"], "root").ok
+    );
+    check(
+      "[C4.2-3] allow-list에 있어도 git log --output evil.txt(split-form) → BLOCK(Core gate)",
+      !validateCommand("git", ["log", "--output", "evil.txt"], "root").ok
+    );
+    check(
+      "[C4.2-4] allow-list에 있어도 git blame --contents evil.txt README.md(split-form) → BLOCK(Core gate, 임의 파일 읽기)",
+      !validateCommand("git", ["blame", "--contents", "evil.txt", "README.md"], "root").ok
+    );
+    check(
+      "[C4.2-5] 같은 policy 안에서 진짜 read-only git blame README.md(옵션 없음)는 여전히 ALLOW(과잉 차단 아님)",
+      validateCommand("git", ["blame", "README.md"], "root").ok
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
+  }
+}
+
 function scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot: string): void {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "safe-executor-fixture-policy-"));
   try {
@@ -435,12 +485,47 @@ async function main(): Promise<void> {
   check("coreCommandSafetyGate: git stash show → ALLOW(회귀 유지)", coreCommandSafetyGate("git", ["stash", "show"]).ok);
   check("coreCommandSafetyGate: git stash push → BLOCK(회귀 유지)", !coreCommandSafetyGate("git", ["stash", "push"]).ok);
 
+  // ---- Phase C Task C4.2 — Git option split-form hardening: "--option=value"(equals-form)와
+  // "--option value"(값이 다음 argv에 오는 split-form) 둘 다 deterministic BLOCK ----
+  check(
+    "coreCommandSafetyGate: git blame --contents=evil.txt README.md → BLOCK(equals-form 회귀)",
+    !coreCommandSafetyGate("git", ["blame", "--contents=evil.txt", "README.md"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git blame --contents evil.txt README.md → BLOCK(split-form, 값이 다음 argv에 옴)",
+    !coreCommandSafetyGate("git", ["blame", "--contents", "evil.txt", "README.md"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git diff --output=evil.txt → BLOCK(equals-form 회귀)",
+    !coreCommandSafetyGate("git", ["diff", "--output=evil.txt"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git diff --output evil.txt → BLOCK(split-form, 값이 다음 argv에 옴)",
+    !coreCommandSafetyGate("git", ["diff", "--output", "evil.txt"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git show --output evil.txt HEAD → BLOCK(split-form)",
+    !coreCommandSafetyGate("git", ["show", "--output", "evil.txt", "HEAD"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git log --output evil.txt → BLOCK(split-form)",
+    !coreCommandSafetyGate("git", ["log", "--output", "evil.txt"]).ok
+  );
+  // 정상 read-only 회귀 유지 — split-form 방어가 옵션 없는 정상 호출을 과잉 차단하지 않음.
+  check("coreCommandSafetyGate: git blame README.md(옵션 없음) → ALLOW(회귀 유지)", coreCommandSafetyGate("git", ["blame", "README.md"]).ok);
+  check("coreCommandSafetyGate: git diff --stat(옵션 없음) → ALLOW(회귀 유지)", coreCommandSafetyGate("git", ["diff", "--stat"]).ok);
+  check("coreCommandSafetyGate: git stash list → ALLOW(회귀 유지, C4.2)", coreCommandSafetyGate("git", ["stash", "list"]).ok);
+
   // ---- Phase C Task C4 — project policy가 Core Command Safety Gate를 약화할 수 없음을 증명 ----
   scenarioProjectPolicyCannotWeakenCommandSafetyGate(isolatedRealisticRoot);
 
   // ---- Phase C Task C4.1 — malicious project policy가 "read-only 옵션 우회"로도 Core Command
   // Safety Gate를 약화할 수 없음을 증명 ----
   scenarioProjectPolicyCannotBypassGateViaDangerousOptions(isolatedRealisticRoot);
+
+  // ---- Phase C Task C4.2 — malicious project policy가 split-form(값이 다음 argv에 오는 형태)을
+  // allowedCommands에 정확히 넣어도 Core Command Safety Gate가 여전히 BLOCK함을 증명 ----
+  scenarioProjectPolicyCannotBypassGateViaSplitFormOptions(isolatedRealisticRoot);
 
   // ---- Phase B Task B1 — Fixture 프로젝트 정책 범용성 증명(§ 요구사항 8) ----
   scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot);
