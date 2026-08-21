@@ -9,20 +9,37 @@ import type { GptReviewRetryResult, ReviewRetryOptions } from "./gpt-reviewer";
 import { runClaudeTask as realReadOnlyClaudeCall } from "./claude-runner";
 import { runClaudeTask as fakeClaudeTask } from "./fake-claude-runner";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
-import type { ClaudeResult } from "./types";
+import type { ClaudeResult, GptDecision } from "./types";
 import { discoverCapability } from "./discovery-orchestrator";
 import type { CapabilityDiscoveryResult, DiscoverCapabilityOptions, SourceCatalog } from "./discovery-orchestrator";
 import type { CapabilityRequirement } from "./capability-resolver";
+import { MAX_REVIEW_CYCLES } from "./policy";
 
 // Agent Execution Orchestration — Phase F Task F2.
 //
 // F1의 routeTask()가 만든 RoutingPlan을 실제로 실행한다: step dependency 확인 → 필요한
 // Agent만 실행 → 결과를 구조화해 다음 step으로 전달 → 최종 실행 결과 반환. 이번 Task는
-// Agent 간 자유대화/복잡한 병렬실행/REVISE 자동 handoff loop를 구현하지 않는다 —
-// executeRoutingPlan()은 각 step을 정확히 한 번만, RoutingStep의 dependency 순서대로
-// 실행하고 끝난다(REVISE는 결과로 보고될 뿐, 자동으로 developer를 다시 부르지 않는다 —
-// 그 loop는 orchestrator.ts의 별개 관심사이며 이 파일은 그것을 감싸지 않고 claude-developer.ts/
-// gpt-reviewer.ts의 실행 primitive를 직접 재사용한다).
+// Agent 간 자유대화/복잡한 병렬실행을 구현하지 않는다 — executeRoutingPlan()은 각
+// RoutingStep을 dependency 순서대로 정확히 한 번만 방문한다(F1의 routing-level dedup은
+// 그대로 유지된다).
+//
+// Phase F Task F3 — reviewer RoutingStep을 "방문"하는 것은 여전히 1회이지만, 그 안에서
+// developer↔reviewer REVISE handoff loop(§ executeReviewerStepWithRevise)를 수행한다:
+// reviewer가 REVISE를 반환하면 그 구체적 지적사항 + 관련 변경 파일 + 실패한 required
+// test만으로 developer를 다시 부르고(§ buildReviseDeveloperTask, 과거 전체 대화나
+// 프로젝트 전체를 다시 담지 않음), required test를 재실행한 뒤 reviewer를 재실행한다 —
+// 이 재호출은 developer/reviewer가 RoutingStep으로 두 번 등장하는 것이 아니라, reviewer
+// RoutingStep 하나를 처리하는 도중의 내부 동작이다("동일 agent 중복 호출 방지"는 routing
+// 레벨 dedup을 말하는 것이지, 정당한 REVISE 재작업까지 막는 것이 아니다). 이 loop는
+// orchestrator.ts의 runOrchestrator()가 이미 실제 운용에서 쓰는 것과 동일한 policy.ts의
+// MAX_REVIEW_CYCLES 상한을 그대로 import해서 재사용하며(값을 다시 정의하지 않음), Claude
+// 재개(continuation)는 claude-developer.ts가 이미 가진 allowedPathPrefixes 기반 "재개
+// 감지" 구조(§ input.developerOptions.allowedPathPrefixes를 매 cycle 그대로 전달)를
+// 그대로 재사용한다 — 새 continuation 메커니즘을 만들지 않는다. GPT 판정에 대한 안전장치
+// override(critical/high가 있는데 PASS→REVISE 강제, required test 실패에도 PASS→REVISE
+// 강제, scope 밖 변경→BLOCK 강제)도 orchestrator.ts의 동일 로직을 미러링한다(§
+// applyDecisionSafetyOverrides 주석 참고 — production pipeline 파일인 orchestrator.ts는
+// 이 Task 범위 밖이라 수정하지 않는다).
 //
 // 역할 연결(전부 기존 Core 실행 경로 재사용, 새 실행 인프라 없음):
 //   - developer → claude-developer.ts의 runDeveloperTaskViaSafeExecutor(Safe Executor 프로토콜)
@@ -243,24 +260,176 @@ async function executeDeveloperStep(agent: AgentDefinition, input: AgentExecutio
   };
 }
 
-async function executeReviewerStep(
+/** reviewer step의 data — GptReviewRetryResult에 REVISE loop 진행 정보만 덧붙인다. */
+export interface ReviewerStepData extends GptReviewRetryResult {
+  /** 이 판정에 도달하기까지 실제로 수행된 REVISE 재작업 횟수(첫 시도 제외). */
+  reviseCycles: number;
+  /**
+   * MAX_REVIEW_CYCLES 도달로 decision이 여전히 REVISE인 채 자동 진행이 중단됐을 때만
+   * true. 이 경우 사람이 "승인"한다고 해서 성공/완료로 전환되는 게 아니다 — critical/high나
+   * 미해결 REVISE 상태가 그대로 남아있을 수 있으므로, 사람이 직접 코드를 다시 확인/개입해야
+   * 한다는 뜻이다(§ computeOverallStatus가 이 플래그를 HUMAN_APPROVAL_REQUIRED가 아니라
+   * BLOCKED + reason="REVIEW_CYCLE_EXHAUSTED"로 매핑하는 이유).
+   */
+  reviewCycleExhausted?: boolean;
+}
+
+/**
+ * GPT reviewer decision에 대한 Core 안전장치 강제 override.
+ * orchestrator.ts의 runOrchestrator() 내부 로직(scopeViolations→BLOCK 강제,
+ * critical/high가 있는데 PASS→REVISE 강제, required test 실패에도 PASS→REVISE 강제)을
+ * 그대로 미러링한다. orchestrator.ts는 이 로직을 별도 함수로 export하지 않고(runOrchestrator
+ * 내부 inline), 그 파일은 autodev.ts production pipeline이 실제로 쓰는 파일이라 이 Task
+ * 범위 밖에서 리팩터링하지 않기로 했다 — 대신 이 작은 predicate(3개 조건)만 여기 그대로
+ * 옮겨 적는다. 이 코드베이스는 이런 작은 안전 predicate/상수의 파일간 복제를 이미 허용하는
+ * 선례가 있다(§ claude-developer.ts/gpt-reviewer.ts의 NO_SCOPE_CONFIGURED 센티널). 이
+ * override 규칙이 orchestrator.ts에서 바뀌면 이 함수도 함께 갱신해야 한다.
+ */
+function applyDecisionSafetyOverrides(
+  gptResult: Pick<GptReviewRetryResult, "decision" | "severity" | "scopeViolations">,
+  requiredTestsFailed: boolean
+): GptDecision {
+  let decision = gptResult.decision;
+  if (gptResult.scopeViolations && gptResult.scopeViolations.length > 0 && decision !== "BLOCK") {
+    decision = "BLOCK";
+  }
+  if (decision === "PASS" && (gptResult.severity.critical > 0 || gptResult.severity.high > 0)) {
+    decision = "REVISE";
+  }
+  if (decision === "PASS" && requiredTestsFailed) {
+    decision = "REVISE";
+  }
+  return decision;
+}
+
+/**
+ * REVISE 발생 시 다음 developer 호출에 넘길 task 문자열을 구성한다. 원래 Task 목표 +
+ * reviewer의 구체적 지적사항 + 관련 변경 파일 + 실패한 required test만 포함한다 — 과거
+ * 대화 전체나 프로젝트 전체를 다시 담지 않는다(§ 토큰 효율 요구사항). 이 문자열이
+ * claude-developer.ts의 transcript 시드(`# Task\n${task}`)가 되고, 같은 developerOptions
+ * (특히 allowedPathPrefixes)를 그대로 유지해서 넘기면 그 파일이 이미 가진 "이전 시도의
+ * in-scope 미완성 변경을 감지해 이어서 진행하라고 안내"하는 재개 구조가 자동으로 함께
+ * 작동한다 — 여기서 새로 만들 필요가 없다.
+ */
+function buildReviseDeveloperTask(originalTaskGoal: string, reviewFeedback: string, developerResult: DeveloperResult): string {
+  const failedTests = developerResult.tests.filter((t) => !t.pass).map((t) => t.name);
+  const parts = [
+    `# 원래 Task 목표\n${originalTaskGoal}`,
+    `# Reviewer 지적사항(REVISE)\n${reviewFeedback}`,
+    `# 관련 변경 파일\n${developerResult.changedFiles.length > 0 ? developerResult.changedFiles.join(", ") : "(없음)"}`,
+  ];
+  if (failedTests.length > 0) {
+    parts.push(`# 실패한 required test\n${failedTests.join(", ")}`);
+  }
+  parts.push("이전 시도의 변경사항은 버리지 말고 위 지적사항을 반영해 이어서 수정하세요.");
+  return parts.join("\n\n");
+}
+
+/**
+ * reviewer RoutingStep을 실행한다. developer 결과가 없으면(선행 미실행) SKIPPED.
+ * decision이 REVISE면(안전장치 override 포함) developer를 다시 불러 tests를 재실행하고
+ * reviewer를 재실행한다 — MAX_REVIEW_CYCLES(policy.ts, orchestrator.ts와 동일한 값) 안에서만.
+ *
+ * 한도 도달 시(orchestrator.ts의 "REVISE 5회 도달 → WAITING_HUMAN"과 동일한 정책) 자동
+ * 진행을 중단하고 reviewCycleExhausted=true를 남긴다. orchestrator.ts의 OrchestratorStatus
+ * 는 WAITING_HUMAN 하나로 "고위험 사전 승인 대기"와 "자동 루프가 수렴하지 못해 멈춤"을
+ * 모두 표현하지만(그 상태에서 자동으로 APPROVED로 되돌아가는 코드 경로 자체가 없음),
+ * 이 파일의 AgentExecutionOverallStatus에서 HUMAN_APPROVAL_REQUIRED는 "승인하면 진행"
+ * 이라는 의미로도 쓰이고 있어(§ plan.requiresHumanApproval 사전 게이트) 그대로 재사용하면
+ * "사람이 승인만 하면 이 REVISE도 통과된 것으로 볼 수 있다"는 오해를 살 수 있다. 그래서
+ * review cycle 소진은 HUMAN_APPROVAL_REQUIRED가 아니라 BLOCKED로 매핑하고(§
+ * computeOverallStatus), reason을 REVIEW_CYCLE_EXHAUSTED로 명시해 "승인=완료"가 아님을
+ * 분명히 한다 — critical/high나 미해결 REVISE 상태는 그대로 보존된다(강제로 PASS/COMPLETED
+ * 로 재작성하지 않음).
+ *
+ * developer 재시도가 구조적으로 실패(success=false)하면 그 자리에서 멈추고 reviewer는
+ * 다시 부르지 않는다(§ orchestrator.ts의 "claude 실패 시 GPT 리뷰 생략" 원칙과 동일).
+ * 반환하는 developer step은 항상 "최신 시도"의 실제 결과를 담는다 — 호출부가 stepResults의
+ * 기존 developer 항목을 이걸로 교체해야 최종 판정이 실제로 검증된 마지막 코드를 본다.
+ */
+async function executeReviewerStepWithRevise(
   agent: AgentDefinition,
   priorResults: AgentStepResult[],
   input: AgentExecutionInput,
-  runner: ReviewerAgentRunner
-): Promise<AgentStepResult> {
-  const developerResult = priorResults.find((r) => r.role === "developer")?.data as DeveloperResult | undefined;
-  if (!developerResult) {
+  developerRunner: DeveloperAgentRunner,
+  reviewerRunner: ReviewerAgentRunner
+): Promise<{ reviewerStep: AgentStepResult; updatedDeveloperStep?: AgentStepResult }> {
+  const developerStepResult = priorResults.find((r) => r.role === "developer");
+  if (!developerStepResult || developerStepResult.status !== "SUCCESS") {
     return {
-      agentId: agent.id,
-      role: "reviewer",
-      status: "SKIPPED",
-      summary: "",
-      reason: "reviewer는 developer 결과가 있어야 리뷰할 수 있습니다(선행 결과 없음).",
+      reviewerStep: {
+        agentId: agent.id,
+        role: "reviewer",
+        status: "SKIPPED",
+        summary: "",
+        reason: "reviewer는 developer 결과가 있어야 리뷰할 수 있습니다(선행 결과 없음).",
+      },
     };
   }
-  const result = await runner(developerResult, 1, input.taskGoal, input.reviewerOptions ?? {});
-  return { agentId: agent.id, role: "reviewer", status: "SUCCESS", summary: result.feedback, data: result };
+
+  let developerData = developerStepResult.data as DeveloperResult;
+  let latestDeveloperStep = developerStepResult;
+  let cycle = 1;
+
+  while (true) {
+    const requiredTestsFailed = developerData.tests.length > 0 && !developerData.tests.every((t) => t.pass);
+    const reviewResult = await reviewerRunner(developerData as ClaudeResult, cycle, input.taskGoal, input.reviewerOptions ?? {});
+    const decision = applyDecisionSafetyOverrides(reviewResult, requiredTestsFailed);
+    const reviseCycles = cycle - 1;
+
+    if (decision === "PASS" || decision === "BLOCK" || decision === "HUMAN_REQUIRED") {
+      return {
+        reviewerStep: {
+          agentId: agent.id,
+          role: "reviewer",
+          status: "SUCCESS",
+          summary: reviewResult.feedback,
+          data: { ...reviewResult, decision, reviseCycles } as ReviewerStepData,
+        },
+        updatedDeveloperStep: reviseCycles > 0 ? latestDeveloperStep : undefined,
+      };
+    }
+
+    // decision === "REVISE"
+    if (cycle >= MAX_REVIEW_CYCLES) {
+      return {
+        reviewerStep: {
+          agentId: agent.id,
+          role: "reviewer",
+          status: "SUCCESS",
+          summary: reviewResult.feedback,
+          data: { ...reviewResult, decision, reviseCycles, reviewCycleExhausted: true } as ReviewerStepData,
+          reason: `REVIEW_CYCLE_EXHAUSTED — MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리할 수 없고, critical/high나 미해결 REVISE 상태가 남아있는 채로 사람이 직접 개입해야 합니다).`,
+        },
+        updatedDeveloperStep: reviseCycles > 0 ? latestDeveloperStep : undefined,
+      };
+    }
+
+    const reviseTask = buildReviseDeveloperTask(input.taskGoal, reviewResult.feedback, developerData);
+    cycle += 1;
+    const nextDeveloperResult = await developerRunner(reviseTask, cycle, input.developerOptions ?? {});
+    latestDeveloperStep = {
+      agentId: latestDeveloperStep.agentId,
+      role: "developer",
+      status: nextDeveloperResult.success ? "SUCCESS" : "FAILED",
+      summary: nextDeveloperResult.summary,
+      data: nextDeveloperResult,
+      reason: nextDeveloperResult.success ? undefined : nextDeveloperResult.errorCode,
+    };
+    if (!nextDeveloperResult.success) {
+      return {
+        reviewerStep: {
+          agentId: agent.id,
+          role: "reviewer",
+          status: "SKIPPED",
+          summary: "",
+          reason: "developer REVISE 재시도가 실패해(success=false) 리뷰를 생략합니다.",
+        },
+        updatedDeveloperStep: latestDeveloperStep,
+      };
+    }
+    developerData = nextDeveloperResult;
+  }
 }
 
 // =========================================================
@@ -295,14 +464,24 @@ export function computeOverallStatus(stepResults: AgentStepResult[]): { status: 
     if (reviewerStep.status !== "SUCCESS") {
       return { status: "FAILED", reason: `reviewer step 실패: ${reviewerStep.reason ?? reviewerStep.summary}` };
     }
-    const reviewerData = reviewerStep.data as GptReviewRetryResult;
+    const reviewerData = reviewerStep.data as ReviewerStepData;
     if (reviewerData.decision === "BLOCK" || reviewerData.decision === "HUMAN_REQUIRED") {
       return { status: "HUMAN_APPROVAL_REQUIRED", reason: `reviewer decision=${reviewerData.decision}` };
     }
+    // executeReviewerStepWithRevise()는 REVISE를 내부에서 MAX_REVIEW_CYCLES까지 자동으로
+    // 재작업/재리뷰한다 — 여기 도달한 시점에 decision이 여전히 REVISE라면 그건 한도 도달로
+    // 자동 진행이 중단된 경우뿐이다(§ reviewCycleExhausted). 이 경우 일부러
+    // HUMAN_APPROVAL_REQUIRED(plan.requiresHumanApproval 사전 게이트와 같은 "승인하면
+    // 진행"이라는 뜻으로도 쓰이는 상태)를 쓰지 않는다 — "review cycle을 다 썼는데도 REVISE
+    // 상태(critical/high 또는 미해결 지적사항 포함)가 남아있다"는 사실을 "사람이 승인만
+    // 하면 통과"로 오해할 수 있기 때문이다. BLOCKED + reason=REVIEW_CYCLE_EXHAUSTED로
+    // 매핑해 승인만으로 완료/성공 전환될 수 없음을 명확히 한다.
     if (reviewerData.decision === "REVISE") {
       return {
-        status: "FAILED",
-        reason: "reviewer decision=REVISE — 이 Task는 자동 REVISE handoff loop를 구현하지 않으므로 후속 처리는 호출부의 몫입니다.",
+        status: "BLOCKED",
+        reason: reviewerData.reviewCycleExhausted
+          ? `REVIEW_CYCLE_EXHAUSTED: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})에 도달해 자동 진행을 중단합니다(critical=${reviewerData.severity.critical}, high=${reviewerData.severity.high} — 승인만으로 완료 처리 불가, 사람이 직접 개입해야 합니다).`
+          : "reviewer decision=REVISE — 아직 해결되지 않은 REVISE 상태입니다.",
       };
     }
   }
@@ -395,7 +574,14 @@ export async function executeRoutingPlan(
     if (step.role === "developer") {
       stepResult = await executeDeveloperStep(agent, input, developerRunner);
     } else if (step.role === "reviewer") {
-      stepResult = await executeReviewerStep(agent, stepResults, input, reviewerRunner);
+      const { reviewerStep, updatedDeveloperStep } = await executeReviewerStepWithRevise(agent, stepResults, input, developerRunner, reviewerRunner);
+      if (updatedDeveloperStep) {
+        const developerIdx = stepResults.findIndex((r) => r.role === "developer");
+        if (developerIdx !== -1) stepResults[developerIdx] = updatedDeveloperStep;
+        if (updatedDeveloperStep.status === "SUCCESS") completed.add(updatedDeveloperStep.agentId);
+        else failedOrSkipped.add(updatedDeveloperStep.agentId);
+      }
+      stepResult = reviewerStep;
     } else if (step.role === "research") {
       stepResult = await executeResearchStep(agent, step, input, stepResults, readOnlyRunner);
     } else {

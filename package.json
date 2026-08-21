@@ -31,6 +31,7 @@
     "test:playwright-browser-backend": "npm run build && node dist/playwright-browser-backend-tests.js",
     "test:agent-registry": "npm run build && node dist/agent-registry-tests.js",
     "test:agent-orchestrator": "npm run build && node dist/agent-orchestrator-tests.js",
+    "test:agent-orchestrator-revise": "npm run build && node dist/agent-orchestrator-revise-tests.js",
     "test:git-changes": "npm run build && node dist/git-changes-tests.js",
     "test:project-context": "npm run build && node dist/project-context-tests.js",
     "test:project-manifest": "npm run build && node dist/project-manifest-tests.js",
