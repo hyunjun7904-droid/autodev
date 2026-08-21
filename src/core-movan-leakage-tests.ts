@@ -122,6 +122,30 @@ function main(): void {
   );
   check("project-adapter-loader.ts에 MOVAN 하드코딩 문자열이 없음(주석 포함)", !/MOVAN/.test(projectAdapterLoader));
 
+  // --- Phase C Task C1 — External Project Adapter Trust Boundary: project-adapter-loader.ts가
+  // 외부 project config의 코드를 실행하지 않고 데이터로만 읽음(§ 요구사항 13). "이런 걸 쓰지
+  // 않는다"는 주석 설명(예: "eval()을 쓰지 않는다")까지 실패시키지 않도록 // 줄 주석을 제거한
+  // 코드만 검사한다.
+  const projectAdapterLoaderNoComments = projectAdapterLoader
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  check(
+    "project-adapter-loader.ts가 외부 adapter 경로를 require()하지 않음(resolvedPath 대상)",
+    !/require\(\s*resolvedPath\s*\)/.test(projectAdapterLoaderNoComments)
+  );
+  check("project-adapter-loader.ts에 동적 import()가 없음", !/\bimport\(/.test(projectAdapterLoaderNoComments));
+  check("project-adapter-loader.ts에 eval()이 없음", !/\beval\(/.test(projectAdapterLoaderNoComments));
+  check("project-adapter-loader.ts에 new Function()이 없음", !/new\s+Function\(/.test(projectAdapterLoaderNoComments));
+  check(
+    "project-adapter-loader.ts가 node:vm을 사용하지 않음",
+    !/require\(\s*["']node:vm["']\s*\)/.test(projectAdapterLoaderNoComments) && !/from\s+"node:vm"/.test(projectAdapterLoaderNoComments)
+  );
+  check(
+    "project-adapter-loader.ts가 project config를 JSON.parse로만 읽음(readFileSync+JSON.parse)",
+    /JSON\.parse\(/.test(projectAdapterLoaderNoComments) && /readFileSync\(/.test(projectAdapterLoaderNoComments)
+  );
+
   // --- 목표 상태(§ 요구사항 11) — MOVAN 전용 adapter/registry/entry point 파일 자체가
   // AutoDev repo 안에 더 이상 존재하지 않는다. ---
   check(

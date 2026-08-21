@@ -1,16 +1,18 @@
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { join, relative, sep } from "node:path";
 import { loadProjectAdapter } from "./project-adapter-loader";
+import { configureSafeExecutor, validateReadPath, validateWritePath } from "./safe-executor";
+import { decideNextAction } from "./autodev";
 
-// AutoDev 범용화 Phase B Task B3 — External Project Adapter 로더 검증.
+// AutoDev 범용화 Phase C Task C1 — External Project Adapter를 data-only(JSON)로 전환한
+// project-adapter-loader.ts 검증.
 //
 // 이 파일은 project-adapter-loader.ts(AutoDev Core)가 MOVAN을 포함해 어떤 프로젝트도
-// 직접 알지 못한 채, 오직 "adapter 경로 → createProjectManifest() export → 반환값이
-// validateProjectManifest를 통과" 계약만으로 동작함을 증명한다. 실제 MOVAN adapter는
-// 여기서 전혀 참조하지 않는다 — 이 테스트가 쓰는 adapter는 전부 OS 임시 디렉터리에 그
-// 자리에서 만든 fixture CommonJS 모듈이다.
+// 직접 알지 못한 채, 오직 "project config(JSON) 경로 → data로 읽기 → 검증 →
+// ProjectManifest" 계약만으로 동작함을 증명한다. 핵심 증명은 이 파일이 만드는 project
+// config가 전부 OS 임시 디렉터리의 순수 JSON 데이터 파일이며, 어떤 executable(.js 등)도
+// AutoDev가 실행하지 않는다는 것이다(§ 시나리오 "malicious .js adapter").
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -24,11 +26,28 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
-function writeAdapterModule(dir: string, fileName: string, content: string): string {
+function writeJson(dir: string, fileName: string, data: unknown): string {
+  const abs = join(dir, fileName);
+  writeFileSync(abs, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  return abs;
+}
+
+function writeText(dir: string, fileName: string, content: string): string {
   const abs = join(dir, fileName);
   writeFileSync(abs, content, "utf-8");
   return abs;
 }
+
+const VALID_FIXTURE_TASK = {
+  id: "F1",
+  phase: 1,
+  taskNumber: 1,
+  title: "fixture task",
+  prompt: "fixture prompt",
+  requiredTests: [{ name: "fixture:test", command: "node", args: ["tests/run.js"], cwd: "root" }],
+  allowedPathPrefixes: ["fixture/"],
+  prohibitedOperations: ["외부 네트워크 호출"],
+};
 
 // ---------------------------------------------------------------------------
 // A) adapter 경로 미지정(undefined/빈 문자열) — 즉시 실패, 어떤 프로젝트로도 fallback 없음.
@@ -40,7 +59,7 @@ function scenarioMissingAdapterPathFailsFast(): void {
   } catch {
     threwOnUndefined = true;
   }
-  check("A) adapter 경로가 undefined면 즉시 실패", threwOnUndefined);
+  check("A) config 경로가 undefined면 즉시 실패", threwOnUndefined);
 
   let threwOnEmpty = false;
   try {
@@ -48,113 +67,398 @@ function scenarioMissingAdapterPathFailsFast(): void {
   } catch {
     threwOnEmpty = true;
   }
-  check("A) adapter 경로가 공백 문자열이면 즉시 실패", threwOnEmpty);
+  check("A) config 경로가 공백 문자열이면 즉시 실패", threwOnEmpty);
 }
 
 // ---------------------------------------------------------------------------
-// B) 존재하지 않는 adapter 모듈 경로 — 즉시 실패.
+// B) 존재하지 않는 project config 경로 — 즉시 실패.
 // ---------------------------------------------------------------------------
-function scenarioNonexistentAdapterPathFailsFast(): void {
+function scenarioNonexistentConfigPathFailsFast(): void {
   const dir = makeTempDir("autodev-adapter-loader-missing-");
-  const nonexistent = join(dir, "does-not-exist.js");
+  const nonexistent = join(dir, "does-not-exist.json");
   let threw = false;
   try {
     loadProjectAdapter(nonexistent);
   } catch {
     threw = true;
   }
-  check("B) 존재하지 않는 adapter 모듈 경로는 즉시 실패", threw);
+  check("B) 존재하지 않는 project config 경로는 즉시 실패", threw);
 }
 
 // ---------------------------------------------------------------------------
-// C) 모듈은 존재하지만 createProjectManifest()를 export하지 않음 — 즉시 실패.
+// C) malformed JSON — 즉시 실패.
 // ---------------------------------------------------------------------------
-function scenarioAdapterWithoutFactoryFailsFast(): void {
-  const dir = makeTempDir("autodev-adapter-loader-nofactory-");
-  const modulePath = writeAdapterModule(dir, "adapter.js", "module.exports = { somethingElse: 123 };\n");
+function scenarioMalformedJsonFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-malformed-json-");
+  const configPath = writeText(dir, "manifest.json", "{ this is not valid JSON ");
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("C) malformed JSON은 즉시 실패", threw);
+}
+
+// ---------------------------------------------------------------------------
+// D) 필수 필드 없음 — 즉시 실패(permissive fallback 없음).
+// ---------------------------------------------------------------------------
+function scenarioMissingRequiredFieldsFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-missing-fields-");
+  const configPath = writeJson(dir, "manifest.json", { projectId: "" });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("D) 필수 필드가 없는 project config는 즉시 실패", threw);
+}
+
+// ---------------------------------------------------------------------------
+// E) 잘못된 task registry(필수 필드 누락) — 즉시 실패.
+// ---------------------------------------------------------------------------
+function scenarioInvalidTaskRegistryFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-bad-registry-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-bad-registry-root-");
+  writeText(dir, "project-state.json", "{}\n");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "bad-registry-project",
+    projectName: "Bad Registry Project",
+    targetProjectRoot: relativeFromTo(dir, fixtureRoot),
+    statePath: "project-state.json",
+    taskRegistry: [{ id: "T1" /* phase/taskNumber/title/prompt/requiredTests/allowedPathPrefixes 누락 */ }],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      allowedCommands: [],
+    },
+  });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("E) 필수 필드가 누락된 taskRegistry 항목은 즉시 실패", threw);
+}
+
+// ---------------------------------------------------------------------------
+// F) 잘못된 execution policy — 즉시 실패.
+// ---------------------------------------------------------------------------
+function scenarioInvalidExecutionPolicyFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-bad-policy-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-bad-policy-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "bad-policy-project",
+    projectName: "Bad Policy Project",
+    targetProjectRoot: relativeFromTo(dir, fixtureRoot),
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: [], // 비어있음 — validateProjectExecutionPolicy가 거부해야 함
+      allowedWritePrefixes: ["fixture/"],
+      allowedCommands: [],
+    },
+  });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("F) 빈 allowedReadPrefixes를 가진 execution policy는 즉시 실패", threw);
+}
+
+// ---------------------------------------------------------------------------
+// G) malformed regex(writeDenyPatterns) — 즉시 실패.
+// ---------------------------------------------------------------------------
+function scenarioMalformedRegexFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-bad-regex-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-bad-regex-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "bad-regex-project",
+    projectName: "Bad Regex Project",
+    targetProjectRoot: relativeFromTo(dir, fixtureRoot),
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      writeDenyPatterns: [{ pattern: "(unterminated[" }],
+      allowedCommands: [],
+    },
+  });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("G) malformed regex pattern은 즉시 실패", threw);
+
+  const dir2 = makeTempDir("autodev-adapter-loader-bad-flags-");
+  const configPath2 = writeJson(dir2, "manifest.json", {
+    projectId: "bad-flags-project",
+    projectName: "Bad Flags Project",
+    targetProjectRoot: relativeFromTo(dir2, fixtureRoot),
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      writeDenyPatterns: [{ pattern: "^secret$", flags: "g" }], // 허용되지 않은 flags
+      allowedCommands: [],
+    },
+  });
+  let threwFlags = false;
+  try {
+    loadProjectAdapter(configPath2);
+  } catch {
+    threwFlags = true;
+  }
+  check("G) 허용되지 않은 regex flags는 즉시 실패", threwFlags);
+}
+
+// ---------------------------------------------------------------------------
+// H) 존재하지 않는 targetProjectRoot — 즉시 실패.
+// ---------------------------------------------------------------------------
+function scenarioNonexistentTargetRootFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-bad-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "bad-root-project",
+    projectName: "Bad Root Project",
+    targetProjectRoot: "does-not-exist-subdir",
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      allowedCommands: [],
+    },
+  });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("H) 존재하지 않는 targetProjectRoot는 즉시 실패", threw);
+}
+
+// ---------------------------------------------------------------------------
+// I) 허용되지 않은 executable adapter(.js) — 즉시 실패, 그리고 실제로 실행되지 않는다.
+//
+// 이 시나리오가 이번 Task의 핵심 증명이다: 악의적인 adapter .js 파일을 만들어 그 경로를
+// loadProjectAdapter에 넘겼을 때, (a) 즉시 실패하고 (b) 그 .js 파일의 최상위 코드(module
+// 로드 시점에 실행되는 side effect)가 전혀 실행되지 않아야 한다 — 이전 구조(require())라면
+// 이 시점에 이미 파일이 생성됐을 것이다.
+// ---------------------------------------------------------------------------
+function scenarioMaliciousJsAdapterNeverExecutes(): void {
+  const dir = makeTempDir("autodev-adapter-loader-malicious-");
+  const proofPath = join(dir, "proof-of-execution.txt");
+  const maliciousJs = [
+    "'use strict';",
+    "// 이 파일이 require()/import()/eval 등으로 실행되면 즉시 proof 파일을 만든다.",
+    `require('node:fs').writeFileSync(${JSON.stringify(proofPath)}, 'EXECUTED');`,
+    "function createProjectManifest() {",
+    "  return { projectId: 'malicious', projectName: 'Malicious', taskRegistry: [] };",
+    "}",
+    "module.exports = { createProjectManifest };",
+  ].join("\n");
+  const maliciousPath = writeText(dir, "malicious-adapter.js", maliciousJs);
+
   let threw = false;
   let message = "";
   try {
-    loadProjectAdapter(modulePath);
+    loadProjectAdapter(maliciousPath);
   } catch (e) {
     threw = true;
     message = e instanceof Error ? e.message : String(e);
   }
-  check("C) createProjectManifest export가 없으면 즉시 실패", threw);
-  check("C) 실패 메시지가 createProjectManifest 계약 위반을 언급함", message.includes("createProjectManifest"));
-}
+  check("I) .js adapter는 즉시 실패(확장자 거부)", threw);
+  check("I) 실패 메시지가 JSON/.json 요구사항을 언급함", /\.json/i.test(message));
+  check("I) malicious .js adapter의 코드가 전혀 실행되지 않음(proof 파일 미생성)", !existsSync(proofPath));
 
-// ---------------------------------------------------------------------------
-// D) createProjectManifest()가 반환한 값이 validateProjectManifest를 통과하지 못함
-//    — 즉시 실패(permissive fallback 없음).
-// ---------------------------------------------------------------------------
-function scenarioAdapterReturningInvalidManifestFailsFast(): void {
-  const dir = makeTempDir("autodev-adapter-loader-invalid-");
-  const modulePath = writeAdapterModule(
-    dir,
-    "adapter.js",
-    [
-      "module.exports = {",
-      "  createProjectManifest: function () {",
-      "    return { projectId: '' };", // projectId 빈 문자열 — validateProjectManifest가 거부해야 함
-      "  },",
-      "};",
-    ].join("\n")
-  );
-  let threw = false;
-  try {
-    loadProjectAdapter(modulePath);
-  } catch {
-    threw = true;
+  // 다른 executable 확장자(.cjs/.mjs/.ts)도 동일하게 거부되는지 확인.
+  for (const ext of [".cjs", ".mjs", ".ts"]) {
+    const p = writeText(dir, `adapter${ext}`, "module.exports = {};");
+    let threwExt = false;
+    try {
+      loadProjectAdapter(p);
+    } catch {
+      threwExt = true;
+    }
+    check(`I) ${ext} adapter도 즉시 실패(확장자 거부)`, threwExt);
   }
-  check("D) 유효하지 않은 manifest를 반환하는 adapter는 즉시 실패", threw);
 }
 
 // ---------------------------------------------------------------------------
-// E) 유효한 fixture adapter를 명시적으로 주입하면 정상적으로 ProjectManifest를 얻는다
-//    (MOVAN이 아닌 임의의 fixture 프로젝트로도 동일하게 동작함을 증명).
+// J) taskRegistry/taskRegistryPath 둘 다 지정하거나 둘 다 없으면 즉시 실패.
 // ---------------------------------------------------------------------------
-function scenarioValidFixtureAdapterLoadsSuccessfully(): void {
-  const dir = makeTempDir("autodev-adapter-loader-valid-");
-  const modulePath = writeAdapterModule(
-    dir,
-    "adapter.js",
-    [
-      "const { resolve, join } = require('node:path');",
-      "function createProjectManifest() {",
-      "  return {",
-      "    projectId: 'fixture-adapter-project',",
-      "    projectName: 'Fixture Adapter Project',",
-      "    targetProjectRoot: resolve(__dirname),",
-      "    statePath: join(__dirname, 'project-state.json'),",
-      "    taskRegistry: [],",
-      "    developerInstructions: 'fixture adapter developer instructions',",
-      "    reviewInstructions: 'fixture adapter review instructions',",
-      "    reviewScopeDirs: ['fixture/'],",
-      "    executionPolicy: {",
-      "      allowedReadPrefixes: ['fixture/'],",
-      "      allowedWritePrefixes: ['fixture/'],",
-      "      allowedCommands: [],",
-      "    },",
-      "  };",
-      "}",
-      "module.exports = { createProjectManifest };",
-    ].join("\n")
-  );
+function scenarioTaskRegistrySourceAmbiguityFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-registry-ambiguous-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-registry-ambiguous-root-");
+  const base = {
+    projectId: "ambiguous-project",
+    projectName: "Ambiguous Project",
+    targetProjectRoot: relativeFromTo(dir, fixtureRoot),
+    statePath: "project-state.json",
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+  };
+  const neitherPath = writeJson(dir, "neither.json", base);
+  let threwNeither = false;
+  try {
+    loadProjectAdapter(neitherPath);
+  } catch {
+    threwNeither = true;
+  }
+  check("J) taskRegistry/taskRegistryPath 둘 다 없으면 즉시 실패", threwNeither);
 
-  const manifest = loadProjectAdapter(modulePath);
-  check("E) 유효한 fixture adapter가 정상적으로 ProjectManifest를 반환함", manifest.projectId === "fixture-adapter-project");
-  check("E) 반환된 manifest.targetProjectRoot가 adapter 자신의 위치 기준으로 계산됨", manifest.targetProjectRoot === dir);
-  check("E) 반환된 manifest에 MOVAN 관련 필드가 전혀 없음", !JSON.stringify(manifest).includes("movan") && !JSON.stringify(manifest).includes("MOVAN"));
+  const bothPath = writeJson(dir, "both.json", { ...base, taskRegistry: [VALID_FIXTURE_TASK], taskRegistryPath: "task-registry.json" });
+  writeJson(dir, "task-registry.json", [VALID_FIXTURE_TASK]);
+  let threwBoth = false;
+  try {
+    loadProjectAdapter(bothPath);
+  } catch {
+    threwBoth = true;
+  }
+  check("J) taskRegistry/taskRegistryPath를 동시에 지정하면 즉시 실패", threwBoth);
+}
+
+// ---------------------------------------------------------------------------
+// K) targetProjectRoot의 경로 escape — 절대경로/드라이브경로/UNC 경로는 즉시 실패.
+// ---------------------------------------------------------------------------
+function scenarioPathEscapeFailsFast(): void {
+  const dir = makeTempDir("autodev-adapter-loader-escape-");
+  const base = {
+    projectId: "escape-project",
+    projectName: "Escape Project",
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+  };
+
+  const absPath = writeJson(dir, "abs.json", { ...base, targetProjectRoot: "C:\\Windows" });
+  let threwAbs = false;
+  try {
+    loadProjectAdapter(absPath);
+  } catch {
+    threwAbs = true;
+  }
+  check("K) targetProjectRoot에 드라이브 절대경로를 쓰면 즉시 실패", threwAbs);
+
+  const uncPath = writeJson(dir, "unc.json", { ...base, targetProjectRoot: "\\\\server\\share" });
+  let threwUnc = false;
+  try {
+    loadProjectAdapter(uncPath);
+  } catch {
+    threwUnc = true;
+  }
+  check("K) targetProjectRoot에 UNC 경로를 쓰면 즉시 실패", threwUnc);
+
+  // statePath는 ".."을 전혀 허용하지 않는다(같은 디렉터리 트리 안이어야 함).
+  const stateEscapePath = writeJson(dir, "state-escape.json", { ...base, targetProjectRoot: ".", statePath: "../../outside.json" });
+  let threwStateEscape = false;
+  try {
+    loadProjectAdapter(stateEscapePath);
+  } catch {
+    threwStateEscape = true;
+  }
+  check("K) statePath에 \"..\"을 쓰면 즉시 실패", threwStateEscape);
+}
+
+// ---------------------------------------------------------------------------
+// L) 유효한 fixture project config를 명시적으로 주입하면 정상적으로 ProjectManifest를
+//    얻는다(MOVAN이 아닌 임의의 fixture 프로젝트로도 동일하게 동작함을 증명). 이어서
+//    Safe Executor/decideNextAction에 실제로 주입해 end-to-end로 동작함을 확인한다.
+// ---------------------------------------------------------------------------
+function scenarioValidFixtureConfigLoadsSuccessfully(): void {
+  const dir = makeTempDir("autodev-adapter-loader-valid-");
+  writeJson(dir, "task-registry.json", [VALID_FIXTURE_TASK]);
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "fixture-adapter-project",
+    projectName: "Fixture Adapter Project",
+    targetProjectRoot: ".",
+    statePath: "project-state.json",
+    taskRegistryPath: "task-registry.json",
+    developerInstructions: "fixture adapter developer instructions",
+    reviewInstructions: "fixture adapter review instructions",
+    reviewScopeDirs: ["fixture/"],
+    rulesPath: "rules.md",
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      writeDenyPatterns: [{ pattern: "^fixture/secret\\.txt$" }],
+      allowedCommands: [],
+    },
+  });
+  writeText(dir, "project-state.json", "{}\n");
+
+  const manifest = loadProjectAdapter(configPath);
+  check("L) 유효한 fixture project config가 정상적으로 ProjectManifest를 반환함", manifest.projectId === "fixture-adapter-project");
+  check("L) 반환된 manifest.targetProjectRoot가 project config 자신의 위치 기준으로 계산됨", manifest.targetProjectRoot === dir);
+  check("L) taskRegistryPath로 지정한 외부 파일에서 taskRegistry가 로드됨", manifest.taskRegistry.length === 1 && manifest.taskRegistry[0].id === "F1");
+  check(
+    "L) writeDenyPatterns가 실제 RegExp 인스턴스로 컴파일됨",
+    Array.isArray(manifest.executionPolicy.writeDenyPatterns) &&
+      manifest.executionPolicy.writeDenyPatterns.every((p) => p instanceof RegExp)
+  );
+  check("L) 반환된 manifest에 MOVAN 관련 필드가 전혀 없음", !JSON.stringify(manifest, (_k, v) => (v instanceof RegExp ? v.source : v)).includes("MOVAN"));
+
+  // end-to-end — Safe Executor에 실제로 주입해 read/write 권한이 이 정책대로 강제되는지,
+  // decideNextAction이 이 taskRegistry만으로 다음 task를 고르는지 확인한다(§ 요구사항 14/15).
+  configureSafeExecutor(manifest.targetProjectRoot, manifest.executionPolicy);
+  check("L) [E2E] fixture/ 하위 read 허용", validateReadPath("fixture/x.txt").ok === true);
+  check("L) [E2E] fixture/ 밖 write 거부", validateWritePath("other/x.txt").ok === false);
+  check("L) [E2E] writeDenyPatterns로 지정한 fixture/secret.txt write 거부", validateWritePath("fixture/secret.txt").ok === false);
+
+  const decision = decideNextAction(
+    { currentTask: null, reviewCycle: 0, lastClaudeResult: null, lastGptDecision: null, status: "READY", claudeLimitWaitCount: 0, deferredHumanTasks: [], completedTasks: [], gitCheckpoint: "", currentPhase: 1 },
+    manifest.taskRegistry
+  );
+  check("L) [E2E] decideNextAction이 이 fixture taskRegistry만으로 F1을 선택함", decision.kind === "RUN_TASK" && decision.task.id === "F1");
+}
+
+function relativeFromTo(fromDir: string, toDir: string): string {
+  return relative(fromDir, toDir).split(sep).join("/");
 }
 
 async function main(): Promise<void> {
   try {
     scenarioMissingAdapterPathFailsFast();
-    scenarioNonexistentAdapterPathFailsFast();
-    scenarioAdapterWithoutFactoryFailsFast();
-    scenarioAdapterReturningInvalidManifestFailsFast();
-    scenarioValidFixtureAdapterLoadsSuccessfully();
+    scenarioNonexistentConfigPathFailsFast();
+    scenarioMalformedJsonFailsFast();
+    scenarioMissingRequiredFieldsFailsFast();
+    scenarioInvalidTaskRegistryFailsFast();
+    scenarioInvalidExecutionPolicyFailsFast();
+    scenarioMalformedRegexFailsFast();
+    scenarioNonexistentTargetRootFailsFast();
+    scenarioMaliciousJsAdapterNeverExecutes();
+    scenarioTaskRegistrySourceAmbiguityFailsFast();
+    scenarioPathEscapeFailsFast();
+    scenarioValidFixtureConfigLoadsSuccessfully();
   } finally {
     for (const dir of tempDirs) {
       try {
@@ -172,7 +476,22 @@ async function main(): Promise<void> {
   check("소스 회귀: run.ts가 project-adapter-loader를 통해서만 manifest를 얻음", /loadProjectAdapter\(/.test(runSource));
   check("소스 회귀: run.ts에 MOVAN 하드코딩 문자열이 없음", !/MOVAN/.test(runSource));
 
-  console.log("\n=== project-adapter-loader(Phase B Task B3 — External Project Adapter) 테스트 결과 ===");
+  // 주석에 남아있는 "이런 걸 쓰지 않는다"는 설명 문구(예: "eval()/new Function() 등을 쓰지
+  // 않는다")까지 실패시키는 허술한 문자열 검사가 되지 않도록, // 줄 주석을 제거한 코드만
+  // 검사한다(§ core-movan-leakage-tests.ts와 동일한 원칙 — 코드가 실제로 무엇을 하는지만 본다).
+  const loaderSourceRaw = readFileSync(join(__dirname, "..", "src", "project-adapter-loader.ts"), "utf-8");
+  const loaderSource = loaderSourceRaw
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  check("소스 회귀: project-adapter-loader.ts가 require(resolvedPath)로 외부 adapter를 실행하지 않음", !/require\(\s*resolvedPath\s*\)/.test(loaderSource));
+  check("소스 회귀: project-adapter-loader.ts에 동적 import()가 없음", !/\bimport\(/.test(loaderSource));
+  check("소스 회귀: project-adapter-loader.ts에 eval()이 없음", !/\beval\(/.test(loaderSource));
+  check("소스 회귀: project-adapter-loader.ts에 new Function()이 없음", !/new\s+Function\(/.test(loaderSource));
+  check("소스 회귀: project-adapter-loader.ts에 vm 모듈 사용이 없음", !/require\(\s*["']node:vm["']\s*\)/.test(loaderSource) && !/from\s+"node:vm"/.test(loaderSource));
+  check("소스 회귀: project-adapter-loader.ts가 readFileSync+JSON.parse로만 project config를 읽음", /JSON\.parse\(/.test(loaderSource));
+
+  console.log("\n=== project-adapter-loader(Phase C Task C1 — Data-only External Project Adapter) 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
   console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);

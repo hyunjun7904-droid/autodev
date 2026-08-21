@@ -2,21 +2,22 @@ import { runAutodevOnce } from "./autodev";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { log } from "./logger";
 
-// AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체).
+// AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체, Phase C Task C1 — project adapter
+// data-only 전환).
 //
 // 이 파일은 어떤 프로젝트를 개발하는지 전혀 모른다 — --project <path> 커맨드라인 인자
-// 또는 AUTODEV_PROJECT_ADAPTER 환경변수로 명시된 external project adapter 모듈 경로를
+// 또는 AUTODEV_PROJECT_ADAPTER 환경변수로 명시된 project config(JSON 데이터 파일) 경로를
 // project-adapter-loader.ts에 넘겨 ProjectManifest를 얻고, 그것을 runAutodevOnce()에
-// 그대로 전달한다. adapter 경로가 없거나 adapter가 계약(createProjectManifest export,
-// validateProjectManifest 통과)을 어기면 즉시 실패한다 — 어떤 기본 프로젝트로도 조용히
-// fallback하지 않는다.
+// 그대로 전달한다. 경로가 없거나, .json이 아니거나, 내용이 스키마를 어기면 즉시 실패한다
+// — 어떤 기본 프로젝트로도 조용히 fallback하지 않는다. project-adapter-loader.ts는 이
+// JSON을 fs.readFileSync+JSON.parse로만 읽는다 — require()/import()/eval() 등으로 프로젝트가
+// 제공한 코드를 실행하지 않는다(§ project-adapter-loader.ts 상단 주석).
 //
 // 특정 프로젝트를 실행하려면: AUTODEV_PROJECT_ADAPTER(또는 --project)에 그 프로젝트 저장소가
-// 소유한 adapter 모듈(예: <project-repo>/.autodev/manifest.js)의 절대경로를 지정한다 — 그
-// 프로젝트 쪽이 소유하는 wrapper 스크립트가 이 경로를 조립해 넘기는 방식을 권장한다. 새
-// 프로젝트를 붙이려면 그 프로젝트가 같은 계약(createProjectManifest export, 반환값이
-// validateProjectManifest 통과)을 따르는 adapter 모듈을 자신의 저장소 안에 두고 그 경로를
-// 지정하면 된다 — 이 파일은 손댈 필요가 없다.
+// 소유한 project config(예: <project-repo>/.autodev/manifest.json)의 절대경로를 지정한다 —
+// 그 프로젝트 쪽이 소유하는 wrapper 스크립트가 이 경로를 조립해 넘기는 방식을 권장한다. 새
+// 프로젝트를 붙이려면 그 프로젝트가 같은 JSON 스키마(project-adapter-loader.ts 참고)를 따르는
+// project config를 자신의 저장소 안에 두고 그 경로를 지정하면 된다 — 이 파일은 손댈 필요가 없다.
 
 function resolveAdapterPathFromArgs(): string | undefined {
   const idx = process.argv.indexOf("--project");

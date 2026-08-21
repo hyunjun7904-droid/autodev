@@ -4,12 +4,13 @@
 # 이전에는 MOVAN repo의 절대경로(AUTODEV_TARGET_PROJECT_ROOT/AUTODEV_STATE_PATH)를 이
 # 스크립트가 직접 하드코딩했다 — 그래서 이 스크립트 자체가 "MOVAN 전용"이었다. 이제는
 # -ProjectAdapter 파라미터(또는 미리 설정된 AUTODEV_PROJECT_ADAPTER 환경변수)로 project
-# adapter 모듈의 절대경로를 명시적으로 받아 dist/run.js에 그대로 전달할 뿐이다 — 지정하지
-# 않으면 기본 프로젝트로 조용히 넘어가지 않고 즉시 실패한다.
+# config(JSON 데이터 파일, Phase C Task C1부터 .js 등 executable 모듈은 거부됨)의 절대경로를
+# 명시적으로 받아 dist/run.js에 그대로 전달할 뿐이다 — 지정하지 않으면 기본 프로젝트로
+# 조용히 넘어가지 않고 즉시 실패한다.
 #
 # 특정 프로젝트를 실행하려면: 그 프로젝트 저장소가 소유한 wrapper 스크립트(예: 그
 # 저장소의 .autodev/start-autodev.ps1)를 대신 실행하라 — 그 wrapper가 자신의
-# .autodev/manifest.js 경로를 -ProjectAdapter로 지정해 이 스크립트를 호출하는 방식을
+# .autodev/manifest.json 경로를 -ProjectAdapter로 지정해 이 스크립트를 호출하는 방식을
 # 권장한다. 새 프로젝트를 붙이려면 그 프로젝트가 동일한 방식의 wrapper를 스스로 두면
 # 된다 — 이 스크립트는 손댈 필요가 없다.
 #
