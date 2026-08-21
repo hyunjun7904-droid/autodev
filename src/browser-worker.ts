@@ -54,6 +54,11 @@ export interface ClickSafeAction {
   type: "CLICK_SAFE";
   selector: string;
   label: string;
+  /** Phase E Task E2 — 실제 backend가 클릭 직전에 DOM에서 관찰한 구조적 신호(선택).
+   *  지정하지 않으면 기존 E1 동작과 완전히 동일하게 label 키워드 검사만 적용된다(§
+   *  executeBrowserAction, 하위 호환). 지정하면 assessClickTargetStructure()의 판정도
+   *  함께 적용된다 — label만으로 안전하다고 판단하지 않는다는 원칙의 구현. */
+  structuralSignals?: ClickTargetStructuralSignals;
 }
 export interface ScreenshotAction {
   type: "SCREENSHOT";
@@ -199,6 +204,107 @@ export function classifyClickRisk(label: string, policy?: BrowserWorkerPolicy): 
 }
 
 // =========================================================
+// Safe Interaction Preflight — Phase E Task E2. label(텍스트)만으로 클릭 안전성을
+// 판단하지 않는다 — 실제 backend가 클릭 직전에 DOM에서 관찰한 구조적 신호도 함께
+// 검사한다. 이 신호들은 실제 페이지 요소의 속성이며(스스로 "안전하다"고 주장하는 페이지
+// 콘텐츠 텍스트가 아니다), 여기서도 URL 관련 신호(href)는 validateNavigationUrl()을,
+// form action 텍스트는 classifyClickRisk()를 그대로 재사용한다(판정 로직 복제 없음).
+// =========================================================
+
+/** 실제 backend(예: playwright-browser-backend.ts)가 클릭 대상 element에서 읽어 채운다 —
+ *  이 값 자체를 페이지가 자기주장으로 조작할 수는 있지만(예: 악의적 페이지가 href를 이상한
+ *  값으로 채움), 그 결과는 오직 "더 보수적으로 판정"하는 방향으로만 쓰인다(위험 신호를
+ *  놓치지 않는 것이 목적이지, 페이지가 "나는 안전하다"고 선언한다고 안전 판정을 내려주지
+ *  않는다). */
+export interface ClickTargetStructuralSignals {
+  /** 소문자 태그명(예: "a", "button", "input"). */
+  tagName: string;
+  /** input/button의 type 속성(예: "submit", "password", "file", "button"). */
+  type?: string;
+  href?: string;
+  target?: string;
+  hasDownloadAttribute: boolean;
+  isFormAssociated: boolean;
+  formAction?: string;
+  formMethod?: string;
+  name?: string;
+  autocomplete?: string;
+}
+
+export interface StructuralClickAssessment {
+  verdict: "ALLOWED" | "BLOCKED" | "HUMAN_APPROVAL_REQUIRED";
+  reasons: string[];
+  highRiskCategories: HighRiskBrowserCategory[];
+}
+
+const JAVASCRIPT_URL_PATTERN = /^\s*javascript:/i;
+const CREDENTIAL_INPUT_TYPES: ReadonlySet<string> = new Set(["password"]);
+const CREDENTIAL_AUTOCOMPLETE_PATTERN = /(current-password|new-password|one-time-code)/i;
+const CREDENTIAL_NAME_PATTERN = /(password|passwd|secret|api[-_]?key|token|otp)/i;
+
+/**
+ * 클릭 대상의 구조적 신호를 검사한다 — element tag/type, href, target, download
+ * attribute, form association/action/method, input/button type, javascript URL 여부,
+ * 새 origin 이동 가능성(href를 validateNavigationUrl로 재검증), 파일 업로드 input 여부,
+ * password/credential 관련 input 여부를 전부 다룬다. 명백히 위험하거나(javascript:,
+ * Core navigation 규칙 위반) 결과를 안전하게 예측할 수 없는 조합은 BLOCKED로, 그 외
+ * 고위험 범주(다운로드/업로드/credential/결제 등)에 해당하면 HUMAN_APPROVAL_REQUIRED로
+ * 판정한다. 아무 위험 신호도 없으면 ALLOWED다(그렇다고 100% 안전을 보장하지는 않는다 —
+ * 알려진 위험 신호가 없다는 뜻일 뿐이다).
+ */
+export function assessClickTargetStructure(signals: ClickTargetStructuralSignals, policy?: BrowserWorkerPolicy): StructuralClickAssessment {
+  const reasons: string[] = [];
+  const categories = new Set<HighRiskBrowserCategory>();
+  let blocked = false;
+
+  const addCategory = (category: HighRiskBrowserCategory, reason: string) => {
+    categories.add(category);
+    reasons.push(reason);
+  };
+
+  if (signals.href !== undefined) {
+    if (JAVASCRIPT_URL_PATTERN.test(signals.href)) {
+      blocked = true;
+      reasons.push(`클릭 대상의 href가 javascript: URL입니다("${signals.href}").`);
+    } else {
+      const urlCheck = validateNavigationUrl(signals.href);
+      if (!urlCheck.ok) {
+        blocked = true;
+        reasons.push(`클릭 대상의 href가 Core navigation 규칙을 위반합니다: ${urlCheck.reason}`);
+      }
+    }
+  }
+
+  if (signals.hasDownloadAttribute) {
+    addCategory("file_download", "클릭 대상에 download attribute가 있어 파일 다운로드를 유발할 수 있습니다.");
+  }
+
+  const tag = signals.tagName.toLowerCase();
+  const type = signals.type?.toLowerCase();
+
+  if (tag === "input" && type === "file") {
+    addCategory("file_upload", "클릭 대상이 file input(업로드 컨트롤)입니다.");
+  }
+  if (
+    (tag === "input" && type !== undefined && CREDENTIAL_INPUT_TYPES.has(type)) ||
+    (signals.autocomplete && CREDENTIAL_AUTOCOMPLETE_PATTERN.test(signals.autocomplete)) ||
+    (signals.name && CREDENTIAL_NAME_PATTERN.test(signals.name))
+  ) {
+    addCategory("password_or_secret_input", "클릭 대상이 password/credential 관련 input으로 판단됩니다.");
+  }
+
+  if (signals.isFormAssociated && signals.formAction) {
+    for (const category of classifyClickRisk(signals.formAction, policy)) {
+      addCategory(category, `클릭 대상이 속한 form의 action("${signals.formAction}")이 고위험 범주(${category})와 일치합니다.`);
+    }
+  }
+
+  const verdict: StructuralClickAssessment["verdict"] = blocked ? "BLOCKED" : categories.size > 0 ? "HUMAN_APPROVAL_REQUIRED" : "ALLOWED";
+
+  return { verdict, reasons, highRiskCategories: [...categories] };
+}
+
+// =========================================================
 // Project Policy — Core 위험등급을 완화할 수 없다(D1~D5와 동일한 설계: 추가만 가능,
 // 대체/약화 불가). CORE_HIGH_RISK_BROWSER_CATEGORIES를 줄이거나, CORE_RISK_PATTERNS를
 // 대체하거나, validateNavigationUrl의 SSRF 차단을 끌 수 있는 필드는 이 타입에 없다.
@@ -319,7 +425,9 @@ export interface BrowserActionOutcome {
  *        전혀 호출하지 않는다.
  *      - CLICK_SAFE: classifyClickRisk(action.label, policy) — 하나라도 매칭되면 즉시
  *        HUMAN_APPROVAL_REQUIRED, backend를 전혀 호출하지 않는다(이번 E1은 승인 후 실행을
- *        구현하지 않는다 — fail-closed).
+ *        구현하지 않는다 — fail-closed). label 검사를 통과했고 action.structuralSignals가
+ *        있으면(Phase E Task E2) assessClickTargetStructure()도 통과해야 한다 — 둘 중
+ *        하나라도 걸리면 backend를 전혀 호출하지 않는다.
  *      - READ_PAGE/EXTRACT_TEXT/FIND/SCREENSHOT: 항상 ALLOWED(순수 읽기, 새 위험 없음).
  *   2) ALLOWED로 판정된 action만 backend에 위임한다. backend가 ok:false를 반환하면 그대로
  *      실패로 보고한다(성공으로 처리하지 않음).
@@ -350,6 +458,19 @@ export async function executeBrowserAction(
         highRiskCategories: risks,
         reason: `CLICK_SAFE 대상("${action.label}")이 고위험 범주(${risks.join(", ")})에 해당해 사람 승인이 필요합니다 — 이번 버전은 승인 후 실행을 구현하지 않습니다.`,
       };
+    }
+    // Phase E Task E2 — label만으로 안전하다고 판단하지 않는다: structuralSignals가
+    // 있으면(실제 backend가 클릭 직전 DOM에서 관찰한 값) 구조적 판정도 함께 적용한다.
+    // 지정하지 않으면(기존 E1 동작과 완전히 동일) 이 단계를 건너뛴다.
+    if (action.structuralSignals) {
+      const structural = assessClickTargetStructure(action.structuralSignals, policy);
+      if (structural.verdict !== "ALLOWED") {
+        return {
+          verdict: structural.verdict,
+          highRiskCategories: structural.highRiskCategories.length > 0 ? structural.highRiskCategories : undefined,
+          reason: `CLICK_SAFE 대상("${action.label}")의 구조적 신호가 안전하지 않습니다: ${structural.reasons.join("; ")}`,
+        };
+      }
     }
   }
 

@@ -235,6 +235,52 @@ redirect로 금지 origin에 도착하면 전체 결과를 BLOCKED로 무효화�
 가 deterministic 테스트 전용 backend를 제공하며, 실제 Playwright 연결은 이 Task에서
 만들지 않았다.
 
+`src/playwright-browser-backend.ts`(Phase E Task E2, Playwright Browser Backend & Safe
+Interaction Preflight)는 E1의 `BrowserBackend`를 실제 Playwright(공식 Microsoft
+패키지, `playwright@1.62.1`, Apache-2.0)로 구현한다. E1의 `executeBrowserAction()`이
+여전히 유일한 상위 실행 경계다 — 이 파일은 그 게이트가 호출하는 backend 구현 하나와,
+그대로 위임하는 `runBrowserAction()` 편의 wrapper만 제공할 뿐, arbitrary
+navigation/download/upload/credential 입력/shell 실행/production action을 수행할 수
+있는 별도 public 경로를 만들지 않는다. 자동 로그인/credential 저장은 구현하지 않는다
+(매 backend 생성마다 새 `BrowserContext`를 쓰고 `storageState`를 저장하지 않는다).
+
+E1에 두 가지를 순수 추가했다: `ClickSafeAction.structuralSignals`(선택 필드, 지정하지
+않으면 기존 동작과 완전히 동일 — E1의 75개 테스트는 무수정 통과)와
+`assessClickTargetStructure()`(element tag/type, href, target, download attribute,
+form association/action/method, input/button type, javascript URL 여부, 새 origin
+이동 가능성(href를 `validateNavigationUrl`로 재검증 — 로직 복제 없음), 파일 업로드
+input 여부, password/credential 관련 input 여부를 검사해 BLOCKED/HUMAN_APPROVAL_REQUIRED/
+ALLOWED를 판정하며, form action 텍스트는 `classifyClickRisk()`를 그대로 재사용한다).
+`executeBrowserAction()`의 CLICK_SAFE 분기는 label 검사를 통과한 뒤 `structuralSignals`가
+있으면 이 판정도 함께 적용한다 — 둘 중 하나라도 걸리면 backend를 전혀 호출하지 않는다.
+
+실제 `PlaywrightBrowserBackend.clickSafe()`는 물리적 클릭 직전에 DOM에서 구조적 신호를
+직접 읽어(`locator.evaluate(...)`) `assessClickTargetStructure()`로 **독립적으로 다시
+검사**한다 — 상위 호출자가 `structuralSignals`를 빠뜨리거나 stale한 값을 넘겨도 이
+backend가 최종 방어선이 된다("Browser가 E1 Core Safety Gate를 우회해서는 안 된다").
+위험하다고 판정되면 실제 `locator.click()`을 호출하지 않고 `{ok:false}`만 반환한다.
+NAVIGATE/CLICK_SAFE가 반환하는 `finalUrl`은 항상 `page.url()`(landing 시점의 실제 URL)
+이라 E1의 redirect 재검증이 그대로 작동한다. popup(`page.on("popup", ...)`)이 열리면
+그 URL을 `validateNavigationUrl()`로 즉시 재검증하고(`config.onPopup`으로 관찰 가능),
+검증 결과와 무관하게 즉시 닫는다 — 이 backend는 두 번째 page에서 추가 action을 실행하는
+멀티 페이지 워크플로를 지원하지 않으므로, "검증 전에는 추가 action을 실행하지 않는다"를
+"그 페이지에서는 아예 action을 실행하지 않는다"로 가장 안전하게 만족시킨다. 모든 backend
+메서드는 Playwright 예외(timeout 포함)를 try/catch로 감싸 `{ok:false}`로 변환한다
+(fail-open 없음).
+
+`PlaywrightPageLike`/`PlaywrightLocatorLike` 등은 실제 Playwright 타입의 부분집합만
+명시적으로 정의한 자체 interface다 — `realChromiumLauncher`가 실제
+`chromium.launch()` 결과를 이 interface로 명시적으로 감싼다(암묵적 구조적 호환에
+기대지 않음). 회귀 테스트는 이 launcher를 fixture로 주입해 실제 브라우저 없이
+deterministic하게 검증한다 — 실제 브라우저로 검증하는
+`playwright-browser-backend-smoke-test.ts`는 `smoke-test`/`real-source-catalog-smoke-test`와
+동일하게 `test:` 접두사가 없는 별도 스크립트다(회귀에 미포함). 이 세션에서는 로컬에
+설치된 Playwright 브라우저 바이너리가 이 패키지 버전이 기대하는 revision과 달라 실제
+실행이 실패했고(`npx playwright install`이 필요하다는 안내 메시지 확인), 이 Task는
+"불필요하면 설치 범위를 확장하지 않는다"에 따라 새 브라우저 바이너리를 다운로드하지
+않았다 — 필요 시 사람이 `npx playwright install chromium` 실행 후 이 smoke test로
+직접 확인할 수 있다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은
