@@ -274,12 +274,26 @@ NAVIGATE/CLICK_SAFE가 반환하는 `finalUrl`은 항상 `page.url()`(landing �
 기대지 않음). 회귀 테스트는 이 launcher를 fixture로 주입해 실제 브라우저 없이
 deterministic하게 검증한다 — 실제 브라우저로 검증하는
 `playwright-browser-backend-smoke-test.ts`는 `smoke-test`/`real-source-catalog-smoke-test`와
-동일하게 `test:` 접두사가 없는 별도 스크립트다(회귀에 미포함). 이 세션에서는 로컬에
-설치된 Playwright 브라우저 바이너리가 이 패키지 버전이 기대하는 revision과 달라 실제
-실행이 실패했고(`npx playwright install`이 필요하다는 안내 메시지 확인), 이 Task는
-"불필요하면 설치 범위를 확장하지 않는다"에 따라 새 브라우저 바이너리를 다운로드하지
-않았다 — 필요 시 사람이 `npx playwright install chromium` 실행 후 이 smoke test로
-직접 확인할 수 있다.
+동일하게 `test:` 접두사가 없는 별도 스크립트다(회귀에 미포함).
+
+Phase E Task E2.1(Real Chromium Smoke & Dependency Gate Reconciliation) — `npx
+playwright install chromium`(공식 Playwright CLI, Chromium만 설치)으로 이 패키지
+버전(1.62.1)이 기대하는 revision을 설치해 실제 브라우저 wiring을 검증했다. 브라우저
+바이너리는 `%LOCALAPPDATA%\ms-playwright`에만 존재하며 이 저장소에는 전혀 커밋되지
+않는다. `PlaywrightPageLike.setContent()`(page.setContent 그대로 위임)와
+`PlaywrightBrowserBackend.loadFixtureContent()`를 추가했다 — network navigation 없이
+격리된 로컬 fixture HTML을 로드하기 위한 것으로, `BrowserAction`에는 대응 action이
+없어 agent가 `executeBrowserAction()`을 통해 호출할 수 있는 경로가 아니다(별도 실행
+경계를 만들지 않는다는 원칙 유지, E1/E2의 40/75개 테스트는 이 추가로 인한 동작 변화
+없이 그대로 통과). smoke test를 이 fixture 기반으로 재작성해 외부 인터넷 없이 실제
+Chromium으로 browser/context/page 생성 → READ_PAGE/EXTRACT_TEXT/FIND → 정상 safe
+click(실제 DOM 변경까지 확인) → download attribute/password input 클릭이 실제 클릭
+전에 Preflight로 거부됨 → SCREENSHOT → dispose까지 11/11 PASS를 실제로 확인했다.
+Playwright 설치로 유입된 `fsevents@2.3.2`(macOS 전용 optional, Windows에는
+설치되지 않음을 확인)는 C5(`scanChangesForDependencyRisk`)가 이미
+`install-script-new-dependency`(severity: human_review)로 정확히 분류하고 있음을
+직접 실행해 재확인했다 — BLOCK도 조용한 PASS도 아니며, 이는 예상된 정상 동작이라
+scanner 규칙은 변경하지 않았다.
 
 ## 향후 운영 요구사항 (미구현)
 

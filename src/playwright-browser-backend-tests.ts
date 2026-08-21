@@ -79,6 +79,7 @@ interface FakePageScript {
   locator?: PlaywrightPageLike["locator"];
   getByText?: PlaywrightPageLike["getByText"];
   screenshot?: PlaywrightPageLike["screenshot"];
+  setContent?: PlaywrightPageLike["setContent"];
 }
 
 function fakePage(script: FakePageScript = {}): { page: PlaywrightPageLike; popupHandlers: ((popup: PlaywrightPageLike) => void)[]; closed: { value: boolean } } {
@@ -91,6 +92,7 @@ function fakePage(script: FakePageScript = {}): { page: PlaywrightPageLike; popu
     locator: script.locator ?? (() => fakeLocator()),
     getByText: script.getByText ?? (() => fakeLocator({ allTextContents: async () => ["match 1"] })),
     screenshot: script.screenshot ?? (async () => new Uint8Array([1, 2, 3])),
+    setContent: script.setContent ?? (async () => {}),
     close: async () => {
       closed.value = true;
     },

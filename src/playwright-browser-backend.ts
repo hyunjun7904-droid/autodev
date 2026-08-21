@@ -69,6 +69,12 @@ export interface PlaywrightPageLike {
   screenshot(options?: { timeout?: number }): Promise<Uint8Array>;
   close(): Promise<void>;
   onPopup(handler: (popup: PlaywrightPageLike) => void): void;
+  /** 실제 network navigation 없이 페이지 콘텐츠를 직접 설정한다(Playwright의
+   *  page.setContent) — Phase E Task E2.1: 격리된 로컬 fixture로 smoke test를 구성하기
+   *  위한 것으로, BrowserAction에는 대응 action이 없다(agent가 호출할 수 있는 실행
+   *  경로가 아니다 — executeBrowserAction()이 소비하는 BrowserBackend interface에도
+   *  없고, PlaywrightBrowserBackend에만 테스트/smoke 전용으로 노출된다). */
+  setContent(html: string): Promise<void>;
 }
 
 export interface PlaywrightContextLike {
@@ -117,6 +123,7 @@ function wrapPage(page: RealPage): PlaywrightPageLike {
     onPopup: (handler) => {
       page.on("popup", (popup: RealPage) => handler(wrapPage(popup)));
     },
+    setContent: (html) => page.setContent(html),
   };
 }
 
@@ -163,6 +170,12 @@ export interface PlaywrightBrowserBackend extends BrowserBackend {
   /** 실제 browser/context/page를 정리한다 — 반드시 호출해야 한다(리소스 누수 방지). 여러
    *  번 호출해도 안전하다. */
   dispose(): Promise<void>;
+  /** Phase E Task E2.1 — 실제 network navigation 없이(page.setContent) 격리된 로컬
+   *  fixture HTML을 로드한다. smoke/통합 테스트가 외부 인터넷 없이 READ_PAGE/
+   *  EXTRACT_TEXT/FIND/CLICK_SAFE를 실제 Chromium으로 검증할 수 있게 하기 위한 것이다 —
+   *  BrowserAction에는 대응하는 action이 없으므로 agent가 executeBrowserAction()을 통해
+   *  호출할 수 있는 경로가 아니다(별도 실행 경계를 만들지 않는다는 원칙 유지). */
+  loadFixtureContent(html: string): Promise<BackendOutcome<Record<string, never>>>;
 }
 
 function toBackendError<T>(reason: string): BackendOutcome<T> {
@@ -223,6 +236,15 @@ export async function createPlaywrightBrowserBackend(config: PlaywrightBackendCo
     try {
       await page.goto(url, { timeout: navigationTimeoutMs, waitUntil: "load" });
       return { ok: true, data: {}, finalUrl: page.url() };
+    } catch (err) {
+      return toBackendError(describeError(err));
+    }
+  }
+
+  async function loadFixtureContent(html: string): Promise<BackendOutcome<Record<string, never>>> {
+    try {
+      await page.setContent(html);
+      return { ok: true, data: {} };
     } catch (err) {
       return toBackendError(describeError(err));
     }
@@ -317,7 +339,7 @@ export async function createPlaywrightBrowserBackend(config: PlaywrightBackendCo
     }
   }
 
-  return { navigate, readPage, extractText, find, clickSafe, screenshot, dispose };
+  return { navigate, readPage, extractText, find, clickSafe, screenshot, dispose, loadFixtureContent };
 }
 
 function describeError(err: unknown): string {

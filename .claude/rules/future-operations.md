@@ -29,8 +29,14 @@ Real Official Source Catalog(`src/real-source-catalog.ts`)를 구현했다. Task
 Apache-2.0)로 구현하고(`src/playwright-browser-backend.ts`), 클릭 직전 DOM 구조적
 신호(tag/type/href/target/download attribute/form action·method/input type/
 password·credential 관련 여부)를 검사하는 Safe Interaction Preflight를
-`assessClickTargetStructure()`(E1에 순수 추가)로 구현했다 — 자세한 내용은
-`.claude/CLAUDE.md` 참고. D1~E2 모두 실제 외부 MCP 설치/실행을 하지 않는다 —
+`assessClickTargetStructure()`(E1에 순수 추가)로 구현했다. Task E2.1은 `npx
+playwright install chromium`(공식 CLI, Chromium만)으로 실제 브라우저를 설치해
+격리된 로컬 fixture(page.setContent)로 실제 Chromium end-to-end(생성→READ_PAGE/
+EXTRACT_TEXT/FIND→안전 클릭 실제 DOM 변경 확인→download/password 클릭이 Preflight로
+사전 거부됨→SCREENSHOT→dispose) 11/11 PASS를 확인했고, Playwright의 optional
+transitive dependency `fsevents@2.3.2`가 C5에서 `install-script-new-dependency`
+(human_review)로 정확히 분류됨을 재확인했다(scanner 규칙 변경 없음) — 자세한 내용은
+`.claude/CLAUDE.md` 참고. D1~E2.1 모두 실제 외부 MCP 설치/실행을 하지 않는다 —
 Notification Service / Dashboard / Agent Router는 아직 시작하지 않았다.
 
 ## Notification 이벤트
@@ -86,10 +92,8 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 - 고위험 browser action(파일 다운로드/업로드/결제/구매/production 변경 등)의 "사람
   승인 후 실제 실행" 경로(E1/E2는 HUMAN_APPROVAL_REQUIRED/BLOCKED 판정과 실제 클릭
   거부까지만 하고, 그 이후 실행 흐름은 구현하지 않았다)
-- 실제 Playwright 브라우저 바이너리 설치(`npx playwright install`)와 그것을 전제로 한
-  실제 사이트 자동조작 — E2는 로컬에 캐시된 바이너리가 이 패키지 버전이 기대하는
-  revision과 달라 실제 실행이 실패함을 확인했고, "불필요하면 설치 범위를 확장하지
-  않는다"에 따라 새로 다운로드하지 않았다(`playwright-browser-backend-smoke-test.ts`가
-  준비돼 있다 — 바이너리 설치 후 실행하면 된다)
+- 실제 사이트(외부 네트워크) 자동조작 — E2.1은 Chromium 바이너리를 설치하고 실제
+  브라우저 wiring/Preflight를 격리된 로컬 fixture로 검증했을 뿐, 실제 외부 웹사이트를
+  대상으로 한 자동조작은 여전히 하지 않았다
 - 멀티 페이지(popup에서의 추가 action) 워크플로 — E2는 popup을 검증 후 항상 즉시 닫을
   뿐, popup 페이지에서 추가 action을 실행하는 기능은 구현하지 않았다
