@@ -111,6 +111,40 @@ candidate만 D1의 `CandidateSource`로 승격시켜 `resolveCapability()`가 �
 수 있게 하는 어댑터다 — 근거가 부족한 candidate는 D1에 판단을 떠넘기지 않고 이
 어댑터 단계에서부터 걸러낸다.
 
+`src/source-adapter.ts`(Phase D Task D3, Official Candidate Source Integration)는 D2의
+`EvidenceSource` 위에 실제 공식 JSON metadata endpoint에서 evidence를 가져오는 범용
+Source Adapter를 더한다 — D1/D2 파일의 기존 동작은 바꾸지 않았다(D2에 기존 로컬
+`KNOWN_ACTION_TAGS`를 `export`로 바꾼 것만 추가했다 — 순수 추가, 동작 변경 없음). MCP/
+공식 API/SDK/CLI 후보 전부 `CapabilityType`(`type` 필드)만 다를 뿐 같은 JSON 스키마로
+표현되므로 벤더별 adapter를 여럿 만들지 않고 `SourceAdapterConfig` 하나의 factory
+(`fetchEvidenceFromOfficialJsonSource`/`createAsyncEvidenceSource`)를 재사용한다.
+
+Core hard rule — **source는 스스로 official 여부를 주장할 수 없다**: fetch되는 JSON 응답
+스키마(`RawCandidateMetadata`)에는 `official`/`sourceType`/`sourceRef`/
+`evidenceTimestamp` 필드가 아예 존재하지 않는다 — 이 네 값은 오직 코드 레벨
+`SourceAdapterConfig`(응답과 무관하게 배포 시점에 고정)로만 채워진다. 응답 바디에
+`"official": true` 같은 필드를 끼워 넣어도 파싱 단계에서 아예 읽히지 않는다(테스트로
+직접 검증됨).
+
+SSRF 방지도 Core hard rule이다(`validateSourceUrl`) — https만 허용, URL에 embedded
+credential(userinfo) 금지, `allowedHosts`(adapter 설정, 요청 내용으로 바뀌지 않는 고정
+목록) 밖은 전부 거부, 그리고 **localhost/private network(10/8, 172.16/12, 192.168/16)/
+link-local·cloud metadata endpoint(169.254/16, 169.254.169.254 포함)/IPv6 loopback·ULA·
+link-local은 `allowedHosts`에 들어있어도 항상 차단**한다(defense in depth —
+`validateSourceAdapterConfig`도 이런 host가 `allowedHosts`에 있으면 config 생성 자체를
+throw로 막는다). 실제 fetch(`nodeHttpFetch`)는 `redirect:"manual"`로 3xx를 자동으로
+따라가지 않고 즉시 거부하고, timeout(`AbortController`)과 응답 크기 한도
+(`maxBodyBytes`, 초과 시 잘라서 계속 쓰지 않고 전체 거부)를 강제하며, 어떤 header/
+credential도 요청에 추가하지 않는다(secret 자동 전송 금지 — `HttpFetch` 시그니처 자체에
+그런 파라미터가 없다).
+
+fetch로 얻은 evidence는 곧바로 신뢰되지 않는다 — `discoverTrustedCandidatesAsync()`가
+비동기 fetch 결과를 D2의 동기 `discoverTrustedCandidates()`(판정 로직 그대로, 복제
+없음)에 위임하므로, source 조회 실패/timeout/malformed response는 전부
+`SOURCE_UNAVAILABLE`로, 그리고 secret 요구/Core action tag/충돌/stale evidence는 D2가
+이미 강제하는 것과 동일하게 `HUMAN_REVIEW_REQUIRED`로 처리된다 — 이 adapter 계층은 그
+판정을 약화시킬 방법이 없다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은

@@ -111,7 +111,9 @@ export interface TrustedDiscoveryPolicy {
   maxStaleAfterDays?: number;
 }
 
-const KNOWN_ACTION_TAGS: ReadonlySet<ActionTag> = new Set([
+/** ActionTag의 전체 목록 — source-adapter.ts(Phase D Task D3)가 외부 응답의 actionTags
+ *  필드를 검증할 때도 이 하나의 출처를 재사용한다(목록 복제 금지). */
+export const KNOWN_ACTION_TAGS: ReadonlySet<ActionTag> = new Set([
   "production_db_write",
   "deployment",
   "live_trading_or_brokerage",

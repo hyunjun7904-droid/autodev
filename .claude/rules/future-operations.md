@@ -10,9 +10,13 @@ Task C4는 Hooks / Permissions Enforcement(Core Command Safety Gate,
 Core Design/Foundation(`src/capability-resolver.ts` — 데이터 모델 + candidate 평가/
 랭킹 + risk/approval 판정)을, Task D2는 그 위에 Trusted Candidate Discovery & Evidence
 (`src/candidate-evidence.ts` — evidence 데이터 모델 + 신뢰도/staleness/충돌 판정 +
-D1 CandidateSource 어댑터, 자세한 내용은 `.claude/CLAUDE.md` 참고)를 구현했다. D1/D2
-모두 실제 외부 MCP 설치/실행을 하지 않는다 — Notification Service / Dashboard / 실제
-MCP 설치·활성화 / Browser Worker / Agent Router는 아직 시작하지 않았다.
+D1 CandidateSource 어댑터)를, Task D3는 D2의 EvidenceSource 위에 실제 공식 JSON
+metadata endpoint에서 evidence를 가져오는 범용 Source Adapter(`src/source-adapter.ts`
+— HTTP fetch seam/timeout/응답 크기 제한/redirect 거부/SSRF 방지 URL 검증/"source가
+official을 자기 주장만으로 확정 못함" 설계, 자세한 내용은 `.claude/CLAUDE.md` 참고)를
+구현했다. D1/D2/D3 모두 실제 외부 MCP 설치/실행을 하지 않는다 — Notification Service /
+Dashboard / 실제 MCP 설치·활성화 / Browser Worker / Agent Router는 아직 시작하지
+않았다.
 
 ## Notification 이벤트
 
@@ -51,7 +55,10 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 
 - Notification Service
 - Dashboard
-- 실제 MCP 서버 설치/다운로드/활성화(D1/D2는 Discovery/Resolver/Evidence의 Core 데이터
-  모델·판정 로직만 구현했다 — 실제 evidence source/candidate source 연동, 실제 활성화
-  실행 경로, Browser Worker, Agent Router는 없음)
+- 실제 MCP 서버 설치/다운로드/활성화(D1/D2/D3는 Discovery/Resolver/Evidence/Source
+  Adapter의 Core 데이터 모델·판정·조회 로직만 구현했다 — 실제 활성화 실행 경로,
+  Browser Worker, Agent Router는 없음)
 - production credential을 실제로 사용하는 evidence/candidate 조회
+- 특정 vendor(예: 실제 MCP registry, npm registry, GitHub API)를 대상으로 한
+  SourceAdapterConfig 인스턴스 등록(D3는 범용 factory만 구현했고, 실제 endpoint URL/
+  vendor별 config는 아직 어디에도 등록돼 있지 않다)
