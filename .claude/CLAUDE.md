@@ -31,7 +31,14 @@ Claude Worker 세션 운영, GPT Reviewer 전달 범위, context 관리 원칙�
   stash push·pop·drop 등)는 project policy의 allowedCommands에 그 조합이 들어있어도 항상
   BLOCK한다. (2) 명령 인자가 ENV_FILE_PATTERNS/SECRET_NAME_PATTERNS(단일 출처, path 검증과
   동일한 상수)에 매칭되면 git이 아닌 명령이라도 BLOCK한다. 이 함수는 ProjectExecutionPolicy를
-  인자로 받지 않으므로 어떤 프로젝트도 이 판정을 약화시킬 방법이 없다.
+  인자로 받지 않으므로 어떤 프로젝트도 이 판정을 약화시킬 방법이 없다. (3) Phase C Task
+  C4.1(Read-only Git Command Hardening) — subcommand 이름만으로는 안전을 판정하지 않는다.
+  `GIT_DANGEROUS_OPTION_PATTERNS`(`--output`/`--ext-diff`/`--textconv`/`--filters`/
+  `--paginate`/`--contents=`)가 read-only로 확인된 git 서브커맨드에 붙어도 항상 BLOCK한다 —
+  이 옵션들은 git 공식 문서 기준으로 임의 파일 쓰기(`--output`, write path 검증 우회)나
+  외부 프로그램 실행(`--ext-diff`/`--textconv`/`--filters`, diff/textconv/필터 드라이버),
+  임의 로컬 파일 읽기(`--contents=`)를 유발할 수 있다. `git remote show <name>`은 `-n`
+  없이는 실제 원격 서버에 네트워크 질의를 보내므로 `-n`이 있을 때만 read-only로 인정한다.
 - 실제 secret 원문은 console / log / error / GPT review prompt / Claude feedback /
   audit output 어디에도 노출하지 않는다 — 탐지 보고에는 파일/위치/탐지 종류만 담는다.
 

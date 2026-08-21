@@ -120,6 +120,72 @@ function scenarioProjectPolicyCannotWeakenCommandSafetyGate(isolatedRealisticRoo
   }
 }
 
+// Phase C Task C4.1 — project policy가 "subcommand는 read-only 목록에 있지만 위험한 옵션이
+// 붙은 정확한 인자 조합"을 allow-list에 명시적으로 넣어도 Core Command Safety Gate가 여전히
+// 차단함을 증명한다. C4의 scenarioProjectPolicyCannotWeakenCommandSafetyGate는 subcommand
+// 레벨(reset/clean/push 등) 우회만 다뤘다 — 이 시나리오는 그보다 한 단계 더 교묘한 "겉보기엔
+// read-only 서브커맨드(diff/show/cat-file/blame/remote)인데 옵션으로 write/외부실행/네트워크를
+// 일으키는" 우회를 다룬다.
+const POLICY_WITH_DANGEROUS_READONLY_OPTIONS_IN_ALLOWLIST: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["web/"],
+  allowedWritePrefixes: ["web/"],
+  allowedCommands: [
+    { cwd: "root", command: "git", args: ["diff", "--output=evil.txt"] },
+    { cwd: "root", command: "git", args: ["log", "--ext-diff"] },
+    { cwd: "root", command: "git", args: ["show", "--textconv", "HEAD:file"] },
+    { cwd: "root", command: "git", args: ["cat-file", "--filters", "HEAD:file"] },
+    { cwd: "root", command: "git", args: ["log", "--paginate"] },
+    { cwd: "root", command: "git", args: ["blame", "--contents=C:\\secrets.txt", "README.md"] },
+    { cwd: "root", command: "git", args: ["remote", "show", "origin"] },
+    // 대조군 — 진짜 read-only(옵션 없음)는 여전히 허용돼야 한다.
+    { cwd: "root", command: "git", args: ["diff"] },
+  ],
+};
+
+function scenarioProjectPolicyCannotBypassGateViaDangerousOptions(isolatedRealisticRoot: string): void {
+  const root = mkdtempSync(join(tmpdir(), "safe-executor-gate-option-override-"));
+  try {
+    mkdirSync(join(root, "web"), { recursive: true });
+    configureSafeExecutor(root, POLICY_WITH_DANGEROUS_READONLY_OPTIONS_IN_ALLOWLIST);
+
+    check(
+      "[C4.1-1] allow-list에 있어도 git diff --output=evil.txt → BLOCK(Core gate, write 우회)",
+      !validateCommand("git", ["diff", "--output=evil.txt"], "root").ok
+    );
+    check(
+      "[C4.1-2] allow-list에 있어도 git log --ext-diff → BLOCK(Core gate, 외부 diff 실행)",
+      !validateCommand("git", ["log", "--ext-diff"], "root").ok
+    );
+    check(
+      "[C4.1-3] allow-list에 있어도 git show --textconv → BLOCK(Core gate, textconv 외부 실행)",
+      !validateCommand("git", ["show", "--textconv", "HEAD:file"], "root").ok
+    );
+    check(
+      "[C4.1-4] allow-list에 있어도 git cat-file --filters → BLOCK(Core gate, 필터 외부 실행)",
+      !validateCommand("git", ["cat-file", "--filters", "HEAD:file"], "root").ok
+    );
+    check(
+      "[C4.1-5] allow-list에 있어도 git log --paginate → BLOCK(Core gate, pager 강제 실행)",
+      !validateCommand("git", ["log", "--paginate"], "root").ok
+    );
+    check(
+      "[C4.1-6] allow-list에 있어도 git blame --contents=<임의경로> → BLOCK(Core gate, 임의 파일 읽기)",
+      !validateCommand("git", ["blame", "--contents=C:\\secrets.txt", "README.md"], "root").ok
+    );
+    check(
+      "[C4.1-7] allow-list에 있어도 git remote show origin(-n 없음) → BLOCK(Core gate, 네트워크 질의)",
+      !validateCommand("git", ["remote", "show", "origin"], "root").ok
+    );
+    check(
+      "[C4.1-8] 같은 policy 안에서 진짜 read-only git diff(옵션 없음)는 여전히 ALLOW(과잉 차단 아님)",
+      validateCommand("git", ["diff"], "root").ok
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
+  }
+}
+
 function scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot: string): void {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "safe-executor-fixture-policy-"));
   try {
@@ -326,8 +392,55 @@ async function main(): Promise<void> {
     coreCommandSafetyGate("node", ["--version"]).ok
   );
 
+  // ---- Phase C Task C4.1 — Read-only Git Command Hardening: 정상 read-only 명령은 계속
+  // 허용된다(과잉 차단 방지 회귀) ----
+  check("coreCommandSafetyGate: git diff → ALLOW(옵션 없음)", coreCommandSafetyGate("git", ["diff"]).ok);
+  check("coreCommandSafetyGate: git diff --stat → ALLOW", coreCommandSafetyGate("git", ["diff", "--stat"]).ok);
+  check("coreCommandSafetyGate: git show HEAD → ALLOW", coreCommandSafetyGate("git", ["show", "HEAD"]).ok);
+  check("coreCommandSafetyGate: git log -p → ALLOW(-p는 log에서 --patch, 전역 pager와 동음이의)", coreCommandSafetyGate("git", ["log", "-p"]).ok);
+  check("coreCommandSafetyGate: git log -1 --oneline → ALLOW", coreCommandSafetyGate("git", ["log", "-1", "--oneline"]).ok);
+  check("coreCommandSafetyGate: git status --short → ALLOW", coreCommandSafetyGate("git", ["status", "--short"]).ok);
+  check("coreCommandSafetyGate: git cat-file -p HEAD → ALLOW", coreCommandSafetyGate("git", ["cat-file", "-p", "HEAD"]).ok);
+  check("coreCommandSafetyGate: git ls-files → ALLOW", coreCommandSafetyGate("git", ["ls-files"]).ok);
+  check("coreCommandSafetyGate: git ls-tree HEAD → ALLOW", coreCommandSafetyGate("git", ["ls-tree", "HEAD"]).ok);
+  check("coreCommandSafetyGate: git remote -v → ALLOW", coreCommandSafetyGate("git", ["remote", "-v"]).ok);
+  check("coreCommandSafetyGate: git remote show origin -n → ALLOW(네트워크 질의 없음)", coreCommandSafetyGate("git", ["remote", "show", "origin", "-n"]).ok);
+  check("coreCommandSafetyGate: git blame README.md → ALLOW", coreCommandSafetyGate("git", ["blame", "README.md"]).ok);
+
+  // ---- Phase C Task C4.1 — write-capable 옵션 BLOCK(subcommand 이름만으로 안전 판단 금지) ----
+  check(
+    "coreCommandSafetyGate: git diff --output=evil.txt → BLOCK(임의 파일 쓰기, write path 검증 우회)",
+    !coreCommandSafetyGate("git", ["diff", "--output=evil.txt"]).ok
+  );
+  check("coreCommandSafetyGate: git log --output C:\\evil.txt → BLOCK", !coreCommandSafetyGate("git", ["log", "--output", "C:\\evil.txt"]).ok);
+  check("coreCommandSafetyGate: git show --output=evil.txt HEAD → BLOCK", !coreCommandSafetyGate("git", ["show", "--output=evil.txt", "HEAD"]).ok);
+
+  // ---- Phase C Task C4.1 — 외부 실행 가능 옵션 BLOCK(external diff / textconv / filters / pager) ----
+  check("coreCommandSafetyGate: git diff --ext-diff → BLOCK(외부 diff 프로그램 실행)", !coreCommandSafetyGate("git", ["diff", "--ext-diff"]).ok);
+  check("coreCommandSafetyGate: git show --textconv HEAD:file → BLOCK(textconv 외부 실행)", !coreCommandSafetyGate("git", ["show", "--textconv", "HEAD:file"]).ok);
+  check("coreCommandSafetyGate: git cat-file --textconv HEAD:file → BLOCK", !coreCommandSafetyGate("git", ["cat-file", "--textconv", "HEAD:file"]).ok);
+  check("coreCommandSafetyGate: git cat-file --filters HEAD:file → BLOCK(clean/smudge 필터 외부 실행)", !coreCommandSafetyGate("git", ["cat-file", "--filters", "HEAD:file"]).ok);
+  check("coreCommandSafetyGate: git log --paginate → BLOCK(비-tty에서도 pager 강제)", !coreCommandSafetyGate("git", ["log", "--paginate"]).ok);
+  check(
+    "coreCommandSafetyGate: git blame --contents=C:\\Windows\\System32\\drivers\\etc\\hosts README.md → BLOCK(임의 로컬 파일 읽기)",
+    !coreCommandSafetyGate("git", ["blame", "--contents=C:\\Windows\\System32\\drivers\\etc\\hosts", "README.md"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: git remote show origin(-n 없음) → BLOCK(실제 네트워크 질의 발생)",
+    !coreCommandSafetyGate("git", ["remote", "show", "origin"]).ok
+  );
+
+  // ---- Phase C Task C4.1 — git stash list 회귀 유지(단순 문자열 매칭으로 과잉 차단 금지) ----
+  check("coreCommandSafetyGate: git stash list → ALLOW(회귀 유지)", coreCommandSafetyGate("git", ["stash", "list"]).ok);
+  check("coreCommandSafetyGate: git stash show → ALLOW(회귀 유지)", coreCommandSafetyGate("git", ["stash", "show"]).ok);
+  check("coreCommandSafetyGate: git stash push → BLOCK(회귀 유지)", !coreCommandSafetyGate("git", ["stash", "push"]).ok);
+
   // ---- Phase C Task C4 — project policy가 Core Command Safety Gate를 약화할 수 없음을 증명 ----
   scenarioProjectPolicyCannotWeakenCommandSafetyGate(isolatedRealisticRoot);
+
+  // ---- Phase C Task C4.1 — malicious project policy가 "read-only 옵션 우회"로도 Core Command
+  // Safety Gate를 약화할 수 없음을 증명 ----
+  scenarioProjectPolicyCannotBypassGateViaDangerousOptions(isolatedRealisticRoot);
 
   // ---- Phase B Task B1 — Fixture 프로젝트 정책 범용성 증명(§ 요구사항 8) ----
   scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot);

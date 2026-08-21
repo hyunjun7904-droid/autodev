@@ -686,7 +686,54 @@ async function scenarioR_resumeContextDetectedForExistingInScopeChanges(): Promi
   }
 }
 
+// Phase C Task C4.1(Read-only Git Command Hardening) — 요구된 source regression: "AutoDev
+// Claude Worker의 production 경로가 직접 Bash/tool 실행으로 Safe Executor를 우회할 수
+// 없는 현재 구조"를 확인한다. 이 파일의 나머지 시나리오는 fake claudeCaller로 라운드
+// 진행/discovery/lock 로직만 검증하므로, "실제 production 호출이 항상 --tools ""로
+// Claude에게 built-in 도구를 주지 않는가"와 "claude-developer.ts 자신이 Claude가 요청한
+// 명령을 Safe Executor 없이 직접 spawn하지 않는가"는 별도로 소스를 직접 읽어 검증해야
+// 한다(런타임 mock으로는 "존재하지 않는 우회 경로가 없다"는 부정 명제를 증명할 수 없다).
+function scenarioS_sourceRegressionProductionPathCannotBypassSafeExecutor(): void {
+  const claudeDeveloperSource = readFileSync(join(__dirname, "..", "src", "claude-developer.ts"), "utf-8");
+  const orchestratorSource = readFileSync(join(__dirname, "..", "src", "orchestrator.ts"), "utf-8");
+
+  // 1) 실제 claude CLI 호출은 항상 --tools ""(빈 문자열)를 넘긴다 — Claude 세션 자체에
+  //    built-in Read/Edit/Write/Bash가 전혀 없다.
+  check(
+    '소스 회귀(C4.1): claude-developer.ts의 callClaude가 항상 "--tools", ""를 넘김(built-in 도구 없음)',
+    /"--tools",\s*\n\s*""/.test(claudeDeveloperSource)
+  );
+
+  // 2) claude-developer.ts 자신은 child_process를 직접 spawn하지 않는다 — claude CLI
+  //    호출은 claude-runner.ts의 execAndClassify에, Claude가 요청한 명령 실행은
+  //    safe-executor.ts의 validateAndExecute에 위임한다. 이 파일 안에 spawn/spawnSync/exec가
+  //    직접 나타나면 Safe Executor를 거치지 않는 우회 실행 경로가 새로 생겼다는 뜻이다.
+  check(
+    "소스 회귀(C4.1): claude-developer.ts에 child_process spawn/exec 직접 호출 없음(전부 claude-runner/safe-executor에 위임)",
+    !/\b(spawnSync|spawn|execSync|exec)\s*\(/.test(claudeDeveloperSource.replace(/execAndClassify/g, ""))
+  );
+
+  // 3) Claude의 ACTION_REQUEST 처리는 doValidateAndExecute(Safe Executor 경유) 단 한
+  //    지점에서만 실행된다 — 다른 실행 경로가 추가되지 않았는지 호출 지점 개수로 확인한다.
+  const validateAndExecuteCallSites = (claudeDeveloperSource.match(/doValidateAndExecute\(/g) ?? []).length;
+  check(
+    `소스 회귀(C4.1): claude-developer.ts에서 doValidateAndExecute 호출 지점이 정확히 2곳(ACTION_REQUEST 처리 1 + 필수 테스트 실행 1)(실제 ${validateAndExecuteCallSites}곳)`,
+    validateAndExecuteCallSites === 2
+  );
+
+  // 4) production 경로(AUTOMATION_DRY_RUN="false")는 runDeveloperTaskViaSafeExecutor만
+  //    선택한다 — orchestrator.ts가 다른 runner로 조용히 대체되지 않았는지 확인한다.
+  check(
+    "소스 회귀(C4.1): orchestrator.ts의 selectDefaultClaudeRunner가 dry-run=false일 때 runDeveloperTaskViaSafeExecutor를 씀",
+    /AUTOMATION_DRY_RUN\s*!==\s*"false"[\s\S]{0,80}return[\s\S]{0,200}runDeveloperTaskViaSafeExecutor/.test(orchestratorSource)
+  );
+}
+
 async function main(): Promise<void> {
+  // Phase C Task C4.1 — 실제 Safe Executor/파일 fixture와 무관한 순수 source-regression
+  // 검사라 격리 root 준비 이전에 먼저 실행한다.
+  scenarioS_sourceRegressionProductionPathCannotBypassSafeExecutor();
+
   // 이 파일의 시나리오는 ACTION_REQUEST를 통해 실제 Safe Executor(automation/ 범위)를
   // 통과한다 — Safe Executor는 configureSafeExecutor()로 명시적으로 주입되기 전까지 어떤
   // 프로젝트로도 조용히 fallback하지 않으므로, 여기서 이 파일 전용 격리된 임시 root+정책을

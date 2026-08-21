@@ -155,6 +155,45 @@ const GIT_READ_ONLY_FIRST_ARG: Readonly<Record<string, ReadonlySet<string>>> = {
   reflog: new Set(["show"]),
 };
 
+// Phase C Task C4.1 — Read-only Git Command Hardening.
+//
+// C4는 "서브커맨드 이름"만으로 read-only를 판정했다. 그런데 git 공식 문서 기준으로, 그
+// 서브커맨드들도 특정 옵션이 붙으면 파일 쓰기/외부 프로그램 실행/네트워크 접근을 일으킬 수
+// 있다 — subcommand 이름만으로 무조건 안전하다고 판단해서는 안 된다:
+//   --output[=<file>]  diff-options(git-diff/log/show가 공유) — stdout이 아니라 임의 경로에
+//                       직접 파일을 쓴다. RUN_COMMAND는 그 write를 validateWritePath로
+//                       검증하지 않으므로(파일 write action이 아니라 명령 인자이기 때문) 이
+//                       옵션 하나로 write 허용 범위/DENY_PATH_PATTERNS를 완전히 우회한다.
+//   --ext-diff          diff.external/GIT_EXTERNAL_DIFF로 설정된 외부 프로그램을 강제 실행.
+//   --textconv          gitattributes의 diff.<driver>.textconv(외부 프로그램)를 강제 실행
+//                        (git-show(1)/git-cat-file(1)).
+//   --filters            git cat-file --filters — 해당 경로에 설정된 clean/smudge 등 필터
+//                        체인(외부 프로그램일 수 있음)을 실행한다(git-cat-file(1)).
+//   --paginate           stdout이 파이프(비-tty)라도 core.pager/$PAGER 실행을 강제한다
+//                        (git(1) "-p, --paginate"). 참고: 서브커맨드 뒤의 단독 "-p"는
+//                        log/diff/show에서 "--patch"(diff 내용 표시)와 동음이의이므로 여기서는
+//                        차단하지 않는다 — pager를 강제하는 전역 옵션 "-p"/"--paginate"는
+//                        서브커맨드보다 앞에만 올 수 있는데, 이 게이트는 args[0]가 반드시
+//                        서브커맨드 이름이어야만 read-only 판정 대상이 되므로 그 형태 자체가
+//                        이미 구조적으로 차단된다(전역 -c를 통한 config injection도 동일한
+//                        이유로 이미 차단됨).
+//   --contents=<file>    git blame --contents=<file> — working tree 대신 임의의 로컬
+//                        파일시스템 경로를 읽어 그 내용을 blame 출력에 그대로 포함한다
+//                        (git-blame(1)) — Safe Executor의 read 허용 범위/DENY_PATH_PATTERNS를
+//                        완전히 우회하는 임의 파일 읽기다.
+// 어떤 read-only 서브커맨드도 이 옵션들을 실제로 필요로 하지 않으므로(AutoDev는 항상
+// spawnSync로 stdout을 직접 캡처한다) blocklist를 서브커맨드별로 나누지 않고 모든 read-only
+// git 호출에 공통으로 적용한다 — 전체 git 옵션 parser를 새로 만들지 않고, 문서로 확인된
+// 위험 옵션만 최소한으로 막는다.
+const GIT_DANGEROUS_OPTION_PATTERNS: RegExp[] = [
+  /^--output(=.*)?$/,
+  /^--ext-diff$/,
+  /^--textconv$/,
+  /^--filters$/,
+  /^--paginate$/,
+  /^--contents=/,
+];
+
 /**
  * git 명령이 read-only(정보 조회만 하고 repo/working tree 상태를 바꾸지 않음)인지 판정한다.
  * false는 "이 allow-list로 read-only임을 증명하지 못했다"는 뜻이며, mutating으로 간주해
@@ -164,11 +203,28 @@ function isReadOnlyGitInvocation(args: string[]): boolean {
   if (args.length === 0) return false; // 인자 없는 "git" 자체는 허용하지 않는다(불필요).
   const [sub, ...rest] = args;
   if (sub.startsWith("-")) return false; // 전역 옵션이 서브커맨드 앞에 오는 형태는 허용하지 않는다.
-  if (GIT_READ_ONLY_NO_SUBARG_CHECK.has(sub)) return true;
-  const allowedFirstArgs = GIT_READ_ONLY_FIRST_ARG[sub];
-  if (!allowedFirstArgs) return false;
-  if (rest.length === 0) return false; // 예: 인자 없는 "git stash"는 push와 동일(mutating).
-  return allowedFirstArgs.has(rest[0]);
+
+  let subcommandReadOnly: boolean;
+  if (GIT_READ_ONLY_NO_SUBARG_CHECK.has(sub)) {
+    subcommandReadOnly = true;
+  } else {
+    const allowedFirstArgs = GIT_READ_ONLY_FIRST_ARG[sub];
+    if (!allowedFirstArgs) return false;
+    // 예: 인자 없는 "git stash"는 push와 동일(mutating).
+    subcommandReadOnly = rest.length > 0 && allowedFirstArgs.has(rest[0]);
+  }
+  if (!subcommandReadOnly) return false;
+
+  // 서브커맨드 자체는 read-only로 확인됐어도, 옵션이 파일쓰기/외부실행을 유발할 수 있다
+  // (§ 위 GIT_DANGEROUS_OPTION_PATTERNS 설명) — 하나라도 매칭되면 차단한다.
+  if (rest.some((a) => GIT_DANGEROUS_OPTION_PATTERNS.some((p) => p.test(a)))) return false;
+
+  // "git remote show <name>"은 -n(--no-query) 없이는 로컬 정보만 보는 다른 read-only
+  // 서브커맨드와 달리 실제로 원격 서버에 네트워크 질의를 보낸다(git-remote(1) "show" 설명) —
+  // -n이 명시적으로 있을 때만 read-only로 인정한다.
+  if (sub === "remote" && rest[0] === "show" && !rest.includes("-n")) return false;
+
+  return true;
 }
 
 /**
