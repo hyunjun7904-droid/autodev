@@ -39,10 +39,15 @@ transitive dependency `fsevents@2.3.2`가 C5에서 `install-script-new-dependenc
 Task 성격에 따라 필요한 전문 Agent만 선택하는 Core Agent Registry & Deterministic
 Router(`src/agent-registry.ts` — 초기 6개 role(planner/research/developer/qa/
 reviewer/security), developer 외 canWriteCode 금지 Core hard rule, taskType별
-정적 워크플로+dependency 표현, LLM을 전혀 호출하지 않는 순수 함수 `routeTask()`,
-자세한 내용은 `.claude/CLAUDE.md` 참고)를 구현했다. D1~F1 모두 실제 외부 MCP 설치/
-실행이나 실제 병렬 Agent 실행을 하지 않는다 — Notification Service / Dashboard는
-아직 시작하지 않았다.
+정적 워크플로+dependency 표현, LLM을 전혀 호출하지 않는 순수 함수 `routeTask()`)를
+구현했다. Task F2는 그 RoutingPlan을 실제로 실행하는 Agent Execution Orchestration
+(`src/agent-orchestrator.ts` — `executeRoutingPlan()`이 dependency가 충족된 step만
+순서대로 실행하고, developer/reviewer/read-only 4개 role 모두 기존 Core 실행 경로
+(claude-developer.ts/gpt-reviewer.ts/claude-runner.ts)를 그대로 재사용하며, QA
+의견이 아니라 실제 required tests exit code가 최종 판정을 결정, 자세한 내용은
+`.claude/CLAUDE.md` 참고)을 구현했다. D1~F2 모두 실제 외부 MCP 설치/실행이나 실제
+병렬 Agent 실행, REVISE 자동 handoff loop를 하지 않는다 — Notification Service /
+Dashboard는 아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -103,10 +108,17 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 - 멀티 페이지(popup에서의 추가 action) 워크플로 — E2는 popup을 검증 후 항상 즉시 닫을
   뿐, popup 페이지에서 추가 action을 실행하는 기능은 구현하지 않았다
 - 실제 병렬 Agent 실행, Agent-to-Agent 대화, Agent가 임의로 새 Agent를 생성하는 기능
-  (F1은 `routeTask()`가 "무엇이 필요한지" 계획만 반환하는 순수 함수 기반만 구현했다 —
-  실제 실행 배선은 다음 Task)
-- Agent Router를 실제 orchestrator.ts/autodev.ts 파이프라인에 연결하는 작업(F1은
-  agent-registry.ts를 독립 모듈로만 추가했고, 기존 실행 경로(claude-developer.ts/
-  gpt-reviewer.ts/orchestrator.ts)는 전혀 수정하지 않았다)
-- 토큰 사용량 실측 Dashboard(F1은 "필요한 Agent만 선택"이라는 구조적 절감만 구현했고,
-  실제 토큰 측정/표시는 하지 않았다)
+  (F1/F2 모두 순차 실행만 구현했다)
+- Agent Execution Orchestrator(F2)를 실제 orchestrator.ts/autodev.ts 파이프라인에
+  연결하는 작업(F2는 agent-orchestrator.ts를 독립 모듈로만 추가했고, 기존 실행 경로
+  (claude-developer.ts/gpt-reviewer.ts/orchestrator.ts/autodev.ts)는 전혀 수정하지
+  않았다)
+- REVISE 자동 handoff loop(F2는 reviewer가 REVISE를 반환하면 그 결과를 그대로
+  보고할 뿐 developer를 자동으로 다시 부르지 않는다 — orchestrator.ts의 기존 REVISE
+  루프와는 별개다)
+- 토큰 사용량 실측 Dashboard(F1/F2는 "필요한 Agent만 선택 + 최소 context 전달"이라는
+  구조적 절감만 구현했고, 실제 토큰 측정/표시는 하지 않았다)
+- read-only agent 응답에서 "자신의 권한 밖 action이 필요하다"는 요청을 자유 텍스트에서
+  안정적으로 파싱하는 기능(F2의 `requestedPermission` 자기보고 필드는 타입/enforcement
+  로직만 구현했고, 실제 운용 read-only runner는 이 필드를 채우지 않는다 — fake runner를
+  쓰는 테스트에서만 채워 enforcement 자체를 검증한다)

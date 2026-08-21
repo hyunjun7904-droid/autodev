@@ -326,9 +326,44 @@ agent를 **추가**만 할 수 있다 — `CORE_AGENT_REGISTRY`의 어떤 `Agent
 policy로 patch되는 코드 경로 자체가 없으므로 Core 권한(canWriteCode/canUseNetwork/
 canRequestHumanApproval/riskLevel)을 확대할 방법이 없다. 이 Task는 실제 병렬 Agent
 실행, Agent 간 자유 대화, Agent의 임의 신규 Agent 생성을 구현하지 않았다 —
-`routeTask()`는 "무엇이 필요한지" 계획만 반환하며, 실제 실행 배선(developer→
-claude-developer.ts, reviewer→gpt-reviewer.ts 등 기존 Core 경로 그대로)은 이 Task
-범위 밖이다.
+`routeTask()`는 "무엇이 필요한지" 계획만 반환하며, 실제 실행 배선은 Phase F Task F2가
+담당한다.
+
+`src/agent-orchestrator.ts`(Phase F Task F2, Agent Execution Orchestration)는 F1의
+`RoutingPlan`을 실제로 실행한다 — `executeRoutingPlan()`이 `plan.steps`(이미 F1이
+priority 순 deterministic ordering을 보장)를 순회하며, 각 step의 `dependsOn`이 전부
+`completed`(SUCCESS) 상태일 때만 실행하고, 선행이 미완료/실패했으면 그 step은
+`SKIPPED`로 기록될 뿐 실행되지 않는다("dependency가 완료되지 않은 step 실행 금지",
+"실패한 prerequisite 뒤의 dependent step 실행 금지"). 이미 실행된 `agentId`는 다시
+실행하지 않는다(F1의 중복 제거 위에 방어적으로 한 번 더 확인). 역할 연결은 전부 기존
+Core 실행 경로를 그대로 재사용한다 — developer는 `claude-developer.ts`의
+`runDeveloperTaskViaSafeExecutor`를, reviewer는 `gpt-reviewer.ts`의
+`reviewClaudeResult`를, planner/research/qa/security(F1이 전부
+`executionModel:"claude-read-only"`로 지정)는 `claude-runner.ts`의 `runClaudeTask`
+(항상 `--tools ""`, 파일/명령 접근 경로 자체가 없음)를 감싼 `realReadOnlyAgentRunner`
+하나를 공유한다. `orchestrator.ts`의 REVISE 자동 루프는 감싸지 않는다 — reviewer가
+`REVISE`를 반환해도 F2는 developer를 자동으로 다시 부르지 않고 그 결과를 그대로
+보고할 뿐이다(범위 밖으로 명시됨).
+
+각 step에는 `taskGoal` + `roleContext`로 지정된 그 role 전용 텍스트 + `dependsOn`
+agent들의 결과 **요약**만 전달한다(`buildStepContext`) — 다른 agent의 원본
+roleContext나 프로젝트 전체를 전달하지 않는다(테스트로 직접 검증: research 전용
+context는 security의 prompt에 나타나지 않고, security는 research의 요약만 받는다).
+deterministic Core로 처리 가능한 작업(F1의 `deterministic_only` 분류)은 `plan.steps`가
+비어 있으므로 이 orchestrator가 어떤 runner도 호출하지 않는다 — LLM 호출 0.
+
+read-only agent는 스스로 `requestedPermission`(자신의 role 권한 밖 action이 필요하다는
+자기 보고)을 반환할 수 있는데, 그 값이 자신의 `AgentDefinition`이 실제로 가진 권한과
+맞지 않으면 그 step은 `BLOCKED`로 판정되고 결과가 무엇이었든 폐기된다 — 이 read-only
+runner 자체는 파일을 쓰거나 명령을 실행할 능력이 구조적으로 없으므로(그런 action
+경로가 없다), 이 체크는 방어 계층일 뿐 유일한 보호막이 아니다.
+
+**최종 판정은 QA/reviewer의 "의견"이 아니라 developer의 실제
+`DeveloperResult.tests`(Safe Executor로 직접 실행한 exitCode 기반, claude-developer.ts가
+이미 보장)가 결정한다** — `computeOverallStatus()`는 QA step의 `data`를 전혀 읽지
+않는다. 이 orchestrator는 checkpoint/commit을 전혀 호출하지 않는다 — Safe Executor/
+Secret Scanner/Dependency Scanner/Git checkpoint/state persistence는 계속 Core
+deterministic service다.
 
 ## 향후 운영 요구사항 (미구현)
 
