@@ -5,6 +5,8 @@ import type { WorkingTreeChange } from "./git-changes";
 import type { TaskDefinition } from "./task-registry";
 import type { GptDecision, SeverityCounts } from "./types";
 import { log } from "./logger";
+import { scanChangesForSecrets } from "./secret-scanner";
+import type { SecretFinding } from "./secret-scanner";
 
 // 자동 Git CHECKPOINT — GPT 승인(Critical 0 / High 0) + 필수 테스트 전부 PASS일 때만
 // commit을 만든다. commit 대상은 해당 task가 실제로 바꾼(allowedPathPrefixes 안의) 파일만
@@ -100,6 +102,9 @@ export interface CheckpointOutcome {
   commitHash?: string;
   filesCommitted?: string[];
   unexpectedFiles?: string[];
+  /** Deterministic Secret Scanner Gate(Phase C Task C3)가 commit 대상에서 발견한 항목 —
+   *  file/line/kind만 담는다(secret 원문은 절대 담기지 않는다). */
+  secretFindings?: SecretFinding[];
 }
 
 /**
@@ -107,11 +112,14 @@ export interface CheckpointOutcome {
  *   1) evaluateApproval — 승인 조건 미달이면 git을 전혀 건드리지 않고 즉시 반환.
  *   2) computeCommitPlan — unexpected가 하나라도 있으면 BLOCK(부분 commit 없음).
  *   3) allowed가 비어있으면(커밋할 것이 없음) 실패로 반환.
- *   4) git add -- <allowed 파일들>만 정확히 실행 → git diff --cached --name-only로 staged
+ *   4) Deterministic Secret Scanner Gate(scanChangesForSecrets) — allowed(commit 대상)만
+ *      검사한다. 하나라도 발견되면 git add조차 실행하지 않고 즉시 BLOCK(fail-open 금지).
+ *      이 단계는 어떤 policy도 받지 않으므로 프로젝트가 약화/우회할 수 없다.
+ *   5) git add -- <allowed 파일들>만 정확히 실행 → git diff --cached --name-only로 staged
  *      집합이 기대한 것과 정확히 일치하는지 재검증(TOCTOU 방지) → 불일치 시 add를 되돌리고
  *      BLOCK.
- *   5) git commit -m <task metadata 기반 메시지>.
- *   6) git rev-parse HEAD로 hash 획득.
+ *   6) git commit -m <task metadata 기반 메시지>.
+ *   7) git rev-parse HEAD로 hash 획득.
  */
 export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformCheckpointOptions): CheckpointOutcome {
   const cwd = opts.cwd ?? PROJECT_ROOT;
@@ -130,6 +138,19 @@ export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformChec
   }
   if (plan.allowed.length === 0) {
     return { ok: false, reason: "commit할 변경 파일이 없습니다." };
+  }
+
+  const secretScan = scanChangesForSecrets(plan.allowed, cwd);
+  if (!secretScan.clean) {
+    log("checkpoint BLOCK — commit 대상에서 민감정보(secret) 패턴 발견", {
+      taskId: taskDef.id,
+      findings: secretScan.findings,
+    });
+    return {
+      ok: false,
+      reason: "commit 대상 파일에서 민감정보(secret) 패턴이 발견되어 commit을 중단했습니다.",
+      secretFindings: secretScan.findings,
+    };
   }
 
   const filesToAdd = plan.allowed.map((c) => c.path);

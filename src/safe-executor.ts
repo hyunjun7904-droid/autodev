@@ -90,9 +90,13 @@ export interface ExecutorResult {
 // 정책(ProjectExecutionPolicy)도 이 목록을 끄거나 좁힐 수 없다 — writeDenyPatterns로 추가만
 // 할 수 있다. 이 패턴들은 어느 project context에도 속하지 않는 진짜 상수라 per-run 분리
 // 대상이 아니다.
+// .env 계열 파일 판정의 단일 출처 — secret-scanner.ts(Phase C Task C3, Deterministic Secret
+// Scanner Gate)가 파일명 기반 env 탐지에 이 배열을 그대로 재사용한다(정규식을 복제하지
+// 않는다). DENY_PATH_PATTERNS 안에서의 위치/동작은 이전과 동일하다.
+export const ENV_FILE_PATTERNS: RegExp[] = [/(^|\/)\.env(\..+)?$/i, /\.local\.env$/i];
+
 export const DENY_PATH_PATTERNS: RegExp[] = [
-  /(^|\/)\.env(\..+)?$/i,
-  /\.local\.env$/i,
+  ...ENV_FILE_PATTERNS,
   /(^|\/)\.git(\/|$)/,
   /(^|\/)node_modules(\/|$)/,
   /(^|\/)\.next(\/|$)/,
