@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 import { getNextTask, findTaskById, isProjectComplete } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
-import { MOVAN_TASK_REGISTRY } from "./project-registries/movan";
 import { DEFAULT_STATE_PATH } from "./state";
 
-// Phase A Task A3 — task-registry.ts(AutoDev Core 엔진: 타입 + 순수 함수)와
-// project-registries/movan.ts(MOVAN 전용 데이터)의 분리를 검증한다.
+// Phase A Task A3 — task-registry.ts(AutoDev Core 엔진: 타입 + 순수 함수)와 프로젝트 전용
+// registry 데이터(예: project-registries/movan.ts)의 분리를 검증한다.
+// Phase B Task B3 — 이 파일은 이제 어떤 특정 프로젝트(MOVAN 포함)의 registry도 import하지
+// 않는다. "여러 Phase에 걸친 순차 진행"이라는 동작은 이 파일 안에서 스스로 만든
+// PRIMARY_FIXTURE_REGISTRY로 증명한다.
 //
 // 이 파일은 실제 automation/config/project-state.json을 읽기만 하고(해시 비교 증거),
 // 절대 쓰지 않는다 — getNextTask/findTaskById/isProjectComplete는 순수 함수이고, 이 파일도
@@ -17,31 +19,38 @@ function check(label: string, cond: boolean): void {
 }
 
 // ---------------------------------------------------------------------------
-// A) 기존 MOVAN_TASK_REGISTRY를 엔진에 주입하면 리팩터링 이전과 동일한 다음 task가 선택된다.
+// A) 여러 Phase에 걸친 fixture registry를 엔진에 주입하면 Phase 경계를 정확히 넘나들며
+// 순서대로 다음 task를 선택한다.
 // ---------------------------------------------------------------------------
-function scenarioMovanRegistryProducesSameNextTaskAsBefore(): void {
+const PRIMARY_FIXTURE_REGISTRY: TaskDefinition[] = [
+  { id: "P1.1", phase: 1, taskNumber: 1, title: "Phase1 Task1", prompt: "prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  { id: "P1.2", phase: 1, taskNumber: 2, title: "Phase1 Task2", prompt: "prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  { id: "P2.1", phase: 2, taskNumber: 1, title: "Phase2 Task1", prompt: "prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+];
+
+function scenarioPrimaryRegistryProducesSequentialNextTask(): void {
   check(
-    "A) completedTasks=['13.1'] → 다음 task='13.2'",
-    getNextTask(MOVAN_TASK_REGISTRY, ["13.1"])?.id === "13.2"
+    "A) completedTasks=['P1.1'] → 다음 task='P1.2'",
+    getNextTask(PRIMARY_FIXTURE_REGISTRY, ["P1.1"])?.id === "P1.2"
   );
   check(
-    "A) completedTasks=['13.1','13.2'] → 다음 task='14.1'(Phase 전환)",
-    getNextTask(MOVAN_TASK_REGISTRY, ["13.1", "13.2"])?.id === "14.1"
+    "A) completedTasks=['P1.1','P1.2'] → 다음 task='P2.1'(Phase 전환)",
+    getNextTask(PRIMARY_FIXTURE_REGISTRY, ["P1.1", "P1.2"])?.id === "P2.1"
   );
-  const allIds = MOVAN_TASK_REGISTRY.map((t) => t.id);
+  const allIds = PRIMARY_FIXTURE_REGISTRY.map((t) => t.id);
   check(
     "A) 전체 completedTasks(모든 id) → 다음 task 없음(null, registry 소진)",
-    getNextTask(MOVAN_TASK_REGISTRY, allIds) === null
+    getNextTask(PRIMARY_FIXTURE_REGISTRY, allIds) === null
   );
   check(
-    "A) 빈 completedTasks → 다음 task='13.1'(registry 첫 항목)",
-    getNextTask(MOVAN_TASK_REGISTRY, [])?.id === "13.1"
+    "A) 빈 completedTasks → 다음 task='P1.1'(registry 첫 항목)",
+    getNextTask(PRIMARY_FIXTURE_REGISTRY, [])?.id === "P1.1"
   );
 }
 
 // ---------------------------------------------------------------------------
-// B/C) 별도의 작은 fixture registry를 주입하면 그 registry만 쓰이고, MOVAN 데이터는
-// 전혀 섞이지 않는다.
+// B/C) 별도의 작은 fixture registry를 주입하면 그 registry만 쓰이고, PRIMARY_FIXTURE_REGISTRY
+// 데이터는 전혀 섞이지 않는다(서로 다른 두 프로젝트가 완전히 독립적으로 동작함을 증명).
 // ---------------------------------------------------------------------------
 const FIXTURE_REGISTRY: TaskDefinition[] = [
   {
@@ -76,17 +85,17 @@ function scenarioFixtureRegistryIsUsedInIsolation(): void {
   const done = getNextTask(FIXTURE_REGISTRY, ["F1", "F2"]);
   check("B) fixture registry 전부 완료 → 다음 task 없음(null)", done === null);
 
-  // C) MOVAN registry의 id("13.1" 등)가 fixture 실행에 전혀 나타나지 않는다 — MOVAN
-  // completedTasks를 그대로 fixture registry에 흘려보내도(둘 다 완료로 취급되지 않는 한)
-  // fixture만의 항목이 그대로 선택되어야 한다(두 registry가 서로 다른 id 공간을 씀).
-  const withUnrelatedCompleted = getNextTask(FIXTURE_REGISTRY, ["13.1", "13.2", "14.1"]);
+  // C) 다른(PRIMARY) registry의 id("P1.1" 등)가 fixture 실행에 전혀 나타나지 않는다 — 다른
+  // 프로젝트의 completedTasks를 그대로 fixture registry에 흘려보내도(둘 다 완료로 취급되지
+  // 않는 한) fixture만의 항목이 그대로 선택되어야 한다(두 registry가 서로 다른 id 공간을 씀).
+  const withUnrelatedCompleted = getNextTask(FIXTURE_REGISTRY, ["P1.1", "P1.2", "P2.1"]);
   check(
-    "C) MOVAN task id가 completedTasks에 섞여 있어도 fixture registry는 여전히 'F1'부터 선택(MOVAN 데이터가 fixture에 섞이지 않음)",
+    "C) 다른 프로젝트의 task id가 completedTasks에 섞여 있어도 fixture registry는 여전히 'F1'부터 선택(다른 프로젝트 데이터가 섞이지 않음)",
     withUnrelatedCompleted?.id === "F1"
   );
   check(
-    "C) fixture registry 결과에 MOVAN 전용 task id('13.1' 등)가 나타나지 않음",
-    !FIXTURE_REGISTRY.some((t) => MOVAN_TASK_REGISTRY.some((m) => m.id === t.id))
+    "C) fixture registry 결과에 다른 프로젝트 전용 task id('P1.1' 등)가 나타나지 않음",
+    !FIXTURE_REGISTRY.some((t) => PRIMARY_FIXTURE_REGISTRY.some((m) => m.id === t.id))
   );
 }
 
@@ -118,13 +127,13 @@ function scenarioEmptyAndCompletedRegistryHandledSafely(): void {
   );
 
   check(
-    "D) isProjectComplete — MOVAN registry를 완료 목록 없이 주입하면 false(할 일이 남음)",
-    isProjectComplete(MOVAN_TASK_REGISTRY, { completedTasks: [] }) === false
+    "D) isProjectComplete — PRIMARY registry를 완료 목록 없이 주입하면 false(할 일이 남음)",
+    isProjectComplete(PRIMARY_FIXTURE_REGISTRY, { completedTasks: [] }) === false
   );
-  const allMovanIds = MOVAN_TASK_REGISTRY.map((t) => t.id);
+  const allPrimaryIds = PRIMARY_FIXTURE_REGISTRY.map((t) => t.id);
   check(
-    "D) isProjectComplete — MOVAN registry의 모든 id가 완료되면 true",
-    isProjectComplete(MOVAN_TASK_REGISTRY, { completedTasks: allMovanIds }) === true
+    "D) isProjectComplete — PRIMARY registry의 모든 id가 완료되면 true",
+    isProjectComplete(PRIMARY_FIXTURE_REGISTRY, { completedTasks: allPrimaryIds }) === true
   );
 }
 
@@ -134,28 +143,28 @@ function scenarioEmptyAndCompletedRegistryHandledSafely(): void {
 // ---------------------------------------------------------------------------
 function scenarioAllThreeFunctionsUseInjectedRegistry(): void {
   check(
-    "E) findTaskById(FIXTURE_REGISTRY, 'F2')가 fixture task를 반환(MOVAN에는 'F2'가 없음)",
+    "E) findTaskById(FIXTURE_REGISTRY, 'F2')가 fixture task를 반환(PRIMARY에는 'F2'가 없음)",
     findTaskById(FIXTURE_REGISTRY, "F2")?.title === "fixture task 2"
   );
   check(
-    "E) findTaskById(MOVAN_TASK_REGISTRY, '13.2')가 MOVAN task를 반환",
-    findTaskById(MOVAN_TASK_REGISTRY, "13.2")?.title === "문서관리 UI 구현"
+    "E) findTaskById(PRIMARY_FIXTURE_REGISTRY, 'P1.2')가 PRIMARY task를 반환",
+    findTaskById(PRIMARY_FIXTURE_REGISTRY, "P1.2")?.title === "Phase1 Task2"
   );
   check(
-    "E) MOVAN registry에서 찾을 수 없는 fixture id('F1')는 undefined",
-    findTaskById(MOVAN_TASK_REGISTRY, "F1") === undefined
+    "E) PRIMARY registry에서 찾을 수 없는 fixture id('F1')는 undefined",
+    findTaskById(PRIMARY_FIXTURE_REGISTRY, "F1") === undefined
   );
 
   check(
     "E) getNextTask에 같은 completedTasks를 줘도 registry가 다르면 다른 결과",
-    getNextTask(MOVAN_TASK_REGISTRY, [])?.id !== getNextTask(FIXTURE_REGISTRY, [])?.id
+    getNextTask(PRIMARY_FIXTURE_REGISTRY, [])?.id !== getNextTask(FIXTURE_REGISTRY, [])?.id
   );
 }
 
 function main(): void {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
-  scenarioMovanRegistryProducesSameNextTaskAsBefore();
+  scenarioPrimaryRegistryProducesSequentialNextTask();
   scenarioFixtureRegistryIsUsedInIsolation();
   scenarioEmptyAndCompletedRegistryHandledSafely();
   scenarioAllThreeFunctionsUseInjectedRegistry();

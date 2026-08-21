@@ -1,17 +1,22 @@
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { buildProtocolSystemPrompt } from "./claude-developer";
 import type { DeveloperProjectContext } from "./claude-developer";
 import { buildReviewInput, buildSystemInstructions } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
-import { MOVAN_PROJECT_MANIFEST } from "./project-manifests/movan";
 import { configureSafeExecutor } from "./safe-executor";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { ClaudeResult } from "./types";
 
 // AutoDev 범용화 Phase A Task A6 — Claude Developer/GPT Reviewer에게 전달되는 system
-// prompt/review instruction에서 MOVAN 하드코딩이 실제로 제거됐는지 증명한다.
+// prompt/review instruction에서 특정 프로젝트 하드코딩이 실제로 제거됐는지 증명한다.
+// Phase B Task B3 — 이 파일은 이제 어떤 특정 프로젝트(MOVAN 포함)도 import하지 않는다.
+// 서로 완전히 독립된 두 개의 fixture 프로젝트("Project Alpha"/"Fixture Calculator")를
+// 직접 만들어, 그 사이에 project-specific 내용이 전혀 섞이지 않음을 증명한다 — 어느
+// 실제 프로젝트를 어댑터로 붙이든 동일한 방식으로 격리된다는 것이 이 파일이 증명하는 것.
 //
 // 이 파일은 실제 claude CLI/OpenAI API를 전혀 호출하지 않는다 — buildProtocolSystemPrompt/
 // buildSystemInstructions/buildReviewInput은 순수 문자열 조립 함수이고, 이 테스트는 그
@@ -22,10 +27,49 @@ function check(label: string, cond: boolean): void {
   results.push(`[${cond ? "PASS" : "FAIL"}] ${label}`);
 }
 
-// Fixture manifest — MOVAN/web/supabase/Microsoft 개념이 전혀 없는, 완전히 무관한 작은
-// 프로젝트를 흉내낸다(§ 요구사항 7). targetProjectRoot는 이 프로세스가 이미 실행 중인
-// automation/dist(실존 경로)를 그대로 재사용한다 — validateProjectManifest가 실제 존재
-// 여부만 확인하고, 이 테스트는 targetProjectRoot의 실제 내용을 전혀 읽지 않는다.
+const tempDirs: string[] = [];
+function makeTempGitRepo(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "dev-reviewer-context-test@example.com"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "Dev Reviewer Context Test"], { cwd: dir });
+  writeFileSync(join(dir, ".gitkeep"), "");
+  spawnSync("git", ["add", "--", ".gitkeep"], { cwd: dir });
+  spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: dir });
+  return dir;
+}
+
+// Project Alpha — rulesPath를 실제로 지정한(그리고 실제 rules 파일 내용이 review input에
+// 삽입되는지까지 확인할 수 있는) fixture 프로젝트. web/supabase/Microsoft 등 어떤 실제
+// 프로젝트 개념도 없다.
+const ALPHA_ROOT = makeTempGitRepo("autodev-dev-reviewer-context-alpha-");
+writeFileSync(join(ALPHA_ROOT, "ALPHA_RULES.md"), "# Project Alpha 운영 규칙\n항상 alpha/** 범위 안에서만 작업한다.\n", "utf-8");
+
+const ALPHA_EXECUTION_POLICY: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["alpha/"],
+  allowedWritePrefixes: ["alpha/"],
+  allowedCommands: [{ cwd: "root", command: "node", args: ["alpha-check.js"] }],
+};
+
+const ALPHA_MANIFEST: ProjectManifest = {
+  projectId: "project-alpha",
+  projectName: "Project Alpha",
+  targetProjectRoot: ALPHA_ROOT,
+  statePath: join(ALPHA_ROOT, "alpha-state.json"),
+  taskRegistry: [],
+  developerInstructions:
+    "허용 read/write 범위: alpha/**. 허용 명령: node alpha-check.js. Project Alpha 고유 규칙만 다룹니다.",
+  reviewInstructions: "Project Alpha 고유 규칙 준수 여부를 확인하세요.",
+  reviewScopeDirs: ["alpha/"],
+  rulesPath: "ALPHA_RULES.md",
+  executionPolicy: ALPHA_EXECUTION_POLICY,
+};
+
+// Fixture Calculator — MOVAN/web/supabase/Microsoft 개념이 전혀 없는, Project Alpha와도
+// 완전히 무관한 두 번째 독립 fixture 프로젝트를 흉내낸다. targetProjectRoot는 이 프로세스가
+// 이미 실행 중인 automation/dist(실존 경로)를 그대로 재사용한다 — validateProjectManifest가
+// 실제 존재 여부만 확인하고, 이 테스트는 targetProjectRoot의 실제 내용을 전혀 읽지 않는다.
 const FIXTURE_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedReadPrefixes: ["calc/"],
   allowedWritePrefixes: ["calc/"],
@@ -45,6 +89,17 @@ const FIXTURE_MANIFEST: ProjectManifest = {
   executionPolicy: FIXTURE_EXECUTION_POLICY,
 };
 
+const ALPHA_DEVELOPER_CONTEXT: DeveloperProjectContext = {
+  projectName: ALPHA_MANIFEST.projectName,
+  instructions: ALPHA_MANIFEST.developerInstructions,
+};
+const ALPHA_REVIEW_CONTEXT: ReviewProjectContext = {
+  projectName: ALPHA_MANIFEST.projectName,
+  instructions: ALPHA_MANIFEST.reviewInstructions,
+  scopeDirs: ALPHA_MANIFEST.reviewScopeDirs,
+  rulesPath: ALPHA_MANIFEST.rulesPath,
+};
+
 const FIXTURE_DEVELOPER_CONTEXT: DeveloperProjectContext = {
   projectName: FIXTURE_MANIFEST.projectName,
   instructions: FIXTURE_MANIFEST.developerInstructions,
@@ -54,21 +109,10 @@ const FIXTURE_REVIEW_CONTEXT: ReviewProjectContext = {
   instructions: FIXTURE_MANIFEST.reviewInstructions,
   scopeDirs: FIXTURE_MANIFEST.reviewScopeDirs,
   // rulesPath를 지정하지 않는다 — 실제 파일을 전혀 읽지 않고 "규칙 파일 미지정" 문구만
-  // 나온다(§ 실제 MOVAN rules.md 내용이 우연히도 섞여 들어올 여지를 원천 차단).
+  // 나온다(§ Project Alpha의 실제 rules 파일 내용이 우연히도 섞여 들어올 여지를 원천 차단).
 };
 
-const MOVAN_DEVELOPER_CONTEXT: DeveloperProjectContext = {
-  projectName: MOVAN_PROJECT_MANIFEST.projectName,
-  instructions: MOVAN_PROJECT_MANIFEST.developerInstructions,
-};
-const MOVAN_REVIEW_CONTEXT: ReviewProjectContext = {
-  projectName: MOVAN_PROJECT_MANIFEST.projectName,
-  instructions: MOVAN_PROJECT_MANIFEST.reviewInstructions,
-  scopeDirs: MOVAN_PROJECT_MANIFEST.reviewScopeDirs,
-  rulesPath: MOVAN_PROJECT_MANIFEST.rulesPath,
-};
-
-const MOVAN_MARKERS = ["MOVAN", "web/", "supabase", "Microsoft"];
+const CROSS_LEAK_MARKERS = ["Project Alpha", "alpha/", "calc/", "Fixture Calculator"];
 
 const FAKE_CLAUDE_RESULT: ClaudeResult = {
   success: true,
@@ -79,31 +123,29 @@ const FAKE_CLAUDE_RESULT: ClaudeResult = {
 };
 
 // ---------------------------------------------------------------------------
-// A) MOVAN manifest 사용 시 기존에 필요한 MOVAN developer/reviewer context가 보존된다.
+// A) Project Alpha manifest 사용 시 그 프로젝트 고유의 developer/reviewer context가 그대로
+// 삽입되고, rulesPath로 지정한 실제 규칙 파일 내용까지 review input에 반영된다.
 // ---------------------------------------------------------------------------
-function scenarioA_movanContextPreserved(): void {
-  const developerPrompt = buildProtocolSystemPrompt(MOVAN_DEVELOPER_CONTEXT);
-  check("A) MOVAN developer prompt에 프로젝트 이름('MOVAN ERP') 포함", developerPrompt.includes("MOVAN ERP"));
-  check("A) MOVAN developer prompt에 허용 read 범위(web/**) 포함", developerPrompt.includes("web/**"));
-  check("A) MOVAN developer prompt에 supabase/migrations 불변 규칙 포함", developerPrompt.includes("supabase/migrations/**"));
-  check("A) MOVAN developer prompt에 허용 명령 목록(npx tsc --noEmit) 포함", developerPrompt.includes("npx tsc --noEmit"));
-  check("A) MOVAN developer prompt에 Microsoft/OAuth 사람 확인 caution 포함", developerPrompt.includes("Microsoft"));
+function scenarioA_alphaContextPreserved(): void {
+  const developerPrompt = buildProtocolSystemPrompt(ALPHA_DEVELOPER_CONTEXT);
+  check("A) Alpha developer prompt에 프로젝트 이름('Project Alpha') 포함", developerPrompt.includes("Project Alpha"));
+  check("A) Alpha developer prompt에 허용 범위(alpha/**) 포함", developerPrompt.includes("alpha/**"));
+  check("A) Alpha developer prompt에 허용 명령(node alpha-check.js) 포함", developerPrompt.includes("node alpha-check.js"));
 
-  const reviewInstructions = buildSystemInstructions(MOVAN_REVIEW_CONTEXT);
-  check("A) MOVAN reviewer instructions에 프로젝트 이름('MOVAN ERP') 포함", reviewInstructions.includes("MOVAN ERP"));
-  check("A) MOVAN reviewer instructions에 Phase 규칙(migration 불변) 포함", reviewInstructions.includes("migration"));
+  const reviewInstructions = buildSystemInstructions(ALPHA_REVIEW_CONTEXT);
+  check("A) Alpha reviewer instructions에 프로젝트 이름('Project Alpha') 포함", reviewInstructions.includes("Project Alpha"));
 
-  const { input } = buildReviewInput("테스트 task", FAKE_CLAUDE_RESULT, 1, MOVAN_REVIEW_CONTEXT.scopeDirs, MOVAN_REVIEW_CONTEXT);
-  check("A) MOVAN reviewer input에 실제 rules.md 요약(운영 규칙) 포함", input.includes("MOVAN 자동개발 시스템"));
+  const { input } = buildReviewInput("테스트 task", FAKE_CLAUDE_RESULT, 1, ALPHA_REVIEW_CONTEXT.scopeDirs, ALPHA_REVIEW_CONTEXT);
+  check("A) Alpha reviewer input에 실제 ALPHA_RULES.md 내용 포함", input.includes("Project Alpha 운영 규칙"));
 }
 
 // ---------------------------------------------------------------------------
-// B) Fixture manifest 사용 시 Claude Developer prompt에 MOVAN/web/supabase/Microsoft
-//    전용 내용이 섞이지 않는다.
+// B) Fixture Calculator manifest 사용 시 Claude Developer prompt에 Project Alpha 전용
+//    내용이 섞이지 않는다.
 // ---------------------------------------------------------------------------
 function scenarioB_fixtureDeveloperPromptIsolated(): void {
   const developerPrompt = buildProtocolSystemPrompt(FIXTURE_DEVELOPER_CONTEXT);
-  for (const marker of MOVAN_MARKERS) {
+  for (const marker of CROSS_LEAK_MARKERS.filter((m) => m !== "calc/" && m !== "Fixture Calculator")) {
     check(`B) Fixture developer prompt에 "${marker}" 문자열이 없음`, !developerPrompt.includes(marker));
   }
   check("B) Fixture developer prompt에 fixture 프로젝트 이름 포함", developerPrompt.includes("Fixture Calculator"));
@@ -111,41 +153,42 @@ function scenarioB_fixtureDeveloperPromptIsolated(): void {
 }
 
 // ---------------------------------------------------------------------------
-// C) Fixture manifest 사용 시 GPT Reviewer prompt(system instructions + review input)에도
-//    MOVAN 전용 내용이 섞이지 않는다.
+// C) Fixture Calculator manifest 사용 시 GPT Reviewer prompt(system instructions + review
+//    input)에도 Project Alpha 전용 내용이 섞이지 않는다.
 // ---------------------------------------------------------------------------
 function scenarioC_fixtureReviewerPromptIsolated(): void {
   const reviewInstructions = buildSystemInstructions(FIXTURE_REVIEW_CONTEXT);
-  for (const marker of MOVAN_MARKERS) {
+  for (const marker of CROSS_LEAK_MARKERS.filter((m) => m !== "calc/" && m !== "Fixture Calculator")) {
     check(`C) Fixture reviewer system instructions에 "${marker}" 문자열이 없음`, !reviewInstructions.includes(marker));
   }
   check("C) Fixture reviewer system instructions에 fixture 프로젝트 이름 포함", reviewInstructions.includes("Fixture Calculator"));
 
-  // scopeDirs를 실제 MOVAN repo에 존재하지 않는 "calc/"로 지정했으므로, 실제 git 작업트리
-  // 스캔 결과에는 (현재 이 repo에서 진행 중인 다른 MOVAN 변경과 무관하게) 아무것도 잡히지
-  // 않는다 — 그래서 review input 검사도 노이즈 없이 신뢰할 수 있다.
+  // scopeDirs를 실제 이 repository에 존재하지 않는 "calc/"로 지정했으므로, 실제 git
+  // 작업트리 스캔 결과에는 아무것도 잡히지 않는다 — 그래서 review input 검사도 노이즈
+  // 없이 신뢰할 수 있다.
   const { input, scopeViolations } = buildReviewInput("fixture 테스트 task", FAKE_CLAUDE_RESULT, 1, FIXTURE_REVIEW_CONTEXT.scopeDirs, FIXTURE_REVIEW_CONTEXT);
-  for (const marker of MOVAN_MARKERS) {
+  for (const marker of CROSS_LEAK_MARKERS.filter((m) => m !== "calc/" && m !== "Fixture Calculator")) {
     check(`C) Fixture reviewer input에 "${marker}" 문자열이 없음`, !input.includes(marker));
   }
-  check("C) Fixture reviewer input에 규칙 파일 미지정 문구 포함(rules.md를 읽지 않음)", input.includes("프로젝트 규칙 파일이 지정되지 않음"));
+  check("C) Fixture reviewer input에 규칙 파일 미지정 문구 포함(rules 파일을 읽지 않음)", input.includes("프로젝트 규칙 파일이 지정되지 않음"));
   check("C) Fixture scopeDirs 안에서는 scope violation이 없음(빈 배열)", scopeViolations.length === 0);
 }
 
 // ---------------------------------------------------------------------------
-// D) MOVAN과 Fixture 사이에 project-specific rules가 서로 누출되지 않는다(양방향).
+// D) Project Alpha와 Fixture Calculator 사이에 project-specific rules가 서로 누출되지
+//    않는다(양방향).
 // ---------------------------------------------------------------------------
 function scenarioD_noCrossLeakBetweenProjects(): void {
-  const movanDeveloperPrompt = buildProtocolSystemPrompt(MOVAN_DEVELOPER_CONTEXT);
-  const movanReviewInstructions = buildSystemInstructions(MOVAN_REVIEW_CONTEXT);
-  check("D) MOVAN developer prompt에 Fixture 고유 규칙(calc/**)이 섞이지 않음", !movanDeveloperPrompt.includes("calc/**"));
-  check("D) MOVAN developer prompt에 Fixture 프로젝트 이름이 섞이지 않음", !movanDeveloperPrompt.includes("Fixture Calculator"));
-  check("D) MOVAN reviewer instructions에 Fixture 프로젝트 이름이 섞이지 않음", !movanReviewInstructions.includes("Fixture Calculator"));
+  const alphaDeveloperPrompt = buildProtocolSystemPrompt(ALPHA_DEVELOPER_CONTEXT);
+  const alphaReviewInstructions = buildSystemInstructions(ALPHA_REVIEW_CONTEXT);
+  check("D) Alpha developer prompt에 Fixture 고유 규칙(calc/**)이 섞이지 않음", !alphaDeveloperPrompt.includes("calc/**"));
+  check("D) Alpha developer prompt에 Fixture 프로젝트 이름이 섞이지 않음", !alphaDeveloperPrompt.includes("Fixture Calculator"));
+  check("D) Alpha reviewer instructions에 Fixture 프로젝트 이름이 섞이지 않음", !alphaReviewInstructions.includes("Fixture Calculator"));
 
   const fixtureDeveloperPrompt = buildProtocolSystemPrompt(FIXTURE_DEVELOPER_CONTEXT);
   const fixtureReviewInstructions = buildSystemInstructions(FIXTURE_REVIEW_CONTEXT);
-  check("D) Fixture developer prompt에 MOVAN 허용 명령(npx tsc --noEmit)이 섞이지 않음", !fixtureDeveloperPrompt.includes("npx tsc --noEmit"));
-  check("D) Fixture reviewer instructions에 MOVAN Phase 규칙(migration)이 섞이지 않음", !fixtureReviewInstructions.includes("migration"));
+  check("D) Fixture developer prompt에 Alpha 허용 명령(node alpha-check.js)이 섞이지 않음", !fixtureDeveloperPrompt.includes("node alpha-check.js"));
+  check("D) Fixture reviewer instructions에 Alpha 프로젝트 이름이 섞이지 않음", !fixtureReviewInstructions.includes("Project Alpha"));
 }
 
 // ---------------------------------------------------------------------------
@@ -185,19 +228,34 @@ function scenarioG_lazyOpenAIClientWorksWithoutApiKey(): void {
 }
 
 function main(): void {
-  // scenarioA_movanContextPreserved()/scenarioC_fixtureReviewerPromptIsolated()가
-  // buildReviewInput → buildChangeSection → readUntrackedFiles를 거쳐 실제 Safe Executor
-  // (validateReadPath)를 호출한다 — configureSafeExecutor()로 명시적으로 주입되기 전까지
-  // 어떤 프로젝트로도 조용히 fallback하지 않으므로 먼저 MOVAN 정책을 주입한다.
-  configureSafeExecutor(MOVAN_PROJECT_MANIFEST.targetProjectRoot, MOVAN_PROJECT_MANIFEST.executionPolicy);
+  try {
+    // scenarioA_alphaContextPreserved()가 buildReviewInput → buildChangeSection →
+    // readUntrackedFiles를 거쳐 실제 Safe Executor(validateReadPath)를 호출한다 —
+    // configureSafeExecutor()로 명시적으로 주입되기 전까지 어떤 프로젝트로도 조용히
+    // fallback하지 않으므로 먼저 Alpha 정책을 주입한다.
+    configureSafeExecutor(ALPHA_MANIFEST.targetProjectRoot, ALPHA_MANIFEST.executionPolicy);
+    scenarioA_alphaContextPreserved();
 
-  scenarioA_movanContextPreserved();
-  scenarioB_fixtureDeveloperPromptIsolated();
-  scenarioC_fixtureReviewerPromptIsolated();
-  scenarioD_noCrossLeakBetweenProjects();
-  scenarioG_lazyOpenAIClientWorksWithoutApiKey();
+    // B/C는 Fixture Calculator의 root/policy로 재구성한 뒤 실행한다 — Safe Executor는
+    // 한 프로세스에 하나의 정책만 갖는다(§ project-context.ts 상단 주석의 "한 프로세스 =
+    // 한 target project" 모델).
+    configureSafeExecutor(FIXTURE_MANIFEST.targetProjectRoot, FIXTURE_MANIFEST.executionPolicy);
+    scenarioB_fixtureDeveloperPromptIsolated();
+    scenarioC_fixtureReviewerPromptIsolated();
 
-  console.log("\n=== developer/reviewer prompt 범용화(Phase A Task A6) 테스트 결과 ===");
+    scenarioD_noCrossLeakBetweenProjects();
+    scenarioG_lazyOpenAIClientWorksWithoutApiKey();
+  } finally {
+    for (const dir of tempDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // 임시 디렉터리 정리 실패는 테스트 결과에 영향 없음
+      }
+    }
+  }
+
+  console.log("\n=== developer/reviewer prompt 범용화(Phase A Task A6 / B Task B3) 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
   console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);

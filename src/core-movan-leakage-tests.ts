@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
 // AutoDev 범용화 Phase B Task B1 — Core MOVAN leakage 검사(§ 요구사항 9).
@@ -28,6 +28,11 @@ function main(): void {
   const orchestrator = readSrc("orchestrator.ts");
   const autodev = readSrc("autodev.ts");
   const taskRegistry = readSrc("task-registry.ts");
+  const projectContext = readSrc("project-context.ts");
+  const state = readSrc("state.ts");
+  const checkpoint = readSrc("checkpoint.ts");
+  const projectAdapterLoader = readSrc("project-adapter-loader.ts");
+  const run = readSrc("run.ts");
 
   // --- safe-executor.ts: MOVAN 전용 import/상수/타입이 남아있지 않음 ---
   check(
@@ -88,7 +93,48 @@ function main(): void {
     !/cwd:\s*"root"\s*\|\s*"web"\s*\|\s*"automation"/.test(taskRegistry)
   );
 
-  console.log("\n=== Core MOVAN leakage(Phase B Task B1 — § 요구사항 9) 테스트 결과 ===");
+  // --- Phase B Task B3 — External Project Adapter 분리 이후 강화된 검사 ---
+  // project-context.ts/state.ts/checkpoint.ts: MOVAN 전용 import/경로 상수가 없음.
+  check(
+    "project-context.ts가 project-manifests/movan을 import하지 않음",
+    !/from\s+"\.\/project-manifests\/movan"/.test(projectContext)
+  );
+  check(
+    "state.ts가 project-manifests/movan을 import하지 않음",
+    !/from\s+"\.\/project-manifests\/movan"/.test(state)
+  );
+  check(
+    "checkpoint.ts가 project-manifests/movan을 import하지 않음",
+    !/from\s+"\.\/project-manifests\/movan"/.test(checkpoint)
+  );
+
+  // entry point(run.ts, run-movan.ts 대체) + project-adapter-loader.ts: MOVAN을 전혀 모르고
+  // 항상 외부 adapter 경로를 요구한다.
+  check(
+    "run.ts가 project-manifests/movan을 import하지 않음",
+    !/from\s+"\.\/project-manifests\/movan"/.test(run)
+  );
+  check("run.ts에 MOVAN 하드코딩 문자열이 없음(주석 포함)", !/MOVAN/.test(run));
+  check("run.ts가 project-adapter-loader를 통해서만 manifest를 얻음", /loadProjectAdapter\(/.test(run));
+  check(
+    "project-adapter-loader.ts가 project-manifests/movan을 import하지 않음",
+    !/from\s+"\.\/project-manifests\/movan"/.test(projectAdapterLoader)
+  );
+  check("project-adapter-loader.ts에 MOVAN 하드코딩 문자열이 없음(주석 포함)", !/MOVAN/.test(projectAdapterLoader));
+
+  // --- 목표 상태(§ 요구사항 11) — MOVAN 전용 adapter/registry/entry point 파일 자체가
+  // AutoDev repo 안에 더 이상 존재하지 않는다. ---
+  check(
+    "src/project-manifests/movan.ts가 존재하지 않음(MOVAN adapter가 MOVAN repo로 이동됨)",
+    !existsSync(join(SRC_DIR, "project-manifests", "movan.ts"))
+  );
+  check(
+    "src/project-registries/movan.ts가 존재하지 않음(MOVAN task registry가 MOVAN repo로 이동됨)",
+    !existsSync(join(SRC_DIR, "project-registries", "movan.ts"))
+  );
+  check("src/run-movan.ts가 존재하지 않음(범용 run.ts로 대체됨)", !existsSync(join(SRC_DIR, "run-movan.ts")));
+
+  console.log("\n=== Core MOVAN leakage(Phase B Task B1/B3 — § 요구사항 9/11) 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
   console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);

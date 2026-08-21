@@ -1,15 +1,27 @@
-# MOVAN AutoDev 시작 스크립트(AutoDev standalone repo에서 MOVAN repo를 external target으로
-# 실행). .env 값은 절대 읽거나 출력하지 않는다 — 존재 여부만 확인한다.
+# AutoDev 범용 시작 스크립트(AutoDev standalone repo 자신의 시작점).
 #
-# Phase B Task B2 — 물리적 repository 분리 이후 AutoDev Root(이 스크립트가 있는 위치)와
-# Target Project Root(MOVAN repo)가 더 이상 같은 repository 안에 중첩돼 있지 않으므로,
-# AUTODEV_TARGET_PROJECT_ROOT/AUTODEV_STATE_PATH를 이 스크립트가 명시적으로 지정해야 한다
-# (project-context.ts는 이 값이 없으면 기본값으로 AutoDev Root의 부모 디렉터리를 쓰는데,
-# 그건 이제 MOVAN repo가 아니라 Desktop 자체이므로 반드시 override가 필요하다). 두 경로 모두
-# 이 machine의 실제 MOVAN repo 위치를 가리키는 절대경로다 — 다른 환경에 옮길 때는 이 두 줄만
-# 바꾸면 된다.
-$env:AUTODEV_TARGET_PROJECT_ROOT = "C:\Users\hyunj\OneDrive\Desktop\claude 자동화"
-$env:AUTODEV_STATE_PATH = "C:\Users\hyunj\OneDrive\Desktop\claude 자동화\.autodev\project-state.json"
+# AutoDev 범용화 Phase B Task B3 — 이 스크립트는 이제 어떤 프로젝트를 개발할지 전혀 모른다.
+# 이전에는 MOVAN repo의 절대경로(AUTODEV_TARGET_PROJECT_ROOT/AUTODEV_STATE_PATH)를 이
+# 스크립트가 직접 하드코딩했다 — 그래서 이 스크립트 자체가 "MOVAN 전용"이었다. 이제는
+# -ProjectAdapter 파라미터(또는 미리 설정된 AUTODEV_PROJECT_ADAPTER 환경변수)로 project
+# adapter 모듈의 절대경로를 명시적으로 받아 dist/run.js에 그대로 전달할 뿐이다 — 지정하지
+# 않으면 기본 프로젝트로 조용히 넘어가지 않고 즉시 실패한다.
+#
+# 특정 프로젝트를 실행하려면: 그 프로젝트 저장소가 소유한 wrapper 스크립트(예: 그
+# 저장소의 .autodev/start-autodev.ps1)를 대신 실행하라 — 그 wrapper가 자신의
+# .autodev/manifest.js 경로를 -ProjectAdapter로 지정해 이 스크립트를 호출하는 방식을
+# 권장한다. 새 프로젝트를 붙이려면 그 프로젝트가 동일한 방식의 wrapper를 스스로 두면
+# 된다 — 이 스크립트는 손댈 필요가 없다.
+#
+# .env 값은 절대 읽거나 출력하지 않는다 — 존재 여부만 확인한다.
+param(
+    [string]$ProjectAdapter = $env:AUTODEV_PROJECT_ADAPTER
+)
+
+if (-not $ProjectAdapter -or $ProjectAdapter.Trim() -eq "") {
+    Write-Output "[start-autodev] project adapter가 지정되지 않았습니다 — -ProjectAdapter <path> 파라미터 또는 AUTODEV_PROJECT_ADAPTER 환경변수로 명시적으로 지정하세요(기본 프로젝트 없음)."
+    exit 1
+}
 
 Set-Location $PSScriptRoot
 
@@ -21,7 +33,7 @@ Set-Location $PSScriptRoot
 # 비정상 종료(killed처럼 보임)로 끝났다. 콘솔 핸들이 없으면 제목 설정을 안전하게 건너뛴다.
 try {
     if ($Host.Name -eq "ConsoleHost") {
-        $Host.UI.RawUI.WindowTitle = "MOVAN AutoDev"
+        $Host.UI.RawUI.WindowTitle = "AutoDev"
     }
 } catch {
     Write-Output "[start-autodev] 콘솔 창 제목 설정을 건너뜁니다(콘솔 핸들 없음 — headless 실행)."
@@ -36,16 +48,16 @@ Write-Output "[start-autodev] .env 존재 확인됨 (내용은 표시하지 않�
 
 $env:AUTOMATION_DRY_RUN = "false"
 
-Write-Output "[start-autodev] AutoDev를 시작합니다 (Ctrl+C로 안전 종료 가능)."
+Write-Output "[start-autodev] AutoDev를 시작합니다(project adapter: $ProjectAdapter, Ctrl+C로 안전 종료 가능)."
 npm run build
 if ($LASTEXITCODE -ne 0) {
     Write-Output "[start-autodev] build 실패(exit $LASTEXITCODE) — AutoDev를 실행하지 않습니다."
     exit $LASTEXITCODE
 }
 
-node dist/run-movan.js
+node dist/run.js --project $ProjectAdapter
 # node의 실제 종료 코드를 wrapper 자신의 종료 코드로 그대로 전달한다 — node가 정상 종료했는데
-# (WAITING_HUMAN 등 정상적인 종료 포함, run-movan.ts는 그 경우 exitCode를 건드리지 않아 0이다)
+# (WAITING_HUMAN 등 정상적인 종료 포함, run.ts는 그 경우 exitCode를 건드리지 않아 0이다)
 # wrapper 쪽 부수적인 문제 때문에 바깥에서 killed/error로 보이는 일이 없도록 한다.
 $autodevExitCode = $LASTEXITCODE
 

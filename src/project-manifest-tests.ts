@@ -1,10 +1,8 @@
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { decideNextAction, runAutodevOnce } from "./autodev";
-import { MOVAN_PROJECT_MANIFEST } from "./project-manifests/movan";
-import { MOVAN_TASK_REGISTRY } from "./project-registries/movan";
 import { validateProjectManifest } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
@@ -14,13 +12,14 @@ import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 
 // Phase A Task A4 — Project Manifest 최소 골격 검증.
+// Phase B Task B3 — External Project Adapter 분리 이후, 이 파일은 어떤 특정 프로젝트(MOVAN
+// 포함)도 import하지 않는다. autodev.ts는 taskRegistry를 기본값 없이 항상 명시적으로
+// 요구하고, 명시적으로 주입한 (fixture) ProjectManifest의 taskRegistry/statePath/
+// targetProjectRoot만 쓰인다는 것을 자체 fixture 데이터만으로 증명한다.
 //
-// autodev.ts는 더 이상 MOVAN_TASK_REGISTRY를 직접 import하지 않는다 — 기본값은
-// MOVAN_PROJECT_MANIFEST를 통해서만 연결되고, 명시적으로 다른(fixture) ProjectManifest를
-// 주입하면 그 manifest의 taskRegistry/statePath/targetProjectRoot만 쓰인다는 것을 증명한다.
-//
-// 이 파일은 실제 automation/config/project-state.json을 읽기만 하고(해시 비교 증거) 절대
-// 쓰지 않는다 — fixture state/target root는 전부 OS 임시 디렉터리 안에서만 다룬다.
+// 이 파일은 실제 automation/config/project-state.json(AutoDev 자신의 config)을 읽기만
+// 하고(해시 비교 증거) 절대 쓰지 않는다 — fixture state/target root는 전부 OS 임시
+// 디렉터리 안에서만 다룬다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -29,15 +28,6 @@ function check(label: string, cond: boolean): void {
 
 function baseState(overrides: Partial<ProjectState>): ProjectState {
   return {
-    project: "MOVAN ERP",
-    currentPhase: 13,
-    phase10Allowed: true,
-    migrationsApplied: [],
-    migrationsImmutable: true,
-    devSupabaseCreated: true,
-    devSupabaseConnected: false,
-    microsoftConnected: false,
-    productionDeployAllowed: false,
     gitCheckpoint: "test",
     currentTask: null,
     reviewCycle: 0,
@@ -47,6 +37,7 @@ function baseState(overrides: Partial<ProjectState>): ProjectState {
     claudeLimitWaitCount: 0,
     deferredHumanTasks: [],
     completedTasks: [],
+    currentPhase: 1,
     ...overrides,
   } as ProjectState;
 }
@@ -56,33 +47,8 @@ function fakePassReviewer(): (result: ClaudeResult, reviewCycle: number, task: s
 }
 
 // ---------------------------------------------------------------------------
-// A) Phase A Task A7 — MOVAN Manifest를 명시적으로 주입해야만 MOVAN 다음 Task가 선택된다.
-// decideNextAction()은 더 이상 기본값(MOVAN)을 갖지 않는다 — taskRegistry 인자가 필수다.
-// ---------------------------------------------------------------------------
-function scenarioExplicitManifestRequiredNoSilentDefault(): void {
-  const state = baseState({ status: "READY", completedTasks: ["13.1"] });
-
-  const decisionExplicitMovan = decideNextAction(state, MOVAN_PROJECT_MANIFEST.taskRegistry);
-  check(
-    "A) MOVAN_PROJECT_MANIFEST.taskRegistry를 명시적으로 주입하면 다음 task='13.2'",
-    decisionExplicitMovan.kind === "RUN_TASK" && decisionExplicitMovan.task.id === "13.2"
-  );
-  check("A) MOVAN_PROJECT_MANIFEST.taskRegistry === MOVAN_TASK_REGISTRY(동일 데이터)", MOVAN_PROJECT_MANIFEST.taskRegistry === MOVAN_TASK_REGISTRY);
-
-  // TS 컴파일 타임에는 taskRegistry가 필수 매개변수라 인자 없이 호출하면 컴파일 에러다.
-  // 런타임에서도(예: 컴파일된 JS를 다른 프로젝트가 잘못 호출하는 경우) 조용히 MOVAN으로
-  // fallback하지 않고 실제로 taskRegistry가 없으면 getNextTask가 빈 배열을 순회해 즉시
-  // STOP(다음 task 없음)을 반환한다는 것을 증명한다 — MOVAN 값을 절대 추측해 채우지 않는다.
-  const decisionEmptyRegistry = decideNextAction(state, []);
-  check(
-    "A) 빈 taskRegistry를 명시적으로 주입하면 MOVAN으로 fallback하지 않고 STOP",
-    decisionEmptyRegistry.kind === "STOP"
-  );
-}
-
-// ---------------------------------------------------------------------------
-// B/C) Fixture Manifest를 주입하면 fixture registry/state/root만 사용하고, MOVAN 데이터가
-// 전혀 섞이지 않는다.
+// 공용 Fixture 데이터 — 서로 다른 두 개의 독립적인 프로젝트를 흉내낸다(id 공간이 겹치지
+// 않는다는 것을 스스로 증명하기 위해 registry를 두 개 둔다).
 // ---------------------------------------------------------------------------
 const FIXTURE_REGISTRY: TaskDefinition[] = [
   {
@@ -107,12 +73,55 @@ const FIXTURE_REGISTRY: TaskDefinition[] = [
   },
 ];
 
+const ALT_FIXTURE_REGISTRY: TaskDefinition[] = [
+  {
+    id: "ALT1",
+    phase: 1,
+    taskNumber: 1,
+    title: "다른 프로젝트의 task 1",
+    prompt: "다른 프로젝트의 task 1 prompt",
+    requiredTests: [],
+    allowedPathPrefixes: ["alt/"],
+    prohibitedOperations: [],
+  },
+];
+
 const FIXTURE_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedReadPrefixes: ["fixture/"],
   allowedWritePrefixes: ["fixture/"],
   allowedCommands: [],
 };
 
+// ---------------------------------------------------------------------------
+// A) 명시적 taskRegistry 주입이 항상 필요하다 — decideNextAction()은 기본값(특정 프로젝트)을
+// 갖지 않는다. 어떤 registry를 주입하든 그 registry의 순서만으로 다음 task가 결정되고,
+// 빈 registry를 주입하면 어떤 프로젝트로도 fallback하지 않고 STOP한다.
+// ---------------------------------------------------------------------------
+function scenarioExplicitManifestRequiredNoSilentDefault(): void {
+  const state = baseState({ status: "READY", completedTasks: ["FX1"] });
+
+  const decisionExplicit = decideNextAction(state, FIXTURE_REGISTRY);
+  check(
+    "A) FIXTURE_REGISTRY를 명시적으로 주입하면 다음 task='FX2'",
+    decisionExplicit.kind === "RUN_TASK" && decisionExplicit.task.id === "FX2"
+  );
+
+  // TS 컴파일 타임에는 taskRegistry가 필수 매개변수라 인자 없이 호출하면 컴파일 에러다.
+  // 런타임에서도(예: 컴파일된 JS를 다른 프로젝트가 잘못 호출하는 경우) 조용히 특정
+  // 프로젝트로 fallback하지 않고 실제로 taskRegistry가 없으면 getNextTask가 빈 배열을
+  // 순회해 즉시 STOP(다음 task 없음)을 반환한다는 것을 증명한다 — 어떤 프로젝트의 값도
+  // 절대 추측해 채우지 않는다.
+  const decisionEmptyRegistry = decideNextAction(state, []);
+  check(
+    "A) 빈 taskRegistry를 명시적으로 주입하면 어떤 프로젝트로도 fallback하지 않고 STOP",
+    decisionEmptyRegistry.kind === "STOP"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// B/C) Fixture Manifest를 주입하면 그 fixture registry/state/root만 사용하고, 다른(ALT)
+// 프로젝트의 데이터가 전혀 섞이지 않는다.
+// ---------------------------------------------------------------------------
 const tempDirs: string[] = [];
 
 function makeTempGitRepo(): string {
@@ -133,10 +142,10 @@ function writeRepoFile(repo: string, relPath: string, content: string): void {
   writeFileSync(abs, content, "utf-8");
 }
 
-async function scenarioFixtureManifestIsolatesFromMovan(): Promise<void> {
+async function scenarioFixtureManifestIsolatesFromOtherProjects(): Promise<void> {
   const root = makeTempGitRepo();
   const statePath = join(root, "fixture-project-state.json");
-  writeFileSync(statePath, JSON.stringify(baseState({ project: "Fixture Project", status: "READY", completedTasks: [] }), null, 2) + "\n", "utf-8");
+  writeFileSync(statePath, JSON.stringify(baseState({ status: "READY", completedTasks: [] }), null, 2) + "\n", "utf-8");
 
   const fixtureManifest: ProjectManifest = {
     projectId: "fixture-project",
@@ -144,8 +153,8 @@ async function scenarioFixtureManifestIsolatesFromMovan(): Promise<void> {
     targetProjectRoot: root,
     statePath,
     taskRegistry: FIXTURE_REGISTRY,
-    developerInstructions: "fixture manifest developer instructions — no MOVAN content.",
-    reviewInstructions: "fixture manifest review instructions — no MOVAN content.",
+    developerInstructions: "fixture manifest developer instructions — no other project content.",
+    reviewInstructions: "fixture manifest review instructions — no other project content.",
     reviewScopeDirs: ["fixture/"],
     executionPolicy: FIXTURE_EXECUTION_POLICY,
   };
@@ -179,12 +188,12 @@ async function scenarioFixtureManifestIsolatesFromMovan(): Promise<void> {
   });
 
   check("B) fixture manifest 실행: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
-  check("B) fixture manifest 실행: taskId='FX1'(fixture registry의 첫 task, MOVAN '13.1' 아님)", result.taskId === "FX1");
+  check("B) fixture manifest 실행: taskId='FX1'(fixture registry의 첫 task, ALT registry 아님)", result.taskId === "FX1");
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
   check("B) manifest.statePath(fixture-project-state.json)에 실제로 기록됨", finalState.completedTasks.includes("FX1"));
   check(
-    "B) 다음 task가 fixture registry의 FX2를 가리킴(MOVAN 다음 task 아님)",
+    "B) 다음 task가 fixture registry의 FX2를 가리킴(다른 프로젝트의 다음 task 아님)",
     typeof finalState.currentTask === "string" && finalState.currentTask.includes("FX2")
   );
 
@@ -195,14 +204,14 @@ async function scenarioFixtureManifestIsolatesFromMovan(): Promise<void> {
   );
 
   check(
-    "C) fixture 실행 결과 completedTasks에 MOVAN 전용 task id가 전혀 섞이지 않음",
-    !MOVAN_TASK_REGISTRY.some((t) => finalState.completedTasks.includes(t.id))
+    "C) fixture 실행 결과 completedTasks에 다른(ALT) 프로젝트의 task id가 전혀 섞이지 않음",
+    !ALT_FIXTURE_REGISTRY.some((t) => finalState.completedTasks.includes(t.id))
   );
-  check("C) fixture registry id 공간과 MOVAN registry id 공간이 겹치지 않음", !FIXTURE_REGISTRY.some((f) => MOVAN_TASK_REGISTRY.some((m) => m.id === f.id)));
+  check("C) fixture registry id 공간과 ALT registry id 공간이 겹치지 않음", !FIXTURE_REGISTRY.some((f) => ALT_FIXTURE_REGISTRY.some((m) => m.id === f.id)));
 }
 
 // ---------------------------------------------------------------------------
-// D) 잘못된 명시적 Manifest는 MOVAN으로 조용히 fallback하지 않고 즉시 실패한다.
+// D) 잘못된 명시적 Manifest는 어떤 프로젝트로도 조용히 fallback하지 않고 즉시 실패한다.
 // ---------------------------------------------------------------------------
 async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<void> {
   let claudeRunnerCalled = false;
@@ -213,6 +222,9 @@ async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<
 
   const NOWHERE_ROOT = join(tmpdir(), "autodev-manifest-nonexistent-root-" + Date.now());
   const NOWHERE_STATE = join(tmpdir(), "autodev-manifest-nonexistent-state-" + Date.now() + ".json");
+  // 이 프로세스가 실제로 실행 중인 이 repository의 root — validateProjectManifest는
+  // existsSync만 확인하므로 존재하는 임의의 디렉터리면 충분하다(실제로 쓰지 않는다).
+  const EXISTING_ROOT = resolve(__dirname, "..");
 
   // D-1) targetProjectRoot가 존재하지 않는 경로.
   const badRootManifest: ProjectManifest = {
@@ -238,7 +250,7 @@ async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<
   const badRegistryManifest = {
     projectId: "bad-registry",
     projectName: "Bad Registry Manifest",
-    targetProjectRoot: MOVAN_PROJECT_MANIFEST.targetProjectRoot,
+    targetProjectRoot: EXISTING_ROOT,
     statePath: NOWHERE_STATE,
     taskRegistry: "not-an-array",
     developerInstructions: "irrelevant",
@@ -254,9 +266,20 @@ async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<
   check("D) taskRegistry가 배열이 아닌 manifest는 즉시 실패", threwBadRegistry);
 
   // D-3) projectId가 빈 문자열.
+  const validShapeManifest: ProjectManifest = {
+    projectId: "valid-shape",
+    projectName: "Valid Shape Manifest",
+    targetProjectRoot: EXISTING_ROOT,
+    statePath: NOWHERE_STATE,
+    taskRegistry: FIXTURE_REGISTRY,
+    developerInstructions: "irrelevant",
+    reviewInstructions: "irrelevant",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: FIXTURE_EXECUTION_POLICY,
+  };
   let threwBadProjectId = false;
   try {
-    validateProjectManifest({ ...MOVAN_PROJECT_MANIFEST, projectId: "" });
+    validateProjectManifest({ ...validShapeManifest, projectId: "" });
   } catch {
     threwBadProjectId = true;
   }
@@ -266,11 +289,11 @@ async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// E) Phase A Task A7 필수 테스트 A — manifest를 아예 지정하지 않으면(런타임에 undefined가
-// 들어오는 경우까지 포함) MOVAN으로 조용히 fallback하지 않고 즉시 실패한다. TS 컴파일
-// 타임에는 opts.manifest가 필수 필드라 아예 생략하면 컴파일 에러다 — 여기서는 컴파일된 JS를
-// 호출하는 쪽이 실수로(또는 다른 언어에서) manifest를 빠뜨리는 상황까지 방어하는지 as
-// unknown 캐스트로 흉내내 런타임 동작을 직접 증명한다.
+// E) manifest를 아예 지정하지 않으면(런타임에 undefined가 들어오는 경우까지 포함) 어떤
+// 프로젝트로도 조용히 fallback하지 않고 즉시 실패한다. TS 컴파일 타임에는 opts.manifest가
+// 필수 필드라 아예 생략하면 컴파일 에러다 — 여기서는 컴파일된 JS를 호출하는 쪽이 실수로
+// (또는 다른 언어에서) manifest를 빠뜨리는 상황까지 방어하는지 as unknown 캐스트로 흉내내
+// 런타임 동작을 직접 증명한다.
 // ---------------------------------------------------------------------------
 async function scenarioMissingManifestFailsFastAtRuntime(): Promise<void> {
   let claudeRunnerCalled = false;
@@ -285,7 +308,7 @@ async function scenarioMissingManifestFailsFastAtRuntime(): Promise<void> {
   } catch {
     threwOnMissingManifest = true;
   }
-  check("E) opts.manifest를 아예 생략(런타임)하면 즉시 실패(silent MOVAN fallback 없음)", threwOnMissingManifest);
+  check("E) opts.manifest를 아예 생략(런타임)하면 즉시 실패(silent fallback 없음)", threwOnMissingManifest);
 
   let threwOnUndefinedManifest = false;
   try {
@@ -296,7 +319,7 @@ async function scenarioMissingManifestFailsFastAtRuntime(): Promise<void> {
   } catch {
     threwOnUndefinedManifest = true;
   }
-  check("E) opts.manifest=undefined도 즉시 실패(silent MOVAN fallback 없음)", threwOnUndefinedManifest);
+  check("E) opts.manifest=undefined도 즉시 실패(silent fallback 없음)", threwOnUndefinedManifest);
   check("E) manifest 누락 시나리오에서 claudeRunner가 한 번도 호출되지 않음", !claudeRunnerCalled);
 }
 
@@ -306,7 +329,7 @@ async function main(): Promise<void> {
   scenarioExplicitManifestRequiredNoSilentDefault();
 
   try {
-    await scenarioFixtureManifestIsolatesFromMovan();
+    await scenarioFixtureManifestIsolatesFromOtherProjects();
     await scenarioInvalidManifestFailsFastWithoutSilentFallback();
     await scenarioMissingManifestFailsFastAtRuntime();
   } finally {
@@ -322,29 +345,29 @@ async function main(): Promise<void> {
   const realStateAfter = readFileSync(DEFAULT_STATE_PATH, "utf-8");
   check("project-state 격리: 실제 project-state.json이 테스트 실행 전후 완전히 동일함", realStateBefore === realStateAfter);
 
-  // 회귀 방지: autodev.ts 소스에 MOVAN_TASK_REGISTRY 직접 import가 재도입되지 않았는지
+  // 회귀 방지: autodev.ts 소스에 특정 프로젝트의 registry 직접 import가 재도입되지 않았는지
   // 소스 스캔으로도 확인한다.
   const autodevSource = readFileSync(join(__dirname, "..", "src", "autodev.ts"), "utf-8");
   check(
-    "소스 회귀: autodev.ts가 MOVAN_TASK_REGISTRY를 직접 import하지 않음(project-registries/movan에서 import 안 함)",
+    "소스 회귀: autodev.ts가 project-registries/movan을 import하지 않음",
     !/from\s+"\.\/project-registries\/movan"/.test(autodevSource)
   );
 
-  // Phase A Task A7 필수 테스트 A/B — autodev.ts(Core)는 MOVAN_PROJECT_MANIFEST를 전혀
-  // import하지 않고(silent fallback 제거), run-movan.ts(MOVAN 전용 진입점)만 명시적으로
-  // MOVAN_PROJECT_MANIFEST를 조립해 runAutodevOnce()에 넘긴다.
+  // Phase A Task A7 / Phase B Task B3 — autodev.ts(Core)는 어떤 프로젝트의 manifest도 전혀
+  // import하지 않고(silent fallback 없음), run.ts(범용 진입점)만 project-adapter-loader를
+  // 통해 외부에서 명시적으로 주입받은 manifest를 runAutodevOnce()에 넘긴다.
   check(
-    "소스 회귀(A7-A): autodev.ts가 project-manifests/movan을 import하지 않음(Core는 MOVAN을 모름)",
+    "소스 회귀(A7/B3): autodev.ts가 project-manifests/movan을 import하지 않음(Core는 특정 프로젝트를 모름)",
     !/from\s+"\.\/project-manifests\/movan"/.test(autodevSource)
   );
-  const runMovanSource = readFileSync(join(__dirname, "..", "src", "run-movan.ts"), "utf-8");
+  const runSource = readFileSync(join(__dirname, "..", "src", "run.ts"), "utf-8");
   check(
-    "소스 회귀(A7-B): run-movan.ts가 project-manifests/movan에서 MOVAN_PROJECT_MANIFEST를 import함",
-    /import\s*\{\s*MOVAN_PROJECT_MANIFEST\s*\}\s*from\s*"\.\/project-manifests\/movan"/.test(runMovanSource)
+    "소스 회귀(B3): run.ts가 project-adapter-loader에서 loadProjectAdapter를 import함",
+    /import\s*\{\s*loadProjectAdapter\s*\}\s*from\s*"\.\/project-adapter-loader"/.test(runSource)
   );
   check(
-    "소스 회귀(A7-B): run-movan.ts가 runAutodevOnce에 manifest: MOVAN_PROJECT_MANIFEST를 명시적으로 전달함",
-    /runAutodevOnce\(\{\s*manifest:\s*MOVAN_PROJECT_MANIFEST\s*\}\)/.test(runMovanSource)
+    "소스 회귀(B3): run.ts가 runAutodevOnce에 loadProjectAdapter()의 반환값을 manifest로 전달함",
+    /runAutodevOnce\(\{\s*manifest\s*\}\)/.test(runSource)
   );
 
   console.log("\n=== project-manifest(Project Manifest 최소 골격) 테스트 결과 ===");

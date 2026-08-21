@@ -3,20 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { decideNextAction, runAutodevOnce } from "./autodev";
-import { MOVAN_TASK_REGISTRY } from "./project-registries/movan";
-import { MOVAN_PROJECT_MANIFEST } from "./project-manifests/movan";
 import { DEFAULT_STATE_PATH } from "./state";
+import type { ProjectManifest } from "./project-manifest";
+import type { ProjectExecutionPolicy } from "./project-policy";
+import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 
 // 이 파일은 두 계층을 검증한다:
-//   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + MOVAN_TASK_REGISTRY
+//   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
 //      데이터 기반 다음 task 선택. autodev.ts가 이 둘을 배선한다).
 //   B) runAutodevOnce() — 실제 orchestrator/checkpoint 배선까지 포함한 통합 시나리오.
 //      claudeRunner/gptReviewer는 항상 fake로 주입해 실제 Claude CLI/OpenAI API를 호출하지
 //      않는다. project-state.json/git commit은 전부 OS 임시 디렉터리 안에서만 일어나며,
 //      실제 automation/config/project-state.json과 실제 프로젝트 repo는 어떤 시나리오에서도
 //      건드리지 않는다(끝에서 실제 state 파일 내용을 read하여 증명한다).
+//
+// Phase B Task B3 — 이 파일은 이제 어떤 특정 프로젝트(MOVAN 포함)의 registry/manifest도
+// import하지 않는다. 여러 Phase에 걸친 순차 진행/최종 human gate 같은 planner 동작은
+// 이 파일 안에서 스스로 만든 다중 Phase fixture registry로 증명한다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -25,15 +30,7 @@ function check(label: string, cond: boolean): void {
 
 function baseState(overrides: Partial<ProjectState>): ProjectState {
   return {
-    project: "MOVAN ERP",
-    currentPhase: 13,
-    phase10Allowed: true,
-    migrationsApplied: [],
-    migrationsImmutable: true,
-    devSupabaseCreated: true,
-    devSupabaseConnected: false,
-    microsoftConnected: false,
-    productionDeployAllowed: false,
+    currentPhase: 1,
     gitCheckpoint: "test",
     currentTask: null,
     reviewCycle: 0,
@@ -47,57 +44,73 @@ function baseState(overrides: Partial<ProjectState>): ProjectState {
   } as ProjectState;
 }
 
+// ---------------------------------------------------------------------------
+// 다중 Phase fixture registry — 특정 프로젝트를 흉내내지 않는다. Phase1(2개 task) →
+// Phase2(2개 task, 마지막이 isHumanGate) 순서로, planner의 "같은 Phase 안 다음 task
+// 선택 → Phase 전환 → 마지막 human gate → 전부 완료 시 STOP" 동작을 전부 검증할 수 있게
+// 구성했다.
+// ---------------------------------------------------------------------------
+const PLANNER_FIXTURE_REGISTRY: TaskDefinition[] = [
+  { id: "P1.1", phase: 1, taskNumber: 1, title: "Phase1 Task1", prompt: "Phase1 Task1 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  { id: "P1.2", phase: 1, taskNumber: 2, title: "Phase1 Task2", prompt: "Phase1 Task2 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  { id: "P2.1", phase: 2, taskNumber: 1, title: "Phase2 Task1", prompt: "Phase2 Task1 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  {
+    id: "P2.2",
+    phase: 2,
+    taskNumber: 2,
+    title: "Phase2 Task2(final human gate)",
+    prompt: "Phase2 Task2 prompt",
+    requiredTests: [],
+    allowedPathPrefixes: ["proj/"],
+    prohibitedOperations: [],
+    isHumanGate: true,
+  },
+];
+
 function idsUpTo(taskId: string): string[] {
-  const idx = MOVAN_TASK_REGISTRY.findIndex((t) => t.id === taskId);
+  const idx = PLANNER_FIXTURE_REGISTRY.findIndex((t) => t.id === taskId);
   if (idx === -1) throw new Error(`알 수 없는 task id: ${taskId}`);
-  return MOVAN_TASK_REGISTRY.slice(0, idx + 1).map((t) => t.id);
+  return PLANNER_FIXTURE_REGISTRY.slice(0, idx + 1).map((t) => t.id);
 }
 
 function allTaskIds(): string[] {
-  return MOVAN_TASK_REGISTRY.map((t) => t.id);
+  return PLANNER_FIXTURE_REGISTRY.map((t) => t.id);
 }
 
 // ---------------------------------------------------------------------------
 // A) planner(decideNextAction) — 순수 함수 시나리오
 // ---------------------------------------------------------------------------
-function scenarioPlannerPhase13Task1DoneSelectsTask2(): void {
-  const state = baseState({ status: "READY", completedTasks: ["13.1"] });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
-  check("planner: Phase13 Task1 완료 → Task2 선택(kind=RUN_TASK)", decision.kind === "RUN_TASK");
-  check("planner: 선택된 task.id === '13.2'", decision.kind === "RUN_TASK" && decision.task.id === "13.2");
-}
-
-function scenarioPlannerTask2DoneSelectsPhase14Task1(): void {
-  const state = baseState({ status: "READY", completedTasks: ["13.1", "13.2"] });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
-  check("planner: Task2 완료 → Phase14 Task1 선택(kind=RUN_TASK)", decision.kind === "RUN_TASK");
-  check("planner: 선택된 task.id === '14.1'", decision.kind === "RUN_TASK" && decision.task.id === "14.1");
+function scenarioPlannerPhase1Task1DoneSelectsTask2(): void {
+  const state = baseState({ status: "READY", completedTasks: ["P1.1"] });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: Phase1 Task1 완료 → Task2 선택(kind=RUN_TASK)", decision.kind === "RUN_TASK");
+  check("planner: 선택된 task.id === 'P1.2'", decision.kind === "RUN_TASK" && decision.task.id === "P1.2");
 }
 
 function scenarioPlannerPhaseLastTaskTransitionsToNextPhase(): void {
-  // Phase 14의 마지막 task(14.2)까지 완료 → Phase 15 첫 task(15.1)로 전환.
-  const state = baseState({ status: "READY", completedTasks: idsUpTo("14.2") });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
-  check("planner: phase 마지막 task(14.2) 완료 → 다음 phase 전환(kind=RUN_TASK)", decision.kind === "RUN_TASK");
+  // Phase1의 마지막 task(P1.2)까지 완료 → Phase2 첫 task(P2.1)로 전환.
+  const state = baseState({ status: "READY", completedTasks: idsUpTo("P1.2") });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: phase 마지막 task(P1.2) 완료 → 다음 phase 전환(kind=RUN_TASK)", decision.kind === "RUN_TASK");
   check(
-    "planner: 선택된 task가 Phase15 Task1(15.1)",
-    decision.kind === "RUN_TASK" && decision.task.id === "15.1" && decision.task.phase === 15
+    "planner: 선택된 task가 Phase2 Task1(P2.1)",
+    decision.kind === "RUN_TASK" && decision.task.id === "P2.1" && decision.task.phase === 2
   );
 }
 
-function scenarioPlannerPhase16LastTaskIsFinalGate(): void {
-  // Phase16 Task2(16.2)까지 완료 → 마지막 task(16.3, isHumanGate)가 선택되어야 한다.
-  const state = baseState({ status: "READY", completedTasks: idsUpTo("16.2") });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
-  check("planner: Phase16 Task2 완료 → Task3(16.3) 선택", decision.kind === "RUN_TASK" && decision.task.id === "16.3");
+function scenarioPlannerFinalGateIsSelected(): void {
+  // Phase2 Task1(P2.1)까지 완료 → 마지막 task(P2.2, isHumanGate)가 선택되어야 한다.
+  const state = baseState({ status: "READY", completedTasks: idsUpTo("P2.1") });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: Phase2 Task1 완료 → Task2(P2.2, final gate) 선택", decision.kind === "RUN_TASK" && decision.task.id === "P2.2");
   check("planner: 선택된 task가 isHumanGate=true", decision.kind === "RUN_TASK" && decision.task.isHumanGate === true);
 }
 
 function scenarioPlannerAllTasksDoneIsFinalGateStop(): void {
-  // registry의 모든 task(16.3 포함)까지 전부 완료 → 더 이상 자동 실행할 task가 없다.
+  // registry의 모든 task(P2.2 포함)까지 전부 완료 → 더 이상 자동 실행할 task가 없다.
   const state = baseState({ status: "READY", completedTasks: allTaskIds() });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
-  check("planner: Phase16 마지막(16.3)까지 전부 완료 → STOP(final gate)", decision.kind === "STOP");
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: 마지막(P2.2)까지 전부 완료 → STOP(final gate)", decision.kind === "STOP");
   check(
     "planner: STOP 사유에 배포/사람 확인 관련 안내 포함",
     decision.kind === "STOP" && (decision.reason.includes("배포") || decision.reason.includes("DEPLOYMENT_WAITING_HUMAN"))
@@ -105,8 +118,8 @@ function scenarioPlannerAllTasksDoneIsFinalGateStop(): void {
 }
 
 function scenarioPlannerWaitingHumanStaysStopped(): void {
-  const state = baseState({ status: "WAITING_HUMAN", completedTasks: ["13.1"] });
-  const decision = decideNextAction(state, MOVAN_TASK_REGISTRY);
+  const state = baseState({ status: "WAITING_HUMAN", completedTasks: ["P1.1"] });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
   check("planner: WAITING_HUMAN 상태 유지 시에도 STOP 결정", decision.kind === "STOP");
   check(
     "planner: WAITING_HUMAN에서는 재저장 불필요(setWaitingHuman=false)",
@@ -119,8 +132,14 @@ function scenarioPlannerWaitingHumanStaysStopped(): void {
 // ---------------------------------------------------------------------------
 const tempDirs: string[] = [];
 
+const PLANNER_EXECUTION_POLICY: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["proj/"],
+  allowedWritePrefixes: ["proj/"],
+  allowedCommands: [],
+};
+
 function makeTempGitRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "movan-autodev-integration-"));
+  const dir = mkdtempSync(join(tmpdir(), "autodev-integration-"));
   tempDirs.push(dir);
   spawnSync("git", ["init", "-q"], { cwd: dir });
   spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: dir });
@@ -132,9 +151,9 @@ function makeTempGitRepo(): string {
 }
 
 function makeTempStateFile(dir: string, overrides: Partial<ProjectState> = {}): string {
-  const statePath = join(dir, "automation", "config", "project-state.json");
-  mkdirSync(join(dir, "automation", "config"), { recursive: true });
-  const state = baseState({ status: "READY", completedTasks: ["13.1"], ...overrides });
+  const statePath = join(dir, ".autodev", "project-state.json");
+  mkdirSync(join(dir, ".autodev"), { recursive: true });
+  const state = baseState({ status: "READY", completedTasks: ["P1.1"], ...overrides });
   writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf-8");
   return statePath;
 }
@@ -145,46 +164,56 @@ function writeRepoFile(repo: string, relPath: string, content: string): void {
   writeFileSync(abs, content, "utf-8");
 }
 
+function buildPlannerManifest(root: string, statePath: string): ProjectManifest {
+  return {
+    projectId: "planner-fixture-project",
+    projectName: "Planner Fixture Project",
+    targetProjectRoot: root,
+    statePath,
+    taskRegistry: PLANNER_FIXTURE_REGISTRY,
+    developerInstructions: "허용 범위: proj/**. 이 fixture 프로젝트의 다중 Phase 순차 진행만 다룹니다.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: PLANNER_EXECUTION_POLICY,
+  };
+}
+
 function fakePassReviewer(): (result: ClaudeResult, reviewCycle: number, task: string, allowedPathPrefixes?: string[]) => Promise<GptReviewerReturn> {
   return async () => ({ decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null });
 }
 
 async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
   const repo = makeTempGitRepo();
-  const statePath = makeTempStateFile(repo); // completedTasks=["13.1"] → 다음은 13.2
+  const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → 다음은 P1.2
+  const manifest = buildPlannerManifest(repo, statePath);
 
   const claudeRunner = async (): Promise<ClaudeResult> => {
-    // Claude가 실제로 파일을 만든 것처럼 temp repo 안에 직접 기록한다(13.2의
-    // allowedPathPrefixes=["web/app/", ...] 범위 안).
-    writeRepoFile(repo, "web/app/fake-task-13-2-marker.tsx", "export default function Marker() { return null; }\n");
+    // Claude가 실제로 파일을 만든 것처럼 temp repo 안에 직접 기록한다(P1.2의
+    // allowedPathPrefixes=["proj/"] 범위 안).
+    writeRepoFile(repo, "proj/fake-task-p1-2-marker.txt", "marker\n");
     return {
       success: true,
-      summary: "테스트: 13.2 구현 완료",
-      changedFiles: ["web/app/fake-task-13-2-marker.tsx"],
-      tests: [
-        { name: "web:tsc", pass: true },
-        { name: "web:build", pass: true },
-      ],
+      summary: "테스트: P1.2 구현 완료",
+      changedFiles: ["proj/fake-task-p1-2-marker.txt"],
+      tests: [{ name: "proj:check", pass: true }],
       rawOutput: "",
     };
   };
 
   const result = await runAutodevOnce({
-    manifest: MOVAN_PROJECT_MANIFEST,
-    statePath,
-    cwd: repo,
+    manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
   });
 
   check("runAutodevOnce happy path: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
-  check("runAutodevOnce happy path: taskId=13.2", result.taskId === "13.2");
+  check("runAutodevOnce happy path: taskId=P1.2", result.taskId === "P1.2");
   check("runAutodevOnce happy path: checkpoint.ok=true", result.checkpoint?.ok === true);
   check("runAutodevOnce happy path: commitHash 존재", typeof result.checkpoint?.commitHash === "string");
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("runAutodevOnce happy path: completedTasks에 13.2 추가됨", finalState.completedTasks.includes("13.2"));
+  check("runAutodevOnce happy path: completedTasks에 P1.2 추가됨", finalState.completedTasks.includes("P1.2"));
   check("runAutodevOnce happy path: status='READY'(다음 task 대기)", finalState.status === "READY");
-  check("runAutodevOnce happy path: currentTask가 14.1을 가리킴", typeof finalState.currentTask === "string" && finalState.currentTask.includes("14.1"));
+  check("runAutodevOnce happy path: currentTask가 P2.1을 가리킴", typeof finalState.currentTask === "string" && finalState.currentTask.includes("P2.1"));
   check("runAutodevOnce happy path: gitCheckpoint가 실제 commit hash로 갱신됨", finalState.gitCheckpoint === result.checkpoint?.commitHash);
 
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
@@ -196,36 +225,34 @@ async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
 async function scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifest(repo, statePath);
 
   const claudeRunner = async (): Promise<ClaudeResult> => {
-    // 13.2의 allowedPathPrefixes 밖(web/lib/storage/)에 파일을 만든다 — checkpoint가
-    // BLOCK해야 한다.
-    writeRepoFile(repo, "web/lib/storage/unexpected.ts", "export const oops = true;\n");
+    // P1.2의 allowedPathPrefixes 밖(other/)에 파일을 만든다 — checkpoint가 BLOCK해야 한다.
+    writeRepoFile(repo, "other/unexpected.txt", "oops\n");
     return {
       success: true,
       summary: "테스트: 범위 밖 파일 생성(의도된 실패 시나리오)",
-      changedFiles: ["web/lib/storage/unexpected.ts"],
-      tests: [{ name: "web:tsc", pass: true }],
+      changedFiles: ["other/unexpected.txt"],
+      tests: [{ name: "proj:check", pass: true }],
       rawOutput: "",
     };
   };
 
   const result = await runAutodevOnce({
-    manifest: MOVAN_PROJECT_MANIFEST,
-    statePath,
-    cwd: repo,
+    manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
   });
 
   check("runAutodevOnce checkpoint-blocked: outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
   check("runAutodevOnce checkpoint-blocked: checkpoint.ok=false", result.checkpoint?.ok === false);
   check(
-    "runAutodevOnce checkpoint-blocked: unexpectedFiles에 web/lib/storage/unexpected.ts 포함",
-    (result.checkpoint?.unexpectedFiles ?? []).includes("web/lib/storage/unexpected.ts")
+    "runAutodevOnce checkpoint-blocked: unexpectedFiles에 other/unexpected.txt 포함",
+    (result.checkpoint?.unexpectedFiles ?? []).includes("other/unexpected.txt")
   );
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("runAutodevOnce checkpoint-blocked: completedTasks에 13.2가 추가되지 않음", !finalState.completedTasks.includes("13.2"));
+  check("runAutodevOnce checkpoint-blocked: completedTasks에 P1.2가 추가되지 않음", !finalState.completedTasks.includes("P1.2"));
   check("runAutodevOnce checkpoint-blocked: status='WAITING_HUMAN'", finalState.status === "WAITING_HUMAN");
   check(
     "runAutodevOnce checkpoint-blocked: deferredHumanTasks에 CHECKPOINT_BLOCKED 기록됨",
@@ -239,11 +266,12 @@ async function scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile(): Promis
 async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifest(repo, statePath);
 
   let claudeCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
     claudeCalls += 1;
-    return { success: true, summary: "테스트: 항상 REVISE 대상", changedFiles: [], tests: [{ name: "web:tsc", pass: true }], rawOutput: "" };
+    return { success: true, summary: "테스트: 항상 REVISE 대상", changedFiles: [], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
   const alwaysRevise = async (): Promise<GptReviewerReturn> => ({
     decision: "REVISE",
@@ -253,9 +281,7 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
   });
 
   const result = await runAutodevOnce({
-    manifest: MOVAN_PROJECT_MANIFEST,
-    statePath,
-    cwd: repo,
+    manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise },
   });
 
@@ -263,7 +289,7 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
   check("runAutodevOnce 미승인: checkpoint가 시도되지 않음(undefined)", result.checkpoint === undefined);
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("runAutodevOnce 미승인: completedTasks 변화 없음", !finalState.completedTasks.includes("13.2"));
+  check("runAutodevOnce 미승인: completedTasks 변화 없음", !finalState.completedTasks.includes("P1.2"));
 
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
   check("runAutodevOnce 미승인: commit이 생성되지 않음(init 1건만)", log.trim().split("\n").length === 1);
@@ -273,6 +299,7 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
 async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: allTaskIds() });
+  const manifest = buildPlannerManifest(repo, statePath);
 
   let claudeCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
@@ -281,9 +308,7 @@ async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
   };
 
   const result = await runAutodevOnce({
-    manifest: MOVAN_PROJECT_MANIFEST,
-    statePath,
-    cwd: repo,
+    manifest,
     orchestratorDeps: { claudeRunner },
   });
   check("runAutodevOnce 모든 task 완료: outcome=STOPPED", result.outcome === "STOPPED");
@@ -293,10 +318,9 @@ async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
-  scenarioPlannerPhase13Task1DoneSelectsTask2();
-  scenarioPlannerTask2DoneSelectsPhase14Task1();
+  scenarioPlannerPhase1Task1DoneSelectsTask2();
   scenarioPlannerPhaseLastTaskTransitionsToNextPhase();
-  scenarioPlannerPhase16LastTaskIsFinalGate();
+  scenarioPlannerFinalGateIsSelected();
   scenarioPlannerAllTasksDoneIsFinalGateStop();
   scenarioPlannerWaitingHumanStaysStopped();
 
@@ -324,9 +348,10 @@ async function main(): Promise<void> {
   check("소스 회귀: autodev.ts에 TASK_2 하드코딩 상수 없음", !/const\s+TASK_2\s*=/.test(autodevSource));
   check("소스 회귀: autodev.ts가 task-registry를 통해서만 다음 task를 고름(getNextTask 사용)", autodevSource.includes("getNextTask"));
 
-  // Phase A Task A7 — autodev.ts(Core)는 이제 MOVAN을 import하지 않는다(silent fallback 제거).
+  // Phase A Task A7 / Phase B Task B3 — autodev.ts(Core)는 어떤 특정 프로젝트도 import하지
+  // 않는다(silent fallback 없음).
   check(
-    "소스 회귀(A7): autodev.ts가 project-manifests/movan을 import하지 않음",
+    "소스 회귀(A7/B3): autodev.ts가 project-manifests/movan을 import하지 않음",
     !/from\s+"\.\/project-manifests\/movan"/.test(autodevSource)
   );
   check(

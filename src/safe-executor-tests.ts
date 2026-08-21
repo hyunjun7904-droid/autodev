@@ -10,7 +10,6 @@ import {
   configureSafeExecutor,
   PROJECT_ROOT,
 } from "./safe-executor";
-import { MOVAN_PROJECT_MANIFEST } from "./project-manifests/movan";
 import type { ProjectExecutionPolicy } from "./project-policy";
 
 const results: string[] = [];
@@ -18,10 +17,33 @@ function check(label: string, cond: boolean): void {
   results.push(`[${cond ? "PASS" : "FAIL"}] ${label}`);
 }
 
-// AutoDev 범용화 Phase B Task B1 — MOVAN과 완전히 다른 경로/명령 정책을 가진 Fixture
-// 프로젝트에서도 Safe Executor가 코드 변경 없이(어떤 프로젝트 문자열도 하드코딩하지 않고)
-// 정상 동작하는지 직접 증명한다(§ 요구사항 8). fixture 시나리오는 이 파일 마지막에 실행하고,
-// 끝나면 다시 MOVAN 정책으로 복귀시켜(이 프로세스 안에서 이후 어떤 코드도 fixture 정책을
+// Phase B Task B3 — 이 파일은 이제 어떤 특정 프로젝트(MOVAN 포함)의 manifest도 import하지
+// 않는다. 대신 실제 프로젝트가 흔히 갖는 형태(web/ 앱 코드 + 불변 supabase/migrations/**
+// 스키마 + 제한된 명령 allow-list)를 흉내낸 REALISTIC_EXECUTION_POLICY를 이 파일 안에서
+// 스스로 정의해, Safe Executor가 그런 형태의 정책에서도 코드 변경 없이(어떤 프로젝트
+// 문자열도 하드코딩하지 않고) 정상 동작함을 증명한다. 이 정책의 실제 값은 이동 전 AutoDev
+// standalone repo의 src/project-manifests/movan.ts(MOVAN_EXECUTION_POLICY)와 동일했던
+// 내용을 그대로 재사용한다(값 자체가 이 테스트의 목적에 잘 맞는 현실적인 예시이기 때문) —
+// 다만 지금은 어떤 프로젝트도 가리키지 않는 이 파일 전용 fixture다.
+const REALISTIC_EXECUTION_POLICY: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["web/", "supabase/migrations/"],
+  allowedWritePrefixes: ["web/"],
+  writeDenyPatterns: [/^supabase\/migrations\/.+\.sql$/, /^README\.md$/i],
+  commandCwdAliases: { web: "web" },
+  allowedCommands: [
+    { cwd: "root", command: "git", args: ["status", "--short"] },
+    { cwd: "root", command: "git", args: ["diff"] },
+    { cwd: "root", command: "git", args: ["diff", "--stat"] },
+    { cwd: "root", command: "git", args: ["log", "-1", "--oneline"] },
+    { cwd: "web", command: "npx", args: ["tsc", "--noEmit"] },
+    { cwd: "web", command: "npm", args: ["run", "build"] },
+  ],
+};
+
+// Phase B Task B1 — MOVAN과 완전히 다른 경로/명령 정책을 가진 Fixture 프로젝트에서도 Safe
+// Executor가 코드 변경 없이(어떤 프로젝트 문자열도 하드코딩하지 않고) 정상 동작하는지 직접
+// 증명한다(§ 요구사항 8). fixture 시나리오는 이 파일 마지막에 실행하고, 끝나면 다시
+// REALISTIC_EXECUTION_POLICY로 복귀시켜(이 프로세스 안에서 이후 어떤 코드도 fixture 정책을
 // 물려받지 않게) 정책이 명시적으로 프로젝트별로 주입된다는 것을 보인다.
 const FIXTURE_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedReadPrefixes: ["src/", "tests/"],
@@ -29,7 +51,7 @@ const FIXTURE_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedCommands: [{ cwd: "root", command: "node", args: ["--version"] }],
 };
 
-function scenarioFixtureProjectPolicyWorksWithoutMovanKnowledge(): void {
+function scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot: string): void {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "safe-executor-fixture-policy-"));
   try {
     mkdirSync(join(fixtureRoot, "src"), { recursive: true });
@@ -59,7 +81,7 @@ function scenarioFixtureProjectPolicyWorksWithoutMovanKnowledge(): void {
     // F) destructive git → BLOCK(Fixture policy가 git을 아예 허용하지 않으므로 당연히 BLOCK)
     check("[8-F] Fixture: git reset --hard → BLOCK", !validateCommand("git", ["reset", "--hard"], "root").ok);
 
-    // H) Fixture policy에 MOVAN/web/supabase 문자열이 전혀 없어도 정상 작동함을 직접 증명
+    // H) Fixture policy에 특정 프로젝트 문자열이 전혀 없어도 정상 작동함을 직접 증명
     const policyJson = JSON.stringify(FIXTURE_EXECUTION_POLICY);
     check(
       "[8-H] Fixture policy 정의 자체에 MOVAN/web/supabase 문자열이 없음",
@@ -67,24 +89,20 @@ function scenarioFixtureProjectPolicyWorksWithoutMovanKnowledge(): void {
     );
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
-    // G) MOVAN policy로 복귀 — 이후(이 파일 안 또는 같은 프로세스의 다른 코드) 어떤 동작도
-    // fixture 정책을 암묵적으로 물려받지 않는다는 것을 명시적 재설정으로 보인다.
-    configureSafeExecutor(MOVAN_PROJECT_MANIFEST.targetProjectRoot, MOVAN_PROJECT_MANIFEST.executionPolicy);
-    check("[8-G] MOVAN policy로 명시적 복귀 후 PROJECT_ROOT가 다시 MOVAN root를 가리킴", PROJECT_ROOT === MOVAN_PROJECT_MANIFEST.targetProjectRoot);
+    // G) 이전(REALISTIC_EXECUTION_POLICY) 정책으로 복귀 — 이후(이 파일 안 또는 같은 프로세스의
+    // 다른 코드) 어떤 동작도 fixture 정책을 암묵적으로 물려받지 않는다는 것을 명시적
+    // 재설정으로 보인다.
+    configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
+    check("[8-G] 이전 정책으로 명시적 복귀 후 PROJECT_ROOT가 다시 그 root를 가리킴", PROJECT_ROOT === isolatedRealisticRoot);
   }
 }
 
-// Phase B Task B2 — 물리적 repository 분리 이전에는 MOVAN_PROJECT_MANIFEST.targetProjectRoot가
-// 곧 실제 MOVAN repo(항상 존재하는 git repo, web/ 실제 존재)였다. AutoDev standalone repo에서는
-// (AUTODEV_TARGET_PROJECT_ROOT를 지정하지 않고 이 파일을 실행하면) 그 값이 임의의 기본 경로로
-// fallback하므로, 아래 main()의 WRITE_FILE ALLOW/RUN_COMMAND 시나리오가 실제 파일을 쓰거나
-// git 명령을 실행할 안전한 곳이 보장되지 않는다(실제로 한 번은 그 기본 경로 밑에 빈 web/lib/
-// 디렉터리가 생성되는 부작용이 있었다 — 즉시 정리함). 이제 이 파일 전용 격리된 임시 git
-// repo(web/ 포함, MOVAN_EXECUTION_POLICY의 실제 값은 그대로 사용)를 만들어 주입한다 — 검증하는
-// 정책 내용(MOVAN_EXECUTION_POLICY)은 바뀌지 않고, "어디에 실제로 쓰는가"만 항상 안전한
-// isolated temp 경로로 바뀐다.
-function makeIsolatedMovanLikeRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), "safe-executor-tests-movan-like-"));
+// Phase B Task B2/B3 — 이 파일 전용 격리된 임시 git repo(web/ 포함, REALISTIC_EXECUTION_POLICY
+// 값은 그대로 사용)를 만들어 주입한다 — 검증하는 정책 내용은 바뀌지 않고, "어디에 실제로
+// 쓰는가"만 항상 안전한 isolated temp 경로로 격리된다(실제 프로젝트 repo는 절대 건드리지
+// 않는다).
+function makeIsolatedRealisticRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "safe-executor-tests-realistic-"));
   spawnSync("git", ["init", "-q"], { cwd: root });
   spawnSync("git", ["config", "user.email", "safe-executor-tests@example.com"], { cwd: root });
   spawnSync("git", ["config", "user.name", "Safe Executor Tests"], { cwd: root });
@@ -96,12 +114,12 @@ function makeIsolatedMovanLikeRoot(): string {
 }
 
 async function main(): Promise<void> {
-  // 이 파일의 나머지 시나리오는 전부 MOVAN 정책을 대상으로 한다 — Safe Executor는
-  // configureSafeExecutor()로 명시적으로 주입되기 전까지 어떤 프로젝트로도 조용히
-  // fallback하지 않으므로, 여기서 이 파일 전용 격리된 MOVAN-like root에 MOVAN의 실제
-  // 정책 값을 주입한다(§ 위 makeIsolatedMovanLikeRoot 주석).
-  const isolatedMovanRoot = makeIsolatedMovanLikeRoot();
-  configureSafeExecutor(isolatedMovanRoot, MOVAN_PROJECT_MANIFEST.executionPolicy);
+  // 이 파일의 나머지 시나리오는 전부 REALISTIC_EXECUTION_POLICY를 대상으로 한다 — Safe
+  // Executor는 configureSafeExecutor()로 명시적으로 주입되기 전까지 어떤 프로젝트로도 조용히
+  // fallback하지 않으므로, 여기서 이 파일 전용 격리된 root에 그 정책 값을 주입한다(§ 위
+  // makeIsolatedRealisticRoot 주석).
+  const isolatedRealisticRoot = makeIsolatedRealisticRoot();
+  configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
 
   // ---- secret path 보호 ----
   check("web/.env.local read → DENY", !validateReadPath("web/.env.local").ok);
@@ -121,7 +139,7 @@ async function main(): Promise<void> {
   check("UNC 경로 → DENY", !validateReadPath("\\\\attacker-host\\share\\file.txt").ok);
   check("다른 드라이브 절대경로 write → DENY", !validateWritePath("D:\\evil.txt").ok);
 
-  // ---- applied migration 보호 (0001~0016) ----
+  // ---- applied migration 보호 ----
   const migResult1 = await validateAndExecute({
     type: "WRITE_FILE",
     path: "supabase/migrations/0001_init_schema.sql",
@@ -149,12 +167,11 @@ async function main(): Promise<void> {
 
   const w1 = await validateAndExecute({ type: "WRITE_FILE", path: webFixtureRel, content: "// safe executor fixture\n" });
   check("web/lib/test-safe-fixture.ts write → ALLOW", w1.ok && existsSync(webFixtureAbs));
-  // Phase B Task B2 — automation/이 더 이상 MOVAN targetProjectRoot 하위에 존재하지 않으므로
-  // MOVAN_EXECUTION_POLICY.allowedWritePrefixes에서도 제거됐다(§ project-manifests/movan.ts).
-  // 이전에는 여기서 "automation/tmp-safe-fixture.txt write → ALLOW"를 확인했지만, 이제는
-  // 정반대로 DENY되는 것이 올바른 동작이다.
+  // automation/은 이 fixture policy의 allowedWritePrefixes에 없으므로 DENY되는 것이 올바른
+  // 동작이다(실제 프로젝트에서도 AutoDev 자신의 소스 디렉터리는 대상 프로젝트가 쓰기를
+  // 허용할 이유가 없다).
   const w2 = await validateAndExecute({ type: "WRITE_FILE", path: "automation/tmp-safe-fixture.txt", content: "should be denied\n" });
-  check("automation/tmp-safe-fixture.txt write → DENY(automation/은 더 이상 MOVAN 허용 범위가 아님)", !w2.ok);
+  check("automation/tmp-safe-fixture.txt write → DENY(automation/은 이 정책의 허용 범위가 아님)", !w2.ok);
 
   // APPLY_PATCH ALLOW 경로도 함께 검증
   const patchResult = await validateAndExecute({
@@ -199,9 +216,9 @@ async function main(): Promise<void> {
   check("RUN_COMMAND 실제 실행(git status --short) 성공", runResult.ok);
 
   // ---- Phase B Task B1 — Fixture 프로젝트 정책 범용성 증명(§ 요구사항 8) ----
-  scenarioFixtureProjectPolicyWorksWithoutMovanKnowledge();
+  scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot);
 
-  rmSync(isolatedMovanRoot, { recursive: true, force: true });
+  rmSync(isolatedRealisticRoot, { recursive: true, force: true });
 
   console.log("\n=== Safe Executor 테스트 결과 ===");
   for (const r of results) console.log(r);
