@@ -4,6 +4,7 @@ import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
 import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
+import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { log } from "./logger";
 import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, CoreState } from "./types";
@@ -46,6 +47,12 @@ export interface OrchestratorDeps {
   /** GPT reviewer에게 전달할 프로젝트 맥락(ProjectManifest로부터 조립됨) — 지정하지 않으면
    *  gpt-reviewer.ts의 범용 기본값을 쓴다. */
   projectContext?: ReviewProjectContext;
+  /** Phase C Task C2 — 이 run 전용 SafeExecutorContext. deps.gptReviewer를 직접 지정하지
+   *  않았을 때만 쓰인다 — 기본 real GPT reviewer(selectDefaultGptReviewer)가 이 context로
+   *  rules 파일/실제 git 변경을 읽어, 다른 project run의 configureSafeExecutor() 호출에
+   *  영향받지 않게 한다. autodev.ts가 runAutodevOnce() 안에서 만든 per-run context를 항상
+   *  명시적으로 넘긴다. */
+  executor?: SafeExecutorContext;
 }
 
 export interface OrchestratorRunResult {
@@ -71,7 +78,7 @@ function selectDefaultClaudeRunner(): (task: string, attempt: number) => Promise
   if (process.env.AUTOMATION_DRY_RUN !== "false") return fakeRunClaudeTask;
   return (task: string, attempt: number) => runDeveloperTaskViaSafeExecutor(task, attempt);
 }
-function selectDefaultGptReviewer(): (
+function selectDefaultGptReviewer(executor?: SafeExecutorContext): (
   result: ClaudeResult,
   reviewCycle: number,
   task: string,
@@ -80,7 +87,7 @@ function selectDefaultGptReviewer(): (
 ) => Promise<GptReviewerReturn> {
   if (process.env.AUTOMATION_DRY_RUN !== "false") return fakeReviewClaudeResult;
   return (result, reviewCycle, task, allowedPathPrefixes, projectContext) =>
-    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext });
+    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor });
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -99,7 +106,7 @@ export async function runOrchestrator(
   deps: OrchestratorDeps = {}
 ): Promise<OrchestratorRunResult> {
   const claudeRunner = deps.claudeRunner ?? selectDefaultClaudeRunner();
-  const gptReviewer = deps.gptReviewer ?? selectDefaultGptReviewer();
+  const gptReviewer = deps.gptReviewer ?? selectDefaultGptReviewer(deps.executor);
   const claudeLimitWaitMs = deps.claudeLimitWaitMs ?? CLAUDE_LIMIT_WAIT_MS;
   const sleep = deps.sleep ?? defaultSleep;
   // 실제 운영 경로가 기본값이다 — 테스트는 반드시 deps.statePath로 임시 경로를 넘겨야

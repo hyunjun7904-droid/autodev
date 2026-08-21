@@ -11,6 +11,7 @@
     "smoke-test": "npm run build && node dist/smoke-test.js",
     "gpt-smoke-test": "npm run build && node dist/gpt-smoke-test.js",
     "test:safe-executor": "npm run build && node dist/safe-executor-tests.js",
+    "test:safe-executor-context": "npm run build && node dist/safe-executor-context-tests.js",
     "test:gpt-retry": "npm run build && node dist/gpt-retry-tests.js",
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",

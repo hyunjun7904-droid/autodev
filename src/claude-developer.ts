@@ -1,7 +1,7 @@
 import { execAndClassify } from "./claude-runner";
 import type { ClaudeErrorCode } from "./claude-runner";
 import { validateAndExecute } from "./safe-executor";
-import type { ExecutorAction } from "./safe-executor";
+import type { ExecutorAction, SafeExecutorContext } from "./safe-executor";
 import { getWorkingTreeChanges } from "./git-changes";
 import type { RequiredTestCommand } from "./task-registry";
 import { log, sanitizeForLog } from "./logger";
@@ -91,6 +91,14 @@ export interface DeveloperTaskOptions {
    *  운용은 autodev.ts가 manifest.reviewScopeDirs를 그대로 넘긴다(GPT reviewer가 스캔하는
    *  범위와 동일). */
   changeScopeDirs?: string[];
+  /** Phase C Task C2 — 이 developer task가 속한 project run 전용 SafeExecutorContext.
+   *  지정하면 이 함수가 실제 파일 읽기/쓰기/명령 실행(ACTION_REQUEST 처리, 필수 테스트
+   *  실행)과 changedFiles 계산에 이 context의 root/policy만 쓴다 — 다른 project의
+   *  configureSafeExecutor() 호출에 영향받지 않는다. 지정하지 않으면 기존과 동일하게
+   *  module-level singleton(Safe Executor의 configureSafeExecutor로 주입된 것)을 쓴다
+   *  (하위 호환 — 기존 테스트가 계속 동작한다). 실제 운용(autodev.ts)은 항상 명시적으로
+   *  넘긴다. */
+  executor?: SafeExecutorContext;
 }
 
 const MAX_INTERNAL_ROUNDS = 20;
@@ -215,18 +223,20 @@ ${ctx.instructions}
 // "git diff --name-only"만 써서 신규(untracked) 파일이 changedFiles에서 누락됐다. scopeDirs는
 // 호출부(runDeveloperTaskViaSafeExecutor)가 opts.changeScopeDirs로 넘긴다 — 이 함수는 어떤
 // 프로젝트의 소스 범위인지 모른다.
-function getActualChangedFiles(scopeDirs: string[]): string[] {
-  const { all } = getWorkingTreeChanges(scopeDirs);
+function getActualChangedFiles(scopeDirs: string[], executor: SafeExecutorContext | undefined): string[] {
+  const { all } = getWorkingTreeChanges(scopeDirs, executor?.projectRoot);
   return all.map((c) => c.path);
 }
 
 async function runRequiredTests(
-  requiredTests: RequiredTestCommand[] | undefined
+  requiredTests: RequiredTestCommand[] | undefined,
+  executor: SafeExecutorContext | undefined
 ): Promise<{ name: string; pass: boolean }[]> {
   if (!requiredTests || requiredTests.length === 0) return [];
+  const doValidateAndExecute = executor?.validateAndExecute ?? validateAndExecute;
   const results: { name: string; pass: boolean }[] = [];
   for (const t of requiredTests) {
-    const res = await validateAndExecute({ type: "RUN_COMMAND", command: t.command, args: t.args, cwd: t.cwd });
+    const res = await doValidateAndExecute({ type: "RUN_COMMAND", command: t.command, args: t.args, cwd: t.cwd });
     results.push({ name: t.name, pass: res.ok });
     if (!res.ok) {
       log(`필수 테스트 실패(${t.name})`, { command: t.command, args: t.args, cwd: t.cwd, denyReason: res.denyReason });
@@ -315,6 +325,12 @@ export async function runDeveloperTaskViaSafeExecutor(
   const sleepFn = opts.sleep ?? defaultDeveloperSleep;
   const usageLimitWaitMs = opts.usageLimitWaitMs ?? DEVELOPER_USAGE_LIMIT_WAIT_MS;
   const usageLimitMaxRetries = opts.usageLimitMaxRetries ?? DEVELOPER_USAGE_LIMIT_MAX_RETRIES;
+  // Phase C Task C2 — 이 run 전용 SafeExecutorContext(지정 안 되면 module-level singleton
+  // 하위 호환). 이 함수 안의 모든 실제 read/write/명령 실행과 changedFiles 계산이 이 하나의
+  // 값만 참조한다 — 다른 developer run이 자신의 executor로 무엇을 하든 이 run에는 보이지
+  // 않는다.
+  const executor = opts.executor;
+  const doValidateAndExecute = executor?.validateAndExecute ?? validateAndExecute;
 
   const transcript: string[] = [`# Task\n${task}`];
 
@@ -323,7 +339,7 @@ export async function runDeveloperTaskViaSafeExecutor(
   // 다루지 않는다 — 그건 기존 checkpoint/GPT reviewer의 scope-violation BLOCK 정책이 그대로
   // 담당한다(이 안내는 순수 정보 제공이지 권한 확장이 아니다).
   if (opts.allowedPathPrefixes && opts.allowedPathPrefixes.length > 0) {
-    const existingInScope = getWorkingTreeChanges(opts.allowedPathPrefixes).all.map((c) => c.path);
+    const existingInScope = getWorkingTreeChanges(opts.allowedPathPrefixes, executor?.projectRoot).all.map((c) => c.path);
     if (existingInScope.length > 0) {
       log(`developer 재개 감지 — 이전 시도의 in-scope 미완성 변경 ${existingInScope.length}개`, { files: existingInScope });
       transcript.push(
@@ -369,7 +385,7 @@ export async function runDeveloperTaskViaSafeExecutor(
     return {
       success: false,
       summary: `구현 단계 전환(잠금) 이후에도 실제 코드 변경 없이 거부된 조사 시도나 반복 PLAN만 ${count}회 계속되어 무진척으로 판단해 조기 종료했습니다.`,
-      changedFiles: getActualChangedFiles(changeScopeDirs),
+      changedFiles: getActualChangedFiles(changeScopeDirs, executor),
       tests: [],
       rawOutput: "",
       errorCode: "NO_PROGRESS_STAGNATION",
@@ -407,7 +423,7 @@ export async function runDeveloperTaskViaSafeExecutor(
         return {
           success: false,
           summary: claudeRaw.summary,
-          changedFiles: getActualChangedFiles(changeScopeDirs),
+          changedFiles: getActualChangedFiles(changeScopeDirs, executor),
           tests: [],
           rawOutput: claudeRaw.rawOutput,
           errorCode: "USAGE_LIMIT",
@@ -427,7 +443,7 @@ export async function runDeveloperTaskViaSafeExecutor(
       return {
         success: false,
         summary: claudeRaw.summary,
-        changedFiles: getActualChangedFiles(changeScopeDirs),
+        changedFiles: getActualChangedFiles(changeScopeDirs, executor),
         tests: [],
         rawOutput: claudeRaw.rawOutput,
         errorCode: claudeRaw.errorCode,
@@ -448,11 +464,11 @@ export async function runDeveloperTaskViaSafeExecutor(
       const summary = typeof parsed.summary === "string" ? parsed.summary : "(summary 없음)";
       // Claude의 자체 보고를 신뢰하지 않는다 — task-registry에 지정된 필수 테스트만
       // AutoDev(Safe Executor)가 직접 실행해 실제 exitCode로 결과를 만든다(§ 요구사항 6).
-      const tests = await runRequiredTests(opts.requiredTests);
+      const tests = await runRequiredTests(opts.requiredTests, executor);
       return {
         success: true,
         summary,
-        changedFiles: getActualChangedFiles(changeScopeDirs),
+        changedFiles: getActualChangedFiles(changeScopeDirs, executor),
         tests,
         rawOutput: sanitizeForLog(claudeRaw.summary),
         deferredHumanTasks,
@@ -510,7 +526,7 @@ export async function runDeveloperTaskViaSafeExecutor(
 
       const roundResults: unknown[] = [];
       for (const rawAction of roundActions) {
-        const result = await validateAndExecute(rawAction);
+        const result = await doValidateAndExecute(rawAction);
         if (!result.ok) {
           const key = actionKey(rawAction);
           const count = (forbiddenRepeatCount.get(key) ?? 0) + 1;
@@ -541,7 +557,7 @@ export async function runDeveloperTaskViaSafeExecutor(
   return {
     success: false,
     summary: `내부 라운드 ${MAX_INTERNAL_ROUNDS}회를 초과했습니다.`,
-    changedFiles: getActualChangedFiles(changeScopeDirs),
+    changedFiles: getActualChangedFiles(changeScopeDirs, executor),
     tests: [],
     rawOutput: "",
     errorCode: "TASK_ACTION_LIMIT",

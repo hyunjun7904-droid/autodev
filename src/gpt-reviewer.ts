@@ -6,6 +6,8 @@ import { AuthenticationError, RateLimitError, APIConnectionTimeoutError, APIConn
 import type { ClaudeResult, GptReviewResult, GptErrorCode } from "./types";
 import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, isPathInScope } from "./git-changes";
 import { PROJECT_ROOT } from "./safe-executor";
+import { validateReadPath } from "./safe-executor";
+import type { SafeExecutorContext } from "./safe-executor";
 import { log, sanitizeForLog } from "./logger";
 
 // 실제 OpenAI Responses API 기반 리뷰어. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
@@ -117,13 +119,27 @@ const RESULT_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-// rulesPath는 targetProjectRoot(PROJECT_ROOT) 기준 상대경로다 — 이 파일은 어느 프로젝트의
-// 어떤 규칙 파일인지 모른다(ReviewProjectContext.rulesPath로 호출부가 지정한다). 지정하지
-// 않으면 규칙 요약 자체를 생략한다(과거처럼 특정 파일 경로를 조용히 기본값으로 쓰지 않는다).
-function getRulesSummary(rulesPath: string | undefined): string {
+// Phase C Task C2 — Per-Run Execution Context. 이 파일이 실제로 파일을 읽는 지점
+// (getRulesSummary/readUntrackedFiles)은 executor(SafeExecutorContext)가 지정되면 그
+// context의 root/validateReadPath만 쓴다 — module-level PROJECT_ROOT/validateReadPath
+// singleton(다른 project가 configureSafeExecutor()로 덮어쓸 수 있는 전역)에 의존하지 않는다.
+// executor를 지정하지 않으면(예: 이 파일을 직접 단위테스트하는 기존 코드) 기존과 동일하게
+// module-level singleton을 쓴다(하위 호환) — 실제 운용(autodev.ts → orchestrator.ts)은
+// 항상 executor를 명시적으로 전달한다.
+type ReviewFileAccess = Pick<SafeExecutorContext, "projectRoot" | "validateReadPath">;
+
+function resolveFileAccess(executor: SafeExecutorContext | undefined): ReviewFileAccess {
+  return executor ?? { projectRoot: PROJECT_ROOT, validateReadPath };
+}
+
+// rulesPath는 targetProjectRoot(access.projectRoot) 기준 상대경로다 — 이 파일은 어느
+// 프로젝트의 어떤 규칙 파일인지 모른다(ReviewProjectContext.rulesPath로 호출부가 지정한다).
+// 지정하지 않으면 규칙 요약 자체를 생략한다(과거처럼 특정 파일 경로를 조용히 기본값으로
+// 쓰지 않는다).
+function getRulesSummary(rulesPath: string | undefined, access: ReviewFileAccess): string {
   if (!rulesPath) return "(프로젝트 규칙 파일이 지정되지 않음)";
   try {
-    const raw = readFileSync(join(PROJECT_ROOT, ...rulesPath.split("/")), "utf-8");
+    const raw = readFileSync(join(access.projectRoot, ...rulesPath.split("/")), "utf-8");
     return raw.slice(0, MAX_RULES_CHARS);
   } catch {
     return "(rules 파일 로드 실패)";
@@ -141,8 +157,12 @@ function getRulesSummary(rulesPath: string | undefined): string {
 // 쓰지 않는다. secret/빌드산출물/로그/temp 파일은 git-changes.ts가 이미 제외했고,
 // task.allowedPathPrefixes 밖 파일은 review 대상에서 제외하되 별도 섹션으로 명시해
 // 정책 위반 여부를 리뷰어/orchestrator 양쪽이 알 수 있게 한다.
-function buildChangeSection(allowedPathPrefixes: string[], scopeDirs: string[]): { text: string; scopeViolations: string[] } {
-  const changes = getWorkingTreeChanges(scopeDirs);
+function buildChangeSection(
+  allowedPathPrefixes: string[],
+  scopeDirs: string[],
+  access: ReviewFileAccess
+): { text: string; scopeViolations: string[] } {
+  const changes = getWorkingTreeChanges(scopeDirs, access.projectRoot);
   const allPaths = changes.all.map((c) => c.path);
   const scopeViolations = allPaths.filter((p) => !isPathInScope(p, allowedPathPrefixes));
   const scopeViolationSet = new Set(scopeViolations);
@@ -151,7 +171,7 @@ function buildChangeSection(allowedPathPrefixes: string[], scopeDirs: string[]):
 
   let trackedDiffText: string;
   try {
-    const raw = getTrackedDiff(scopeDirs);
+    const raw = getTrackedDiff(scopeDirs, access.projectRoot);
     trackedDiffText = !raw
       ? "(tracked diff 없음)"
       : raw.length <= MAX_DIFF_CHARS
@@ -161,10 +181,11 @@ function buildChangeSection(allowedPathPrefixes: string[], scopeDirs: string[]):
     trackedDiffText = `(git diff 조회 실패: ${sanitizeForLog(String(e)).slice(0, 200)})`;
   }
 
-  const { files: untrackedFiles, skipped } = readUntrackedFiles(inScopeUntracked, {
-    perFileMaxChars: 20_000,
-    totalBudgetChars: MAX_DIFF_CHARS,
-  });
+  const { files: untrackedFiles, skipped } = readUntrackedFiles(
+    inScopeUntracked,
+    { perFileMaxChars: 20_000, totalBudgetChars: MAX_DIFF_CHARS },
+    { validateReadPath: access.validateReadPath }
+  );
   const untrackedText = untrackedFiles.length
     ? untrackedFiles
         .map((f) => `--- 신규 파일: ${f.path}${f.truncated ? " (내용 일부 truncated)" : ""} ---\n${f.content}`)
@@ -189,15 +210,17 @@ export function buildReviewInput(
   result: ClaudeResult,
   reviewCycle: number,
   allowedPathPrefixes: string[],
-  projectContext: ReviewProjectContext
+  projectContext: ReviewProjectContext,
+  executor?: SafeExecutorContext
 ): { input: string; scopeViolations: string[] } {
+  const access = resolveFileAccess(executor);
   const testsSummary = result.tests.map((t) => `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`).join("\n") || "(없음)";
-  const { text: changeSection, scopeViolations } = buildChangeSection(allowedPathPrefixes, projectContext.scopeDirs);
+  const { text: changeSection, scopeViolations } = buildChangeSection(allowedPathPrefixes, projectContext.scopeDirs, access);
   const input = [
     `# Task\n${task}`,
     `# Review cycle\n${reviewCycle}`,
     `# 프로젝트\n${projectContext.projectName}`,
-    `# 프로젝트 규칙 요약\n${getRulesSummary(projectContext.rulesPath)}`,
+    `# 프로젝트 규칙 요약\n${getRulesSummary(projectContext.rulesPath, access)}`,
     `# Claude 결과 요약\n${result.summary}`,
     `# Claude가 보고한 변경 파일\n${result.changedFiles.join("\n") || "(없음)"}`,
     `# 테스트 결과(AutoDev가 실제로 실행해 확인한 exitCode 기준)\n${testsSummary}`,
@@ -245,10 +268,11 @@ export async function reviewClaudeResultOnce(
   reviewCycle: number,
   task = "(task 미지정)",
   allowedPathPrefixes?: string[],
-  projectContext: ReviewProjectContext = DEFAULT_REVIEW_PROJECT_CONTEXT
+  projectContext: ReviewProjectContext = DEFAULT_REVIEW_PROJECT_CONTEXT,
+  executor?: SafeExecutorContext
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
-  const { input, scopeViolations } = buildReviewInput(task, result, reviewCycle, effectiveAllowedPathPrefixes, projectContext);
+  const { input, scopeViolations } = buildReviewInput(task, result, reviewCycle, effectiveAllowedPathPrefixes, projectContext, executor);
 
   try {
     const response = await getClient().responses.create({
@@ -321,6 +345,12 @@ export interface ReviewRetryOptions {
    *  (범용 기본값)를 쓴다. 실제 운용은 autodev.ts가 ProjectManifest로부터 조립해 항상
    *  명시적으로 넘긴다. */
   projectContext?: ReviewProjectContext;
+  /** Phase C Task C2 — 이 review가 속한 project run 전용 SafeExecutorContext. 지정하면
+   *  rules 파일 읽기/실제 git 변경 스캔이 이 context의 root/validateReadPath만 쓴다(다른
+   *  project의 configureSafeExecutor() 호출에 영향받지 않음). 지정하지 않으면 기존과 동일하게
+   *  module-level singleton을 쓴다(하위 호환) — 실제 운용은 orchestrator.ts가 항상 명시적으로
+   *  넘긴다. */
+  executor?: SafeExecutorContext;
 }
 
 export async function reviewClaudeResultWithRetry(
@@ -335,7 +365,7 @@ export async function reviewClaudeResultWithRetry(
   const allowedPathPrefixes = opts.allowedPathPrefixes ?? projectContext.scopeDirs;
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const r = await attempt(result, reviewCycle, task, allowedPathPrefixes, projectContext);
+    const r = await attempt(result, reviewCycle, task, allowedPathPrefixes, projectContext, opts.executor);
     if (!r.transient) {
       return { ...r, gptTransportRetry: i };
     }

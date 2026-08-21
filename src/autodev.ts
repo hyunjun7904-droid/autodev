@@ -9,7 +9,7 @@ import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
 import { validateProjectManifest } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
-import { configureSafeExecutor } from "./safe-executor";
+import { createSafeExecutorContext } from "./safe-executor";
 import { performTaskCheckpoint, commitProjectStateOnly } from "./checkpoint";
 import type { CheckpointOutcome } from "./checkpoint";
 import { log } from "./logger";
@@ -127,7 +127,14 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   // Safe Executor의 실제 read/write/명령 enforcement를 이 manifest의 Project Policy로
   // 명시적으로 설정한다(Phase B Task B1) — Safe Executor 자체는 어떤 프로젝트인지 모르고,
   // 이 호출이 유일한 주입 지점이다(silent MOVAN/permissive fallback 없음).
-  configureSafeExecutor(manifest.targetProjectRoot, manifest.executionPolicy);
+  //
+  // Phase C Task C2 — 이 run 전용 SafeExecutorContext를 만든다. module-global mutable
+  // singleton을 설정하는 하위 호환 wrapper 함수(같은 프로세스의 다른 실행이 나중에 덮어쓸 수
+  // 있는 전역)는 이 production 경로에서 더 이상 호출하지 않는다 — 이 executorContext는 이
+  // runAutodevOnce() 호출 하나에만 속하며, 아래에서 필요한 곳(Developer/GPT Reviewer)에
+  // 명시적으로 전달한다. 같은 프로세스 안에서 다른 project의 runAutodevOnce()가 동시에/
+  // 번갈아 실행돼도 이 executorContext의 root/policy는 절대 바뀌지 않는다.
+  const executorContext = createSafeExecutorContext(manifest.targetProjectRoot, manifest.executionPolicy);
 
   const statePath = opts.statePath ?? manifest.statePath;
   const cwd = opts.cwd ?? manifest.targetProjectRoot;
@@ -171,6 +178,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // 범위"다 — claude-developer.ts가 DeveloperResult.changedFiles를 계산할 때도 같은
       // 범위를 쓴다(이전에는 이 파일에 ["web/", "automation/"]로 하드코딩돼 있었다).
       changeScopeDirs: manifest.reviewScopeDirs,
+      // Phase C Task C2 — 이 run 전용 executorContext를 명시적으로 넘긴다. Developer는
+      // module-level Safe Executor singleton을 전혀 거치지 않고 이 context의 root/policy로만
+      // 파일/명령을 검증·실행한다.
+      executor: executorContext,
     });
 
   const { finalState } = await runOrchestrator(taskDef.prompt, {
@@ -178,6 +189,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     allowedPathPrefixes: taskDef.allowedPathPrefixes,
     claudeRunner: defaultClaudeRunner,
     projectContext: reviewContext,
+    // Phase C Task C2 — deps.gptReviewer를 명시적으로 지정하지 않는 한(테스트가 흔히 그렇게
+    // 한다) orchestrator의 기본 real GPT reviewer가 이 context를 써서 rules 파일/실제 git
+    // 변경을 읽는다 — module-level singleton에 의존하지 않는다.
+    executor: executorContext,
     ...opts.orchestratorDeps,
   });
 

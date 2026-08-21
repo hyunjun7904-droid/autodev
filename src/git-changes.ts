@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { PROJECT_ROOT, DENY_PATH_PATTERNS, SECRET_NAME_PATTERNS, validateReadPath } from "./safe-executor";
+import type { SafeExecutorContext } from "./safe-executor";
 
 // 변경 파일 탐지의 단일 출처. 이전에는 claude-developer.ts(getActualChangedFiles)와
 // gpt-reviewer.ts(getScopedDiff)가 각자 "git diff --name-only"만 사용해 신규(untracked)
@@ -122,13 +123,20 @@ export interface UntrackedFileContent {
  * secret 이름 패턴에 걸리는 파일은 아예 읽지 않는다(이중 방어). totalBudgetChars를
  * 넘기면 그 이후 파일은 건너뛰고 skipped에 기록한다(어떤 파일이 잘렸는지 호출부가 알 수
  * 있게 하기 위함 — 요구사항: "truncation 시 어떤 파일이 잘렸는지 reviewer가 알 수 있게").
+ *
+ * Phase C Task C2 — executor(SafeExecutorContext)를 지정하면 그 context의
+ * validateReadPath만 쓴다(그 project run 전용 root/policy로 검증) — module-level 전역
+ * validateReadPath/currentPolicy에 의존하지 않는다. 지정하지 않으면 기존과 동일하게
+ * module-level singleton(configureSafeExecutor로 주입된 것)을 쓴다(하위 호환).
  */
 export function readUntrackedFiles(
   changes: WorkingTreeChange[],
-  opts: { perFileMaxChars?: number; totalBudgetChars?: number } = {}
+  opts: { perFileMaxChars?: number; totalBudgetChars?: number } = {},
+  executor?: Pick<SafeExecutorContext, "validateReadPath">
 ): { files: UntrackedFileContent[]; skipped: string[] } {
   const perFileMaxChars = opts.perFileMaxChars ?? 20_000;
   const totalBudgetChars = opts.totalBudgetChars ?? 65_000;
+  const doValidateReadPath = executor?.validateReadPath ?? validateReadPath;
   const files: UntrackedFileContent[] = [];
   const skipped: string[] = [];
   let used = 0;
@@ -138,7 +146,7 @@ export function readUntrackedFiles(
       skipped.push(change.path);
       continue;
     }
-    const v = validateReadPath(change.path);
+    const v = doValidateReadPath(change.path);
     if (!v.ok) {
       skipped.push(`${change.path} (읽기 거부: ${v.reason})`);
       continue;

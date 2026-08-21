@@ -80,11 +80,19 @@ function main(): void {
     !/from\s+"\.\/project-manifests\/movan"/.test(orchestrator)
   );
 
-  // --- autodev.ts: MOVAN 전용 import가 없고, configureSafeExecutor를 명시적으로 호출함 ---
+  // --- autodev.ts: MOVAN 전용 import가 없고, per-run SafeExecutorContext를 명시적으로 생성함 ---
   check("autodev.ts가 project-manifests/movan을 import하지 않음(A7부터 유지)", !/from\s+"\.\/project-manifests\/movan"/.test(autodev));
   check(
-    "autodev.ts가 manifest.executionPolicy를 configureSafeExecutor에 명시적으로 넘김",
-    /configureSafeExecutor\(manifest\.targetProjectRoot,\s*manifest\.executionPolicy\)/.test(autodev)
+    "autodev.ts가 manifest.executionPolicy를 createSafeExecutorContext에 명시적으로 넘김",
+    /createSafeExecutorContext\(manifest\.targetProjectRoot,\s*manifest\.executionPolicy\)/.test(autodev)
+  );
+  // Phase C Task C2 — Per-Run Execution Context 격리: production 실행 경로(runAutodevOnce)는
+  // module-level mutable singleton을 설정하는 configureSafeExecutor()를 더 이상 호출하지
+  // 않는다(다른 project run이 같은 프로세스에서 나중에 그 전역을 덮어쓸 수 있는 위험을
+  // 제거하기 위함) — 대신 이 run 전용 context를 만들어 필요한 곳에 명시적으로 전달한다.
+  check(
+    "autodev.ts가 configureSafeExecutor()를 호출하지 않음(module-global 설정 제거)",
+    !/configureSafeExecutor\(/.test(autodev)
   );
 
   // --- task-registry.ts: MOVAN 전용 cwd 리터럴 유니온이 없음(RequiredTestCommand.cwd가 string으로 일반화) ---
