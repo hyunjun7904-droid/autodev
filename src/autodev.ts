@@ -12,6 +12,10 @@ import type { ProjectManifest } from "./project-manifest";
 import { createSafeExecutorContext } from "./safe-executor";
 import { performTaskCheckpoint, commitProjectStateOnly } from "./checkpoint";
 import type { CheckpointOutcome } from "./checkpoint";
+import { routeTask, CORE_AGENT_REGISTRY } from "./agent-registry";
+import type { RoutableTaskInput, RoutingPlan } from "./agent-registry";
+import { executeRoutingPlan } from "./agent-orchestrator";
+import type { AgentStepResult, ReadOnlyAgentRunner } from "./agent-orchestrator";
 import { log } from "./logger";
 import type { CoreState } from "./types";
 
@@ -22,6 +26,21 @@ import type { CoreState } from "./types";
 // 전부 이 파일이 배선한다. Phase별 if문을 여기 하드코딩하지 않는다 — task-registry.ts의
 // getNextTask()에 ProjectManifest.taskRegistry를 주입한 순서/completedTasks만으로 다음
 // task를 고른다(decideNextAction).
+//
+// Phase F Task F4 — Production Pipeline Integration. task-registry.ts의 모든 task는
+// 정의상 "코드를 구현하는" 작업이므로, 실제 developer/reviewer/REVISE 루프는 여전히 아래
+// runOrchestrator()(기존 성숙한 상태 머신 — usage-limit 재시도, MAX_GPT_CALLS 등 F1~F3에는
+// 없는 안전장치를 갖춘 production 경로)가 전담한다 — F1~F3 Agent orchestration이 이 핵심
+// 루프를 대체하지 않는다(Agent가 Safe Executor/GPT Reviewer/checkpoint 같은 Core service를
+// 대체하면 안 된다는 원칙). 대신 F1의 routeTask()로 이 task에 필요한 agent 구성을 실제로
+// 결정하고, developer에 의존하지 않는 advisory read-only role(research/security/planner
+// 등 — F1 routing이 taskType별로 정의)만 F2의 executeRoutingPlan()으로 실제 실행해 순수
+// 정보로 첨부한다(§ runAdvisoryAgents 아래). qa는 developer 결과에 의존하므로(F1 routing)
+// 이 pre-pass에서는 developer가 없어 항상 dependency 미충족으로 SKIPPED 처리된다(F2의
+// 기존 dependency-gating을 그대로 재사용 — 새 분기를 만들지 않는다) — task-registry
+// task는 항상 requiredTests(비어있지 않으면 hasFixedRequiredTests=true)를 갖고 있으므로,
+// F1 routing 자체도 이미 qa를 제외하는 경우가 대부분이다. 이 advisory 결과는
+// developer/reviewer/checkpoint의 어떤 판정에도 영향을 주지 않는다(순수 정보).
 //
 // AutoDev 범용화 Phase A Task A7 — 이 파일은 이제 MOVAN을 전혀 모른다. project-manifests/
 // movan.ts를 import하지 않고, ProjectManifest를 기본값 없이 항상 호출부가 명시적으로
@@ -90,6 +109,13 @@ export interface AutodevRunOptions {
    *  호출하지 않고 전체 흐름(선택→실행→checkpoint→state 갱신)을 검증한다. claudeRunner를
    *  직접 넘기면 taskDef.requiredTests 자동 바인딩을 덮어쓴다(테스트가 원한다면). */
   orchestratorDeps?: OrchestratorDeps;
+  /**
+   * Phase F Task F4 — F1 routing이 이 task에 대해 선택한, developer/reviewer에 의존하지
+   * 않는 advisory read-only agent(research/security/planner 등) 실행에 쓸 runner.
+   * 지정하지 않으면 agent-orchestrator.ts의 기존 AUTOMATION_DRY_RUN 기본 선택(fake/real)을
+   * 그대로 따른다. 테스트는 반드시 fake를 주입해 실제 Claude API를 호출하지 않는다.
+   */
+  advisoryReadOnlyRunner?: ReadOnlyAgentRunner;
 }
 
 export type AutodevRunOutcome =
@@ -104,10 +130,61 @@ export interface AutodevRunResult {
   orchestratorStatus?: string;
   checkpoint?: CheckpointOutcome;
   reason?: string;
+  /**
+   * Phase F Task F4 — F1이 이 task에 선택한 advisory read-only agent(developer/reviewer
+   * 제외)의 실행 결과 중 실제로 실행된(SKIPPED가 아닌) 것만 담는다. 비어있으면(대부분의
+   * 실제 task-registry task가 여기 해당한다) 필드 자체가 없다. developer/reviewer/
+   * checkpoint의 어떤 판정에도 영향을 주지 않는 순수 정보다.
+   */
+  agentAdvisory?: AgentStepResult[];
 }
 
 function computeStateRelPath(statePath: string, cwd: string): string {
   return relative(cwd, statePath).split(sep).join("/");
+}
+
+/**
+ * F1의 routeTask()로 이 task에 필요한 agent 구성을 결정하고, developer/reviewer를 제외한
+ * advisory read-only role(research/security/planner 등)만 F2의 executeRoutingPlan()으로
+ * 실제 실행한다. qa는 developer에 의존하므로(F1 routing) 이 필터링된 sub-plan에는 그
+ * 의존성이 없어 executeRoutingPlan()의 기존 dependency-gating이 자동으로 SKIPPED 처리한다
+ * (별도 분기를 새로 만들지 않는다) — SKIPPED 결과는 정보로서 의미가 없으므로 걸러낸다.
+ * plan.requiresHumanApproval이면(F1이 policy.ts로 이미 판정) 어떤 agent도 실행하지 않는다
+ * (§ 고위험 task는 Claude/GPT 어떤 것도 호출하지 않는다는 기존 원칙과 동일).
+ */
+export async function runAdvisoryAgents(
+  taskDef: TaskDefinition,
+  advisoryReadOnlyRunner: ReadOnlyAgentRunner | undefined
+): Promise<{ routingPlan: RoutingPlan; agentAdvisory?: AgentStepResult[] }> {
+  const routableTask: RoutableTaskInput = {
+    id: taskDef.id,
+    description: taskDef.prompt,
+    taskType: "code_implementation",
+    hasFixedRequiredTests: taskDef.requiredTests.length > 0,
+  };
+  const routingPlan = routeTask(routableTask);
+  if (routingPlan.requiresHumanApproval) {
+    return { routingPlan };
+  }
+
+  const advisorySteps = routingPlan.steps.filter((s) => s.role !== "developer" && s.role !== "reviewer");
+  if (advisorySteps.length === 0) {
+    return { routingPlan };
+  }
+
+  const advisoryPlan: RoutingPlan = { ...routingPlan, steps: advisorySteps };
+  const advisoryResult = await executeRoutingPlan(
+    advisoryPlan,
+    { taskId: taskDef.id, taskGoal: taskDef.prompt },
+    CORE_AGENT_REGISTRY,
+    advisoryReadOnlyRunner ? { readOnlyRunner: advisoryReadOnlyRunner } : {}
+  );
+  const executed = advisoryResult.stepResults.filter((r) => r.status !== "SKIPPED");
+  if (executed.length === 0) {
+    return { routingPlan };
+  }
+  console.log(`[autodev] task ${taskDef.id} — advisory agent 실행: ${executed.map((r) => `${r.role}=${r.status}`).join(", ")}`);
+  return { routingPlan, agentAdvisory: executed };
 }
 
 // 1회 실행 — "다음 task 선택 → Claude 개발(+AutoDev가 직접 실행하는 필수 테스트) →
@@ -153,6 +230,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
   const taskDef = decision.task;
   console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
+
+  // Phase F Task F4 — F1 routeTask() + F2 executeRoutingPlan()을 실제 production 경로에
+  // 연결한다. developer/reviewer/REVISE 루프는 여전히 아래 runOrchestrator()가 전담하고,
+  // 이 결과는 그 판정에 전혀 영향을 주지 않는 순수 advisory 정보다(§ runAdvisoryAgents).
+  const { agentAdvisory } = await runAdvisoryAgents(taskDef, opts.advisoryReadOnlyRunner);
 
   // manifest.developerInstructions/reviewInstructions는 Claude Developer/GPT Reviewer
   // Core(claude-developer.ts/gpt-reviewer.ts)가 전혀 모르는 프로젝트별 내용이다 — 이 파일이
@@ -203,6 +285,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       taskId: taskDef.id,
       orchestratorStatus: String(finalState.status),
       reason: `orchestrator status=${finalState.status}`,
+      ...(agentAdvisory ? { agentAdvisory } : {}),
     };
   }
 
@@ -236,6 +319,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       orchestratorStatus: String(finalState.status),
       checkpoint,
       reason: checkpoint.reason,
+      ...(agentAdvisory ? { agentAdvisory } : {}),
     };
   }
 
@@ -281,6 +365,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     taskId: taskDef.id,
     orchestratorStatus: String(finalState.status),
     checkpoint,
+    ...(agentAdvisory ? { agentAdvisory } : {}),
   };
 }
 

@@ -6,6 +6,7 @@ import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
+import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { log } from "./logger";
 import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, CoreState } from "./types";
 
@@ -203,35 +204,20 @@ export async function runOrchestrator(
       state.deferredHumanTasks.push(`${gptResult.errorCode}: ${gptResult.feedback}`);
     }
 
-    let decision = gptResult.decision;
-
-    // task.allowedPathPrefixes 밖에서 실제 변경이 발견되면 GPT decision과 무관하게 BLOCK으로
-    // 강제한다(§ 요구사항 3/7) — "allowed task paths 밖 파일은 정책 위반으로 BLOCK"을 LLM
-    // 판단에만 맡기지 않는다.
-    if (gptResult.scopeViolations && gptResult.scopeViolations.length > 0 && decision !== "BLOCK") {
-      log("허용 경로(allowedPathPrefixes) 밖 변경 감지 — 오케스트레이터가 BLOCK으로 강제 전환", {
-        scopeViolations: gptResult.scopeViolations,
-      });
-      decision = "BLOCK";
-    }
-
-    // critical/high가 있는데 GPT가 PASS를 반환했다면 신뢰하지 않고 강제로 REVISE 취급한다.
-    if (decision === "PASS" && (gptResult.severity.critical > 0 || gptResult.severity.high > 0)) {
-      log("GPT가 critical/high와 함께 PASS를 반환 — 오케스트레이터가 REVISE로 강제 전환", {
+    // GPT decision에 대한 안전장치 override(scope 밖 변경→BLOCK, critical/high 있는데
+    // PASS→REVISE, 필수 테스트 실패에도 PASS→REVISE)는 review-policy.ts의 단일 출처를
+    // 그대로 쓴다(Phase F Task F4) — agent-orchestrator.ts(F2/F3)의 REVISE loop도 동일한
+    // 함수를 쓰므로 두 실행경로의 판정이 서로 달라질 위험이 없다.
+    const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
+    const decision = applyReviewDecisionPolicy(gptResult, requiredTestsFailed);
+    if (decision !== gptResult.decision) {
+      log("Core 안전장치가 GPT decision을 override함", {
+        raw: gptResult.decision,
+        overridden: decision,
         severity: gptResult.severity,
+        scopeViolations: gptResult.scopeViolations,
+        requiredTestsFailed,
       });
-      decision = "REVISE";
-    }
-
-    // 필수 테스트(AutoDev가 Safe Executor로 직접 실행해 확인한 실제 exitCode 기준)가
-    // 하나라도 실패했는데 GPT가 PASS를 반환했다면 신뢰하지 않는다 — Claude의 자체 보고나
-    // GPT의 판단만으로 검증 안 된 코드를 승인하지 않는다(§ 요구사항 6).
-    const requiredTestsFailed = claudeResult.tests.some((t) => !t.pass);
-    if (decision === "PASS" && requiredTestsFailed) {
-      log("필수 테스트 실패에도 GPT가 PASS를 반환 — 오케스트레이터가 REVISE로 강제 전환", {
-        tests: claudeResult.tests,
-      });
-      decision = "REVISE";
     }
 
     state.lastGptDecision = { ...gptResult, decision };
@@ -248,6 +234,13 @@ export async function runOrchestrator(
     // REVISE
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
       log(`연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — WAITING_HUMAN`);
+      // Phase F Task F4 — 이 상태는 "사람이 승인하면 통과"가 아니다: critical/high나
+      // 미해결 REVISE 지적사항이 그대로 남아있을 수 있다. agent-orchestrator.ts(F2/F3)의
+      // BLOCKED+REVIEW_CYCLE_EXHAUSTED와 같은 의미를 이 파일의 기존 WAITING_HUMAN enum
+      // 위에서 deferredHumanTasks reason으로 명확히 남긴다(enum 자체는 바꾸지 않는다).
+      state.deferredHumanTasks.push(
+        `${REVIEW_CYCLE_EXHAUSTED_REASON}: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})회 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리 불가).`
+      );
       setStatus("WAITING_HUMAN");
       break;
     }

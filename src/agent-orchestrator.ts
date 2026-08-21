@@ -9,11 +9,12 @@ import type { GptReviewRetryResult, ReviewRetryOptions } from "./gpt-reviewer";
 import { runClaudeTask as realReadOnlyClaudeCall } from "./claude-runner";
 import { runClaudeTask as fakeClaudeTask } from "./fake-claude-runner";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
-import type { ClaudeResult, GptDecision } from "./types";
+import type { ClaudeResult } from "./types";
 import { discoverCapability } from "./discovery-orchestrator";
 import type { CapabilityDiscoveryResult, DiscoverCapabilityOptions, SourceCatalog } from "./discovery-orchestrator";
 import type { CapabilityRequirement } from "./capability-resolver";
 import { MAX_REVIEW_CYCLES } from "./policy";
+import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 
 // Agent Execution Orchestration — Phase F Task F2.
 //
@@ -35,11 +36,14 @@ import { MAX_REVIEW_CYCLES } from "./policy";
 // MAX_REVIEW_CYCLES 상한을 그대로 import해서 재사용하며(값을 다시 정의하지 않음), Claude
 // 재개(continuation)는 claude-developer.ts가 이미 가진 allowedPathPrefixes 기반 "재개
 // 감지" 구조(§ input.developerOptions.allowedPathPrefixes를 매 cycle 그대로 전달)를
-// 그대로 재사용한다 — 새 continuation 메커니즘을 만들지 않는다. GPT 판정에 대한 안전장치
-// override(critical/high가 있는데 PASS→REVISE 강제, required test 실패에도 PASS→REVISE
-// 강제, scope 밖 변경→BLOCK 강제)도 orchestrator.ts의 동일 로직을 미러링한다(§
-// applyDecisionSafetyOverrides 주석 참고 — production pipeline 파일인 orchestrator.ts는
-// 이 Task 범위 밖이라 수정하지 않는다).
+// 그대로 재사용한다 — 새 continuation 메커니즘을 만들지 않는다.
+//
+// Phase F Task F4 — GPT 판정에 대한 안전장치 override(critical/high가 있는데 PASS→REVISE
+// 강제, required test 실패에도 PASS→REVISE 강제, scope 밖 변경→BLOCK 강제)는 이제
+// review-policy.ts(applyReviewDecisionPolicy/hasFailedRequiredTest)의 단일 출처를 그대로
+// 쓴다 — orchestrator.ts(production 실행경로)도 동일한 함수를 쓰므로, 두 실행경로의 판정이
+// 서로 달라질 위험이 구조적으로 없다(이전에는 이 override 로직이 두 파일에 각각
+// 인라인/미러링돼 있었다 — F4가 그 중복을 제거했다).
 //
 // 역할 연결(전부 기존 Core 실행 경로 재사용, 새 실행 인프라 없음):
 //   - developer → claude-developer.ts의 runDeveloperTaskViaSafeExecutor(Safe Executor 프로토콜)
@@ -275,34 +279,6 @@ export interface ReviewerStepData extends GptReviewRetryResult {
 }
 
 /**
- * GPT reviewer decision에 대한 Core 안전장치 강제 override.
- * orchestrator.ts의 runOrchestrator() 내부 로직(scopeViolations→BLOCK 강제,
- * critical/high가 있는데 PASS→REVISE 강제, required test 실패에도 PASS→REVISE 강제)을
- * 그대로 미러링한다. orchestrator.ts는 이 로직을 별도 함수로 export하지 않고(runOrchestrator
- * 내부 inline), 그 파일은 autodev.ts production pipeline이 실제로 쓰는 파일이라 이 Task
- * 범위 밖에서 리팩터링하지 않기로 했다 — 대신 이 작은 predicate(3개 조건)만 여기 그대로
- * 옮겨 적는다. 이 코드베이스는 이런 작은 안전 predicate/상수의 파일간 복제를 이미 허용하는
- * 선례가 있다(§ claude-developer.ts/gpt-reviewer.ts의 NO_SCOPE_CONFIGURED 센티널). 이
- * override 규칙이 orchestrator.ts에서 바뀌면 이 함수도 함께 갱신해야 한다.
- */
-function applyDecisionSafetyOverrides(
-  gptResult: Pick<GptReviewRetryResult, "decision" | "severity" | "scopeViolations">,
-  requiredTestsFailed: boolean
-): GptDecision {
-  let decision = gptResult.decision;
-  if (gptResult.scopeViolations && gptResult.scopeViolations.length > 0 && decision !== "BLOCK") {
-    decision = "BLOCK";
-  }
-  if (decision === "PASS" && (gptResult.severity.critical > 0 || gptResult.severity.high > 0)) {
-    decision = "REVISE";
-  }
-  if (decision === "PASS" && requiredTestsFailed) {
-    decision = "REVISE";
-  }
-  return decision;
-}
-
-/**
  * REVISE 발생 시 다음 developer 호출에 넘길 task 문자열을 구성한다. 원래 Task 목표 +
  * reviewer의 구체적 지적사항 + 관련 변경 파일 + 실패한 required test만 포함한다 — 과거
  * 대화 전체나 프로젝트 전체를 다시 담지 않는다(§ 토큰 효율 요구사항). 이 문자열이
@@ -372,9 +348,9 @@ async function executeReviewerStepWithRevise(
   let cycle = 1;
 
   while (true) {
-    const requiredTestsFailed = developerData.tests.length > 0 && !developerData.tests.every((t) => t.pass);
+    const requiredTestsFailed = hasFailedRequiredTest(developerData.tests);
     const reviewResult = await reviewerRunner(developerData as ClaudeResult, cycle, input.taskGoal, input.reviewerOptions ?? {});
-    const decision = applyDecisionSafetyOverrides(reviewResult, requiredTestsFailed);
+    const decision = applyReviewDecisionPolicy(reviewResult, requiredTestsFailed);
     const reviseCycles = cycle - 1;
 
     if (decision === "PASS" || decision === "BLOCK" || decision === "HUMAN_REQUIRED") {
@@ -399,7 +375,7 @@ async function executeReviewerStepWithRevise(
           status: "SUCCESS",
           summary: reviewResult.feedback,
           data: { ...reviewResult, decision, reviseCycles, reviewCycleExhausted: true } as ReviewerStepData,
-          reason: `REVIEW_CYCLE_EXHAUSTED — MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리할 수 없고, critical/high나 미해결 REVISE 상태가 남아있는 채로 사람이 직접 개입해야 합니다).`,
+          reason: `${REVIEW_CYCLE_EXHAUSTED_REASON} — MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리할 수 없고, critical/high나 미해결 REVISE 상태가 남아있는 채로 사람이 직접 개입해야 합니다).`,
         },
         updatedDeveloperStep: reviseCycles > 0 ? latestDeveloperStep : undefined,
       };
@@ -480,7 +456,7 @@ export function computeOverallStatus(stepResults: AgentStepResult[]): { status: 
       return {
         status: "BLOCKED",
         reason: reviewerData.reviewCycleExhausted
-          ? `REVIEW_CYCLE_EXHAUSTED: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})에 도달해 자동 진행을 중단합니다(critical=${reviewerData.severity.critical}, high=${reviewerData.severity.high} — 승인만으로 완료 처리 불가, 사람이 직접 개입해야 합니다).`
+          ? `${REVIEW_CYCLE_EXHAUSTED_REASON}: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})에 도달해 자동 진행을 중단합니다(critical=${reviewerData.severity.critical}, high=${reviewerData.severity.high} — 승인만으로 완료 처리 불가, 사람이 직접 개입해야 합니다).`
           : "reviewer decision=REVISE — 아직 해결되지 않은 REVISE 상태입니다.",
       };
     }
