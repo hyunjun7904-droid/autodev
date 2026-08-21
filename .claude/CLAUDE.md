@@ -41,10 +41,28 @@ Claude Worker 세션 운영, GPT Reviewer 전달 범위, context 관리 원칙�
   없이는 실제 원격 서버에 네트워크 질의를 보내므로 `-n`이 있을 때만 read-only로 인정한다.
 - 실제 secret 원문은 console / log / error / GPT review prompt / Claude feedback /
   audit output 어디에도 노출하지 않는다 — 탐지 보고에는 파일/위치/탐지 종류만 담는다.
+- **Deterministic Dependency / Supply-chain Scanner Gate**(`src/dependency-scanner.ts`,
+  Phase C Task C5) — commit(checkpoint) 대상에 `package.json`/`package-lock.json`
+  변경이 있을 때만 실행되며(무관한 task는 파일시스템/네트워크 접근 없이 즉시 PASS),
+  manifest/lockfile 일관성(npm lockfileVersion 2/3의 `packages[""]`가 package.json
+  dependencies/devDependencies를 그대로 미러링해야 함), lockfile 존재 여부, 각 lockfile
+  package entry의 설치 출처(insecure `http://`/git 미고정 참조는 BLOCK, git 커밋 SHA
+  고정·`file:`·workspace link·신뢰된 registry(`registry.npmjs.org`) 밖 tarball URL은
+  HUMAN_REVIEW_REQUIRED), integrity 필드 유무/형식, 신규(HEAD 대비 새로 생긴)
+  `hasInstallScript` 패키지, 그리고 주입된 vulnerability audit source(운용 기본값은 공식
+  `npm audit --json` — `npmAuditVulnerabilitySource`, 자동 `audit fix`/dependency
+  upgrade는 수행하지 않음)의 Critical/High를 판정한다. 판정 결과는 PASS/BLOCK/
+  HUMAN_REVIEW_REQUIRED 셋 중 하나이며, PASS가 아니면(BLOCK이든 HUMAN_REVIEW_REQUIRED든)
+  `performTaskCheckpoint`가 git add조차 실행하기 전에 commit을 중단한다. Secret Scanner와
+  마찬가지로 AI 판단에 의존하지 않으며, 어떤 policy/옵션도 받지 않아 프로젝트가 우회할 수
+  없다(`PerformCheckpointOptions.dependencyVulnerabilityAuditSource`는 `cwd`와 동일한
+  성격의 테스트 전용 seam일 뿐, 구조/source/integrity/install-script 검사는 이 값과 무관
+  하게 항상 수행된다). 자세한 구조는 `src/dependency-scanner.ts` 상단 주석 참고.
 
-세 모듈의 책임은 명확히 분리된다: Safe Executor(경로 접근 범위 + 명령 실행 자체의 Core
-안전 게이트), Secret Scanner(commit 직전 내용 검사), 그리고 명령 실행 permission
-(`policy.allowedCommands`)은 project 소유이되 Core Command Safety Gate 위에서만 동작한다.
+네 모듈의 책임은 명확히 분리된다: Safe Executor(경로 접근 범위 + 명령 실행 자체의 Core
+안전 게이트), Secret Scanner(commit 직전 내용 검사), Dependency / Supply-chain Scanner
+(commit 직전 dependency 변경 검사), 그리고 명령 실행 permission(`policy.allowedCommands`)은
+project 소유이되 Core Command Safety Gate 위에서만 동작한다.
 
 ## 향후 운영 요구사항 (미구현)
 

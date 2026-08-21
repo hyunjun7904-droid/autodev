@@ -7,6 +7,8 @@ import type { GptDecision, SeverityCounts } from "./types";
 import { log } from "./logger";
 import { scanChangesForSecrets } from "./secret-scanner";
 import type { SecretFinding } from "./secret-scanner";
+import { scanChangesForDependencyRisk, npmAuditVulnerabilitySource } from "./dependency-scanner";
+import type { DependencyFinding, DependencyScanVerdict, VulnerabilityAuditSource } from "./dependency-scanner";
 
 // 자동 Git CHECKPOINT — GPT 승인(Critical 0 / High 0) + 필수 테스트 전부 PASS일 때만
 // commit을 만든다. commit 대상은 해당 task가 실제로 바꾼(allowedPathPrefixes 안의) 파일만
@@ -94,6 +96,12 @@ export interface PerformCheckpointOptions {
   /** project-state.json의 cwd 기준 상대경로 등 — 이 product commit의 대상/판정에서
    *  완전히 제외한다(별도 administrative commit으로 처리되므로). */
   excludePaths?: string[];
+  /** Deterministic Dependency / Supply-chain Scanner Gate(Phase C Task C5)의 vulnerability
+   *  조회 구현 — 지정하지 않으면 실제 운용 기본값인 npmAuditVulnerabilitySource(공식
+   *  `npm audit --json`)를 쓴다. cwd와 마찬가지로 테스트 전용 seam이다(scanner 자체를
+   *  끄거나 약화시키는 옵션이 아니다 — 구조/source/integrity/install-script 검사는 이
+   *  값과 무관하게 항상 수행된다). */
+  dependencyVulnerabilityAuditSource?: VulnerabilityAuditSource;
 }
 
 export interface CheckpointOutcome {
@@ -105,6 +113,10 @@ export interface CheckpointOutcome {
   /** Deterministic Secret Scanner Gate(Phase C Task C3)가 commit 대상에서 발견한 항목 —
    *  file/line/kind만 담는다(secret 원문은 절대 담기지 않는다). */
   secretFindings?: SecretFinding[];
+  /** Deterministic Dependency / Supply-chain Scanner Gate(Phase C Task C5)가 commit
+   *  대상에서 발견한 항목과 그 최종 판정(BLOCK/HUMAN_REVIEW_REQUIRED). */
+  dependencyFindings?: DependencyFinding[];
+  dependencyScanVerdict?: DependencyScanVerdict;
 }
 
 /**
@@ -150,6 +162,26 @@ export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformChec
       ok: false,
       reason: "commit 대상 파일에서 민감정보(secret) 패턴이 발견되어 commit을 중단했습니다.",
       secretFindings: secretScan.findings,
+    };
+  }
+
+  const depScan = scanChangesForDependencyRisk(plan.allowed, cwd, {
+    vulnerabilityAuditSource: opts.dependencyVulnerabilityAuditSource ?? npmAuditVulnerabilitySource,
+  });
+  if (depScan.verdict !== "PASS") {
+    log("checkpoint BLOCK — dependency/supply-chain 위험 발견", {
+      taskId: taskDef.id,
+      verdict: depScan.verdict,
+      findings: depScan.findings,
+    });
+    return {
+      ok: false,
+      reason:
+        depScan.verdict === "BLOCK"
+          ? "commit 대상 dependency 변경에서 Critical/High 수준 supply-chain 위험이 발견되어 commit을 중단했습니다."
+          : "commit 대상 dependency 변경에 사람 확인이 필요한 supply-chain 위험이 있어 commit을 중단했습니다(HUMAN_REVIEW_REQUIRED).",
+      dependencyFindings: depScan.findings,
+      dependencyScanVerdict: depScan.verdict,
     };
   }
 
