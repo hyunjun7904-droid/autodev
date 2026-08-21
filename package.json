@@ -21,6 +21,7 @@
     "test:secret-scanner": "npm run build && node dist/secret-scanner-tests.js",
     "test:dependency-scanner": "npm run build && node dist/dependency-scanner-tests.js",
     "test:capability-resolver": "npm run build && node dist/capability-resolver-tests.js",
+    "test:candidate-evidence": "npm run build && node dist/candidate-evidence-tests.js",
     "test:git-changes": "npm run build && node dist/git-changes-tests.js",
     "test:project-context": "npm run build && node dist/project-context-tests.js",
     "test:project-manifest": "npm run build && node dist/project-manifest-tests.js",

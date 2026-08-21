@@ -8,9 +8,11 @@ Task C4는 Hooks / Permissions Enforcement(Core Command Safety Gate,
 보안 섹션 참고)를, Task C5는 Deterministic Dependency / Supply-chain Scanner Gate
 (`src/dependency-scanner.ts`)를, Task D1은 Capability Discovery & MCP Resolver의
 Core Design/Foundation(`src/capability-resolver.ts` — 데이터 모델 + candidate 평가/
-랭킹 + risk/approval 판정, 자세한 내용은 `.claude/CLAUDE.md` 참고)을 구현했다. D1은
-실제 외부 MCP 설치/실행을 하지 않는다 — Notification Service / Dashboard / 실제 MCP
-설치·활성화 / Browser Worker / Agent Router는 아직 시작하지 않았다.
+랭킹 + risk/approval 판정)을, Task D2는 그 위에 Trusted Candidate Discovery & Evidence
+(`src/candidate-evidence.ts` — evidence 데이터 모델 + 신뢰도/staleness/충돌 판정 +
+D1 CandidateSource 어댑터, 자세한 내용은 `.claude/CLAUDE.md` 참고)를 구현했다. D1/D2
+모두 실제 외부 MCP 설치/실행을 하지 않는다 — Notification Service / Dashboard / 실제
+MCP 설치·활성화 / Browser Worker / Agent Router는 아직 시작하지 않았다.
 
 ## Notification 이벤트
 
@@ -49,5 +51,7 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 
 - Notification Service
 - Dashboard
-- 실제 MCP 서버 설치/다운로드/활성화(D1은 Discovery/Resolver의 Core 데이터 모델·판정
-  로직만 구현했다 — 실제 활성화 실행 경로/Browser Worker/Agent Router는 없음)
+- 실제 MCP 서버 설치/다운로드/활성화(D1/D2는 Discovery/Resolver/Evidence의 Core 데이터
+  모델·판정 로직만 구현했다 — 실제 evidence source/candidate source 연동, 실제 활성화
+  실행 경로, Browser Worker, Agent Router는 없음)
+- production credential을 실제로 사용하는 evidence/candidate 조회

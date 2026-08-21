@@ -85,6 +85,32 @@ Core hard rule: `candidate.requiresSecret === true`이거나 `actionTags`에
 자체는 Safe Executor/Secret Scanner/Core Command Safety Gate/Dependency Scanner를
 전혀 우회하지 않는다(그 네 게이트 앞단에서 "무엇을 쓸지" 구조화만 한다).
 
+`src/candidate-evidence.ts`(Phase D Task D2, Trusted Candidate Discovery & Evidence)는
+D1의 `CandidateSource` seam 위에 후보의 출처/근거/신뢰도를 구조화한다 — D1
+(`capability-resolver.ts`)은 이 Task에서 전혀 수정하지 않았다. `CandidateEvidence`는
+source type(공식 vendor 문서 > 공식 repository > 공식 SDK/registry metadata > 신뢰
+가능한 vendor-maintained > 일반 기술자료 > community_signal 순 신뢰 우선순위)/official
+여부/publisher/maintenance 상태/최신성/permission/network·secret 요구/비용/license/
+security signal/evidence 수집 시각을 담는 순수 입력 레코드이고, `evaluateEvidence()`가
+그 근거의 신뢰도(`EvidenceConfidence`: `SUFFICIENT`/`UNKNOWN`/`HUMAN_REVIEW_REQUIRED`)를
+deterministic하게 판정한다 — 근거가 부족하면 절대 추측으로 값을 채우지 않고 `UNKNOWN`
+또는 `HUMAN_REVIEW_REQUIRED`로 남긴다. `detectEvidenceConflicts()`는 같은 candidate를
+가리키는 evidence들이 핵심 필드(official/requiresSecret/requiresNetwork/
+maintenanceStatus/costRisk)에서 서로 다른 값을 보고하면 다수결/최신값으로 조용히
+병합하지 않고 무조건 `HUMAN_REVIEW_REQUIRED`로 승격한다. `discoverTrustedCandidates()`는
+evidence source 조회가 실패하거나(`SOURCE_UNAVAILABLE`) evidence가 없으면
+(`NO_EVIDENCE_FOUND`) 근거 없이 자동 선택하지 않는다.
+
+Core hard rule은 D1과 동일한 설계를 그대로 재사용한다: `requiresSecret`과
+`CORE_ALWAYS_HUMAN_APPROVAL_TAGS`(D1에서 import, 목록을 복제하지 않음)는 항상
+`HUMAN_REVIEW_REQUIRED`를 강제하고, `TrustedDiscoveryPolicy`는 이 목록에 추가만
+가능하다. staleness 기준(Core 기본값 180일)도 project policy(`maxStaleAfterDays`)로
+더 엄격하게(짧게) 줄일 수만 있을 뿐, Core 기본값보다 크게 줘도 무시되고 늘려서 완화할
+수 없다. `toCandidateSource()`는 D2의 신뢰도 판정을 통과한(`confidence==="SUFFICIENT"`)
+candidate만 D1의 `CandidateSource`로 승격시켜 `resolveCapability()`가 그대로 소비할
+수 있게 하는 어댑터다 — 근거가 부족한 candidate는 D1에 판단을 떠넘기지 않고 이
+어댑터 단계에서부터 걸러낸다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은
