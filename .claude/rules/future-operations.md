@@ -20,9 +20,14 @@ official을 자기 주장만으로 확정 못함" 설계)를, Task D4는 D1+D2+D
 (`discoverCapability`)로 연결, 새 평가 로직 없이 D1/D2/D3 재사용만)를, Task D5는 실제로
 존재/유지되는 공식 source 3건(GitHub REST API 하나로 통합 — Anthropic 공식 TypeScript
 SDK/MCP 공식 reference servers/Puppeteer 공식 저장소, 2026-08-21 확인)을 bootstrap한
-Real Official Source Catalog(`src/real-source-catalog.ts`, 자세한 내용은
-`.claude/CLAUDE.md` 참고)를 구현했다. D1~D5 모두 실제 외부 MCP 설치/실행을 하지 않는다
-— Notification Service / Dashboard / 실제 MCP 설치·활성화 / Browser Worker / Agent
+Real Official Source Catalog(`src/real-source-catalog.ts`)를 구현했다. Task E1은 API/
+공식 metadata/일반 HTTP로도 부족할 때만 쓰는 최후 수단 Browser Worker의 Core 실행모델과
+보안 경계(`src/browser-worker.ts` — 닫힌 BrowserAction union, D3의
+`isPrivateOrMetadataHost()`를 재사용하는 URL/navigation validator, 11개 Core 고위험
+범주 + CLICK_SAFE 키워드 분류, redirect 재검증, deterministic fake backend, 자세한
+내용은 `.claude/CLAUDE.md` 참고)를 구현했다 — 범용 웹 자동화·실제 Playwright 연결·
+로그인 자동화는 만들지 않았다. D1~E1 모두 실제 외부 MCP 설치/실행을 하지 않는다 —
+Notification Service / Dashboard / 실제 MCP 설치·활성화 / 실제 브라우저 실행 / Agent
 Router는 아직 시작하지 않았다.
 
 ## Notification 이벤트
@@ -73,3 +78,10 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
 - MCP/API-SDK/CLI 외의 다른 capability domain(payment_or_financial/deployment/
   communication/storage 등)을 위한 real catalog entry(D5는 대표적인 3건만 최소
   bootstrap했다 — "많이 등록하지 않는다" 원칙)
+- 실제 Playwright(또는 다른 실제 브라우저 엔진) 연결(E1은 BrowserBackend interface +
+  deterministic fake backend만 구현했다 — 실제 사이트 자동조작은 E1 완료조건이 아니다)
+- 로그인 자동화, password/credential을 실제로 입력하는 흐름(BrowserAction에 그런
+  action 자체가 없다 — 향후 필요해지면 별도 Task에서 명시적으로 설계해야 한다)
+- 고위험 browser action(파일 다운로드/업로드/결제/구매/production 변경 등)의 "사람
+  승인 후 실제 실행" 경로(E1은 HUMAN_APPROVAL_REQUIRED 판정까지만 하고, 그 이후 실행
+  흐름은 구현하지 않았다)

@@ -203,6 +203,38 @@ deterministic 회귀를 불안정하게 만들지 않기 위함). `real-source-c
 (전체 회귀에 포함됨)는 실제 네트워크를 전혀 쓰지 않고, 2026-08-21에 확인한 실제 응답을
 그대로 스냅샷한 fixture로 매퍼/catalog/discoverCapability를 검증한다.
 
+`src/browser-worker.ts`(Phase E Task E1, Browser Worker Safety Boundary & Core
+Foundation)는 API/공식 metadata/일반 HTTP 조회로도 해결할 수 없을 때만 쓰는 최후
+수단의 Core 실행모델이다. `BrowserAction`은 닫힌 union(`NAVIGATE`/`READ_PAGE`/
+`EXTRACT_TEXT`/`FIND`/`CLICK_SAFE`/`SCREENSHOT`)이라 파일 다운로드/업로드/password·
+secret 입력/임의 executable 실행/browser extension 설치를 표현할 action 자체가 없다
+— 이 타입 시스템 자체가 Core 안전규칙의 상당 부분을 이미 강제한다. SSRF 방지
+(`validateNavigationUrl`)는 D3의 `isPrivateOrMetadataHost()`를 그대로 재사용한다(추가
+export 1건 — D3의 47개 테스트는 수정 없이 그대로 통과) — D3의 `validateSourceUrl()`은
+고정 `allowedHosts` allow-list가 필수라 "그때그때 다른 공식 문서를 봐야 하는" Browser
+Worker의 threat model과 맞지 않아 그대로 재사용할 수 없었고, host 판정 자체(localhost/
+private/link-local/cloud metadata)만 공유하고 scheme(https만 허용, 그 외 전부 자동
+거부)/allow-list 정책은 이 파일이 독자적으로 둔다.
+
+CLICK_SAFE만 결과를 미리 완전히 통제할 수 없는 action이다(클릭 대상의 실제 동작은
+페이지 로직에 달려있다) — `label`(관찰된 버튼/링크 텍스트)을 `classifyClickRisk()`가
+키워드로 검사해 11개 Core 고위험 범주(file_download/file_upload/
+password_or_secret_input/payment_or_purchase/financial_transaction/
+brokerage_or_trading/production_db_change/production_deploy/
+account_security_settings_change/extension_install/arbitrary_executable_run) 중
+하나라도 매칭되면 `HUMAN_APPROVAL_REQUIRED`로 판정하고 **backend를 전혀 호출하지
+않는다**(fail-closed — 이번 E1은 승인 후 실행까지 구현하지 않는다). `BrowserWorkerPolicy`
+는 D1~D5와 동일한 설계로 이 Core 목록에 키워드를 **추가**만 할 수 있을 뿐 대체/약화시킬
+필드가 없다. NAVIGATE의 backend 실행 결과에 `finalUrl`(실제 landing URL, redirect
+반영)이 있으면 `validateNavigationUrl`로 다시 검증한다 — 최초 요청 URL이 통과했어도
+redirect로 금지 origin에 도착하면 전체 결과를 BLOCKED로 무효화한다("page가 다른 URL로
+유도해도 Core 규칙 재검사"). 페이지 콘텐츠(READ_PAGE/EXTRACT_TEXT/FIND 결과)는 어디서도
+"실행할 명령"으로 다시 파싱되지 않는다 — 그 결과는 순수 데이터로만 호출부에 반환되며,
+페이지가 "이 명령을 실행하라"/"보안 규칙을 무시하라" 같은 텍스트를 담고 있어도 이
+모듈의 판정에 구조적으로 전혀 영향을 줄 수 없다(테스트로 직접 증명). `createFakeBrowserBackend()`
+가 deterministic 테스트 전용 backend를 제공하며, 실제 Playwright 연결은 이 Task에서
+만들지 않았다.
+
 ## 향후 운영 요구사항 (미구현)
 
 아직 구현되지 않은 장기 설계 요구사항(Notification Service, 모바일 승인 흐름 등)은

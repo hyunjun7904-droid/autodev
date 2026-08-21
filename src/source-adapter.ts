@@ -51,7 +51,10 @@ const BLOCKED_HOSTNAMES: ReadonlySet<string> = new Set(["localhost", "0.0.0.0", 
 // 차단된다.
 const PRIVATE_IPV4_PATTERNS: RegExp[] = [/^10\./, /^127\./, /^169\.254\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./, /^0\./];
 
-function isPrivateOrMetadataHost(hostname: string): boolean {
+/** localhost/private network/link-local/cloud metadata endpoint 판정의 단일 출처 —
+ *  browser-worker.ts(Phase E Task E1)의 navigation validator도 이 함수를 그대로
+ *  재사용한다(SSRF 방지 로직 복제 금지). */
+export function isPrivateOrMetadataHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
   if (BLOCKED_HOSTNAMES.has(h)) return true;
   if (PRIVATE_IPV4_PATTERNS.some((p) => p.test(h))) return true;
