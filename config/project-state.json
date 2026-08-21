@@ -1,0 +1,12 @@
+{
+  "currentTask": null,
+  "reviewCycle": 0,
+  "lastClaudeResult": null,
+  "lastGptDecision": null,
+  "status": "IDLE",
+  "claudeLimitWaitCount": 0,
+  "deferredHumanTasks": [],
+  "completedTasks": [],
+  "gitCheckpoint": "",
+  "currentPhase": 0
+}

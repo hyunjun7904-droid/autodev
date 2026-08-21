@@ -1,0 +1,39 @@
+{
+  "name": "autodev",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AutoDev — Claude/GPT 기반 자동 개발 오케스트레이션 엔진(범용 Core + src/project-manifests/movan.ts의 MOVAN project adapter). MOVAN repository와 물리적으로 분리된 standalone Node.js/TypeScript 패키지(Phase B Task B2).",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "dry-run": "npm run build && node dist/dry-run.js",
+    "test:runner": "npm run build && node dist/runner-tests.js",
+    "smoke-test": "npm run build && node dist/smoke-test.js",
+    "gpt-smoke-test": "npm run build && node dist/gpt-smoke-test.js",
+    "test:safe-executor": "npm run build && node dist/safe-executor-tests.js",
+    "test:gpt-retry": "npm run build && node dist/gpt-retry-tests.js",
+    "test:policy": "npm run build && node dist/policy-tests.js",
+    "test:autodev": "npm run build && node dist/autodev-tests.js",
+    "test:task-registry": "npm run build && node dist/task-registry-tests.js",
+    "test:claude-developer": "npm run build && node dist/claude-developer-tests.js",
+    "test:checkpoint": "npm run build && node dist/checkpoint-tests.js",
+    "test:git-changes": "npm run build && node dist/git-changes-tests.js",
+    "test:project-context": "npm run build && node dist/project-context-tests.js",
+    "test:project-manifest": "npm run build && node dist/project-manifest-tests.js",
+    "test:project-policy": "npm run build && node dist/project-policy-tests.js",
+    "test:core-movan-leakage": "npm run build && node dist/core-movan-leakage-tests.js",
+    "test:developer-reviewer-context": "npm run build && node dist/developer-reviewer-context-tests.js",
+    "test:state": "npm run build && node dist/state-tests.js",
+    "test:core-state": "npm run build && node dist/core-state-tests.js",
+    "test:fixture-e2e": "npm run build && node dist/fixture-e2e-tests.js",
+    "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "openai": "^7.4.0"
+  }
+}
