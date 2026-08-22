@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEvent, classifyEventCategory, isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
-import { createInMemoryEventStore, createFileEventStore, selectDefaultEventStore } from "./event-store";
+import { createInMemoryEventStore, createFileEventStore, selectDefaultEventStore, getAuditIntegrityStatus, describeAuditIntegrity } from "./event-store";
 import type { EventStore } from "./event-store";
 
 // Observability & Audit Event Foundation 테스트(Phase G Task G1/G2). 실제 Claude/GPT 유료
@@ -295,7 +295,62 @@ function scenarioAuditIntegrityNotSilentlySkipped(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 14) Production EventStore 선택 — AUTOMATION_DRY_RUN이 명시적으로 "false"일 때만 실제
+// 14) Audit Integrity status/설명 helper(Phase G Task G2.1) — integrityIssues가 없으면
+//     CLEAN, 있으면 DEGRADED로 단일 판정한다. describeAuditIntegrity()는 손상 건수/사유만
+//     요약하고 원문은 절대 포함하지 않는다.
+// ---------------------------------------------------------------------------
+function scenarioAuditIntegrityStatusHelper(): void {
+  const cleanResult = { integrityIssues: [] };
+  check("integrity status: 손상 없으면 CLEAN", getAuditIntegrityStatus(cleanResult) === "CLEAN");
+  check("integrity 설명: CLEAN일 때 손상 없음을 명시", describeAuditIntegrity(cleanResult).startsWith("CLEAN"));
+
+  const dir = makeTempDir();
+  const filePath = join(dir, "events.jsonl");
+  writeFileSync(filePath, "", "utf-8");
+  const store = createFileEventStore(filePath);
+  store.append(baseInput({ eventType: "RUN_STARTED" }));
+  appendFileSync(filePath, "NOT_VALID_JSON_AT_ALL\n", "utf-8");
+  appendFileSync(filePath, `${JSON.stringify({ foo: "bar" })}\n`, "utf-8");
+  const degradedResult = store.query({ runId: "run-1" });
+
+  check("integrity status: 손상이 있으면 DEGRADED", getAuditIntegrityStatus(degradedResult) === "DEGRADED");
+  const description = describeAuditIntegrity(degradedResult);
+  check("integrity 설명: DEGRADED로 시작하고 손상 건수(2)를 포함", description.startsWith("DEGRADED") && description.includes("2건"));
+  check("integrity 설명: JSON_PARSE_ERROR/SCHEMA_INVALID 사유별 건수를 포함", description.includes("JSON_PARSE_ERROR=1") && description.includes("SCHEMA_INVALID=1"));
+  check("integrity 설명: 손상된 원문이 설명 문자열에 남지 않음", !description.includes("NOT_VALID_JSON_AT_ALL"));
+}
+
+// ---------------------------------------------------------------------------
+// 15) checkAuditWritable(Phase G Task G2.1) — checkpoint 전 audit-critical 저장소 사용
+//     가능 여부를 부수효과 없이 미리 확인한다. 정상 경로에서는 ok:true이고 실제 파일이
+//     새로 생기지 않는다(순수 점검). 저장소가 쓰기 불가능한 상황(디렉터리 자리에 파일이
+//     있어 mkdir/access가 구조적으로 실패하는 경우)에서는 ok:false + error를 반환한다.
+// ---------------------------------------------------------------------------
+function scenarioCheckAuditWritable(): void {
+  const dir = makeTempDir();
+  const filePath = join(dir, "events.jsonl");
+  const store = createFileEventStore(filePath);
+
+  const beforeCheck = existsSync(filePath);
+  const health = store.checkAuditWritable?.();
+  check("checkAuditWritable: 정상 경로에서 ok:true", health?.ok === true);
+  check("checkAuditWritable: 파일이 없던 상태 그대로 유지됨(부수효과 없음)", beforeCheck === false && !existsSync(filePath));
+
+  // 디렉터리가 있어야 할 자리에 일반 파일을 둬서 실제 fs 오류를 유발한다(OS 권한을
+  // 건드리지 않는 이식 가능한 방법).
+  const blockerFile = join(dir, "not-a-directory");
+  writeFileSync(blockerFile, "x", "utf-8");
+  const blockedFilePath = join(blockerFile, "sub", "events.jsonl");
+  const blockedStore = createFileEventStore(blockedFilePath);
+  const blockedHealth = blockedStore.checkAuditWritable?.();
+  check("checkAuditWritable: 저장소를 쓸 수 없으면 ok:false + error를 반환", blockedHealth?.ok === false && typeof blockedHealth?.error === "string");
+
+  const inMemory = createInMemoryEventStore();
+  check("checkAuditWritable: in-memory store는 이 메서드를 구현하지 않음(항상 사용 가능한 것으로 간주)", typeof inMemory.checkAuditWritable === "undefined");
+}
+
+// ---------------------------------------------------------------------------
+// 16) Production EventStore 선택 — AUTOMATION_DRY_RUN이 명시적으로 "false"일 때만 실제
 //     파일 store를 고른다(production과 test storage 분리).
 // ---------------------------------------------------------------------------
 function scenarioDefaultEventStoreSelection(): void {
@@ -337,6 +392,8 @@ async function main(): Promise<void> {
     scenarioPolicyCannotDisableAudit();
     scenarioFileStorePersistsAcrossRestarts();
     scenarioAuditIntegrityNotSilentlySkipped();
+    scenarioAuditIntegrityStatusHelper();
+    scenarioCheckAuditWritable();
     scenarioDefaultEventStoreSelection();
   } finally {
     for (const d of tempDirs) {

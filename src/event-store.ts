@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createEvent } from "./observability-event";
 import type { AutoDevEvent, AutoDevEventInput, AutoDevEventType, AutoDevEventCategory } from "./observability-event";
@@ -56,9 +56,26 @@ export interface AppendResult {
   error?: string;
 }
 
+/** Phase G Task G2.1 — checkAuditWritable()의 반환 타입. AppendResult와 의도적으로 분리한다
+ *  (checkAuditWritable은 event를 만들지 않으므로 event 필드가 없다). */
+export interface AuditWritableCheck {
+  ok: boolean;
+  error?: string;
+}
+
 export interface EventStore {
   append(input: AutoDevEventInput): AppendResult;
   query(filter?: EventQueryFilter): QueryResult;
+  /**
+   * Phase G Task G2.1 — checkpoint(git commit)처럼 한 번 넘어가면 되돌리지 않는 경계
+   * 직전에, audit-critical 저장소가 지금 실제로 쓰기 가능한지 부수효과 없이(실제 append
+   * 없이) 미리 확인한다. append-only 보장을 이 점검이 깨지 않는다 — 이 메서드는 어떤
+   * event도 만들거나 저장하지 않는다.
+   * 이 메서드를 구현하지 않는 EventStore(예: in-memory store, 기존 테스트 fake)는 호출부가
+   * `store.checkAuditWritable?.() ?? { ok: true }`로 처리한다 — 항상 사용 가능한 것으로
+   * 간주되어 기존 동작이 전혀 바뀌지 않는다.
+   */
+  checkAuditWritable?(): AuditWritableCheck;
 }
 
 function matchesFilter(event: AutoDevEvent, filter: EventQueryFilter): boolean {
@@ -128,6 +145,29 @@ export function createFileEventStore(filePath: string): EventStore {
         integrityIssues,
       };
     },
+    checkAuditWritable() {
+      try {
+        // append()가 mkdirSync(dir, {recursive:true})로 만들 디렉터리를 실제로 만들지
+        // 않고, 그 상위 중 실제로 존재하는 첫 조상까지만 거슬러 올라가 확인한다(부수효과
+        // 없는 점검). 그 조상이 디렉터리가 아니라 파일이면(예: 상위 경로 일부가 실제로는
+        // 일반 파일) mkdirSync 자체가 구조적으로 불가능하므로 명시적으로 실패시킨다 —
+        // accessSync만으로는 "파일이지만 쓰기 권한은 있음"을 걸러낼 수 없기 때문이다.
+        let probe = dirname(filePath);
+        while (!existsSync(probe)) {
+          const parent = dirname(probe);
+          if (parent === probe) break; // 파일시스템 root까지 올라왔다.
+          probe = parent;
+        }
+        if (!statSync(probe).isDirectory()) {
+          throw new Error(`${probe}는 디렉터리가 아니라서 audit-critical 저장소 경로를 만들 수 없습니다.`);
+        }
+        accessSync(probe, fsConstants.W_OK);
+        if (existsSync(filePath)) accessSync(filePath, fsConstants.W_OK);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
   };
 }
 
@@ -176,6 +216,35 @@ function readLastKnownSequence(filePath: string): number {
     if (e.sequence > max) max = e.sequence;
   }
   return max;
+}
+
+// Phase G Task G2.1 — Audit Integrity 소비자용 단일 판정 helper. query()가 이미
+// integrityIssues를 숨기지 않지만, 소비자마다 "integrityIssues.length > 0"을 직접 재구현하면
+// 기준이 갈릴 위험이 있다(예: 누군가는 실수로 이 검사를 빠뜨리고 events만 보고 "정상 기록"
+// 으로 취급할 수 있다). 이 두 helper가 그 단일 출처다 — Dashboard/Notification(범위 밖)을
+// 만들지 않고, 순수 판정/설명 문자열만 제공한다.
+
+export type AuditIntegrityStatus = "CLEAN" | "DEGRADED";
+
+/** integrityIssues가 하나라도 있으면 DEGRADED — 이 조회 결과를 "완전한 정상 기록"으로 취급할
+ *  수 없다는 뜻이다(§ 요구사항: query 결과가 완전한 기록인 것처럼 행동하지 않음). */
+export function getAuditIntegrityStatus(result: Pick<QueryResult, "integrityIssues">): AuditIntegrityStatus {
+  return result.integrityIssues.length > 0 ? "DEGRADED" : "CLEAN";
+}
+
+/** DEGRADED일 때 사람이 읽을 수 있는 한 줄 요약을 만든다 — reason 필드(예:
+ *  deferredHumanTasks)에 그대로 넣을 수 있는 형태다. integrityIssues가 이미 file/line/
+ *  reason만 담고 있으므로(§ event-store.ts 상단 주석), 이 함수도 손상된 원문을 어디에서도
+ *  다시 읽거나 포함하지 않는다. */
+export function describeAuditIntegrity(result: Pick<QueryResult, "integrityIssues">): string {
+  if (result.integrityIssues.length === 0) return "CLEAN — 손상된 audit 기록이 없습니다.";
+  const counts = { JSON_PARSE_ERROR: 0, SCHEMA_INVALID: 0 };
+  for (const issue of result.integrityIssues) counts[issue.reason] += 1;
+  return (
+    `DEGRADED — 손상된 audit 기록 ${result.integrityIssues.length}건 ` +
+    `(JSON_PARSE_ERROR=${counts.JSON_PARSE_ERROR}, SCHEMA_INVALID=${counts.SCHEMA_INVALID}). ` +
+    `이 조회 결과는 완전한 기록이 아닐 수 있습니다.`
+  );
 }
 
 // Phase G Task G2 — Production EventStore 연결. AUTOMATION_DRY_RUN이 명시적으로 "false"일

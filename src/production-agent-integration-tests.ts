@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { runAutodevOnce, runPreDevelopmentAdvisory, runPostDevelopmentAdvisory } from "./autodev";
+import { runOrchestrator } from "./orchestrator";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -10,7 +11,7 @@ import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 import type { ReadOnlyAgentRunner } from "./agent-orchestrator";
 import { createInMemoryEventStore } from "./event-store";
-import type { EventStore } from "./event-store";
+import type { EventStore, AuditWritableCheck } from "./event-store";
 import { isAuditCriticalEvent } from "./observability-event";
 
 // Production Pipeline Integration & Review Policy 단일화 테스트(Phase F Task F4/F4.1). 실제
@@ -616,6 +617,163 @@ async function scenarioAuditCriticalAppendFailureNotFailOpen(): Promise<void> {
     "audit-critical 실패: 조용히 무시되지 않고 deferredHumanTasks에 AUDIT_EVENT_LOST로 surface됨",
     finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST"))
   );
+  // Phase G Task G2.1 — final-state 경계(CHECKPOINT_CREATED/TASK_COMPLETED/RUN_COMPLETED)
+  // 셋 다 개별적으로 실패가 surface돼야 한다 — 그중 하나라도 조용히 "정상 성공"처럼 넘어가지
+  // 않는다(§ 요구사항 5: final state audit 실패를 성공으로 조용히 보고하지 않음).
+  check(
+    "audit-critical 실패: CHECKPOINT_CREATED 기록 실패가 개별적으로 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST(CHECKPOINT_CREATED)"))
+  );
+  check(
+    "audit-critical 실패: TASK_COMPLETED 기록 실패가 개별적으로 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST(TASK_COMPLETED)"))
+  );
+  check(
+    "audit-critical 실패: RUN_COMPLETED 기록 실패가 개별적으로 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST(RUN_COMPLETED)"))
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase G Task G2.1 — telemetry event(REVIEW_STARTED 등, isAuditCriticalEvent가 false)의
+// 기록 실패는 warning 로그만 남기고 run은 정상 진행되며, deferredHumanTasks에는 아무것도
+// 남지 않는다(audit-critical과 정책이 명확히 다름을 증명한다 — § 요구사항 1).
+// ---------------------------------------------------------------------------
+function makeTelemetryFailingEventStore(): EventStore {
+  const inner = createInMemoryEventStore();
+  return {
+    append(input) {
+      if (!isAuditCriticalEvent(input.eventType)) {
+        return { ok: false, error: "SIMULATED_TELEMETRY_SINK_DOWN" };
+      }
+      return inner.append(input);
+    },
+    query: (filter) => inner.query(filter),
+  };
+}
+
+async function scenarioTelemetryFailureDoesNotBlockRun(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const events = makeTelemetryFailingEventStore();
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+
+  check("telemetry 실패: run outcome은 정상 진행됨(APPROVED_AND_CHECKPOINTED)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "telemetry 실패: deferredHumanTasks에 아무 항목도 추가되지 않음(audit-critical과 달리 사람에게 남기지 않음)",
+    finalState.deferredHumanTasks.length === 0
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase G Task G2.1 — checkpoint(git commit) 전에 audit-critical 저장소가 사용 불가능하다고
+// 확인되면(§ EventStore.checkAuditWritable) commit 자체를 시도하지 않는다 — 이미 만들어진
+// commit을 되돌리는 대신, 되돌릴 수 없는 경계 이전에 막는다(§ 요구사항: checkpoint 전
+// audit-critical 저장소 사용불가가 확인되면 commit/checkpoint를 진행하지 않는다).
+// ---------------------------------------------------------------------------
+function makeAuditUnwritableEventStore(): EventStore {
+  const inner = createInMemoryEventStore();
+  return {
+    append: (input) => inner.append(input),
+    query: (filter) => inner.query(filter),
+    checkAuditWritable: (): AuditWritableCheck => ({ ok: false, error: "SIMULATED_STORE_UNAVAILABLE" }),
+  };
+}
+
+function commitCount(repo: string): number {
+  const res = spawnSync("git", ["rev-list", "--count", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  return Number((res.stdout || "0").trim());
+}
+
+async function scenarioAuditStoreUnavailableBeforeCheckpointBlocksCommit(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const events = makeAuditUnwritableEventStore();
+  const commitsBefore = commitCount(repo);
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+
+  check("audit store 사용 불가(사전 확인): outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check("audit store 사용 불가(사전 확인): git commit이 전혀 만들어지지 않음(commit 수 불변)", commitCount(repo) === commitsBefore);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("audit store 사용 불가(사전 확인): status가 WAITING_HUMAN으로 전환됨", finalState.status === "WAITING_HUMAN");
+  check(
+    "audit store 사용 불가(사전 확인): deferredHumanTasks에 AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT로 명확히 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT"))
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase G Task G2.1 — SECURITY_BLOCKED(secret 발견으로 checkpoint 자체가 BLOCK된 경로)의
+// audit 기록이 실패해도 원래의 Security BLOCK이 반대로 풀리지 않는다 — audit 실패는 추가
+// 정보로만 덧붙는다(§ 요구사항: SECURITY_BLOCKED 기록 실패 → 원래 Security BLOCK 유지 →
+// 추가로 audit 실패를 표시).
+// ---------------------------------------------------------------------------
+async function scenarioSecurityBlockedAuditFailureKeepsBlock(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    // 파일명에 "secret"이 들어가면 git-changes.ts의 SECRET_NAME_PATTERNS가 commit 대상
+    // 목록에 들어오기도 전에 걸러내(§ isExcludedPath) content 기반 secret-scanner 게이트를
+    // 검증할 수 없다 — 그래서 무해한 파일명에 secret-shape "내용"만 담는다.
+    writeRepoFile(repo, "proj/config.txt", 'const key = "sk-ant-verysecretvalue1234567890";\n');
+    return { success: true, summary: "구현 완료", changedFiles: ["proj/config.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+  const events = makeAuditFailingEventStore();
+  const commitsBefore = commitCount(repo);
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+
+  check("SECURITY_BLOCKED + audit 실패: outcome=RAN_TASK_CHECKPOINT_BLOCKED(원래 Security BLOCK 유지)", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check("SECURITY_BLOCKED + audit 실패: secret이 담긴 commit이 만들어지지 않음(commit 수 불변)", commitCount(repo) === commitsBefore);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("SECURITY_BLOCKED + audit 실패: status가 WAITING_HUMAN으로 유지됨", finalState.status === "WAITING_HUMAN");
+  check(
+    "SECURITY_BLOCKED + audit 실패: 원래의 CHECKPOINT_BLOCKED(secret) 사유가 그대로 남음",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("CHECKPOINT_BLOCKED") && t.includes(taskDef.id))
+  );
+  check(
+    "SECURITY_BLOCKED + audit 실패: 추가로 audit 기록 실패도 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST(SECURITY_BLOCKED)"))
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase G Task G2.1 — orchestrator.ts의 고위험 사전 게이트(HUMAN_APPROVAL_REQUIRED, Claude
+// worker 호출 전 즉시 WAITING_HUMAN)에서도 audit 기록 실패가 승인대기 상태를 풀어주지
+// 않는다 — setStatus("WAITING_HUMAN")가 emitEvent보다 먼저 실행되므로, event append가
+// 실패해도 이미 확정된 상태 전이는 그대로 유지된다(§ 요구사항: human approval event 실패
+// → 승인대기 상태 유지 + audit failure 표시).
+// ---------------------------------------------------------------------------
+async function scenarioHumanApprovalGateAuditFailureKeepsWaiting(): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "autodev-g21-human-approval-"));
+  tempDirs.push(dir);
+  const statePath = join(dir, "project-state.json");
+  writeFileSync(statePath, JSON.stringify(baseState({ status: "IDLE" })) + "\n", "utf-8");
+  const events = makeAuditFailingEventStore();
+
+  const { finalState } = await runOrchestrator("production DB에서 고객 데이터를 삭제해줘", {
+    statePath,
+    events,
+    runId: "run-g21-human-approval",
+    taskId: "T-human-approval",
+  });
+
+  check("고위험 사전 게이트 + audit 실패: status가 WAITING_HUMAN으로 유지됨", finalState.status === "WAITING_HUMAN");
+  check(
+    "고위험 사전 게이트 + audit 실패: HUMAN_APPROVAL_REQUIRED 기록 실패가 surface됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("AUDIT_EVENT_LOST(HUMAN_APPROVAL_REQUIRED)"))
+  );
 }
 
 async function main(): Promise<void> {
@@ -641,6 +799,10 @@ async function main(): Promise<void> {
     await scenarioMaxCycleExhaustedRecordsAuditEvents();
     await scenarioAdvisoryAgentsRecordAgentEvents();
     await scenarioAuditCriticalAppendFailureNotFailOpen();
+    await scenarioTelemetryFailureDoesNotBlockRun();
+    await scenarioAuditStoreUnavailableBeforeCheckpointBlocksCommit();
+    await scenarioSecurityBlockedAuditFailureKeepsBlock();
+    await scenarioHumanApprovalGateAuditFailureKeepsWaiting();
   } finally {
     for (const d of tempDirs) {
       try {

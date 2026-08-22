@@ -78,6 +78,19 @@ import type { CoreState, ClaudeResult } from "./types";
 // deferredHumanTasks에 남긴다 — 새로운 저장 경로를 만들지 않는다. 그 외 telemetry
 // event 실패는 log() 경고만 남기고 실행을 막지 않는다.
 //
+// Phase G Task G2.1 — Audit-Critical Delivery Fail-Closed Hardening. G2까지는 audit-critical
+// event 기록 실패가 항상 "사후 surface"(이미 벌어진 일을 deferredHumanTasks에 남기는 것)
+// 였다 — CHECKPOINT_CREATED/TASK_COMPLETED/RUN_COMPLETED는 git commit(performTaskCheckpoint)
+// 이 이미 끝난 뒤에야 기록을 시도하므로, 그 기록이 실패해도 commit 자체를 막을 방법이
+// 없었다. 이미 만들어진 commit을 자동으로 되돌리는 구조는 만들지 않기로 했으므로(§
+// 요구사항), 대신 commit "이전"에 audit-critical 저장소가 지금 실제로 쓰기 가능한지
+// 부수효과 없이 미리 확인한다(§ EventStore.checkAuditWritable, event-store.ts). 사용
+// 불가능하다고 확인되면 git을 전혀 건드리지 않고 checkpoint 자체를 진행하지 않는다(아래
+// checkpoint 직전의 auditHealth 검사). 이미 WAITING_HUMAN으로 확정된 경로(SECURITY_BLOCKED/
+// REVIEW_BLOCKED/REVIEW_CYCLE_EXHAUSTED/고위험 사전 게이트)는 audit 기록이 실패해도 그
+// 상태 전이가 먼저 확정된 뒤에 emitEvent를 호출하는 기존 순서 그대로다 — audit 실패가 이미
+// 내려진 BLOCK 판정을 반대로 풀어주는 경로는 이 파일 어디에도 없다.
+//
 // AutoDev 범용화 Phase A Task A7 — 이 파일은 이제 MOVAN을 전혀 모른다. project-manifests/
 // movan.ts를 import하지 않고, ProjectManifest를 기본값 없이 항상 호출부가 명시적으로
 // 주입해야만 동작한다(runAutodevOnce(opts) — opts.manifest는 필수). manifest를 지정하지
@@ -495,6 +508,63 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   // 이미 적용했지만(§ 요구사항 6), checkpoint 직전에도 다시 한번 독립적으로 확인한다.
   const tests = finalState.lastClaudeResult?.tests ?? [];
   const requiredTestsAllPassed = tests.length > 0 && tests.every((t) => t.pass);
+
+  // Phase G Task G2.1 — checkpoint(git commit)는 되돌릴 수 없는 경계다. commit 이후에
+  // CHECKPOINT_CREATED/TASK_COMPLETED/RUN_COMPLETED 기록이 실패해도 이미 만들어진 commit을
+  // 자동으로 reset/rewrite하지 않는다(§ 요구사항 — 이미 생성된 commit을 되돌리는 구조는
+  // 만들지 않는다). 그래서 이 경계는 사전에 막는다: audit-critical 저장소가 지금 실제로
+  // 쓰기 가능한지 부수효과 없는 점검(§ EventStore.checkAuditWritable)으로 먼저 확인하고,
+  // 사용 불가능하다고 확인되면 git을 전혀 건드리지 않고 checkpoint 자체를 진행하지 않는다.
+  // events가 지정되지 않았거나(테스트/dry-run) 이 메서드를 구현하지 않는 store는 항상 사용
+  // 가능한 것으로 간주한다(기존 동작 100% 보존).
+  const auditHealth = events?.checkAuditWritable?.() ?? { ok: true };
+  if (!auditHealth.ok) {
+    log("checkpoint 금지 — checkpoint 전 audit-critical 저장소 사용 불가 확인됨(commit 시도 안 함)", {
+      taskId: taskDef.id,
+      error: auditHealth.error,
+    });
+    emitEvent(
+      events,
+      {
+        eventType: "HUMAN_APPROVAL_REQUIRED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "checkpoint",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reason: `AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT: ${auditHealth.error ?? "unknown"}`,
+      },
+      auditFailures
+    );
+    emitEvent(
+      events,
+      {
+        eventType: "RUN_BLOCKED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "checkpoint",
+        outcome: "BLOCKED",
+        reason: "audit-critical 저장소 사용 불가로 checkpoint를 진행하지 않았습니다.",
+      },
+      auditFailures
+    );
+    const afterOrchestrator = loadState(statePath);
+    afterOrchestrator.status = "WAITING_HUMAN";
+    afterOrchestrator.deferredHumanTasks.push(
+      `AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT(${taskDef.id}): ${auditHealth.error ?? "unknown"} — audit-critical 저장소를 쓸 수 없어 commit을 시도하지 않았습니다.`,
+      ...auditFailures
+    );
+    saveState(afterOrchestrator, statePath);
+    return {
+      outcome: "RAN_TASK_CHECKPOINT_BLOCKED",
+      taskId: taskDef.id,
+      orchestratorStatus: String(finalState.status),
+      reason: "audit-critical 저장소 사용 불가로 checkpoint를 진행하지 않았습니다.",
+      ...agentAdvisoryField,
+    };
+  }
 
   const stateRelPath = computeStateRelPath(statePath, cwd);
   const checkpoint = performTaskCheckpoint(taskDef, {
