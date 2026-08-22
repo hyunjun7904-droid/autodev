@@ -23,11 +23,12 @@ import { TASK_ID_PATTERN } from "./self-dev-completion";
 // git-tracked 상태가 아니므로 이 선언 자체가 "완료됐다"는 증거가 되지 않는다(여전히
 // self-dev-complete.ts의 deterministic 재검증만이 TASK_COMPLETED를 만든다).
 //
-// baseHeadHash(선언 시점의 HEAD)를 함께 기록해두는 이유: 이전 Task에서 남긴 stale
-// context(예: 실패해서 지워지지 않은 선언, 또는 사람이 지우는 걸 잊음)가 그 이후 벌어진
-// *다른* 무관한 commit/push에 잘못 달라붙는 것을 막는다 — hook은 현재 HEAD가
-// baseHeadHash와 여전히 같으면("이 Task를 위한 새 commit이 아직 없다") 트리거하지 않는다
-// (§ self-dev-completion-hook.ts).
+// baseHeadHash(선언 시점의 HEAD)는 감사/진단용 메타데이터로 함께 기록한다 — hook의 트리거
+// 판정에는 쓰지 않는다(§ self-dev-completion-hook.ts 주석 — "선언 이후 새 commit이
+// 있어야만 트리거"로 만들면, self-dev:begin을 commit 직후/push 직전에 실행하는 것도(권장
+// 순서보다 한 박자 늦게 선언한 정상적인 경우) 매번 오탐으로 막히기 때문이다). "선언이
+// 실제로 이 push/commit에 대응하는가"는 pushRequired 일치 여부로 걸러지고, 최종 완료
+// 여부는 self-dev-complete.ts의 deterministic 재검증이 판정한다.
 
 export const SELF_DEV_TASK_CONTEXT_DIR = ".autodev-self-dev";
 export const SELF_DEV_TASK_CONTEXT_FILENAME = "current-task.local.json";

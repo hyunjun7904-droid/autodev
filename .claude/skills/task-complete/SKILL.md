@@ -67,7 +67,7 @@ uncommitted 작업이 있는지 먼저 확인한다 — 사용자의 명시적 �
 
 **4) build.** `npm run build` (또는 동일한 이유로 `node node_modules/typescript/bin/tsc`).
 
-**5) Self-Dev Task Context 선언 — commit 직전, 반드시 이 순서.**
+**5) Self-Dev Task Context 선언 — commit 전후 아무 때나(늦어도 push 전까지).**
 
 ```
 npm run self-dev:begin -- --task-id <TaskId> [--push]

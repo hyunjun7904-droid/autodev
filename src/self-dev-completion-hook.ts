@@ -1,7 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { getCurrentHeadHash } from "./git-changes";
 import { isTaskContextError, readSelfDevTaskContext, clearSelfDevTaskContext } from "./self-dev-task-context";
 
 // Self-Dev Completion Bridge — 자동 트리거 판정(Phase G Task G7.3.1b, Self-Dev Completion
@@ -64,16 +63,14 @@ export function decideSelfDevCompletionTrigger(input: HookDecisionInput): HookDe
     return { trigger: false, reason: "이 Task는 push가 필요하지 않습니다 — commit 시점에 트리거되며, push 단독으로는 트리거하지 않습니다." };
   }
 
-  const currentHead = getCurrentHeadHash(input.repoRoot);
-  if (!currentHead) {
-    return { trigger: false, reason: "git HEAD를 확인할 수 없습니다." };
-  }
-  if (currentHead === context.baseHeadHash) {
-    return {
-      trigger: false,
-      reason: "self-dev:begin 선언 이후 새 commit이 없습니다(stale context로 판단) — 자동 트리거하지 않습니다.",
-    };
-  }
+  // context.baseHeadHash(선언 시점 HEAD)를 여기서 currentHead와 비교해 "선언 이후 새
+  // commit이 없으면 stale"로 거부하지 않는다 — 그렇게 하면 self-dev:begin을 commit *직후*,
+  // push *직전*에 실행하는 것도(§ SKILL.md step 5가 요구하는 순서보다 한 박자 늦게 선언한
+  // 경우) 매번 오탐으로 막히게 된다: 이 경우 currentHead === baseHeadHash가 정상이고,
+  // 여전히 유효한 완료 선언이다. baseHeadHash는 감사/진단용 메타데이터로만 남긴다.
+  // "선언이 실제로 이 push/commit에 대응하는가"는 이미 위에서 pushRequired 일치 여부로
+  // 걸러졌고, 최종적으로는 self-dev-complete.ts의 deterministic 재검증(commit/push가 실제로
+  // 반영됐는지까지 포함)이 완료 여부를 판정하므로 여기서 추가 추측을 하지 않는다.
 
   return { trigger: true, taskId: context.taskId, pushRequired: context.pushRequired, reason: "completion workflow 트리거 조건을 충족했습니다." };
 }

@@ -117,15 +117,17 @@ function scenarioCommitOnlyIgnoresPush(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 7) 새 commit이 없음(stale context) → 트리거하지 않는다
+// 7) commit *직후*(push 직전)에 선언해도(baseHeadHash === 현재 HEAD) 정상적으로 트리거한다
+//    — self-dev:begin을 SKILL.md가 권장하는 순서(commit 전)보다 한 박자 늦게, commit
+//    직후에 실행한 경우에도 오탐으로 막히면 안 된다(§ self-dev-completion-hook.ts 주석).
 // ---------------------------------------------------------------------------
-function scenarioStaleContextNeverTriggers(): void {
-  const dir = makeGitRepo("sdch-stale-");
+function scenarioDeclareAfterCommitStillTriggers(): void {
+  const dir = makeGitRepo("sdch-declare-after-commit-");
+  // 먼저 "완료용" commit을 만들고, 그 다음에야 context를 선언한다(권장 순서의 역순).
+  commitMore(dir, "a.txt");
   writeSelfDevTaskContext(dir, { taskId: "G7.3.1b", pushRequired: true });
-  // 새 commit을 만들지 않고 곧바로 push 시도
   const decision = decideSelfDevCompletionTrigger({ command: "git push origin main", repoRoot: dir });
-  check("7) 선언 이후 새 commit이 없음 → trigger=false(stale)", decision.trigger === false);
-  check("7) reason에 stale 관련 안내 포함", !decision.trigger && decision.reason.includes("새 commit이 없습니다"));
+  check("7) commit 직후 선언(baseHeadHash===현재 HEAD) → trigger=true(오탐 없음)", decision.trigger === true);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +244,7 @@ function main(): void {
   scenarioPushRequiredTriggersOnPush();
   scenarioCommitOnlyTriggersOnCommit();
   scenarioCommitOnlyIgnoresPush();
-  scenarioStaleContextNeverTriggers();
+  scenarioDeclareAfterCommitStillTriggers();
   scenarioCorruptedContextNeverTriggers();
   scenarioChainedCommandDetectsPush();
   scenarioRunHookSkipsRunnerWhenNotTriggered();
