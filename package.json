@@ -46,6 +46,7 @@
     "test:event-store": "npm run build && node dist/event-store-tests.js",
     "test:metrics": "npm run build && node dist/metrics-tests.js",
     "test:usage-telemetry": "npm run build && node dist/usage-telemetry-tests.js",
+    "test:live-snapshot": "npm run build && node dist/live-snapshot-tests.js",
     "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
   },
   "devDependencies": {
