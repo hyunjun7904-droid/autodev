@@ -1,7 +1,7 @@
 import { resolve, dirname, extname } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { validateProjectManifest } from "./project-manifest";
-import type { ProjectManifest } from "./project-manifest";
+import type { ProjectManifest, RemoteGitSafetyPolicy } from "./project-manifest";
 import { validateProjectExecutionPolicy } from "./project-policy";
 import type { ProjectExecutionPolicy, AllowedCommandSpec } from "./project-policy";
 import type { TaskDefinition, RequiredTestCommand } from "./task-registry";
@@ -163,6 +163,24 @@ function buildExecutionPolicyFromData(raw: unknown, projectLabel: string): Proje
   return policy;
 }
 
+// Phase G Task G7.3.1a — project config의 remoteGitSafety(raw JSON)를 RemoteGitSafetyPolicy로
+// 읽는다. project-manifest.ts가 이 필드의 shape(remoteName/expectedBranch)에 대한 source of
+// truth다 — 이 함수는 그 두 필드만 그대로 옮기고(추측/추가 필드 생성 없음), 실제 타입/값 검증은
+// validateProjectManifest()(project-manifest.ts)의 validateRemoteGitSafetyPolicy()에 전부
+// 위임한다(이 파일이 그 검증 규칙을 다시 만들지 않는다 — § buildExecutionPolicyFromData와
+// 동일한 관례). raw.remoteGitSafety가 없으면 undefined를 그대로 반환해 기존 manifest(이 필드
+// 없음)의 동작(Gate 비활성)을 완전히 보존한다.
+function buildRemoteGitSafetyFromData(raw: unknown, projectLabel: string): RemoteGitSafetyPolicy | undefined {
+  if (raw === undefined) return undefined;
+  if (!isPlainObject(raw)) {
+    throw new Error(`Invalid project config(${projectLabel}): remoteGitSafety가 비어있거나 객체가 아닙니다.`);
+  }
+  return {
+    ...(raw.remoteName !== undefined ? { remoteName: raw.remoteName as string } : {}),
+    ...(raw.expectedBranch !== undefined ? { expectedBranch: raw.expectedBranch as string } : {}),
+  };
+}
+
 function buildTaskDefinitionFromData(raw: unknown, index: number, projectLabel: string): TaskDefinition {
   if (!isPlainObject(raw)) {
     throw new Error(`Invalid project config(${projectLabel}): taskRegistry[${index}]가 객체가 아닙니다.`);
@@ -275,6 +293,7 @@ export function loadProjectAdapter(adapterPath: string | undefined): ProjectMani
   const statePath = resolveConfigRelativePath(configDir, raw.statePath, "statePath", { allowParentEscape: false });
   const taskRegistry = loadTaskRegistry(configDir, raw, projectLabel);
   const executionPolicy = buildExecutionPolicyFromData(raw.executionPolicy, projectLabel);
+  const remoteGitSafety = buildRemoteGitSafetyFromData(raw.remoteGitSafety, projectLabel);
 
   const manifest: ProjectManifest = {
     projectId: raw.projectId as string,
@@ -287,6 +306,7 @@ export function loadProjectAdapter(adapterPath: string | undefined): ProjectMani
     reviewScopeDirs: raw.reviewScopeDirs as string[],
     executionPolicy,
     ...(raw.rulesPath !== undefined ? { rulesPath: raw.rulesPath as string } : {}),
+    ...(remoteGitSafety !== undefined ? { remoteGitSafety } : {}),
   };
 
   validateProjectManifest(manifest);

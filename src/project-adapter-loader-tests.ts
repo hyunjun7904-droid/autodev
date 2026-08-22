@@ -1,9 +1,11 @@
 import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
+import { spawnSync } from "node:child_process";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { configureSafeExecutor, validateReadPath, validateWritePath } from "./safe-executor";
-import { decideNextAction } from "./autodev";
+import { decideNextAction, runAutodevOnce } from "./autodev";
+import type { ClaudeResult } from "./types";
 
 // AutoDev 범용화 Phase C Task C1 — External Project Adapter를 data-only(JSON)로 전환한
 // project-adapter-loader.ts 검증.
@@ -445,6 +447,209 @@ function relativeFromTo(fromDir: string, toDir: string): string {
   return relative(fromDir, toDir).split(sep).join("/");
 }
 
+// ---------------------------------------------------------------------------
+// M~T) Phase G Task G7.3.1a — Project Adapter RemoteGitSafety Passthrough Fix.
+//
+// project-adapter-loader.ts가 raw project config(.autodev/manifest.json)의 remoteGitSafety
+// 필드를 ProjectManifest로 전달하지 않아, 실제 run.ts → loadProjectAdapter() production
+// 경로에서 manifest.remoteGitSafety가 항상 undefined였던 data-path gap을 고정한다.
+// ---------------------------------------------------------------------------
+function baseRemoteGitSafetyConfigFields(dir: string, fixtureRoot: string): Record<string, unknown> {
+  return {
+    projectId: "rgs-passthrough-project",
+    projectName: "RGS Passthrough Project",
+    targetProjectRoot: relativeFromTo(dir, fixtureRoot),
+    statePath: "project-state.json",
+    taskRegistry: [VALID_FIXTURE_TASK],
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+  };
+}
+
+function scenarioRemoteGitSafetyAbsentIsUndefined(): void {
+  const dir = makeTempDir("autodev-adapter-loader-rgs-absent-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-absent-root-");
+  const configPath = writeJson(dir, "manifest.json", baseRemoteGitSafetyConfigFields(dir, fixtureRoot));
+  const manifest = loadProjectAdapter(configPath);
+  check("M) remoteGitSafety가 없는 project config → manifest.remoteGitSafety === undefined(backward compatible)", manifest.remoteGitSafety === undefined);
+}
+
+function scenarioRemoteGitSafetyValidPassesThrough(): void {
+  const dir = makeTempDir("autodev-adapter-loader-rgs-valid-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-valid-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+    remoteGitSafety: { remoteName: "upstream", expectedBranch: "release" },
+  });
+  const manifest = loadProjectAdapter(configPath);
+  check("N) valid remoteGitSafety가 loader 결과(ProjectManifest)에 그대로 존재함", manifest.remoteGitSafety !== undefined);
+  check("N) remoteGitSafety.remoteName이 그대로 passthrough됨", manifest.remoteGitSafety?.remoteName === "upstream");
+  check("N) remoteGitSafety.expectedBranch가 그대로 passthrough됨", manifest.remoteGitSafety?.expectedBranch === "release");
+
+  const dir2 = makeTempDir("autodev-adapter-loader-rgs-partial-");
+  const configPath2 = writeJson(dir2, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir2, fixtureRoot),
+    remoteGitSafety: {},
+  });
+  const manifest2 = loadProjectAdapter(configPath2);
+  check("N) remoteGitSafety={}(필드 전부 optional)도 정상적으로 로드되어 존재함", manifest2.remoteGitSafety !== undefined);
+  check("N) 지정하지 않은 remoteName은 undefined로 유지됨(호출부 DEFAULT_REMOTE_NAME 책임)", manifest2.remoteGitSafety?.remoteName === undefined);
+}
+
+function scenarioRemoteGitSafetyInvalidRemoteNameFailsFast(): void {
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-bad-remote-root-");
+
+  const dir1 = makeTempDir("autodev-adapter-loader-rgs-bad-remote-empty-");
+  const configPath1 = writeJson(dir1, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir1, fixtureRoot),
+    remoteGitSafety: { remoteName: "" },
+  });
+  let threwEmpty = false;
+  try {
+    loadProjectAdapter(configPath1);
+  } catch {
+    threwEmpty = true;
+  }
+  check("P) remoteGitSafety.remoteName이 빈 문자열이면 즉시 실패(fail-closed, silent disable 아님)", threwEmpty);
+
+  const dir2 = makeTempDir("autodev-adapter-loader-rgs-bad-remote-type-");
+  const configPath2 = writeJson(dir2, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir2, fixtureRoot),
+    remoteGitSafety: { remoteName: 123 },
+  });
+  let threwType = false;
+  try {
+    loadProjectAdapter(configPath2);
+  } catch {
+    threwType = true;
+  }
+  check("P) remoteGitSafety.remoteName이 문자열이 아니면 즉시 실패(fail-closed)", threwType);
+}
+
+function scenarioRemoteGitSafetyInvalidExpectedBranchFailsFast(): void {
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-bad-branch-root-");
+
+  const dir1 = makeTempDir("autodev-adapter-loader-rgs-bad-branch-empty-");
+  const configPath1 = writeJson(dir1, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir1, fixtureRoot),
+    remoteGitSafety: { expectedBranch: "" },
+  });
+  let threwEmpty = false;
+  try {
+    loadProjectAdapter(configPath1);
+  } catch {
+    threwEmpty = true;
+  }
+  check("Q) remoteGitSafety.expectedBranch가 빈 문자열이면 즉시 실패(fail-closed)", threwEmpty);
+
+  const dir2 = makeTempDir("autodev-adapter-loader-rgs-bad-branch-type-");
+  const configPath2 = writeJson(dir2, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir2, fixtureRoot),
+    remoteGitSafety: { expectedBranch: 42 },
+  });
+  let threwType = false;
+  try {
+    loadProjectAdapter(configPath2);
+  } catch {
+    threwType = true;
+  }
+  check("Q) remoteGitSafety.expectedBranch가 문자열이 아니면 즉시 실패(fail-closed)", threwType);
+}
+
+function scenarioRemoteGitSafetyInvalidShapeFailsClosed(): void {
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-bad-shape-root-");
+  const badValues: unknown[] = ["origin", 123, ["origin"], null];
+  for (let i = 0; i < badValues.length; i++) {
+    const dir = makeTempDir(`autodev-adapter-loader-rgs-bad-shape-${i}-`);
+    const configPath = writeJson(dir, "manifest.json", {
+      ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+      remoteGitSafety: badValues[i],
+    });
+    let threw = false;
+    try {
+      loadProjectAdapter(configPath);
+    } catch {
+      threw = true;
+    }
+    check(`R) remoteGitSafety가 object shape이 아니면(${JSON.stringify(badValues[i])}) 즉시 실패(fail-closed)`, threw);
+  }
+}
+
+function scenarioRemoteGitSafetyValidConfigPassesManifestValidation(): void {
+  const dir = makeTempDir("autodev-adapter-loader-rgs-manifest-valid-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-rgs-manifest-valid-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+    remoteGitSafety: { remoteName: "origin", expectedBranch: "main" },
+  });
+  let threw = false;
+  let manifestOk = false;
+  try {
+    const manifest = loadProjectAdapter(configPath);
+    manifestOk = manifest.projectId === "rgs-passthrough-project";
+  } catch {
+    threw = true;
+  }
+  check("S) valid remoteGitSafety를 포함한 manifest가 validateProjectManifest()를 그대로 통과함(예외 없음)", !threw && manifestOk);
+}
+
+// T) [E2E] loader가 반환한 manifest.remoteGitSafety를 실제 runAutodevOnce()가 사용하는지
+//    확인한다 — remote가 없는 temp git repo이므로 Gate가 NO_REMOTE로 fail-closed BLOCK한다
+//    (실제 GitHub remote/네트워크 호출 없음). Claude worker가 호출되면 안 된다는 것까지 함께
+//    증명한다(Gate가 loadState/orchestrator보다 먼저 막는다 — § autodev.ts).
+async function scenarioRemoteGitSafetyVisibleToRunAutodevOnce(): Promise<void> {
+  const dir = makeTempDir("autodev-adapter-loader-rgs-e2e-");
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "AutoDev Test"], { cwd: dir });
+  writeText(dir, ".gitkeep", "");
+  spawnSync("git", ["add", "--", ".gitkeep"], { cwd: dir });
+  spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: dir });
+
+  writeJson(dir, "task-registry.json", [VALID_FIXTURE_TASK]);
+  writeJson(dir, "project-state.json", {
+    currentPhase: 1,
+    gitCheckpoint: "test",
+    currentTask: null,
+    reviewCycle: 0,
+    lastClaudeResult: null,
+    lastGptDecision: null,
+    status: "READY",
+    claudeLimitWaitCount: 0,
+    deferredHumanTasks: [],
+    completedTasks: [],
+  });
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "rgs-e2e-project",
+    projectName: "RGS E2E Project",
+    targetProjectRoot: ".",
+    statePath: "project-state.json",
+    taskRegistryPath: "task-registry.json",
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+    remoteGitSafety: {},
+  });
+
+  const manifest = loadProjectAdapter(configPath);
+  check("T) [E2E] loader 결과에 remoteGitSafety가 존재함(runAutodevOnce에 넘기기 전 사전조건)", manifest.remoteGitSafety !== undefined);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner } });
+  check(
+    "T) [E2E] loader→runAutodevOnce data path: remote가 없으면 outcome=BLOCKED_REMOTE_GIT(Gate가 실제로 remoteGitSafety를 봄)",
+    result.outcome === "BLOCKED_REMOTE_GIT"
+  );
+  check("T) [E2E] Gate가 막았으므로 Claude worker가 전혀 호출되지 않음", claudeCalls === 0);
+}
+
 async function main(): Promise<void> {
   try {
     scenarioMissingAdapterPathFailsFast();
@@ -459,6 +664,13 @@ async function main(): Promise<void> {
     scenarioTaskRegistrySourceAmbiguityFailsFast();
     scenarioPathEscapeFailsFast();
     scenarioValidFixtureConfigLoadsSuccessfully();
+    scenarioRemoteGitSafetyAbsentIsUndefined();
+    scenarioRemoteGitSafetyValidPassesThrough();
+    scenarioRemoteGitSafetyInvalidRemoteNameFailsFast();
+    scenarioRemoteGitSafetyInvalidExpectedBranchFailsFast();
+    scenarioRemoteGitSafetyInvalidShapeFailsClosed();
+    scenarioRemoteGitSafetyValidConfigPassesManifestValidation();
+    await scenarioRemoteGitSafetyVisibleToRunAutodevOnce();
   } finally {
     for (const dir of tempDirs) {
       try {
