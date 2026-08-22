@@ -45,14 +45,19 @@ export interface SecretScanResult {
   findings: SecretFinding[];
 }
 
-interface ContentPattern {
+export interface ContentPattern {
   kind: SecretFindingKind;
   regex: RegExp;
 }
 
 // 각 정규식은 전역(g) 플래그를 쓰지 않는다 — .test()를 여러 줄에 반복 호출해도 lastIndex
 // 상태를 공유하지 않게 하기 위함(전역 플래그 재사용 시 흔한 버그를 피한다).
-const CONTENT_PATTERNS: ContentPattern[] = [
+//
+// Phase G Task G1 — observability-event.ts가 audit event payload의 secret-shape 텍스트
+// 값을 redact할 때 이 배열을 그대로 재사용한다(단일 출처, 목록 복제 금지). 이 배열은 여기
+// export되지만, 그 사실이 이 Task 범위 밖에서 새로운 secret 판정 로직을 만들어도 된다는
+// 뜻은 아니다 — 항상 여기서 import해서 쓴다.
+export const SECRET_CONTENT_PATTERNS: ContentPattern[] = [
   { kind: "private-key-header", regex: /-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----/ },
   { kind: "cloud-provider-key", regex: /\bAKIA[0-9A-Z]{16}\b/ },
   { kind: "generic-api-key", regex: /\bsk-(ant-)?[A-Za-z0-9_-]{20,}\b/ },
@@ -70,7 +75,7 @@ export function scanContentForSecrets(content: string, filePath: string): Secret
   const lines = content.split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    for (const { kind, regex } of CONTENT_PATTERNS) {
+    for (const { kind, regex } of SECRET_CONTENT_PATTERNS) {
       if (regex.test(line)) {
         findings.push({ file: filePath, line: i + 1, kind });
       }

@@ -9,6 +9,7 @@ import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 import type { ReadOnlyAgentRunner } from "./agent-orchestrator";
+import { createInMemoryEventStore } from "./event-store";
 
 // Production Pipeline Integration & Review Policy 단일화 테스트(Phase F Task F4/F4.1). 실제
 // Claude/GPT 유료 API를 전혀 호출하지 않는다 — claudeRunner/gptReviewer/advisoryReadOnlyRunner는
@@ -453,6 +454,96 @@ async function scenarioReviewerErrorNotFailOpen(): Promise<void> {
   check("reviewer 오류: checkpoint가 시도되지 않음", result.checkpoint === undefined);
 }
 
+// ---------------------------------------------------------------------------
+// Phase G Task G1 — Observability & Audit production seam을 실제 runAutodevOnce() 호출로
+// "fake integration"한다: opts.events(in-memory EventStore)를 주입해 실제 run/task/test/
+// reviewer/checkpoint event가 기록되는지 증명한다. opts.events를 지정하지 않는 나머지
+// 모든 시나리오는 이 파일 전체에서 event를 전혀 만들지 않는다는 것도 이미 그 시나리오들이
+// 계속 정상 통과한다는 사실 자체로 증명된다(seam이 기본적으로 완전한 no-op).
+// ---------------------------------------------------------------------------
+async function scenarioApprovedRunRecordsRealEvents(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const events = createInMemoryEventStore();
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+
+  check("event 기록(정상 승인): outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  const all = events.query();
+  const types = all.map((e) => e.eventType);
+  check("event 기록: RUN_STARTED가 기록됨", types.includes("RUN_STARTED"));
+  check("event 기록: TASK_STARTED가 기록됨", types.includes("TASK_STARTED"));
+  check("event 기록: TEST_COMPLETED가 기록됨(outcome=SUCCESS)", all.some((e) => e.eventType === "TEST_COMPLETED" && e.outcome === "SUCCESS"));
+  check("event 기록: REVIEW_APPROVED가 기록됨", types.includes("REVIEW_APPROVED"));
+  check("event 기록: CHECKPOINT_CREATED가 기록됨", types.includes("CHECKPOINT_CREATED"));
+  check("event 기록: RUN_COMPLETED가 기록됨", types.includes("RUN_COMPLETED"));
+  check("event 기록: 모든 event가 동일 runId를 공유함(correlation)", new Set(all.map((e) => e.runId)).size === 1);
+  check(
+    "event 기록: taskId가 있는 event는 모두 동일 taskId를 공유함(RUN_STARTED는 task 선택 전이라 taskId가 없음)",
+    all.filter((e) => e.eventType !== "RUN_STARTED").every((e) => e.taskId === taskDef.id)
+  );
+  check("event 기록: RUN_STARTED가 sequence상 가장 먼저(1)", events.query({ eventType: "RUN_STARTED" })[0]?.sequence === 1);
+}
+
+async function scenarioReviseRunRecordsFinalDecisionWithCycleCount(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  let reviewCalls = 0;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => {
+    reviewCalls += 1;
+    if (reviewCalls === 1) return { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: "수정 필요", nextTask: null };
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "이제 문제 없음", nextTask: null };
+  };
+  const events = createInMemoryEventStore();
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer }, events });
+
+  const approved = events.query({ eventType: "REVIEW_APPROVED" })[0];
+  check("event 기록(REVISE 후 승인): REVIEW_APPROVED event가 기록됨", approved !== undefined);
+  check("event 기록: 최종 REVIEW_APPROVED의 reviseCycle이 실제 cycle 수(2)를 담음", approved?.reviseCycle === 2);
+}
+
+async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const gptReviewer = fakeReviewer({ decision: "REVISE", feedback: "계속 REVISE" });
+  const events = createInMemoryEventStore();
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer }, events });
+
+  const exhausted = events.query({ eventType: "REVIEW_CYCLE_EXHAUSTED" })[0];
+  check("event 기록(cycle 소진): REVIEW_CYCLE_EXHAUSTED event가 audit 카테고리로 기록됨", exhausted?.categories.includes("audit") === true);
+  check("event 기록: reviseCycle=5가 정확히 담김", exhausted?.reviseCycle === 5);
+  check("event 기록: humanInterventionRequired=true", exhausted?.humanInterventionRequired === true);
+  check("event 기록: HUMAN_APPROVAL_REQUIRED도 함께 기록됨", events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).length === 1);
+  check("event 기록: RUN_BLOCKED가 기록됨(RUN_COMPLETED가 아님)", events.query({ eventType: "RUN_BLOCKED" }).length === 1 && events.query({ eventType: "RUN_COMPLETED" }).length === 0);
+}
+
+async function scenarioAdvisoryAgentsRecordAgentEvents(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ needsSecurityReview: true, requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const advisoryReadOnlyRunner: ReadOnlyAgentRunner = async () => ({ success: true, summary: "[FAKE] 보안 검토 완료", rawOutput: "" });
+  const events = createInMemoryEventStore();
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events, advisoryReadOnlyRunner });
+
+  check("event 기록(advisory): AGENT_SELECTED가 security에 대해 기록됨", events.query({ eventType: "AGENT_SELECTED", agentId: "core-security" }).length === 1);
+  check("event 기록(advisory): AGENT_STARTED가 기록됨", events.query({ eventType: "AGENT_STARTED", agentId: "core-security" }).length === 1);
+  check("event 기록(advisory): AGENT_COMPLETED가 SUCCESS로 기록됨", events.query({ eventType: "AGENT_COMPLETED", agentId: "core-security" })[0]?.outcome === "SUCCESS");
+}
+
 async function main(): Promise<void> {
   try {
     await scenarioPlainCodeTaskZeroAdvisoryCalls();
@@ -470,6 +561,10 @@ async function main(): Promise<void> {
     await scenarioCriticalHighBlocksApproval();
     await scenarioMaxCycleExhaustedReasonRecorded();
     await scenarioReviewerErrorNotFailOpen();
+    await scenarioApprovedRunRecordsRealEvents();
+    await scenarioReviseRunRecordsFinalDecisionWithCycleCount();
+    await scenarioMaxCycleExhaustedRecordsAuditEvents();
+    await scenarioAdvisoryAgentsRecordAgentEvents();
   } finally {
     for (const d of tempDirs) {
       try {

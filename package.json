@@ -43,6 +43,7 @@
     "test:core-state": "npm run build && node dist/core-state-tests.js",
     "test:fixture-e2e": "npm run build && node dist/fixture-e2e-tests.js",
     "test:production-agent-integration": "npm run build && node dist/production-agent-integration-tests.js",
+    "test:event-store": "npm run build && node dist/event-store-tests.js",
     "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
   },
   "devDependencies": {
