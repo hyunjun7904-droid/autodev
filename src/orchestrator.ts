@@ -7,6 +7,9 @@ import type { ReviewProjectContext } from "./gpt-reviewer";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
+import { buildTestSummary, isAuditCriticalEvent } from "./observability-event";
+import type { AutoDevEventInput } from "./observability-event";
+import type { EventStore } from "./event-store";
 import { log } from "./logger";
 import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, CoreState } from "./types";
 
@@ -54,6 +57,18 @@ export interface OrchestratorDeps {
    *  영향받지 않게 한다. autodev.ts가 runAutodevOnce() 안에서 만든 per-run context를 항상
    *  명시적으로 넘긴다. */
   executor?: SafeExecutorContext;
+  /**
+   * Phase G Task G2 — 지정하면 REVISE loop의 각 실제 cycle마다(DEVELOPER_RETRY_STARTED/
+   * TEST_COMPLETED/REVIEW_STARTED/REVIEW_APPROVED·REVISE·BLOCKED/REVIEW_CYCLE_EXHAUSTED/
+   * 고위험 사전 게이트의 HUMAN_APPROVAL_REQUIRED) event를 기록한다. 지정하지 않으면 이
+   * 파일의 동작은 G2 이전과 완전히 동일하다(instrumentation이 전부 no-op). deps.runId가
+   * 없으면 deps.events가 있어도 아무 event도 만들지 않는다(runId 없는 event는 correlation이
+   * 불가능하므로 애초에 만들지 않는다).
+   */
+  events?: EventStore;
+  runId?: string;
+  taskId?: string;
+  projectId?: string;
 }
 
 export interface OrchestratorRunResult {
@@ -116,6 +131,25 @@ export async function runOrchestrator(
   const saveCurrentState = (s: ProjectState) => saveState(s, statePath);
 
   const state = loadState(statePath);
+
+  // Phase G Task G2 — deps.events/deps.runId가 없으면 완전한 no-op이다(이 함수의 기존
+  // 동작을 전혀 바꾸지 않는다). audit-critical event(HUMAN_APPROVAL_REQUIRED/
+  // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED)의 기록이 실패하면 state.deferredHumanTasks에
+  // 남긴다 — 이미 이 함수가 매 전이마다 saveCurrentState(state)로 저장하므로 별도의 저장
+  // 경로를 새로 만들 필요가 없다. telemetry event(REVIEW_STARTED 등)는 실패해도 log()
+  // 경고만 남기고 state를 건드리지 않는다(§ 요구사항 6 — audit-critical과 telemetry의
+  // 실패 처리 정책을 이 함수 하나에서 구분한다).
+  const emitEvent = (input: Omit<AutoDevEventInput, "runId" | "taskId" | "projectId">): void => {
+    if (!deps.events || !deps.runId) return;
+    const result = deps.events.append({ ...input, runId: deps.runId, taskId: deps.taskId, projectId: deps.projectId });
+    if (result.ok) return;
+    if (isAuditCriticalEvent(input.eventType)) {
+      log(`AUDIT_CRITICAL_EVENT_LOST: ${input.eventType} 기록 실패 — 이 실행의 감사 기록이 불완전합니다.`, { error: result.error });
+      state.deferredHumanTasks.push(`AUDIT_EVENT_LOST(${input.eventType}): ${result.error ?? "unknown"}`);
+    } else {
+      log("observability event 기록 실패(telemetry)", { eventType: input.eventType, error: result.error });
+    }
+  };
   const statusHistory: OrchestratorStatus[] = [];
   const setStatus = (s: OrchestratorStatus) => {
     state.status = s;
@@ -135,6 +169,7 @@ export async function runOrchestrator(
   if (risk && requiresHumanApproval(risk)) {
     log("위험 작업 감지 — Claude worker 호출 전 즉시 중지", { action: risk });
     setStatus("WAITING_HUMAN");
+    emitEvent({ eventType: "HUMAN_APPROVAL_REQUIRED", executionPhase: "task_selection", outcome: "BLOCKED", humanInterventionRequired: true, reason: `고위험 작업 감지(${risk}) — Claude worker 호출 전 즉시 중지` });
     saveCurrentState(state);
     return { finalState: state, statusHistory };
   }
@@ -145,6 +180,11 @@ export async function runOrchestrator(
   while (true) {
     setStatus("CLAUDE_WORKING");
     state.reviewCycle += 1;
+    // 최초 시도(reviewCycle===1)는 TASK_STARTED로 이미 경계가 표시된다(autodev.ts) — 이
+    // event는 REVISE 이후의 실제 재시도에서만 쓴다.
+    if (state.reviewCycle > 1) {
+      emitEvent({ eventType: "DEVELOPER_RETRY_STARTED", executionPhase: "development", outcome: "PENDING", reviseCycle: state.reviewCycle });
+    }
     saveCurrentState(state);
 
     const claudeResult = await claudeRunner(task, state.reviewCycle);
@@ -176,6 +216,16 @@ export async function runOrchestrator(
       break;
     }
 
+    if (claudeResult.tests.length > 0) {
+      emitEvent({
+        eventType: "TEST_COMPLETED",
+        executionPhase: "test",
+        outcome: claudeResult.tests.every((t) => t.pass) ? "SUCCESS" : "FAILED",
+        reviseCycle: state.reviewCycle,
+        testSummary: buildTestSummary(claudeResult.tests),
+      });
+    }
+
     setStatus("WAITING_GPT_REVIEW");
     gptCallCount += 1;
     if (gptCallCount > MAX_GPT_CALLS) {
@@ -184,6 +234,7 @@ export async function runOrchestrator(
       break;
     }
 
+    emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
     const gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext);
 
     // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
@@ -224,14 +275,42 @@ export async function runOrchestrator(
 
     if (decision === "PASS") {
       setStatus("APPROVED");
+      emitEvent({
+        eventType: "REVIEW_APPROVED",
+        executionPhase: "review",
+        outcome: "SUCCESS",
+        reviewDecision: decision,
+        reviewSeverity: gptResult.severity,
+        reviseCycle: state.reviewCycle,
+        reason: gptResult.feedback,
+      });
       break;
     }
     if (decision === "BLOCK" || decision === "HUMAN_REQUIRED") {
       setStatus("WAITING_HUMAN");
+      emitEvent({
+        eventType: "REVIEW_BLOCKED",
+        executionPhase: "review",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reviewDecision: decision,
+        reviewSeverity: gptResult.severity,
+        reviseCycle: state.reviewCycle,
+        reason: gptResult.feedback,
+      });
       break;
     }
 
     // REVISE
+    emitEvent({
+      eventType: "REVIEW_REVISE",
+      executionPhase: "review",
+      outcome: "PENDING",
+      reviewDecision: decision,
+      reviewSeverity: gptResult.severity,
+      reviseCycle: state.reviewCycle,
+      reason: gptResult.feedback,
+    });
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
       log(`연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — WAITING_HUMAN`);
       // Phase F Task F4 — 이 상태는 "사람이 승인하면 통과"가 아니다: critical/high나
@@ -242,6 +321,14 @@ export async function runOrchestrator(
         `${REVIEW_CYCLE_EXHAUSTED_REASON}: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})회 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리 불가).`
       );
       setStatus("WAITING_HUMAN");
+      emitEvent({
+        eventType: "REVIEW_CYCLE_EXHAUSTED",
+        executionPhase: "review",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reviseCycle: state.reviewCycle,
+        reason: `${REVIEW_CYCLE_EXHAUSTED_REASON}: MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달`,
+      });
       break;
     }
     setStatus("REVISION_REQUIRED");

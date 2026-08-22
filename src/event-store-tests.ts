@@ -1,14 +1,17 @@
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEvent, classifyEventCategory } from "./observability-event";
+import { createEvent, classifyEventCategory, isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
-import { createInMemoryEventStore, createFileEventStore } from "./event-store";
+import { createInMemoryEventStore, createFileEventStore, selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 
-// Observability & Audit Event Foundation 테스트(Phase G Task G1). 실제 Claude/GPT 유료
+// Observability & Audit Event Foundation 테스트(Phase G Task G1/G2). 실제 Claude/GPT 유료
 // API를 호출하지 않는다 — 이 파일은 순수 데이터 모델(observability-event.ts)과 append-only
 // 저장소(event-store.ts)만 검증한다. MOVAN product task도 실행하지 않는다.
+//
+// Phase G Task G2 — query()는 이제 { events, integrityIssues }를 반환한다(예전에는 배열을
+// 바로 반환했다). 이 파일의 모든 query() 호출은 .events로 접근한다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -50,7 +53,7 @@ function scenarioDeterministicEventOrdering(): void {
 
   check("ordering: 3개 append 모두 성공", r1.ok && r2.ok && r3.ok);
   check("ordering: sequence가 1,2,3으로 단조증가", r1.event?.sequence === 1 && r2.event?.sequence === 2 && r3.event?.sequence === 3);
-  const queried = store.query({ runId: "run-1" });
+  const queried = store.query({ runId: "run-1" }).events;
   check(
     "ordering: query 결과도 append 순서(sequence 오름차순)와 동일",
     queried.map((e) => e.eventType).join(",") === "RUN_STARTED,TASK_STARTED,TASK_COMPLETED"
@@ -68,14 +71,15 @@ function scenarioAppendOnlyGuarantee(): void {
   check("append-only: remove 메서드가 존재하지 않음", typeof store["remove"] === "undefined");
 
   store.append(baseInput({ eventType: "RUN_STARTED", reason: "원본" }));
-  const queried = store.query({ runId: "run-1" });
+  const queried = store.query({ runId: "run-1" }).events;
   queried[0].reason = "변조 시도";
-  const requeried = store.query({ runId: "run-1" });
+  const requeried = store.query({ runId: "run-1" }).events;
   check("append-only: query 결과를 수정해도 저장된 원본은 그대로임", requeried[0].reason === "원본");
 }
 
 // ---------------------------------------------------------------------------
-// 4) run/task/agent correlation — filter로 정확히 골라낼 수 있다.
+// 4) run/task/agent correlation — filter로 정확히 골라낼 수 있다. 서로 다른 run의 event가
+//    섞이지 않는다는 것도 여기서 함께 증명한다.
 // ---------------------------------------------------------------------------
 function scenarioRunTaskAgentCorrelation(): void {
   const store = createInMemoryEventStore();
@@ -84,11 +88,12 @@ function scenarioRunTaskAgentCorrelation(): void {
   store.append(baseInput({ eventType: "AGENT_STARTED", runId: "run-A", taskId: "T1", agentId: "core-security", agentRole: "security" }));
   store.append(baseInput({ eventType: "RUN_STARTED", runId: "run-B", taskId: "T2" }));
 
-  check("correlation: runId=run-A로 3건만 조회됨", store.query({ runId: "run-A" }).length === 3);
-  check("correlation: runId=run-B로 1건만 조회됨", store.query({ runId: "run-B" }).length === 1);
-  check("correlation: taskId=T1로 3건 조회됨", store.query({ taskId: "T1" }).length === 3);
-  check("correlation: agentId=core-qa로 정확히 1건만 조회됨", store.query({ agentId: "core-qa" }).length === 1);
-  check("correlation: eventType=AGENT_STARTED로 정확히 2건 조회됨", store.query({ eventType: "AGENT_STARTED" }).length === 2);
+  check("correlation: runId=run-A로 3건만 조회됨", store.query({ runId: "run-A" }).events.length === 3);
+  check("correlation: runId=run-B로 1건만 조회됨", store.query({ runId: "run-B" }).events.length === 1);
+  check("correlation: run-A 조회 결과에 run-B의 event가 섞이지 않음", store.query({ runId: "run-A" }).events.every((e) => e.runId === "run-A"));
+  check("correlation: taskId=T1로 3건 조회됨", store.query({ taskId: "T1" }).events.length === 3);
+  check("correlation: agentId=core-qa로 정확히 1건만 조회됨", store.query({ agentId: "core-qa" }).events.length === 1);
+  check("correlation: eventType=AGENT_STARTED로 정확히 2건 조회됨", store.query({ eventType: "AGENT_STARTED" }).events.length === 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,21 +109,39 @@ function scenarioZeroAgentTaskRecordedNormally(): void {
   store.append(baseInput({ eventType: "CHECKPOINT_CREATED", taskId: "T-plain" }));
   store.append(baseInput({ eventType: "RUN_COMPLETED", taskId: "T-plain" }));
 
-  const all = store.query({ taskId: "T-plain" });
+  const all = store.query({ taskId: "T-plain" }).events;
   check("agent 0회: 6개 event가 전부 정상 기록됨", all.length === 6);
-  check("agent 0회: AGENT 계열 event가 하나도 없음(정상)", store.query({ taskId: "T-plain", eventType: "AGENT_STARTED" }).length === 0);
+  check("agent 0회: AGENT 계열 event가 하나도 없음(정상)", store.query({ taskId: "T-plain", eventType: "AGENT_STARTED" }).events.length === 0);
   check("agent 0회: 순서가 RUN_STARTED로 시작해 RUN_COMPLETED로 끝남", all[0].eventType === "RUN_STARTED" && all[all.length - 1].eventType === "RUN_COMPLETED");
 }
 
 // ---------------------------------------------------------------------------
-// 6) REVISE cycle 기록.
+// 6) REVISE 2회 cycle별 event 순서 검증(§ orchestrator.ts의 새 instrumentation을 그대로
+//    모사 — 이 파일은 event-store만 검증하므로 orchestrator.ts를 호출하지 않고 동일한
+//    순서로 직접 append한다. 실제 orchestrator.ts 배선은 production-agent-integration-
+//    tests.ts가 담당한다).
 // ---------------------------------------------------------------------------
-function scenarioReviseCycleRecorded(): void {
+function scenarioReviseCycleEventOrder(): void {
   const store = createInMemoryEventStore();
-  const result = store.append(baseInput({ eventType: "REVIEW_REVISE", reviewDecision: "REVISE", reviseCycle: 2, reason: "테스트 커버리지 부족" }));
-  check("REVISE cycle: 기록 성공", result.ok);
-  check("REVISE cycle: reviseCycle=2가 그대로 보존됨", result.event?.reviseCycle === 2);
-  check("REVISE cycle: reviewDecision=REVISE가 보존됨", result.event?.reviewDecision === "REVISE");
+  // cycle 1: REVISE.
+  store.append(baseInput({ eventType: "TEST_COMPLETED", reviseCycle: 1, testSummary: { total: 1, passed: 1, failed: 0 } }));
+  store.append(baseInput({ eventType: "REVIEW_STARTED", reviseCycle: 1 }));
+  store.append(baseInput({ eventType: "REVIEW_REVISE", reviewDecision: "REVISE", reviseCycle: 1, reason: "테스트 커버리지 부족" }));
+  // cycle 2: 재시도 후 APPROVED.
+  store.append(baseInput({ eventType: "DEVELOPER_RETRY_STARTED", reviseCycle: 2 }));
+  store.append(baseInput({ eventType: "TEST_COMPLETED", reviseCycle: 2, testSummary: { total: 1, passed: 1, failed: 0 } }));
+  store.append(baseInput({ eventType: "REVIEW_STARTED", reviseCycle: 2 }));
+  const approved = store.append(baseInput({ eventType: "REVIEW_APPROVED", reviewDecision: "PASS", reviseCycle: 2 }));
+
+  const all = store.query({ runId: "run-1" }).events;
+  check(
+    "REVISE 2회: cycle별 event 순서가 정확함",
+    all.map((e) => e.eventType).join(",") ===
+      "TEST_COMPLETED,REVIEW_STARTED,REVIEW_REVISE,DEVELOPER_RETRY_STARTED,TEST_COMPLETED,REVIEW_STARTED,REVIEW_APPROVED"
+  );
+  check("REVISE 2회: DEVELOPER_RETRY_STARTED는 정확히 1회(최초 시도는 재시도가 아님)", all.filter((e) => e.eventType === "DEVELOPER_RETRY_STARTED").length === 1);
+  check("REVISE 2회: 최종 REVIEW_APPROVED의 reviseCycle=2", approved.event?.reviseCycle === 2);
+  check("REVISE 2회: 첫 REVIEW_REVISE의 reviseCycle=1", all.find((e) => e.eventType === "REVIEW_REVISE")?.reviseCycle === 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +158,12 @@ function scenarioBlockedAndReviewCycleExhaustedRecorded(): void {
   check("REVIEW_CYCLE_EXHAUSTED 기록: 성공 + reviseCycle=5", exhausted.ok && exhausted.event?.reviseCycle === 5);
   check("REVIEW_CYCLE_EXHAUSTED 기록: audit 카테고리 포함", exhausted.event?.categories.includes("audit") === true);
   check("SECURITY_BLOCKED 기록: audit 카테고리 포함", securityBlocked.event?.categories.includes("audit") === true);
+  check("audit-critical 판정: REVIEW_BLOCKED/REVIEW_CYCLE_EXHAUSTED/SECURITY_BLOCKED 모두 audit-critical", [
+    isAuditCriticalEvent("REVIEW_BLOCKED"),
+    isAuditCriticalEvent("REVIEW_CYCLE_EXHAUSTED"),
+    isAuditCriticalEvent("SECURITY_BLOCKED"),
+  ].every(Boolean));
+  check("audit-critical 판정: REVIEW_STARTED/TEST_STARTED 같은 순수 telemetry는 audit-critical이 아님", !isAuditCriticalEvent("REVIEW_STARTED") && !isAuditCriticalEvent("TEST_STARTED"));
 }
 
 // ---------------------------------------------------------------------------
@@ -151,7 +180,9 @@ function scenarioTestPassFailRecorded(): void {
 
 // ---------------------------------------------------------------------------
 // 9) secret-like 값이 audit payload에 그대로 남지 않음 — key 기반(logger.ts)과 모양 기반
-//    (secret-scanner.ts) 둘 다.
+//    (secret-scanner.ts) 둘 다. raw prompt/전체 Claude output도 애초에 이 event 모델에
+//    담을 필드 자체가 없다(reason/error.message/metadata만 있고, 전체 transcript 필드가
+//    없다).
 // ---------------------------------------------------------------------------
 function scenarioSecretLikeValuesRedacted(): void {
   const store = createInMemoryEventStore();
@@ -162,12 +193,16 @@ function scenarioSecretLikeValuesRedacted(): void {
     baseInput({ eventType: "AGENT_FAILED", error: { message: "sk-ant-abcdefghijklmnopqrstuvwxyz012345 가 노출된 채로 로그에 남았습니다." } })
   );
   const inMetadata = store.append(baseInput({ eventType: "AGENT_FAILED", metadata: { note: "token=sk-ant-zzzzzzzzzzzzzzzzzzzzzzzzz" } }));
+  const reviewerFeedback = store.append(
+    baseInput({ eventType: "REVIEW_REVISE", reason: ".env 파일에 client_secret=abcdef1234567890 이 그대로 커밋됐습니다." })
+  );
 
   check("secret 보호(key 기반): reason에 실제 key 값이 남아있지 않음", !keyBased.event?.reason?.includes("verysecretvalue1234567890"));
   check("secret 보호(key 기반): [REDACTED] 마커가 포함됨", keyBased.event?.reason?.includes("[REDACTED]") === true);
   check("secret 보호(모양 기반, key 이름 없음): error.message에 실제 key 값이 남아있지 않음", !shapeBased.event?.error?.message.includes("abcdefghijklmnopqrstuvwxyz012345"));
   check("secret 보호(모양 기반): [REDACTED] 마커가 포함됨", shapeBased.event?.error?.message.includes("[REDACTED]") === true);
   check("secret 보호(metadata): metadata 문자열 값도 redact됨", !String(inMetadata.event?.metadata?.note).includes("zzzzzzzzzzzzzzzzzzzzzzzzz"));
+  check("secret 보호(reviewer feedback/reason): .env 안의 client_secret 값이 남지 않음", !reviewerFeedback.event?.reason?.includes("abcdef1234567890"));
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +231,7 @@ function scenarioPolicyCannotDisableAudit(): void {
   // "비활성화 policy"를 흉내내려는 시도(임의 여분 필드)를 넘겨도 무시되고 정상 기록된다.
   const attempted = { ...baseInput({ eventType: "SECURITY_BLOCKED" }), disabled: true, skipAudit: true } as unknown as AutoDevEventInput;
   const result = store.append(attempted);
-  check("정책 무력화 불가: 임의의 disabled/skipAudit 필드를 넣어도 정상 기록됨", result.ok && store.query({ eventType: "SECURITY_BLOCKED" }).length === 1);
+  check("정책 무력화 불가: 임의의 disabled/skipAudit 필드를 넣어도 정상 기록됨", result.ok && store.query({ eventType: "SECURITY_BLOCKED" }).events.length === 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,22 +251,75 @@ function scenarioFileStorePersistsAcrossRestarts(): void {
   const third = store2.append(baseInput({ eventType: "TASK_COMPLETED" }));
 
   check("file store: 재시작 후 sequence가 이어짐(3)", third.event?.sequence === 3);
-  const all = store2.query({ runId: "run-1" });
-  check("file store: 재시작 전에 기록된 event까지 전부 조회됨(3건)", all.length === 3);
-  check("file store: 순서가 append 순서와 동일", all.map((e) => e.eventType).join(",") === "RUN_STARTED,TASK_STARTED,TASK_COMPLETED");
+  const result = store2.query({ runId: "run-1" });
+  check("file store: 재시작 전에 기록된 event까지 전부 조회됨(3건)", result.events.length === 3);
+  check("file store: 순서가 append 순서와 동일", result.events.map((e) => e.eventType).join(",") === "RUN_STARTED,TASK_STARTED,TASK_COMPLETED");
+  check("file store: 손상이 없으면 integrityIssues가 빈 배열", result.integrityIssues.length === 0);
 }
 
-function scenarioFileStoreSkipsCorruptedLines(): void {
+// ---------------------------------------------------------------------------
+// 13) Audit Integrity(Phase G Task G2) — 손상된 JSONL 줄을 조용히 정상 처리하지 않는다.
+//     JSON_PARSE_ERROR와 SCHEMA_INVALID(파싱은 되지만 필수 필드가 없는 경우) 둘 다 잡고,
+//     file/line/reason만 보고하며 손상된 원문은 절대 담지 않는다. 이후 query가 "완전한
+//     기록"인 것처럼 굴지 않는다 — integrityIssues가 그 사실을 명시적으로 드러낸다.
+// ---------------------------------------------------------------------------
+function scenarioAuditIntegrityNotSilentlySkipped(): void {
   const dir = makeTempDir();
   const filePath = join(dir, "events.jsonl");
   writeFileSync(filePath, "", "utf-8");
   const store = createFileEventStore(filePath);
   store.append(baseInput({ eventType: "RUN_STARTED" }));
-  appendFileSync(filePath, "이건 유효한 JSON이 아닙니다\n", "utf-8");
+
+  const secretLikeCorruptLine = 'ANTHROPIC_API_KEY=sk-ant-thisIsNotValidJsonAtAll1234567890';
+  appendFileSync(filePath, `${secretLikeCorruptLine}\n`, "utf-8");
+  appendFileSync(filePath, `${JSON.stringify({ foo: "bar" })}\n`, "utf-8"); // JSON은 맞지만 event 스키마가 아님.
   store.append(baseInput({ eventType: "RUN_COMPLETED" }));
 
-  const all = store.query({ runId: "run-1" });
-  check("file store: 손상된 줄은 건너뛰고 나머지 2건은 정상 조회됨", all.length === 2);
+  const result = store.query({ runId: "run-1" });
+
+  check("audit integrity: 정상 파싱된 2건은 여전히 조회됨(best-effort)", result.events.length === 2);
+  check("audit integrity: 손상을 조용히 넘기지 않음(integrityIssues가 비어있지 않음)", result.integrityIssues.length === 2);
+  check(
+    "audit integrity: JSON 자체가 깨진 줄은 JSON_PARSE_ERROR로 보고됨",
+    result.integrityIssues.some((i) => i.reason === "JSON_PARSE_ERROR")
+  );
+  check(
+    "audit integrity: JSON은 맞지만 event 스키마가 아닌 줄은 SCHEMA_INVALID로 보고됨(정상 event로 위장되지 않음)",
+    result.integrityIssues.some((i) => i.reason === "SCHEMA_INVALID")
+  );
+  check("audit integrity: 손상 위치가 file/line만 안전하게 보고됨", result.integrityIssues.every((i) => typeof i.file === "string" && typeof i.line === "number"));
+  check(
+    "audit integrity: 손상된 줄의 원문(secret-like 값 포함)이 integrityIssues 어디에도 그대로 남지 않음",
+    !JSON.stringify(result.integrityIssues).includes("thisIsNotValidJsonAtAll1234567890")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 14) Production EventStore 선택 — AUTOMATION_DRY_RUN이 명시적으로 "false"일 때만 실제
+//     파일 store를 고른다(production과 test storage 분리).
+// ---------------------------------------------------------------------------
+function scenarioDefaultEventStoreSelection(): void {
+  // 실제 production runtime 경로(logs/events.jsonl)는 절대 건드리지 않는다 — 이
+  // 테스트에서 AUTOMATION_DRY_RUN=false 분기를 확인할 때도 임시 경로만 override로 넘긴다
+  // (§ selectDefaultEventStore의 filePath 테스트 override).
+  const dir = makeTempDir();
+  const tempEventLogPath = join(dir, "prod-like-events.jsonl");
+  const original = process.env.AUTOMATION_DRY_RUN;
+  try {
+    delete process.env.AUTOMATION_DRY_RUN;
+    const dryRunStore = selectDefaultEventStore(tempEventLogPath);
+    const dryRunResult = dryRunStore.append(baseInput({ eventType: "RUN_STARTED" }));
+    check("기본 선택: AUTOMATION_DRY_RUN 미설정이면 in-memory store(같은 경로를 줘도 파일이 생기지 않음)", dryRunResult.ok === true);
+    check("기본 선택: in-memory이므로 override 경로에 파일이 생성되지 않음", !existsSync(tempEventLogPath));
+
+    process.env.AUTOMATION_DRY_RUN = "false";
+    const prodStore = selectDefaultEventStore(tempEventLogPath);
+    check("기본 선택: AUTOMATION_DRY_RUN=false면 실제 파일 store가 선택됨(append 성공)", prodStore.append(baseInput({ eventType: "RUN_STARTED" })).ok === true);
+    check("기본 선택: false일 때는 override 경로에 실제로 파일이 생성됨", existsSync(tempEventLogPath));
+  } finally {
+    if (original === undefined) delete process.env.AUTOMATION_DRY_RUN;
+    else process.env.AUTOMATION_DRY_RUN = original;
+  }
 }
 
 async function main(): Promise<void> {
@@ -241,14 +329,15 @@ async function main(): Promise<void> {
     scenarioAppendOnlyGuarantee();
     scenarioRunTaskAgentCorrelation();
     scenarioZeroAgentTaskRecordedNormally();
-    scenarioReviseCycleRecorded();
+    scenarioReviseCycleEventOrder();
     scenarioBlockedAndReviewCycleExhaustedRecorded();
     scenarioTestPassFailRecorded();
     scenarioSecretLikeValuesRedacted();
     scenarioUnknownTokenCostNotFabricated();
     scenarioPolicyCannotDisableAudit();
     scenarioFileStorePersistsAcrossRestarts();
-    scenarioFileStoreSkipsCorruptedLines();
+    scenarioAuditIntegrityNotSilentlySkipped();
+    scenarioDefaultEventStoreSelection();
   } finally {
     for (const d of tempDirs) {
       try {
@@ -259,7 +348,7 @@ async function main(): Promise<void> {
     }
   }
 
-  console.log("\n=== event-store(G1) 테스트 결과 ===");
+  console.log("\n=== event-store(G1/G2) 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
   console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);

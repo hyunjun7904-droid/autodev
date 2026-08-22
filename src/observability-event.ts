@@ -4,7 +4,7 @@ import { SECRET_CONTENT_PATTERNS } from "./secret-scanner";
 import type { AgentRole } from "./agent-registry";
 import type { GptDecision, SeverityCounts } from "./types";
 
-// Observability & Audit Event Foundation — Phase G Task G1.
+// Observability & Audit Event Foundation — Phase G Task G1/G2.
 //
 // 두 목적을 구분한다:
 //   - Observability: 성능/상태/비용/실행 흐름을 보기 위한 데이터.
@@ -12,7 +12,12 @@ import type { GptDecision, SeverityCounts } from "./types";
 // 둘 다 이 파일의 공통 event envelope(AutoDevEvent)을 쓴다 — event type마다
 // classifyEventCategory()가 두 카테고리 중 어디에 속하는지(또는 둘 다인지) deterministic
 // 하게 정해준다. 이 파일은 순수 데이터 모델 + sanitization만 다룬다 — 실제 저장은
-// event-store.ts, production 배선은 autodev.ts가 각자 담당한다(관심사 분리).
+// event-store.ts, production 배선은 autodev.ts/orchestrator.ts가 각자 담당한다(관심사 분리).
+//
+// Phase G Task G2 — isAuditCriticalEvent()는 classifyEventCategory()와 다른 질문에
+// 답한다: classifyEventCategory는 "이 event를 어떤 목적의 조회에 포함시킬지"(query 필터용)
+// 이고, isAuditCriticalEvent는 "이 event 기록이 실패했을 때 조용히 넘어가면 안 되는지"
+// (실패 처리 정책용)다. 두 테이블은 의도적으로 서로 다른 기준이라 겹치지 않을 수 있다.
 //
 // 이 파일은 Dashboard/UI/Notification을 만들지 않는다(범위 밖) — 오직 "무엇을 어떻게
 // 구조화해서 남길지"만 정의한다.
@@ -20,7 +25,10 @@ import type { GptDecision, SeverityCounts } from "./types";
 /** 이 Task가 다루는 최소 event 종류 — 이름은 이 저장소의 실제 상태 어휘(orchestrator.ts의
  *  OrchestratorStatus, review-policy.ts의 REVIEW_CYCLE_EXHAUSTED, checkpoint.ts의 Secret/
  *  Dependency Gate)에 맞춰 정리했다. 새 event type이 필요해지면 이 union과 아래
- *  EVENT_CATEGORIES 테이블에 함께 추가한다(단일 출처). */
+ *  EVENT_CATEGORIES/AUDIT_CRITICAL_EVENT_TYPES 테이블에 함께 추가한다(단일 출처).
+ *  DEVELOPER_RETRY_STARTED(G2)는 orchestrator.ts의 REVISE loop가 developer를 다시 부르는
+ *  cycle(reviewCycle>1)에서만 쓰인다 — 최초 시도는 이 event를 쓰지 않는다(그건 이미
+ *  TASK_STARTED로 경계가 표시된다). */
 export type AutoDevEventType =
   | "RUN_STARTED"
   | "RUN_COMPLETED"
@@ -31,6 +39,7 @@ export type AutoDevEventType =
   | "AGENT_STARTED"
   | "AGENT_COMPLETED"
   | "AGENT_FAILED"
+  | "DEVELOPER_RETRY_STARTED"
   | "TEST_STARTED"
   | "TEST_COMPLETED"
   | "REVIEW_STARTED"
@@ -57,6 +66,7 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   AGENT_STARTED: ["observability"],
   AGENT_COMPLETED: ["observability", "audit"],
   AGENT_FAILED: ["observability", "audit"],
+  DEVELOPER_RETRY_STARTED: ["observability"],
   TEST_STARTED: ["observability"],
   TEST_COMPLETED: ["observability", "audit"],
   REVIEW_STARTED: ["observability"],
@@ -73,6 +83,42 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
  *  (함수가 policy 인자를 받지 않는다 — 이 코드베이스의 Core hard rule 패턴과 동일). */
 export function classifyEventCategory(eventType: AutoDevEventType): readonly AutoDevEventCategory[] {
   return EVENT_CATEGORIES[eventType];
+}
+
+// Phase G Task G2 — "이 event 기록이 실패하면 조용히 넘어가면 안 된다"고 판정하는 event
+// type의 단일 출처. 요구사항이 명시한 4가지(security block/human approval/checkpoint/
+// run·task 최종 상태)만 담는다 — *_STARTED류나 test/agent 진행 상황 같은 일반 telemetry는
+// 여기 없다(그런 event는 기록에 실패해도 production 실행에 영향을 주지 않는, 순수 관측
+// 정보다). 이 판정도 policy 인자를 받지 않는다 — Project config가 무엇을 audit-critical로
+// 볼지 재정의할 수 없다.
+const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDevEventType>([
+  "SECURITY_BLOCKED",
+  "HUMAN_APPROVAL_REQUIRED",
+  "REVIEW_CYCLE_EXHAUSTED",
+  "REVIEW_BLOCKED",
+  "CHECKPOINT_CREATED",
+  "RUN_COMPLETED",
+  "RUN_BLOCKED",
+  "TASK_COMPLETED",
+]);
+
+/** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/
+ *  orchestrator.ts의 실패 처리 정책이 이 함수로만 판단한다 — 각자 다시 판정 기준을 만들지
+ *  않는다). */
+export function isAuditCriticalEvent(eventType: AutoDevEventType): boolean {
+  return AUDIT_CRITICAL_EVENT_TYPES.has(eventType);
+}
+
+/** claude-developer.ts의 DeveloperResult.tests(실제 Safe Executor exitCode 기반)로부터
+ *  TestResultSummary를 만든다 — orchestrator.ts/autodev.ts 양쪽이 이 함수 하나만 쓴다(같은
+ *  집계 로직을 두 곳에 복제하지 않는다). */
+export function buildTestSummary(tests: { name: string; pass: boolean }[]): TestResultSummary {
+  return {
+    total: tests.length,
+    passed: tests.filter((t) => t.pass).length,
+    failed: tests.filter((t) => !t.pass).length,
+    failedNames: tests.filter((t) => !t.pass).map((t) => t.name),
+  };
 }
 
 /** AgentStepStatus(agent-orchestrator.ts)와 호환되는 상위집합 — *_STARTED류 event를 위한

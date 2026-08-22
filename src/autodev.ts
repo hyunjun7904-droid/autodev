@@ -17,8 +17,9 @@ import type { AdvisorySignals } from "./agent-registry";
 import { executeRoutingPlan } from "./agent-orchestrator";
 import type { AgentStepResult, ReadOnlyAgentRunner } from "./agent-orchestrator";
 import { classifyTaskRisk, requiresHumanApproval } from "./policy";
-import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
+import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
+import { isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import { randomUUID } from "node:crypto";
 import { log } from "./logger";
@@ -59,14 +60,23 @@ import type { CoreState, ClaudeResult } from "./types";
 // 어떤 LLM 호출도 하지 않는다 — "Agent가 있으니 일단 호출"하지 않는다.
 //
 // Phase G Task G1 — Observability & Audit Event Foundation의 production instrumentation
-// seam. opts.events(event-store.ts의 EventStore)를 지정하지 않으면 이 파일의 동작은
-// G1 이전과 완전히 동일하다(emitEvent가 즉시 no-op) — 기존 production flow를 크게 뜯지
-// 않는다. 지정하면 run/task/agent/test/reviewer/checkpoint 지점에서 실제로 이미 계산된
-// 값(finalState.lastClaudeResult/lastGptDecision, checkpoint.ok 등)만으로 event를
-// 기록한다 — 새로운 판정을 만들지 않고, 기존 값을 관찰만 한다. developer/reviewer의 매
-// REVISE cycle마다 개별 event를 남기지는 않는다(그 loop는 orchestrator.ts 내부에 있고,
-// 이번 Task는 그 내부를 뜯지 않는다 — § 남은 문제) — 대신 최종 decision과 실제
-// reviewCycle 횟수를 하나의 event에 담는다.
+// seam. run/task/agent/checkpoint 지점의 event는 이 파일이 담당하고(§ emitEvent 아래),
+// developer/reviewer/test/REVISE cycle 지점의 event는 orchestrator.ts가 자신의 REVISE
+// loop 안에서 직접 담당한다(§ Phase G Task G2 — orchestrator.ts에 deps.events/deps.runId로
+// 전달). 두 파일 모두 새로운 판정을 만들지 않고 기존에 이미 계산된 값만 관찰한다.
+//
+// Phase G Task G2 — Production EventStore 연결. opts.events를 지정하지 않으면
+// selectDefaultEventStore()가 대신 선택한다 — AUTOMATION_DRY_RUN이 명시적으로 "false"일
+// 때(실제 production, run.ts가 이 값을 설정하지 않으면 여전히 기본은 dry-run이다)만 실제
+// 파일 store를, 그 외(테스트/dry-run 기본값)에는 in-memory store를 자동으로 쓴다 — "opts.
+// events 미지정 때문에 관측이 꺼지는 일"과 "테스트가 실제 runtime event 파일을 건드리는
+// 일"을 동시에 막는다(기존 test 코드는 전혀 수정할 필요가 없다 — 테스트 환경은
+// AUTOMATION_DRY_RUN을 "false"로 설정하지 않으므로 자동으로 in-memory를 받는다).
+// Audit-critical event(SECURITY_BLOCKED/HUMAN_APPROVAL_REQUIRED/CHECKPOINT_CREATED/
+// RUN·TASK 최종 상태 — § observability-event.ts의 isAuditCriticalEvent)의 기록이
+// 실패하면 이 파일이 이미 저장 직전인 state 객체(checkpoint 실패/승인 경로)의
+// deferredHumanTasks에 남긴다 — 새로운 저장 경로를 만들지 않는다. 그 외 telemetry
+// event 실패는 log() 경고만 남기고 실행을 막지 않는다.
 //
 // AutoDev 범용화 Phase A Task A7 — 이 파일은 이제 MOVAN을 전혀 모른다. project-manifests/
 // movan.ts를 import하지 않고, ProjectManifest를 기본값 없이 항상 호출부가 명시적으로
@@ -242,17 +252,31 @@ export async function runPostDevelopmentAdvisory(
 }
 
 /**
- * events가 지정되지 않았으면 즉시 no-op(이 파일의 기존 동작을 전혀 바꾸지 않는다). append가
- * 실패하면(event-store.ts는 실패를 ok:false로 정직하게 반환한다) 그 사실을 logger.ts의
- * log()로 눈에 보이게 남긴다 — 실패를 조용히 성공으로 위장하지 않는다. 이 함수 자체가
- * runAutodevOnce()의 실제 흐름/반환값에는 영향을 주지 않는다(observability 실패가 production
- * 실행을 막으면 안 된다).
+ * events가 지정되지 않았으면 즉시 no-op. append가 실패하면(event-store.ts는 실패를
+ * ok:false로 정직하게 반환한다) 그 사실을 logger.ts의 log()로 눈에 보이게 남긴다 — 실패를
+ * 조용히 성공으로 위장하지 않는다. audit-critical event(§ isAuditCriticalEvent)의 실패는
+ * auditFailures에도 짧은 사유만 쌓인다 — 호출부가 이미 저장 직전인 state 객체의
+ * deferredHumanTasks에 이어붙일 수 있게(§ 요구사항 6, 새 저장 경로를 만들지 않는다). 이
+ * 함수 자체는 runAutodevOnce()의 실제 흐름/반환값을 절대 바꾸지 않는다(observability
+ * 실패가 production 코드 배포 자체를 막으면 안 된다는 원칙 — telemetry든 audit-critical
+ * event 손실이든 동일하게, "이 함수 하나가 최종 outcome을 바꾸지 않는다"는 점은 같다.
+ * audit-critical과 telemetry의 차이는 "얼마나 눈에 띄게/영구적으로 surface하는가"에
+ * 있다 — 전자는 project-state.json에도 남고, 후자는 log 한 줄로 끝난다).
  */
-function emitEvent(events: EventStore | undefined, input: AutoDevEventInput): void {
+function emitEvent(events: EventStore | undefined, input: AutoDevEventInput, auditFailures?: string[]): void {
   if (!events) return;
   const result = events.append(input);
-  if (!result.ok) {
-    log("audit/observability event 기록 실패", { eventType: input.eventType, runId: input.runId, error: result.error });
+  if (result.ok) return;
+  if (isAuditCriticalEvent(input.eventType)) {
+    log(`AUDIT_CRITICAL_EVENT_LOST: ${input.eventType} 기록 실패 — 이 실행의 감사 기록이 불완전합니다.`, {
+      eventType: input.eventType,
+      runId: input.runId,
+      taskId: input.taskId,
+      error: result.error,
+    });
+    auditFailures?.push(`AUDIT_EVENT_LOST(${input.eventType}): ${result.error ?? "unknown"}`);
+  } else {
+    log("observability event 기록 실패(telemetry)", { eventType: input.eventType, runId: input.runId, error: result.error });
   }
 }
 
@@ -316,7 +340,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   const statePath = opts.statePath ?? manifest.statePath;
   const cwd = opts.cwd ?? manifest.targetProjectRoot;
   const runId = opts.runId ?? randomUUID();
-  const events = opts.events;
+  const events = opts.events ?? selectDefaultEventStore();
+  // Phase G Task G2 — audit-critical event 기록 실패 사유만(원문/추가정보 없이) 쌓아뒀다가
+  // 이미 저장 직전인 state 객체의 deferredHumanTasks에 이어붙인다(§ emitEvent 주석).
+  const auditFailures: string[] = [];
 
   emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
 
@@ -390,80 +417,57 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 한다) orchestrator의 기본 real GPT reviewer가 이 context를 써서 rules 파일/실제 git
     // 변경을 읽는다 — module-level singleton에 의존하지 않는다.
     executor: executorContext,
+    // Phase G Task G2 — REVISE loop의 각 cycle마다(DEVELOPER_RETRY_STARTED/TEST_COMPLETED/
+    // REVIEW_STARTED/REVIEW_APPROVED·REVISE·BLOCKED/REVIEW_CYCLE_EXHAUSTED) event를 남기는
+    // instrumentation은 orchestrator.ts 자신이 담당한다 — 이 파일은 events/runId/taskId/
+    // projectId만 넘긴다.
+    events,
+    runId,
+    taskId: taskDef.id,
+    projectId: manifest.projectId,
     ...opts.orchestratorDeps,
   });
 
-  // Phase G Task G1 — orchestrator.ts가 이미 계산한 값(finalState)만 관찰해서 test/review
-  // event를 남긴다. REVISE loop 자체는 orchestrator.ts 내부에 있어 cycle별 개별 event는
-  // 없다 — 최종 decision 하나에 실제 reviewCycle 횟수(finalState.reviewCycle)를 담는다.
-  const testsForEvent = finalState.lastClaudeResult?.tests ?? [];
-  if (testsForEvent.length > 0) {
-    emitEvent(events, {
-      eventType: "TEST_COMPLETED",
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "test",
-      outcome: testsForEvent.every((t) => t.pass) ? "SUCCESS" : "FAILED",
-      testSummary: {
-        total: testsForEvent.length,
-        passed: testsForEvent.filter((t) => t.pass).length,
-        failed: testsForEvent.filter((t) => !t.pass).length,
-        failedNames: testsForEvent.filter((t) => !t.pass).map((t) => t.name),
-      },
-    });
-  }
-  const reviewDecision = finalState.lastGptDecision?.decision;
-  if (reviewDecision) {
-    const reviewEventType = reviewDecision === "PASS" ? "REVIEW_APPROVED" : reviewDecision === "REVISE" ? "REVIEW_REVISE" : "REVIEW_BLOCKED";
-    emitEvent(events, {
-      eventType: reviewEventType,
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "review",
-      outcome: reviewDecision === "PASS" ? "SUCCESS" : reviewDecision === "REVISE" ? "PENDING" : "BLOCKED",
-      reviewDecision,
-      reviewSeverity: finalState.lastGptDecision?.severity,
-      reviseCycle: finalState.reviewCycle,
-      reason: finalState.lastGptDecision?.feedback,
-    });
-  }
-  if (finalState.deferredHumanTasks.some((t) => t.startsWith(REVIEW_CYCLE_EXHAUSTED_REASON))) {
-    emitEvent(events, {
-      eventType: "REVIEW_CYCLE_EXHAUSTED",
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "review",
-      outcome: "BLOCKED",
-      reviseCycle: finalState.reviewCycle,
-      humanInterventionRequired: true,
-      reason: finalState.deferredHumanTasks.find((t) => t.startsWith(REVIEW_CYCLE_EXHAUSTED_REASON)),
-    });
-  }
-
+  // orchestrator.ts가 이미 이 실행의 구체적인 사유(HUMAN_APPROVAL_REQUIRED 사전 게이트/
+  // REVIEW_STARTED·APPROVED·REVISE·BLOCKED/TEST_COMPLETED/REVIEW_CYCLE_EXHAUSTED 등)를
+  // cycle 단위로 기록했다(§ runOrchestrator에 넘긴 events/runId/taskId/projectId). 여기서는
+  // 그 결과를 요약하는 run-level bookend event만 남긴다.
   if (finalState.status !== "APPROVED") {
     console.log(`[autodev] task ${taskDef.id} — orchestrator가 APPROVED로 끝나지 않음(status=${finalState.status}). checkpoint 생략.`);
-    emitEvent(events, {
-      eventType: "HUMAN_APPROVAL_REQUIRED",
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "review",
-      outcome: "BLOCKED",
-      humanInterventionRequired: true,
-      reason: `orchestrator status=${finalState.status}`,
-    });
-    emitEvent(events, {
-      eventType: "RUN_BLOCKED",
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "review",
-      outcome: "BLOCKED",
-      reason: `orchestrator status=${finalState.status}`,
-    });
+    // claude 구조적 실패/GPT 호출 상한 초과처럼 orchestrator.ts에서 cycle 단위 event 이름이
+    // 따로 없는 나머지 WAITING_HUMAN 사유까지 이 HUMAN_APPROVAL_REQUIRED 하나로 포괄한다.
+    emitEvent(
+      events,
+      {
+        eventType: "HUMAN_APPROVAL_REQUIRED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "review",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reason: `orchestrator status=${finalState.status}`,
+      },
+      auditFailures
+    );
+    emitEvent(
+      events,
+      {
+        eventType: "RUN_BLOCKED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "review",
+        outcome: "BLOCKED",
+        reason: `orchestrator status=${finalState.status}`,
+      },
+      auditFailures
+    );
+    if (auditFailures.length > 0) {
+      const afterOrchestrator = loadState(statePath);
+      afterOrchestrator.deferredHumanTasks.push(...auditFailures);
+      saveState(afterOrchestrator, statePath);
+    }
     return {
       outcome: "RAN_TASK_NOT_APPROVED",
       taskId: taskDef.id,
@@ -503,31 +507,44 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   });
 
   if (!checkpoint.ok) {
+    // Phase G Task G1 — Secret/Dependency Scanner Gate(Core, checkpoint.ts)가 실제로 걸린
+    // 경우만 SECURITY_BLOCKED로 남긴다(원문은 담지 않는다 — checkpoint.secretFindings는
+    // 이미 file/line/kind만 담고 원문을 포함하지 않는다). 그 외 checkpoint 실패 사유(예:
+    // allowedPathPrefixes 밖 변경)는 HUMAN_APPROVAL_REQUIRED로 남긴다. 이 event들을 먼저
+    // 만들어 auditFailures를 채운 뒤, 아래 한 번의 saveState()에 함께 반영한다(Phase G Task
+    // G2 — audit-critical 기록 실패도 같은 저장 경로로 surface한다, 새 저장 경로를 만들지
+    // 않는다).
+    const isSecurityGate = (checkpoint.secretFindings?.length ?? 0) > 0 || checkpoint.dependencyScanVerdict === "BLOCK";
+    emitEvent(
+      events,
+      {
+        eventType: isSecurityGate ? "SECURITY_BLOCKED" : "HUMAN_APPROVAL_REQUIRED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "checkpoint",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reason: checkpoint.reason,
+        metadata: { secretFindingCount: checkpoint.secretFindings?.length ?? 0, dependencyScanVerdict: checkpoint.dependencyScanVerdict ?? null },
+      },
+      auditFailures
+    );
+    emitEvent(
+      events,
+      { eventType: "RUN_BLOCKED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "checkpoint", outcome: "BLOCKED", reason: checkpoint.reason },
+      auditFailures
+    );
+
     const afterOrchestrator = loadState(statePath);
     afterOrchestrator.status = "WAITING_HUMAN";
     afterOrchestrator.deferredHumanTasks.push(
       `CHECKPOINT_BLOCKED(${taskDef.id}): ${checkpoint.reason}` +
-        (checkpoint.unexpectedFiles?.length ? ` — unexpected: ${checkpoint.unexpectedFiles.join(", ")}` : "")
+        (checkpoint.unexpectedFiles?.length ? ` — unexpected: ${checkpoint.unexpectedFiles.join(", ")}` : ""),
+      ...auditFailures
     );
     saveState(afterOrchestrator, statePath);
     log("checkpoint 실패 — WAITING_HUMAN으로 전환", { taskId: taskDef.id, reason: checkpoint.reason });
-    // Phase G Task G1 — Secret/Dependency Scanner Gate(Core, checkpoint.ts)가 실제로 걸린
-    // 경우만 SECURITY_BLOCKED로 남긴다(원문은 담지 않는다 — checkpoint.secretFindings는
-    // 이미 file/line/kind만 담고 원문을 포함하지 않는다). 그 외 checkpoint 실패 사유(예:
-    // allowedPathPrefixes 밖 변경)는 HUMAN_APPROVAL_REQUIRED로 남긴다.
-    const isSecurityGate = (checkpoint.secretFindings?.length ?? 0) > 0 || checkpoint.dependencyScanVerdict === "BLOCK";
-    emitEvent(events, {
-      eventType: isSecurityGate ? "SECURITY_BLOCKED" : "HUMAN_APPROVAL_REQUIRED",
-      runId,
-      projectId: manifest.projectId,
-      taskId: taskDef.id,
-      executionPhase: "checkpoint",
-      outcome: "BLOCKED",
-      humanInterventionRequired: true,
-      reason: checkpoint.reason,
-      metadata: { secretFindingCount: checkpoint.secretFindings?.length ?? 0, dependencyScanVerdict: checkpoint.dependencyScanVerdict ?? null },
-    });
-    emitEvent(events, { eventType: "RUN_BLOCKED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "checkpoint", outcome: "BLOCKED", reason: checkpoint.reason });
     return {
       outcome: "RAN_TASK_CHECKPOINT_BLOCKED",
       taskId: taskDef.id,
@@ -538,15 +555,21 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     };
   }
 
-  emitEvent(events, {
-    eventType: "CHECKPOINT_CREATED",
-    runId,
-    projectId: manifest.projectId,
-    taskId: taskDef.id,
-    executionPhase: "checkpoint",
-    outcome: "SUCCESS",
-    metadata: { commitHash: checkpoint.commitHash ?? null },
-  });
+  emitEvent(
+    events,
+    {
+      eventType: "CHECKPOINT_CREATED",
+      runId,
+      projectId: manifest.projectId,
+      taskId: taskDef.id,
+      executionPhase: "checkpoint",
+      outcome: "SUCCESS",
+      metadata: { commitHash: checkpoint.commitHash ?? null },
+    },
+    auditFailures
+  );
+  emitEvent(events, { eventType: "TASK_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" }, auditFailures);
+  emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" }, auditFailures);
 
   // product commit(위 performTaskCheckpoint)이 끝난 뒤에만 project-state.json을 갱신하고
   // 별도의 administrative commit으로 남긴다 — project-state.json은 스스로를 같은 commit
@@ -556,6 +579,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   updated.gitCheckpoint = checkpoint.commitHash ?? updated.gitCheckpoint;
   updated.currentPhase = taskDef.phase;
   updated.lastGptDecision = finalState.lastGptDecision;
+  if (auditFailures.length > 0) updated.deferredHumanTasks.push(...auditFailures);
 
   const next = getNextTask(manifest.taskRegistry, updated.completedTasks);
   if (next) {
@@ -585,8 +609,6 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   }
 
   console.log(`[autodev] task ${taskDef.id} APPROVED + checkpoint 완료 (commit ${checkpoint.commitHash ?? "?"})`);
-  emitEvent(events, { eventType: "TASK_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" });
-  emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" });
   return {
     outcome: "RAN_TASK_APPROVED_AND_CHECKPOINTED",
     taskId: taskDef.id,
