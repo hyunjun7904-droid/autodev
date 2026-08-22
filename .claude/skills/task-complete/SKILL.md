@@ -30,23 +30,52 @@ commit-only Task라면 commit) 이후 이 메시지가 전혀 보이지 않는�
 선언)를 빼먹은 것이다 — 그때만 원인을 재확인하고, 임의로 수동 명령을 대신 실행하지 않는다(사람에게
 알리고 STOP).
 
-## 언제 이 Skill을 쓰지 않는가 — 즉시 STOP
+## 언제 이 Skill을 쓰지 않는가 — 즉시 STOP, terminal status bridge 실행
 
-다음 중 하나라도 해당하면 이 Skill을 실행하지 않는다. 이런 상태에서 TASK_COMPLETED를 만들면 안
-된다(§ 요구사항):
+다음 중 하나라도 해당하면 이 Skill(완료 절차)을 실행하지 않는다. 이런 상태에서 TASK_COMPLETED를
+만들면 안 된다(§ 요구사항):
 
 - Task의 Acceptance Criteria를 아직 다 만족하지 못했다.
-- required tests/typecheck/build 중 하나라도 FAIL이다.
+- required tests/typecheck/build 중 하나라도 FAIL이다(단, **고칠 수 있는** test/build/typecheck
+  실패는 BLOCKED가 아니다 — 문제를 고쳐서 계속 진행한다. 더 이상 안전하게 자동으로 진행할 수
+  없는 구조적 문제일 때만 아래 BLOCKED다).
 - 사람의 승인/확인이 필요한 상태다(WAITING_HUMAN) — 예: production DB/배포/등 `policy.ts`의
   `ALWAYS_HUMAN` 대상 작업이 있거나, 범위를 벗어난 결정이 필요하다.
 - 보안 게이트(Safe Executor/Secret Scanner/Dependency Scanner/Core Command Safety Gate)가
   BLOCK했다.
 - git 상태가 불확실하다(merge/rebase/cherry-pick 진행 중, 의도하지 않은 변경 혼입 등).
 
-이런 경우 Task를 `IN_PROGRESS`/`BLOCKED`/`WAITING_HUMAN`으로 보고하고 멈춘다. 새 알림 종류를
-만들지 않는다 — 이미 같은 파이프라인에 연결된 기존 event(`HUMAN_APPROVAL_REQUIRED`/
-`SECURITY_BLOCKED`/`RUN_BLOCKED` 등, § `notification.ts`)가 있고, 그 event들은 production 코드
-경로(`autodev.ts`/`orchestrator.ts`)에서만 기록된다 — 이 Skill이 그 판정을 대신하지 않는다.
+**Task를 `BLOCKED` 또는 `WAITING_HUMAN`으로 최종 보고한다고 실제로 판정했다면, 그 보고를 하기
+전에 반드시 아래 canonical self-dev terminal-status 명령을 먼저 실행한다(Phase G Task
+G7.3.2)** — 이 저장소 자신을 개발하는 Task에서 발생한 BLOCKED/WAITING_HUMAN을 사람이 매번
+"Telegram 보내라"고 따로 지시하지 않아도 알려주기 위함이다:
+
+```
+npm run self-dev:blocked -- --reason "<짧고 안전한 사유>"
+npm run self-dev:waiting-human -- --reason "<짧고 안전한 사유>"
+```
+
+- 먼저 `npm run self-dev:begin -- --task-id <TaskId>`(§ step 5, 완료 전 아무 때나 미리 실행해도
+  된다 — 이 명령들도 그 context를 그대로 재사용한다)로 이 Task의 taskId를 선언해 두어야 한다.
+  선언이 없으면 이 명령들은 아무 event도 만들지 않고 실패한다(fail-closed) — 그때만 먼저
+  `self-dev:begin`을 실행한 뒤 다시 시도한다. taskId를 transcript/commit message에서 추측하지
+  않는다.
+- `--reason`은 짧고 안전한 사유만 담는다(빈 값 금지, 200자 이내, Bot Token/API key/전체
+  prompt/전체 Claude·GPT 출력/전체 stack trace 금지 — 그런 값은 `self-dev-terminal-status.ts`의
+  `validateSelfDevTerminalReason()`이 거부한다).
+- 이 명령은 `self-dev:begin`이 선언한 context를 **소비(삭제)하지 않는다** — Task가 이후 실제로
+  완료되면 여전히 기존 completion 절차(step 5~8)가 정상 동작한다.
+- BLOCKED는 기존 `RUN_BLOCKED`(CRITICAL) 알림 경로를, WAITING_HUMAN은 신규
+  `SELF_DEV_WAITING_HUMAN` 알림 경로를 재사용한다(둘 다 `notification-service.ts`/
+  `telegram-controller.ts`를 그대로 재사용 — 새 provider/controller/queue 없음). 두 경로 모두
+  `approval-service.ts`가 명시적으로 ApprovalRequest 생성 대상에서 제외한다 — Telegram에
+  Approve/Reject/Defer 버튼이 절대 뜨지 않는다(실제 resumable production action이 없으므로).
+  같은 taskId+terminalStatus+reason으로 다시 실행해도 중복 event/알림은 만들어지지 않는다
+  (dedupe, § `self-dev-terminal-status.ts`).
+- 이 명령들을 실행한 뒤 Task를 `BLOCKED`/`WAITING_HUMAN`으로 보고하고 멈춘다. Stop hook이나
+  세션 종료 자체를 BLOCKED/WAITING_HUMAN으로 추측해서 자동 트리거하지 않는다 — commit/push
+  PostToolUse hook(§ 아래 "자동 트리거 아키텍처")은 여전히 COMPLETED 전용이다. BLOCKED/
+  WAITING_HUMAN은 commit이 없을 수도 있으므로, 이 별도의 명시적 명령이 유일한 경로다.
 
 ## 완료 절차
 

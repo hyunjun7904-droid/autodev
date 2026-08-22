@@ -59,6 +59,13 @@ export function createApprovalRequestsFromEvents(
     // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED)와 같은 batch에 짝을 이뤄 나오는 run-level
     // bookend일 뿐이다(§ autodev.ts) — 같은 차단에 두 번째 버튼 세트를 만들지 않는다.
     if (notification.notificationType === "RUN_BLOCKED") continue;
+    // Phase G Task G7.3.2 — self-dev informational-only WAITING_HUMAN(§ self-dev-terminal-
+    // status.ts). self-dev Claude Code 세션에는 production runAutodevOnce()의 실제
+    // resumable action이 없으므로, 여기서 걸러내지 않으면 실제로 동작하지 않는 승인
+    // 버튼이 생길 수 있다(요구사항이 명시적으로 금지) — ApprovalRequest 자체를 만들지
+    // 않는다(버튼이 안 보이는 것만으로는 부족하다, § telegram-approval-provider.ts와는
+    // 별개로 store에 request가 0건이어야 한다).
+    if (notification.notificationType === "SELF_DEV_WAITING_HUMAN") continue;
 
     if (approvalStore.getByDedupeKey(notification.dedupeKey)) continue;
 

@@ -163,6 +163,17 @@ function scenarioNoApprovalForRunBlockedBookend(): void {
   const result = createApprovalRequestsFromEvents(eventStore.query().events, approvalStore, { eventStore });
   check("RUN_BLOCKED는 다른 구체적 event와 짝을 이루는 bookend라 별도 승인 요청을 만들지 않음", result.created.length === 0);
 }
+function scenarioNoApprovalForSelfDevWaitingHuman(): void {
+  // Phase G Task G7.3.2 — self-dev informational-only WAITING_HUMAN에는 실제 resumable
+  // production action이 없다(§ self-dev-terminal-status.ts). ApprovalRequest가 구조적으로
+  // 0건이어야 한다(버튼이 안 보이는 것만으로는 부족하다).
+  const approvalStore: ApprovalStore = createInMemoryApprovalStore();
+  const eventStore: EventStore = createInMemoryEventStore();
+  eventStore.append({ eventType: "SELF_DEV_WAITING_HUMAN", runId: "r1", taskId: "G7.3.2", reason: "사용자 확인 필요(fixture)" });
+  const result = createApprovalRequestsFromEvents(eventStore.query().events, approvalStore, { eventStore });
+  check("SELF_DEV_WAITING_HUMAN -> ApprovalRequest 0건", result.created.length === 0);
+  check("SELF_DEV_WAITING_HUMAN -> ApprovalStore에도 request 없음", approvalStore.list().length === 0);
+}
 function scenarioIdempotentAcrossRepeatedBatches(): void {
   const approvalStore: ApprovalStore = createInMemoryApprovalStore();
   const eventStore: EventStore = createInMemoryEventStore();
@@ -510,6 +521,7 @@ async function main(): Promise<void> {
   scenarioCreatesApprovalForSecurityBlockedNotRemotelyApprovable();
   scenarioNoApprovalForNonHumanActionEvent();
   scenarioNoApprovalForRunBlockedBookend();
+  scenarioNoApprovalForSelfDevWaitingHuman();
   scenarioIdempotentAcrossRepeatedBatches();
   scenarioGitExpectationPassedThrough();
 

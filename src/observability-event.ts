@@ -97,7 +97,13 @@ export type AutoDevEventType =
   | "REMOTE_GIT_SAFE"
   | "REMOTE_GIT_BLOCKED"
   | "REMOTE_GIT_CHANGED"
-  | "REMOTE_PUSH_REJECTED";
+  | "REMOTE_PUSH_REJECTED"
+  // Phase G Task G7.3.2 — Self-Dev BLOCKED / WAITING_HUMAN Telegram Notification Bridge.
+  // self-dev Claude Code Task가 WAITING_HUMAN(사람 확인이 필요하지만 Telegram 원격 승인
+  // 버튼으로 재개할 수 없는 상태)에 도달했다는 사실만 담는다(§ self-dev-terminal-status.ts).
+  // self-dev BLOCKED는 새 event type을 만들지 않고 기존 RUN_BLOCKED를 그대로 재사용한다
+  // (§ approval-service.ts의 기존 RUN_BLOCKED 제외 규칙을 그대로 재사용하기 위함).
+  | "SELF_DEV_WAITING_HUMAN";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -150,6 +156,7 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   REMOTE_GIT_BLOCKED: ["observability", "audit"],
   REMOTE_GIT_CHANGED: ["observability", "audit"],
   REMOTE_PUSH_REJECTED: ["observability", "audit"],
+  SELF_DEV_WAITING_HUMAN: ["observability", "audit"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
@@ -192,6 +199,9 @@ const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDe
   "REMOTE_GIT_BLOCKED",
   "REMOTE_GIT_CHANGED",
   "REMOTE_PUSH_REJECTED",
+  // Phase G Task G7.3.2 — self-dev가 사람 확인이 필요한 상태로 멈췄다는 사실 자체가 감사상
+  // 중요하다(§ HUMAN_APPROVAL_REQUIRED/REVIEW_BLOCKED와 동일한 근거).
+  "SELF_DEV_WAITING_HUMAN",
 ]);
 
 /** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/

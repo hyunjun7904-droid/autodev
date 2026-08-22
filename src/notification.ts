@@ -49,7 +49,13 @@ export type NotificationType =
   | "HUMAN_APPROVAL_REQUIRED"
   | "SECURITY_BLOCKED"
   | "REVIEW_CYCLE_EXHAUSTED"
-  | "RUN_BLOCKED";
+  | "RUN_BLOCKED"
+  // Phase G Task G7.3.2 — self-dev informational-only WAITING_HUMAN(§ self-dev-terminal-
+  // status.ts 상단 주석). 기존 "WAITING_HUMAN"(REVIEW_BLOCKED 전용)과 의도적으로 분리한다 —
+  // 이 type은 requiresHumanAction=true이지만 approval-service.ts가 명시적으로 ApprovalRequest
+  // 생성 대상에서 제외한다(실제 resumable production action이 없으므로 버튼을 절대 만들지
+  // 않는다).
+  | "SELF_DEV_WAITING_HUMAN";
 
 export interface NotificationMessage {
   id: string;
@@ -87,6 +93,7 @@ const NOTIFICATION_SEVERITY: Record<NotificationType, NotificationSeverity> = {
   REVIEW_CYCLE_EXHAUSTED: "ACTION_REQUIRED",
   RUN_BLOCKED: "CRITICAL",
   SECURITY_BLOCKED: "CRITICAL",
+  SELF_DEV_WAITING_HUMAN: "ACTION_REQUIRED",
 };
 
 const REQUIRES_HUMAN_ACTION: Record<NotificationType, boolean> = {
@@ -98,6 +105,13 @@ const REQUIRES_HUMAN_ACTION: Record<NotificationType, boolean> = {
   REVIEW_CYCLE_EXHAUSTED: true,
   RUN_BLOCKED: true,
   SECURITY_BLOCKED: true,
+  // true다(사람이 실제로 확인해야 하는 상태라는 사실은 정확하다 — notification-store.ts의
+  // actionRequiredPendingCount 등 dashboard 집계가 이 사실을 정확히 반영해야 한다). 다만
+  // approval-service.ts가 이 notificationType을 명시적으로 ApprovalRequest 생성 대상에서
+  // 제외하므로(§ 그 파일), 이 값이 true여도 버튼이 있는 승인 요청은 절대 만들어지지 않는다
+  // (RUN_BLOCKED와 동일한 "requiresHumanAction=true지만 approval-service.ts가 별도 차단"
+  // 패턴).
+  SELF_DEV_WAITING_HUMAN: true,
 };
 
 interface NotificationContent {
@@ -145,6 +159,10 @@ const NOTIFICATION_CONTENT: Record<NotificationType, (event: AutoDevEvent) => No
     title: "[AutoDev] 실행 차단",
     shortMessage: `Run ${e.runId}이 Task ${taskLabel(e)}에서 차단되어 중단되었습니다.`,
   }),
+  SELF_DEV_WAITING_HUMAN: (e) => ({
+    title: "[AutoDev] 사용자 확인 필요",
+    shortMessage: `Task ${taskLabel(e)}가 사용자 확인이 필요한 상태입니다(Telegram 원격 승인으로 재개할 수 없습니다).`,
+  }),
 };
 
 // event type → notification type 단일 매핑. 이 표에 없는 event type은 알림을 만들지 않는다
@@ -160,6 +178,10 @@ const EVENT_TO_NOTIFICATION_TYPE: Partial<Record<AutoDevEventType, NotificationT
   REVIEW_BLOCKED: "WAITING_HUMAN",
   // RUN_COMPLETED는 의도적으로 여기 없다(§ 파일 상단 주석 — 2026-08-22 incident 이후
   // TASK_COMPLETED와 중복되는 중간/완료 정보는 보내지 않는다).
+  // Phase G Task G7.3.2 — self-dev BLOCKED는 이 표에 별도 항목이 없다(RUN_BLOCKED가 이미
+  // 위에서 매핑돼 있고, self-dev-terminal-status.ts가 그 기존 eventType을 그대로 재사용
+  // 한다 — 새 event type 없음).
+  SELF_DEV_WAITING_HUMAN: "SELF_DEV_WAITING_HUMAN",
 };
 
 function buildDedupeKey(runId: string, taskId: string | undefined, type: NotificationType, cycle: number | undefined): string {

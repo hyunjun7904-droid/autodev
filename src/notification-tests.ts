@@ -99,6 +99,18 @@ function scenarioRunBlocked(): void {
   check("RUN_BLOCKED: requiresHumanAction=true", n?.requiresHumanAction === true);
 }
 
+// Phase G Task G7.3.2 — self-dev informational-only WAITING_HUMAN. 기존 "WAITING_HUMAN"
+// (REVIEW_BLOCKED 전용)과 notificationType이 다르다는 사실 자체가 approval-service.ts의
+// 별도 제외 규칙이 필요한 이유다(§ self-dev-terminal-status.ts 상단 주석).
+function scenarioSelfDevWaitingHuman(): void {
+  const n = classifyEventForNotification(ev({ eventType: "SELF_DEV_WAITING_HUMAN", runId: "r8b", taskId: "G7.3.2" }));
+  check("SELF_DEV_WAITING_HUMAN: type 일치", n?.notificationType === "SELF_DEV_WAITING_HUMAN");
+  check("SELF_DEV_WAITING_HUMAN: 기존 WAITING_HUMAN(REVIEW_BLOCKED)과 다른 type", n?.notificationType !== "WAITING_HUMAN");
+  check("SELF_DEV_WAITING_HUMAN: severity=ACTION_REQUIRED", n?.severity === "ACTION_REQUIRED");
+  check("SELF_DEV_WAITING_HUMAN: requiresHumanAction=true", n?.requiresHumanAction === true);
+  check("SELF_DEV_WAITING_HUMAN: title 고정 템플릿", n?.title === "[AutoDev] 사용자 확인 필요");
+}
+
 // ---------------------------------------------------------------------------
 // 2) 알림 대상이 아닌 event — 순수 진행 상황(*_STARTED, AGENT_*, REVIEW_STARTED/APPROVED/
 //    REVISE, CHECKPOINT_CREATED)은 알림을 만들지 않는다.
@@ -196,6 +208,7 @@ async function main(): Promise<void> {
   scenarioSecurityBlocked();
   scenarioReviewCycleExhausted();
   scenarioRunBlocked();
+  scenarioSelfDevWaitingHuman();
   scenarioNonNotifiableEvents();
   scenarioDedupeKeyStability();
   scenarioNoSensitiveDataLeak();
