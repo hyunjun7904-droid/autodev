@@ -73,7 +73,19 @@ export type AutoDevEventType =
   | "APPROVAL_STALE"
   | "AUTO_RESUME_STARTED"
   | "AUTO_RESUME_BLOCKED"
-  | "AUTO_RESUME_COMPLETED";
+  | "AUTO_RESUME_COMPLETED"
+  // Phase G Task G7 — Project Lock & Concurrent Writer Safety. 이 6개는 project-lock.ts의
+  // 판정 결과를 "관찰"만 한다 — 판정 자체는 project-lock.ts가 전담하고, 이 event들은 그
+  // 결과를 audit 기록으로 남기는 용도다(§ event 배선은 checkpoint.ts/safe-executor.ts와
+  // 동일하게 autodev.ts가 전담). PROJECT_LOCK_BLOCKED는 PROJECT_ALREADY_LOCKED/
+  // LOCK_STATE_UNCERTAIN 둘 다를 포괄한다(metadata.lockBlockedCode로 구분) — 요구사항이
+  // 예시한 event 이름 목록을 그대로 따르되 불필요하게 event type 수를 늘리지 않는다.
+  | "PROJECT_LOCK_ACQUIRED"
+  | "PROJECT_LOCK_BLOCKED"
+  | "PROJECT_LOCK_RELEASED"
+  | "PROJECT_LOCK_STALE_DETECTED"
+  | "PROJECT_LOCK_RECOVERED"
+  | "PROJECT_LOCK_CORRUPT";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -115,6 +127,12 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   AUTO_RESUME_STARTED: ["observability"],
   AUTO_RESUME_BLOCKED: ["observability", "audit"],
   AUTO_RESUME_COMPLETED: ["observability"],
+  PROJECT_LOCK_ACQUIRED: ["observability"],
+  PROJECT_LOCK_BLOCKED: ["observability", "audit"],
+  PROJECT_LOCK_RELEASED: ["observability"],
+  PROJECT_LOCK_STALE_DETECTED: ["observability", "audit"],
+  PROJECT_LOCK_RECOVERED: ["observability", "audit"],
+  PROJECT_LOCK_CORRUPT: ["observability", "audit"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
@@ -147,6 +165,10 @@ const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDe
   "APPROVAL_UNAUTHORIZED",
   "APPROVAL_STALE",
   "AUTO_RESUME_BLOCKED",
+  // Phase G Task G7 — 동시 writer 진입이 막혔거나(BLOCKED) lock 상태를 신뢰할 수 없어
+  // 진행을 중단한 경우(CORRUPT) 모두 보안상 중요한 사실이라 기록 실패를 조용히 넘기지 않는다.
+  "PROJECT_LOCK_BLOCKED",
+  "PROJECT_LOCK_CORRUPT",
 ]);
 
 /** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/

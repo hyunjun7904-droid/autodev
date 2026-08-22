@@ -486,12 +486,22 @@ async function scenarioApprovedRunRecordsRealEvents(): Promise<void> {
   check("event 기록: REVIEW_APPROVED가 기록됨", types.includes("REVIEW_APPROVED"));
   check("event 기록: CHECKPOINT_CREATED가 기록됨", types.includes("CHECKPOINT_CREATED"));
   check("event 기록: RUN_COMPLETED가 기록됨", types.includes("RUN_COMPLETED"));
+  // Phase G Task G7 — Project Lock event(PROJECT_LOCK_ACQUIRED/RELEASED)도 이 실행에서
+  // 실제로 기록된다. task 선택 이전(acquire)/이후(state_update에서 release)에 일어나는
+  // run-level event라 RUN_STARTED와 마찬가지로 taskId가 없다(§ 요구사항: lock은 project
+  // 단위이지 task 단위가 아니다).
+  check("event 기록: PROJECT_LOCK_ACQUIRED가 기록됨", types.includes("PROJECT_LOCK_ACQUIRED"));
+  check("event 기록: PROJECT_LOCK_RELEASED가 기록됨(성공 후 release)", types.includes("PROJECT_LOCK_RELEASED"));
   check("event 기록: 모든 event가 동일 runId를 공유함(correlation)", new Set(all.map((e) => e.runId)).size === 1);
+  const taskAgnosticEventTypes = new Set(["RUN_STARTED", "PROJECT_LOCK_ACQUIRED", "PROJECT_LOCK_RELEASED"]);
   check(
-    "event 기록: taskId가 있는 event는 모두 동일 taskId를 공유함(RUN_STARTED는 task 선택 전이라 taskId가 없음)",
-    all.filter((e) => e.eventType !== "RUN_STARTED").every((e) => e.taskId === taskDef.id)
+    "event 기록: taskId가 있는 event는 모두 동일 taskId를 공유함(RUN_STARTED/PROJECT_LOCK_*는 task 선택 전후라 taskId가 없음)",
+    all.filter((e) => !taskAgnosticEventTypes.has(e.eventType)).every((e) => e.taskId === taskDef.id)
   );
-  check("event 기록: RUN_STARTED가 sequence상 가장 먼저(1)", events.query({ eventType: "RUN_STARTED" }).events[0]?.sequence === 1);
+  check(
+    "event 기록: PROJECT_LOCK_ACQUIRED가 sequence상 가장 먼저(1), RUN_STARTED가 그 다음(2)",
+    events.query({ eventType: "PROJECT_LOCK_ACQUIRED" }).events[0]?.sequence === 1 && events.query({ eventType: "RUN_STARTED" }).events[0]?.sequence === 2
+  );
 }
 
 // Phase G Task G2 — production entrypoint(runAutodevOnce)가 opts.events를 지정하지 않아도

@@ -19,6 +19,8 @@ import type { AgentStepResult, ReadOnlyAgentRunner } from "./agent-orchestrator"
 import { classifyTaskRisk, requiresHumanApproval } from "./policy";
 import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
+import { acquireProjectLock, releaseProjectLock } from "./project-lock";
+import type { ProjectLockHandle, ProjectLockOwnerKind } from "./project-lock";
 import { isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import { randomUUID } from "node:crypto";
@@ -175,13 +177,25 @@ export interface AutodevRunOptions {
   events?: EventStore;
   /** 지정하지 않으면 이 실행마다 새 runId를 생성한다(node:crypto의 randomUUID). */
   runId?: string;
+  /**
+   * Phase G Task G7 — Project Lock metadata의 ownerKind. 지정하지 않으면 "autodev"(일반
+   * AutoDev 실행)를 쓴다. auto-resume.ts가 performAutoResume()에서 이 값을
+   * "telegram-resume"로 지정해 호출한다 — lock 판정 로직 자체(project-lock.ts)는 두 호출
+   * 경로가 완전히 동일하게 공유한다(canonical service 하나, 두 개의 서로 다른 lock 구현이
+   * 아니다).
+   */
+  lockOwnerKind?: ProjectLockOwnerKind;
 }
 
 export type AutodevRunOutcome =
   | "STOPPED"
   | "RAN_TASK_APPROVED_AND_CHECKPOINTED"
   | "RAN_TASK_NOT_APPROVED"
-  | "RAN_TASK_CHECKPOINT_BLOCKED";
+  | "RAN_TASK_CHECKPOINT_BLOCKED"
+  /** Phase G Task G7 — 같은 project를 다른 프로세스가 이미 쓰고 있거나(PROJECT_ALREADY_LOCKED)
+   *  lock 상태를 신뢰할 수 없어서(LOCK_STATE_UNCERTAIN/CORRUPT_LOCK) 이 실행 자체를 시작하지
+   *  않은 경우. state.json/git 어느 쪽도 건드리지 않는다 — reason에 어떤 lock 코드였는지 남는다. */
+  | "BLOCKED_PROJECT_LOCK";
 
 export interface AutodevRunResult {
   outcome: AutodevRunOutcome;
@@ -346,40 +360,136 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   }
   const manifest = opts.manifest;
   validateProjectManifest(manifest);
-  // Safe Executor의 실제 read/write/명령 enforcement를 이 manifest의 Project Policy로
-  // 명시적으로 설정한다(Phase B Task B1) — Safe Executor 자체는 어떤 프로젝트인지 모르고,
-  // 이 호출이 유일한 주입 지점이다(silent MOVAN/permissive fallback 없음).
-  //
-  // Phase C Task C2 — 이 run 전용 SafeExecutorContext를 만든다. module-global mutable
-  // singleton을 설정하는 하위 호환 wrapper 함수(같은 프로세스의 다른 실행이 나중에 덮어쓸 수
-  // 있는 전역)는 이 production 경로에서 더 이상 호출하지 않는다 — 이 executorContext는 이
-  // runAutodevOnce() 호출 하나에만 속하며, 아래에서 필요한 곳(Developer/GPT Reviewer)에
-  // 명시적으로 전달한다. 같은 프로세스 안에서 다른 project의 runAutodevOnce()가 동시에/
-  // 번갈아 실행돼도 이 executorContext의 root/policy는 절대 바뀌지 않는다.
-  const executorContext = createSafeExecutorContext(manifest.targetProjectRoot, manifest.executionPolicy);
 
-  const statePath = opts.statePath ?? manifest.statePath;
-  const cwd = opts.cwd ?? manifest.targetProjectRoot;
   const runId = opts.runId ?? randomUUID();
   const events = opts.events ?? selectDefaultEventStore();
-  // Phase G Task G2 — audit-critical event 기록 실패 사유만(원문/추가정보 없이) 쌓아뒀다가
-  // 이미 저장 직전인 state 객체의 deferredHumanTasks에 이어붙인다(§ emitEvent 주석).
-  const auditFailures: string[] = [];
+  const lockOwnerKind: ProjectLockOwnerKind = opts.lockOwnerKind ?? "autodev";
 
-  emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
+  // Phase G Task G7 — Project Lock & Concurrent Writer Safety. 실제 production write(state
+  // 읽기/Developer 실행/checkpoint)를 시작하기 전에, 이 project(canonical real path 기준)를
+  // 다른 프로세스가 이미 쓰고 있지 않은지 원자적으로 확인한다. 이 판정은 project-lock.ts
+  // 하나가 전담한다 — 일반 AutoDev 실행(run.ts)과 Telegram Auto Resume(auto-resume.ts)
+  // 모두 이 함수(runAutodevOnce) 하나를 거치므로 두 경로가 서로 다른 lock 구현을 갖지
+  // 않는다(§ 요구사항 14). 실패하면 state.json/git 어느 쪽도 건드리지 않고 즉시 반환한다 —
+  // "이미 다른 프로세스가 이 파일들을 만지고 있을 수 있다"는 바로 그 이유 때문에, 이
+  // 경로에서는 loadState()조차 호출하지 않는다(동시 쓰기 race를 새로 만들지 않기 위함).
+  const lockAcquireResult = acquireProjectLock({
+    projectId: manifest.projectId,
+    targetProjectRoot: manifest.targetProjectRoot,
+    ownerKind: lockOwnerKind,
+    runId,
+  });
 
-  const state = loadState(statePath);
-  const decision = decideNextAction(state, manifest.taskRegistry);
-
-  if (decision.kind === "STOP") {
-    console.log(`[autodev] ${decision.reason}`);
-    if (decision.setWaitingHuman && (state.status as unknown as string) !== "WAITING_HUMAN") {
-      state.status = "WAITING_HUMAN";
-      saveState(state, statePath);
-    }
-    emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "SKIPPED", reason: decision.reason });
-    return { outcome: "STOPPED", reason: decision.reason };
+  if (!lockAcquireResult.ok) {
+    const lockEventType = lockAcquireResult.code === "CORRUPT_LOCK" ? "PROJECT_LOCK_CORRUPT" : "PROJECT_LOCK_BLOCKED";
+    log(`Project Lock BLOCK(${lockAcquireResult.code}) — production writer를 시작하지 않습니다.`, {
+      projectId: manifest.projectId,
+      code: lockAcquireResult.code,
+      reason: lockAcquireResult.reason,
+    });
+    emitEvent(events, {
+      eventType: lockEventType,
+      runId,
+      projectId: manifest.projectId,
+      executionPhase: "task_selection",
+      outcome: "BLOCKED",
+      humanInterventionRequired: true,
+      reason: lockAcquireResult.reason,
+      metadata: {
+        lockBlockedCode: lockAcquireResult.code,
+        ...(lockAcquireResult.code === "PROJECT_ALREADY_LOCKED" && lockAcquireResult.existingOwner
+          ? { existingOwnerPid: lockAcquireResult.existingOwner.pid, existingOwnerKind: lockAcquireResult.existingOwner.ownerKind }
+          : {}),
+      },
+    });
+    return { outcome: "BLOCKED_PROJECT_LOCK", reason: lockAcquireResult.reason };
   }
+
+  const lock: ProjectLockHandle = lockAcquireResult.lock;
+  emitEvent(events, {
+    eventType: "PROJECT_LOCK_ACQUIRED",
+    runId,
+    projectId: manifest.projectId,
+    executionPhase: "task_selection",
+    outcome: "SUCCESS",
+    metadata: { ownerKind: lockOwnerKind },
+  });
+  if (lockAcquireResult.recoveredFromStale) {
+    const { previousOwnerPid, evidence } = lockAcquireResult.recoveredFromStale;
+    emitEvent(events, {
+      eventType: "PROJECT_LOCK_STALE_DETECTED",
+      runId,
+      projectId: manifest.projectId,
+      executionPhase: "task_selection",
+      outcome: "SUCCESS",
+      reason: evidence,
+      metadata: { previousOwnerPid },
+    });
+    emitEvent(events, {
+      eventType: "PROJECT_LOCK_RECOVERED",
+      runId,
+      projectId: manifest.projectId,
+      executionPhase: "task_selection",
+      outcome: "SUCCESS",
+      metadata: { previousOwnerPid },
+    });
+  }
+
+  // 이 시점부터는 lock을 잡고 있다 — 아래 finalizeProjectLock()이 실행 결과에 따라
+  // release/keep을 결정한다(§ 요구사항 9, WAITING_HUMAN lifecycle 정책은 각 반환 지점에서
+  // lockShouldRelease를 명시적으로 false로 설정하는 방식으로 표현한다).
+  let lockShouldRelease = true;
+  function finalizeProjectLock(): void {
+    if (lockShouldRelease) {
+      const rel = releaseProjectLock(lock);
+      if (rel.ok) {
+        emitEvent(events, { eventType: "PROJECT_LOCK_RELEASED", runId, projectId: manifest.projectId, executionPhase: "state_update", outcome: "SUCCESS" });
+      } else {
+        log("Project Lock release 실패 — 다음 acquire 시도가 stale 판정으로 복구해야 할 수 있습니다.", { projectId: manifest.projectId, reason: rel.reason });
+      }
+    } else {
+      log(
+        "Project Lock을 유지합니다(production working state가 WAITING_HUMAN으로 보존됨) — 이 프로세스가 종료된 뒤에는 stale 판정(owner PID 죽음/재사용 증명)으로만 다음 writer가 복구할 수 있습니다.",
+        { projectId: manifest.projectId, pid: lock.metadata.pid }
+      );
+    }
+  }
+
+  try {
+    // Safe Executor의 실제 read/write/명령 enforcement를 이 manifest의 Project Policy로
+    // 명시적으로 설정한다(Phase B Task B1) — Safe Executor 자체는 어떤 프로젝트인지 모르고,
+    // 이 호출이 유일한 주입 지점이다(silent MOVAN/permissive fallback 없음).
+    //
+    // Phase C Task C2 — 이 run 전용 SafeExecutorContext를 만든다. module-global mutable
+    // singleton을 설정하는 하위 호환 wrapper 함수(같은 프로세스의 다른 실행이 나중에 덮어쓸 수
+    // 있는 전역)는 이 production 경로에서 더 이상 호출하지 않는다 — 이 executorContext는 이
+    // runAutodevOnce() 호출 하나에만 속하며, 아래에서 필요한 곳(Developer/GPT Reviewer)에
+    // 명시적으로 전달한다. 같은 프로세스 안에서 다른 project의 runAutodevOnce()가 동시에/
+    // 번갈아 실행돼도 이 executorContext의 root/policy는 절대 바뀌지 않는다.
+    const executorContext = createSafeExecutorContext(manifest.targetProjectRoot, manifest.executionPolicy);
+
+    const statePath = opts.statePath ?? manifest.statePath;
+    const cwd = opts.cwd ?? manifest.targetProjectRoot;
+    // Phase G Task G2 — audit-critical event 기록 실패 사유만(원문/추가정보 없이) 쌓아뒀다가
+    // 이미 저장 직전인 state 객체의 deferredHumanTasks에 이어붙인다(§ emitEvent 주석).
+    const auditFailures: string[] = [];
+
+    emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
+
+    const state = loadState(statePath);
+    const decision = decideNextAction(state, manifest.taskRegistry);
+
+    if (decision.kind === "STOP") {
+      console.log(`[autodev] ${decision.reason}`);
+      if (decision.setWaitingHuman && (state.status as unknown as string) !== "WAITING_HUMAN") {
+        state.status = "WAITING_HUMAN";
+        saveState(state, statePath);
+      }
+      emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "SKIPPED", reason: decision.reason });
+      // 이 분기는 어떤 developer/checkpoint 작업도 하지 않았다 — working tree에 아무 위험도
+      // 남기지 않았으므로 안전하게 release한다(lockShouldRelease는 기본값 true 그대로).
+      return { outcome: "STOPPED", reason: decision.reason };
+    }
 
   const taskDef = decision.task;
   console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
@@ -489,6 +599,12 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       afterOrchestrator.deferredHumanTasks.push(...auditFailures);
       saveState(afterOrchestrator, statePath);
     }
+    // Phase G Task G7 — orchestrator가 APPROVED로 끝나지 않았다는 것은 developer가 실제로
+    // 만든 코드 변경이 working tree에 커밋되지 않은 채 남아있을 수 있다는 뜻이다(checkpoint는
+    // APPROVED일 때만 실행된다 — performTaskCheckpoint 호출 자체가 아래에 있다). 이 lock을
+    // 여기서 release하면 다른 writer가 그 미완성/미검증 변경 위에 그대로 개발을 시작할 수
+    // 있으므로, 이 프로세스가 살아있는 동안은 release하지 않는다(§ 요구사항 9).
+    lockShouldRelease = false;
     return {
       outcome: "RAN_TASK_NOT_APPROVED",
       taskId: taskDef.id,
@@ -565,6 +681,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       ...auditFailures
     );
     saveState(afterOrchestrator, statePath);
+    // Phase G Task G7 — reviewer가 이미 APPROVED한 실제 코드 변경이 아직 commit되지 않은 채
+    // working tree에 그대로 있다(audit store 문제로 checkpoint 자체를 시도하지 않았을 뿐).
+    // 다른 writer가 이 위에서 시작하지 못하도록 이 프로세스가 살아있는 동안 lock을 유지한다.
+    lockShouldRelease = false;
     return {
       outcome: "RAN_TASK_CHECKPOINT_BLOCKED",
       taskId: taskDef.id,
@@ -623,6 +743,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     );
     saveState(afterOrchestrator, statePath);
     log("checkpoint 실패 — WAITING_HUMAN으로 전환", { taskId: taskDef.id, reason: checkpoint.reason });
+    // Phase G Task G7 — checkpoint가 BLOCK한 이유(unexpected files/secret/dependency 위험)와
+    // 무관하게, 이 시점의 working tree에는 이 task가 실제로 만든(또는 예상 밖의) 변경이 그대로
+    // 남아있다 — 정확히 요구사항 9가 경고하는 상황이다. 이 프로세스가 살아있는 동안 lock을
+    // 유지해 다른 writer가 이 미해결 상태 위에서 작업을 시작하지 못하게 한다.
+    lockShouldRelease = false;
     return {
       outcome: "RAN_TASK_CHECKPOINT_BLOCKED",
       taskId: taskDef.id,
@@ -687,6 +812,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   }
 
   console.log(`[autodev] task ${taskDef.id} APPROVED + checkpoint 완료 (commit ${checkpoint.commitHash ?? "?"})`);
+  // Phase G Task G7 — product commit + administrative commit이 모두 끝난 뒤라 working tree가
+  // clean하다(또는 adminCommit 실패만 남았어도 코드 자체는 이미 안전하게 커밋됨) — 안전하게
+  // release한다(lockShouldRelease는 기본값 true 그대로).
   return {
     outcome: "RAN_TASK_APPROVED_AND_CHECKPOINTED",
     taskId: taskDef.id,
@@ -694,6 +822,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     checkpoint,
     ...agentAdvisoryField,
   };
+  } catch (err) {
+    // Phase G Task G7 — 처리되지 않은 예외는 이 실행의 최종 상태를 알 수 없다는 뜻이다(fail
+    // closed). working tree/state.json이 안전한 상태인지 확신할 수 없으므로 lock을 release하지
+    // 않는다 — 이 프로세스가 실제로 종료된 뒤에야 다음 acquire 시도가 stale 판정(owner PID
+    // 죽음 증명)으로 복구할 수 있다.
+    lockShouldRelease = false;
+    throw err;
+  } finally {
+    finalizeProjectLock();
+  }
 }
 
 // 프로세스 진입점(main()/SIGINT 처리/require.main===module 가드)은 이 파일에 없다 — Core는

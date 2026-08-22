@@ -6,6 +6,7 @@ import type { ProjectManifest } from "./project-manifest";
 import type { EventStore } from "./event-store";
 import type { ApprovalRequest } from "./approval";
 import type { OrchestratorDeps } from "./orchestrator";
+import { peekProjectLock } from "./project-lock";
 
 // Safe Auto Resume — Phase G Task G6.
 //
@@ -18,7 +19,7 @@ import type { OrchestratorDeps } from "./orchestrator";
 // 어떤 Gate도 우회하지 않는다 — approval.ts의 REMOTELY_APPROVABLE_APPROVAL_TYPES가
 // ORCHESTRATOR_NOT_APPROVED_GENERIC만 허용하는 이유이기도 하다).
 //
-// 이 파일이 실제로 수행하는 재검사 3가지:
+// 이 파일이 실제로 수행하는 재검사:
 //   1) approval.remotelyApprovable 재확인(§ approval-service.ts가 이미 확인했어도 다시
 //      확인한다 — "한 곳만 확인하고 다른 경로는 신뢰"하지 않는다).
 //   2) Stale-state 재확인(승인 생성 시점과 지금 사이 task가 이미 끝났거나 상태가
@@ -26,6 +27,14 @@ import type { OrchestratorDeps } from "./orchestrator";
 //   3) Git Safety 재확인(git-changes.ts의 기존 읽기 전용 helper만 재사용 — 새 판정
 //      로직을 만들지 않는다). 불일치하면 RESUME_BLOCKED_GIT_STATE로 중단하고, git
 //      reset/clean/checkout 등 어떤 "자동 수정"도 시도하지 않는다.
+//   4) Phase G Task G7 — Project Lock 재확인(peekProjectLock, project-lock.ts). Telegram
+//      APPROVE 자체는 lock override 권한이 아니다 — 이 project를 지금 다른 프로세스가 이미
+//      쓰고 있다면(예: PC에서 AutoDev가 같은 project를 이미 수정 중) 아래 state.status
+//      READY 전환조차 시도하지 않고 즉시 BLOCKED로 중단한다. 이 함수는 lock을 만들거나
+//      지우지 않는 읽기 전용 사전 확인일 뿐이다 — 실제 원자적 acquire/release는 여전히
+//      runAutodevOnce() 하나(project-lock.ts를 직접 쓰는 유일한 지점)가 전담한다(§ 요구사항
+//      14, 두 실행 경로가 서로 다른 lock 구현을 갖지 않는다). Telegram callback에는 lock을
+//      강제로 삭제/탈취하는 기능이 없다(§ 요구사항 11).
 //
 // 이 중 하나라도 실패하면 WAITING_HUMAN 상태(state.status)를 그대로 둔 채(변경하지 않고)
 // BLOCKED를 반환한다 — 안전한 경우에만 state.status를 "READY"로 바꿔 다음 실행이 이 task를
@@ -97,6 +106,15 @@ export async function performAutoResume(
     return { kind: "BLOCKED", reason: gitCheck.reason ?? "RESUME_BLOCKED_GIT_STATE" };
   }
 
+  // 4) Project Lock 재확인 — 아래 state.status READY 전환(쓰기)조차 다른 살아있는 owner가
+  //    있다면 시도하지 않는다(§ 요구사항 10/21). 이 peek이 통과해도 그 사이 다른 프로세스가
+  //    먼저 실제 lock을 잡을 수 있다 — 그 최종 승부는 runAutodevOnce()의 원자적 acquire가
+  //    가른다(이 함수는 그 결과를 그대로 BLOCKED로 반환할 뿐, 여기서 다시 판정하지 않는다).
+  const lockPeek = peekProjectLock(manifest.projectId, manifest.targetProjectRoot);
+  if (lockPeek.locked) {
+    return { kind: "BLOCKED", reason: `PROJECT_ALREADY_LOCKED: ${lockPeek.reason}` };
+  }
+
   // 안전 확인 완료 — WAITING_HUMAN을 벗어나 decideNextAction()이 이 미완료 task를 다시
   // 선택할 수 있게 한다(autodev.ts가 task 완료 후 다음 task를 고를 때 쓰는 것과 동일한
   // "READY" marker — 새 상태 값을 만들지 않는다).
@@ -108,8 +126,12 @@ export async function performAutoResume(
     manifest,
     statePath,
     cwd,
+    lockOwnerKind: "telegram-resume",
     ...(opts.events ? { events: opts.events } : {}),
     ...(opts.orchestratorDeps ? { orchestratorDeps: opts.orchestratorDeps } : {}),
   });
+  if (result.outcome === "BLOCKED_PROJECT_LOCK") {
+    return { kind: "BLOCKED", reason: `PROJECT_ALREADY_LOCKED: ${result.reason ?? ""}` };
+  }
   return { kind: "COMPLETED", result };
 }
