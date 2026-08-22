@@ -12,10 +12,23 @@ checkpoint 파이프라인이 전담한다.
 
 **핵심 원칙 — Claude Code 세션이 끝났다는 사실 자체는 완료의 증거가 아니다.** Stop hook이나
 "작업을 다 했다"는 자기보고만으로 TASK_COMPLETED를 만들지 않는다. 아래 순서를 전부 사람이/Claude가
-직접 실행하고 실제로 통과한 뒤에만, 마지막 단계에서 `self-dev-complete.ts`(deterministic bridge)가
-그 evidence를 **이 저장소를 대상으로 직접 재검증**한 뒤에만 event가 만들어진다(§ 아키텍처는 아래
-참고). 즉 이 Skill 자체를 건너뛰고 evidence를 조작해 CLI에 거짓 flag를 넘겨도, 마지막 bridge
-재검증이 fail-closed로 막는다.
+직접 실행하고 실제로 통과한 뒤에만, `self-dev-complete.ts`(deterministic bridge)가 그 evidence를
+**이 저장소를 대상으로 직접 재검증**한 뒤에만 event가 만들어진다(§ 아키텍처는 아래 참고). 즉 이
+Skill 자체를 건너뛰고 evidence를 조작해 CLI에 거짓 flag를 넘겨도, 마지막 bridge 재검증이
+fail-closed로 막는다.
+
+**Phase G Task G7.3.1b 이후 — bridge 호출은 자동이다.** 이전에는 아래 절차의 마지막 단계
+(`npm run self-dev:complete`)를 Claude가 직접 기억해서 실행해야 했고, 실제로 이 단계가 누락돼
+완료 알림이 오지 않은 사고(G7.3.1a)가 있었다. 이제는 **step 5(아래)에서 context를 선언하기만
+하면, 이후 commit/push가 성공하는 순간 PostToolUse hook(`.claude/settings.json` →
+`.claude/hooks/self-dev-completion-hook.js` → `dist/self-dev-completion-hook.js`)이
+`dist/self-dev-complete.js`를 자동으로 호출**한다. **Claude는 정상 경로에서 `npm run
+self-dev:complete`/`npm run notify:task-completed`를 직접 실행하지 않는다** — 직접 실행하면
+이 자동화가 실제로 동작하는지 검증할 수 없게 된다. hook이 실행되면 다음 turn에
+`[self-dev completion hook] ...` systemMessage로 결과(성공/실패)가 보인다. push(또는
+commit-only Task라면 commit) 이후 이 메시지가 전혀 보이지 않는다면, 대개 아래 step 5(context
+선언)를 빼먹은 것이다 — 그때만 원인을 재확인하고, 임의로 수동 명령을 대신 실행하지 않는다(사람에게
+알리고 STOP).
 
 ## 언제 이 Skill을 쓰지 않는가 — 즉시 STOP
 
@@ -54,38 +67,71 @@ uncommitted 작업이 있는지 먼저 확인한다 — 사용자의 명시적 �
 
 **4) build.** `npm run build` (또는 동일한 이유로 `node node_modules/typescript/bin/tsc`).
 
-**5) 변경 파일만 정확히 stage하고 commit.** `git add -A`/`git add .` 금지 — 이번 Task에서 실제로
+**5) Self-Dev Task Context 선언 — commit 직전, 반드시 이 순서.**
+
+```
+npm run self-dev:begin -- --task-id <TaskId> [--push]
+```
+
+- `<TaskId>`는 이 저장소의 Task 식별자(예: `G7.3.1b`)다. 추측/생략 금지 — 명시적으로 알고 있는
+  값만 넘긴다.
+- 이 Task가 push까지 요구한다면 `--push`를 반드시 붙인다(아래 step 7과 반드시 일치해야 한다 —
+  여기서 `--push`를 붙였는데 실제로 push를 하지 않으면 hook이 계속 push를 기다리기만 하고
+  트리거되지 않는다).
+- 이 명령은 **완료를 주장하지 않는다** — 로컬 전용(gitignored) context 파일에 "지금부터 이어지는
+  commit(+push)이 이 taskId에 대응한다"는 사실과 현재 HEAD(baseline)만 남긴다(§
+  `self-dev-task-context.ts`). 실제 완료 판정은 여전히 아래 자동 트리거가 호출하는
+  `self-dev-complete.ts`가 전담한다.
+
+**6) 변경 파일만 정확히 stage하고 commit.** `git add -A`/`git add .` 금지 — 이번 Task에서 실제로
 바뀐 파일만 경로를 지정해 stage한다. `git status`로 예상치 못한 파일이 섞이지 않았는지 확인한 뒤
-commit한다.
+commit한다. **push가 필요 없는 Task라면 이 commit이 성공하는 순간 hook이 자동으로 완료 조건을
+재검증한다** — 이후 아무 것도 수동으로 실행하지 않는다.
 
-**6) push가 필요한 Task라면.** origin과의 divergence를 먼저 확인하고, fast-forward push만
-수행한다(force push 금지). push 후 실제로 반영됐는지 확인한다.
+**7) push가 필요한 Task라면.** origin과의 divergence를 먼저 확인하고, fast-forward push만
+수행한다(force push 금지). **이 push가 성공하는 순간 hook이 자동으로 완료 조건을 재검증한다** —
+이후 아무 것도 수동으로 실행하지 않는다.
 
-**7) Self-Dev Task Completion Bridge 실행 — 이 Task가 만드는 유일한 완료 신호.**
+**8) 완료 신호는 자동이다 — 확인만 한다.** step 5에서 선언한 context와, step 6/7의 commit(또는
+push)이 성공하면, PostToolUse hook이 `dist/self-dev-complete.js --task-id <TaskId> [--push]`를
+자동으로 호출한다(§ 아래 "자동 트리거 아키텍처"). Claude는 다음 turn에 나타나는
+`[self-dev completion hook] ...` systemMessage로 결과만 확인한다:
+
+- 성공 메시지가 보이면 완료다(다음 절차 없음).
+- `FAILED`가 보이면 완료 조건을 충족하지 못한 것이다(원인은 메시지에 그대로 담겨 있다 —
+  typecheck/build/전체 회귀/push 중 하나) — 문제를 고치고 다시 step 6/7(commit 또는 push)을
+  반복한다. context는 실패 시 그대로 유지되므로 step 5를 다시 실행할 필요는 없다.
+- 아무 메시지도 보이지 않으면(가장 흔한 원인) step 5를 빼먹었거나 `--push` 지정이 step 7과
+  어긋난 것이다 — 이 경우에만 원인을 재확인하고, **임의로 `npm run self-dev:complete`를 대신
+  실행하지 않는다**(사람에게 알리고 상태를 `BLOCKED`/`WAITING_HUMAN`으로 보고한 뒤 STOP —
+  hook 자체가 고장났는지 원인 파악이 먼저다. § 아래 "Hook을 못 쓰는 예외적인 경우").
+
+## Hook을 못 쓰는 예외적인 경우
+
+이 저장소가 아닌 다른 환경(hooks가 비활성화된 세션 등)에서 부득이하게 수동으로 완료 신호를
+만들어야 한다면, 사람에게 그 사실을 명시적으로 알리고 승인을 받은 뒤에만
+`npm run self-dev:complete -- --task-id <TaskId> [--push]`를 직접 실행한다. 이것은 예외
+경로이지 정상 경로가 아니다 — 정상 경로에서 이 명령을 Claude가 스스로 판단해서 직접 실행하면 이
+Task(G7.3.1b)가 검증하려는 것(자동 트리거가 실제로 동작하는가)을 증명할 수 없다.
+
+## 자동 트리거 아키텍처 — 단일 판정 출처
 
 ```
-npm run self-dev:complete -- --task-id <TaskId> [--push]
-```
-
-- `<TaskId>`는 이 저장소의 Task 식별자(예: `G7.2.1`)다.
-- 이 Task가 push까지 요구했다면 `--push`를 반드시 붙인다(붙이지 않으면 이 bridge는 push
-  여부를 검증하지 않는다 — 요구사항을 느슨하게 만들지 않도록 실제로 push가 필요했는지 먼저
-  확인한다).
-- `AUTODEV_PROJECT_ADAPTER`가 로컬에 설정돼 있지 않다면(gitignored `.env`, § 아래 "로컬 설정")
-  `--project <manifest.json 경로>`를 직접 지정한다.
-
-이 명령은 **호출자가 주장하는 값을 신뢰하지 않는다** — 이 저장소를 대상으로 typecheck/build/
-전체 회귀를 자체적으로 다시 실행하고, git으로 HEAD commit과(`--push`가 있으면) push 반영 여부를
-직접 재확인한 뒤에만 `TASK_COMPLETED`를 기록하고 기존 production notification 경로(EventStore →
-notification-service.ts → NotificationStore/dedupe → telegram-controller.ts → Telegram
-Provider)로 전달을 시도한다. 1)~6)을 건너뛰고 이 명령만 실행해도, 이 재검증 자체가
-fail-closed이므로 실패 상태에서는 event가 만들어지지 않는다.
-
-## 아키텍처 — 단일 판정 출처
-
-```
+.claude/settings.json (PostToolUse/Bash) → .claude/hooks/self-dev-completion-hook.js (IO만)
+                                              │
+                                              ▼
+                        dist/self-dev-completion-hook.js (src/self-dev-completion-hook.ts)
+                          - decideSelfDevCompletionTrigger() — git push/commit 감지 +
+                            self-dev-task-context.ts에 선언된 taskId/pushRequired/baseline
+                            HEAD를 읽어 "지금 트리거해야 하는가"만 판정(추측 없음, 없으면
+                            트리거 안 함)
+                          - runSelfDevCompletionHook()      — 트리거 조건 충족 시에만
+                            dist/self-dev-complete.js를 호출하고, 성공하면 context를 소비
+                            (clear)한다. 실패하면 context를 남겨 재시도를 허용한다.
+                              │
+                              ▼
 notify-task-completed.ts (사람이 명시적으로 실행하는 CLI, evidence를 flag로 주장)
-self-dev-complete.ts     (이 Skill이 호출하는 자동 bridge, evidence를 이 저장소에서 직접 재실행)
+self-dev-complete.ts     (hook이 호출하는 자동 bridge, evidence를 이 저장소에서 직접 재실행)
                               │
                               ▼  둘 다 아래 세 함수만 호출한다(단일 출처)
                     self-dev-completion.ts
@@ -98,6 +144,12 @@ self-dev-complete.ts     (이 Skill이 호출하는 자동 bridge, evidence를 �
                                                                 → notification-service.ts
                                                                 → Telegram
 ```
+
+**TASK_COMPLETED를 실제로 만들지 말지는 여전히 전적으로 `self-dev-complete.ts` →
+`self-dev-completion.ts`의 deterministic 재검증이 결정한다** — hook(`self-dev-completion-hook.ts`)은
+"지금이 그 스크립트를 호출할 시점인가"만 판정할 뿐, 완료 여부를 스스로 판정하지 않는다. hook
+판정이 틀려서 엉뚱한 시점에 호출되더라도(예: 잘못된 명령 매칭), 아래 재검증이 fail-closed이므로
+완료 조건을 충족하지 못한 상태에서는 여전히 event가 만들어지지 않는다.
 
 `projectId`는 의도적으로 대상 프로젝트(예: `movan`)를 쓰지 않는다 — `autodev-core-self-dev` 고정값
 이다(AutoDev repo/대상 project leakage 없음). `runId`는 `taskId`+`commitHash`의 결정론적 해시라,

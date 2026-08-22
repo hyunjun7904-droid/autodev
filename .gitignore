@@ -17,6 +17,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Self-dev task context(Phase G Task G7.3.1b) — 로컬 전용 선언, repo 이력에 남기지 않는다.
+.autodev-self-dev/
+
 # OS / editor
 .DS_Store
 Thumbs.db

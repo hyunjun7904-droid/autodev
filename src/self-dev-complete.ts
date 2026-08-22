@@ -11,6 +11,7 @@ import {
   recordSelfDevTaskCompleted,
   deliverSelfDevCompletionNotification,
 } from "./self-dev-completion";
+import { clearSelfDevTaskContext } from "./self-dev-task-context";
 
 // Self-Dev Task Completion Bridge — 자동 경로(Phase G Task G7.2.1).
 //
@@ -314,6 +315,11 @@ async function main(): Promise<void> {
   } else {
     console.log(`[self-dev-complete] TASK_COMPLETED 기록됨 taskId=${evidence.taskId} runId=${result.runId} commit=${evidence.commitHash}`);
   }
+
+  // 완료가 durable하게 기록된 시점(신규 기록이든 기존 재사용이든)에만 self-dev-task-context를
+  // 소비한다 — Phase G Task G7.3.1b. 실패 경로(위 return들)에서는 호출하지 않아, 문제를 고친
+  // 뒤 같은 taskId로 다시 push했을 때 PostToolUse hook이 여전히 자동으로 재시도할 수 있다.
+  clearSelfDevTaskContext(REPO_ROOT);
 
   const { delivered } = await deliverSelfDevCompletionNotification(manifest);
   if (!delivered) {

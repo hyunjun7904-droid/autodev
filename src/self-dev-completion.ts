@@ -55,7 +55,10 @@ export interface EvidenceValidationError {
   error: string;
 }
 
-const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+// self-dev-task-context.ts(Phase G Task G7.3.1b)도 동일한 taskId 형식을 재검증할 때 이
+// 패턴을 그대로 재사용한다 — "무엇이 유효한 taskId인가"의 기준이 두 곳에서 갈라지지 않게
+// 한다.
+export const TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{7,40}$/i;
 const VALID_SOURCES: ReadonlySet<string> = new Set<SelfDevCompletionSource>([
   "claude-code-self-dev-cli",
