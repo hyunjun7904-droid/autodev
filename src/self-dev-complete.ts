@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { selectDefaultEventStore } from "./event-store";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { getCurrentHeadHash } from "./git-changes";
+import { DEFAULT_REMOTE_NAME } from "./remote-git-safety";
 import {
   validateSelfDevCompletionEvidence,
   recordSelfDevTaskCompleted,
@@ -210,20 +211,30 @@ export function runDeterministicCompletionChecks(
   const commitHash = getCurrentHeadHash(repoRoot);
   if (!commitHash) reasons.push("git HEAD commit hash를 확인할 수 없습니다.");
 
-  // push 검증은 fetch를 하지 않는다(§ 요구사항 10 — GitHub Sync는 범위 밖) — git push가
-  // 성공하면 로컬 remote-tracking ref(@{u})가 fetch 없이도 즉시 갱신되므로, HEAD와 @{u}를
-  // 비교하는 것만으로 네트워크 호출 없이 "이 push가 실제로 반영됐는가"를 판정할 수 있다.
+  // Phase G Task G7.3(GitHub Sync & Remote Repository Safety) 이전에는 push 검증이 fetch를
+  // 하지 않았다("GitHub Sync는 범위 밖") — 로컬 remote-tracking ref(@{u})가 실제로는 오래된
+  // 값이어도(예: 이 push 이후 다른 clone/PC가 같은 branch에 추가로 push했는데 이 로컬은 아직
+  // 그 사실을 모르는 경우) "push가 반영됐다"로 잘못 판정할 여지가 있었다. 이제는 비교 전에
+  // 실제 fetch를 한 번 수행한다 — fetch는 read-only(remote-tracking ref만 갱신, working
+  // tree는 건드리지 않음, § remote-git-safety.ts safeFetchRemote와 동일한 원칙)이므로 이
+  // 재검증 자체가 새로운 위험을 만들지 않는다. fetch가 실패하면(network 장애 등) 그것을
+  // "반영 안 됨"으로 조용히 넘기지 않고 별도 사유로 명시한다(fail-closed).
   let pushPassed = !pushRequired;
   if (pushRequired) {
-    const upstream = runner("git", ["rev-parse", "@{u}"], repoRoot);
-    if (!upstream.ok) {
-      reasons.push("upstream tracking branch(@{u})를 확인할 수 없습니다 — push 여부를 검증할 수 없습니다.");
+    const fetch = runner("git", ["fetch", "--prune", "--", DEFAULT_REMOTE_NAME], repoRoot);
+    if (!fetch.ok) {
+      reasons.push(`remote(${DEFAULT_REMOTE_NAME}) fetch에 실패했습니다 — push 반영 여부를 신뢰할 수 있게 검증할 수 없습니다.`);
     } else {
-      const upstreamHash = upstream.stdout.trim();
-      if (commitHash && upstreamHash === commitHash) {
-        pushPassed = true;
+      const upstream = runner("git", ["rev-parse", "@{u}"], repoRoot);
+      if (!upstream.ok) {
+        reasons.push("upstream tracking branch(@{u})를 확인할 수 없습니다 — push 여부를 검증할 수 없습니다.");
       } else {
-        reasons.push(`HEAD(${commitHash ?? "?"})가 upstream(${upstreamHash})과 다릅니다 — push가 아직 반영되지 않은 것으로 보입니다.`);
+        const upstreamHash = upstream.stdout.trim();
+        if (commitHash && upstreamHash === commitHash) {
+          pushPassed = true;
+        } else {
+          reasons.push(`HEAD(${commitHash ?? "?"})가 upstream(${upstreamHash})과 다릅니다 — push가 아직 반영되지 않은 것으로 보입니다.`);
+        }
       }
     }
   }

@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import type { TaskDefinition } from "./task-registry";
 import { validateProjectExecutionPolicy } from "./project-policy";
 import type { ProjectExecutionPolicy } from "./project-policy";
+import { DEFAULT_REMOTE_NAME } from "./remote-git-safety";
 
 // AutoDev 범용화 Phase A Task A4 — Project Manifest 최소 골격.
 //
@@ -55,6 +56,44 @@ export interface ProjectManifest {
    *  secret 패턴 등 Core hard rule)는 이 값과 무관하게 항상 적용된다 — 이 필드는 그 위에서
    *  프로젝트별로 "무엇을 추가로 허용/차단할지"만 정한다. */
   executionPolicy: ProjectExecutionPolicy;
+  /**
+   * Phase G Task G7.3 — GitHub Sync & Remote Repository Safety. 지정하면 runAutodevOnce()가
+   * 이 project의 targetProjectRoot를 대상으로 run 시작 전 Remote Safety Gate(local HEAD ==
+   * origin/<branch>인지 fetch로 재확인)와 checkpoint 직전 재확인(REMOTE_CHANGED_DURING_RUN)을
+   * 수행한다. 지정하지 않으면(기본값, 기존 manifest는 전부 이 필드가 없다) 이 Gate는 완전히
+   * 비활성화된다 — remote가 아예 없는 fixture/temp git repo를 쓰는 기존 테스트/manifest의
+   * 동작을 100% 보존하기 위한 명시적 opt-in이다(project가 스스로 이 안전장치를 요청해야만
+   * 켜진다 — 어떤 project도 "silent" 강제 대상이 아니다).
+   */
+  remoteGitSafety?: RemoteGitSafetyPolicy;
+}
+
+export interface RemoteGitSafetyPolicy {
+  /** 기본값 "origin". */
+  remoteName?: string;
+  /** 지정하면 이 branch가 아닐 때 즉시 UNEXPECTED_BRANCH로 BLOCK한다. */
+  expectedBranch?: string;
+}
+
+/** manifest.remoteGitSafety가 명시적으로 주입됐을 때만 검증한다 — validateProjectManifest와
+ *  동일하게 잘못된 필드는 즉시 throw하고, 절대 permissive한 기본값으로 대체하지 않는다. */
+export function validateRemoteGitSafetyPolicy(policy: RemoteGitSafetyPolicy, projectLabel = "(project)"): void {
+  if (!policy || typeof policy !== "object") {
+    throw new Error(`Invalid RemoteGitSafetyPolicy(${projectLabel}): policy가 비어있거나 객체가 아닙니다.`);
+  }
+  if (policy.remoteName !== undefined && (typeof policy.remoteName !== "string" || policy.remoteName.trim().length === 0)) {
+    throw new Error(`Invalid RemoteGitSafetyPolicy(${projectLabel}): remoteName이 비어있지 않은 문자열이어야 합니다.`);
+  }
+  if (policy.expectedBranch !== undefined && (typeof policy.expectedBranch !== "string" || policy.expectedBranch.trim().length === 0)) {
+    throw new Error(`Invalid RemoteGitSafetyPolicy(${projectLabel}): expectedBranch가 비어있지 않은 문자열이어야 합니다.`);
+  }
+}
+
+/** manifest.remoteGitSafety가 있으면 remoteName 기본값(DEFAULT_REMOTE_NAME)까지 채운
+ *  완전한 형태로 정규화한다 — 호출부(autodev.ts)가 매번 "?? DEFAULT_REMOTE_NAME"을 반복하지
+ *  않게 하는 단일 출처. */
+export function resolveRemoteGitSafetyPolicy(policy: RemoteGitSafetyPolicy): Required<Pick<RemoteGitSafetyPolicy, "remoteName">> & RemoteGitSafetyPolicy {
+  return { ...policy, remoteName: policy.remoteName ?? DEFAULT_REMOTE_NAME };
 }
 
 /**
@@ -93,4 +132,7 @@ export function validateProjectManifest(manifest: ProjectManifest): void {
   // executionPolicy는 자체 검증 함수(project-policy.ts)에 위임한다 — 여기서 permissive한
   // 기본값으로 대체하지 않는다(정책 누락/잘못된 정책은 여기서 바로 throw).
   validateProjectExecutionPolicy(manifest.executionPolicy, manifest.projectId);
+  if (manifest.remoteGitSafety !== undefined) {
+    validateRemoteGitSafetyPolicy(manifest.remoteGitSafety, manifest.projectId);
+  }
 }

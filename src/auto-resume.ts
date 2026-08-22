@@ -133,5 +133,12 @@ export async function performAutoResume(
   if (result.outcome === "BLOCKED_PROJECT_LOCK") {
     return { kind: "BLOCKED", reason: `PROJECT_ALREADY_LOCKED: ${result.reason ?? ""}` };
   }
+  // Phase G Task G7.3 — Telegram APPROVE는 Remote Git Safety를 우회하지 않는다(§ 요구사항
+  // 10). runAutodevOnce()가 이미 Project Lock 다음에 이 Gate를 통과해야만 실제 실행을
+  // 시작하므로, 이 함수는 그 결과를 그대로 BLOCKED로 반영할 뿐 여기서 다시 판정하지 않는다
+  // (§ Project Lock 재확인과 동일한 원칙 — 단일 판정 출처는 여전히 runAutodevOnce() 하나).
+  if (result.outcome === "BLOCKED_REMOTE_GIT") {
+    return { kind: "BLOCKED", reason: `REMOTE_GIT_BLOCKED: ${result.reason ?? ""}` };
+  }
   return { kind: "COMPLETED", result };
 }

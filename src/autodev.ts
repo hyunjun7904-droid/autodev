@@ -7,8 +7,10 @@ import type { DeveloperProjectContext } from "./claude-developer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
-import { validateProjectManifest } from "./project-manifest";
+import { validateProjectManifest, resolveRemoteGitSafetyPolicy } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
+import { checkRemoteSafeToStart, checkRemoteUnchangedSince } from "./remote-git-safety";
+import type { RemoteGitSnapshot } from "./remote-git-safety";
 import { createSafeExecutorContext } from "./safe-executor";
 import { performTaskCheckpoint, commitProjectStateOnly } from "./checkpoint";
 import type { CheckpointOutcome } from "./checkpoint";
@@ -195,7 +197,12 @@ export type AutodevRunOutcome =
   /** Phase G Task G7 — 같은 project를 다른 프로세스가 이미 쓰고 있거나(PROJECT_ALREADY_LOCKED)
    *  lock 상태를 신뢰할 수 없어서(LOCK_STATE_UNCERTAIN/CORRUPT_LOCK) 이 실행 자체를 시작하지
    *  않은 경우. state.json/git 어느 쪽도 건드리지 않는다 — reason에 어떤 lock 코드였는지 남는다. */
-  | "BLOCKED_PROJECT_LOCK";
+  | "BLOCKED_PROJECT_LOCK"
+  /** Phase G Task G7.3 — manifest.remoteGitSafety가 지정된 project에서, run 시작 전 Remote
+   *  Safety Gate(local HEAD == origin/<branch> 재확인)가 통과하지 못한 경우. state.json/git
+   *  어느 쪽도 건드리지 않는다(loadState조차 호출하지 않는다) — reason에 remote-git-safety.ts의
+   *  RemoteGitBlockedCode가 남는다. */
+  | "BLOCKED_REMOTE_GIT";
 
 export interface AutodevRunResult {
   outcome: AutodevRunOutcome;
@@ -474,6 +481,58 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 이미 저장 직전인 state 객체의 deferredHumanTasks에 이어붙인다(§ emitEvent 주석).
     const auditFailures: string[] = [];
 
+    // Phase G Task G7.3 — GitHub Sync & Remote Repository Safety. manifest.remoteGitSafety가
+    // 지정된 project에서만 활성화된다(§ project-manifest.ts — 지정하지 않으면 완전히 no-op이라
+    // remote가 없는 기존 fixture/temp git repo 테스트/manifest는 100% 기존 동작 그대로다).
+    // Project Lock 다음, 어떤 production write(state 읽기 포함)보다도 먼저 확인한다 — 이
+    // Gate가 막으면 loadState조차 호출하지 않는다(§ Project Lock BLOCK 분기와 동일한 원칙).
+    // fetch 실패/remote 없음/upstream 없음/detached HEAD/remote ahead/local ahead/diverged/
+    // 비교 불가 전부 fail-closed BLOCK이다 — 어떤 git 상태도 자동으로 바꾸지 않는다(§
+    // remote-git-safety.ts).
+    let remoteSnapshot: RemoteGitSnapshot | undefined;
+    if (manifest.remoteGitSafety) {
+      const remotePolicy = resolveRemoteGitSafetyPolicy(manifest.remoteGitSafety);
+      emitEvent(events, {
+        eventType: "REMOTE_GIT_CHECK_STARTED",
+        runId,
+        projectId: manifest.projectId,
+        executionPhase: "task_selection",
+        outcome: "PENDING",
+        metadata: { remoteName: remotePolicy.remoteName },
+      });
+      const remoteCheck = checkRemoteSafeToStart(cwd, remotePolicy);
+      if (!remoteCheck.ok) {
+        log(`Remote Git Safety BLOCK(${remoteCheck.code}) — production writer를 시작하지 않습니다.`, {
+          projectId: manifest.projectId,
+          code: remoteCheck.code,
+          reason: remoteCheck.reason,
+        });
+        emitEvent(events, {
+          eventType: "REMOTE_GIT_BLOCKED",
+          runId,
+          projectId: manifest.projectId,
+          executionPhase: "task_selection",
+          outcome: "BLOCKED",
+          humanInterventionRequired: true,
+          reason: remoteCheck.reason,
+          metadata: { remoteGitBlockedCode: remoteCheck.code },
+        });
+        // 이 분기는 state.json/git 어느 쪽도 건드리지 않았다(loadState조차 호출하지 않음) —
+        // finally의 finalizeProjectLock()이 기본값(lockShouldRelease=true)대로 안전하게
+        // release한다(§ Project Lock BLOCK 분기와 동일).
+        return { outcome: "BLOCKED_REMOTE_GIT", reason: remoteCheck.reason };
+      }
+      remoteSnapshot = remoteCheck.snapshot;
+      emitEvent(events, {
+        eventType: "REMOTE_GIT_SAFE",
+        runId,
+        projectId: manifest.projectId,
+        executionPhase: "task_selection",
+        outcome: "SUCCESS",
+        metadata: { remoteName: remoteSnapshot.remoteName, branch: remoteSnapshot.branch },
+      });
+    }
+
     emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
 
     const state = loadState(statePath);
@@ -692,6 +751,69 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       reason: "audit-critical 저장소 사용 불가로 checkpoint를 진행하지 않았습니다.",
       ...agentAdvisoryField,
     };
+  }
+
+  // Phase G Task G7.3 — remote가 이 run 시작 시점 이후 바뀌었는지 checkpoint(git commit)
+  // 직전 다시 확인한다(§ 요구사항 5) — checkpoint는 되돌릴 수 없는 경계이므로 바로 위
+  // audit store 점검과 동일한 원칙으로 commit을 시도하기 전에 미리 막는다.
+  // remoteSnapshot이 없으면(manifest가 이 Gate를 요청하지 않음) 완전히 no-op이다. 이 재확인은
+  // fetch(remote-tracking ref 갱신)만 하고 어떤 git 상태도 바꾸지 않는다 — reset/rebase/merge
+  // 자동 수행 없음, working tree의 실제 코드 변경은 그대로 보존된다.
+  if (remoteSnapshot) {
+    const remoteRecheck = checkRemoteUnchangedSince(cwd, remoteSnapshot);
+    if (!remoteRecheck.ok) {
+      const eventType = remoteRecheck.code === "REMOTE_CHANGED_DURING_RUN" ? "REMOTE_GIT_CHANGED" : "REMOTE_GIT_BLOCKED";
+      log(`checkpoint 금지 — remote git 상태 재확인 실패(${remoteRecheck.code}), commit 시도 안 함`, {
+        taskId: taskDef.id,
+        reason: remoteRecheck.reason,
+      });
+      emitEvent(
+        events,
+        {
+          eventType,
+          runId,
+          projectId: manifest.projectId,
+          taskId: taskDef.id,
+          executionPhase: "checkpoint",
+          outcome: "BLOCKED",
+          humanInterventionRequired: true,
+          reason: remoteRecheck.reason,
+          metadata: { remoteGitBlockedCode: remoteRecheck.code },
+        },
+        auditFailures
+      );
+      emitEvent(
+        events,
+        {
+          eventType: "RUN_BLOCKED",
+          runId,
+          projectId: manifest.projectId,
+          taskId: taskDef.id,
+          executionPhase: "checkpoint",
+          outcome: "BLOCKED",
+          reason: "remote git 상태가 이 run 동안 변경되었거나(또는 재확인 실패) checkpoint를 진행하지 않았습니다.",
+        },
+        auditFailures
+      );
+      const afterRemoteCheck = loadState(statePath);
+      afterRemoteCheck.status = "WAITING_HUMAN";
+      afterRemoteCheck.deferredHumanTasks.push(
+        `REMOTE_GIT_CHANGED_DURING_RUN(${taskDef.id}): ${remoteRecheck.reason} — commit을 시도하지 않았습니다.`,
+        ...auditFailures
+      );
+      saveState(afterRemoteCheck, statePath);
+      // 이 task가 실제로 만든(reviewer가 이미 APPROVED한) 코드 변경이 아직 commit되지 않은 채
+      // working tree에 그대로 남아있다 — 다른 writer가 이 위에서 시작하지 못하도록 이
+      // 프로세스가 살아있는 동안 lock을 유지한다(§ 감사 store 점검 gate와 동일한 원칙).
+      lockShouldRelease = false;
+      return {
+        outcome: "RAN_TASK_CHECKPOINT_BLOCKED",
+        taskId: taskDef.id,
+        orchestratorStatus: String(finalState.status),
+        reason: `remote git 상태 재확인 실패(${remoteRecheck.code}): ${remoteRecheck.reason}`,
+        ...agentAdvisoryField,
+      };
+    }
   }
 
   const stateRelPath = computeStateRelPath(statePath, cwd);

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -182,6 +182,127 @@ function fakePassReviewer(): (result: ClaudeResult, reviewCycle: number, task: s
   return async () => ({ decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null });
 }
 
+// ---------------------------------------------------------------------------
+// C) Phase G Task G7.3 — manifest.remoteGitSafety가 지정된 project에서 Remote Safety Gate가
+//    실제로 runAutodevOnce()에 배선되는지 통합 검증한다(세부 판정 로직 자체의 회귀는
+//    remote-git-safety-tests.ts가 전담 — 여기서는 "opt-in 배선이 실제로 동작하는지"만
+//    확인한다). manifest.remoteGitSafety를 지정하지 않는 위 A)/B) 시나리오는 전부 이 Gate와
+//    무관하게 기존 그대로 동작한다(remote가 없는 temp repo에서도 깨지지 않음 — 이 파일
+//    스스로가 그 회귀 방지 증거다).
+// ---------------------------------------------------------------------------
+function makeTempGitRepoWithOrigin(): { repo: string; origin: string } {
+  const origin = mkdtempSync(join(tmpdir(), "autodev-rgs-origin-"));
+  tempDirs.push(origin);
+  spawnSync("git", ["init", "-q", "--bare", "--initial-branch=main"], { cwd: origin });
+
+  const seedParent = mkdtempSync(join(tmpdir(), "autodev-rgs-seed-"));
+  tempDirs.push(seedParent);
+  const seedRepo = join(seedParent, "repo");
+  spawnSync("git", ["clone", "-q", origin, seedRepo], { cwd: seedParent });
+  spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: seedRepo });
+  spawnSync("git", ["config", "user.name", "AutoDev Test"], { cwd: seedRepo });
+  writeFileSync(join(seedRepo, ".gitkeep"), "");
+  spawnSync("git", ["add", "--", ".gitkeep"], { cwd: seedRepo });
+  spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: seedRepo });
+  spawnSync("git", ["push", "-q", "-u", "origin", "HEAD:refs/heads/main"], { cwd: seedRepo });
+
+  const clonesParent = mkdtempSync(join(tmpdir(), "autodev-rgs-clone-"));
+  tempDirs.push(clonesParent);
+  const repo = join(clonesParent, "repo");
+  spawnSync("git", ["clone", "-q", origin, repo], { cwd: clonesParent });
+  spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: repo });
+  spawnSync("git", ["config", "user.name", "AutoDev Test"], { cwd: repo });
+
+  return { repo, origin };
+}
+
+/** 다른 writer(별도 clone)가 origin에 새 commit을 push한 상황을 흉내낸다 — 이 저장소 자신의
+ *  repo/origin은 건드리지 않는다(§ 요구사항 16 — 실제 git concurrency scenario). */
+function pushExtraCommitToOrigin(origin: string, fileName: string): void {
+  const parent = mkdtempSync(join(tmpdir(), "autodev-rgs-other-"));
+  tempDirs.push(parent);
+  const other = join(parent, "repo");
+  spawnSync("git", ["clone", "-q", origin, other], { cwd: parent });
+  spawnSync("git", ["config", "user.email", "other-writer@example.com"], { cwd: other });
+  spawnSync("git", ["config", "user.name", "Other Writer"], { cwd: other });
+  writeFileSync(join(other, fileName), "external change\n", "utf-8");
+  spawnSync("git", ["add", "--", fileName], { cwd: other });
+  spawnSync("git", ["commit", "-q", "-m", "external commit"], { cwd: other });
+  spawnSync("git", ["push", "-q", "origin", "HEAD:refs/heads/main"], { cwd: other });
+}
+
+function buildPlannerManifestWithRemoteGitSafety(root: string, statePath: string): ProjectManifest {
+  return { ...buildPlannerManifest(root, statePath), remoteGitSafety: {} };
+}
+
+async function scenarioRunAutodevOnceBlockedByRemoteGitAtStart(): Promise<void> {
+  const { repo, origin } = makeTempGitRepoWithOrigin();
+  const statePath = makeTempStateFile(repo);
+  const beforeState = readFileSync(statePath, "utf-8");
+  pushExtraCommitToOrigin(origin, "external-before-start.txt"); // repo가 이제 stale(REMOTE_AHEAD).
+
+  const manifest = buildPlannerManifestWithRemoteGitSafety(repo, statePath);
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner } });
+
+  check("remote-git-safety 통합: 시작 전 remote가 앞서 있으면 outcome=BLOCKED_REMOTE_GIT", result.outcome === "BLOCKED_REMOTE_GIT");
+  check("remote-git-safety 통합: Claude worker가 전혀 호출되지 않음", claudeCalls === 0);
+  const afterState = readFileSync(statePath, "utf-8");
+  check("remote-git-safety 통합: state.json이 전혀 건드려지지 않음(loadState조차 호출 안 함)", afterState === beforeState);
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("remote-git-safety 통합: local repo에 새 commit이 생기지 않음(init 1건만)", log.split("\n").length === 1);
+}
+
+async function scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint(): Promise<void> {
+  const { repo, origin } = makeTempGitRepoWithOrigin();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithRemoteGitSafety(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/fake-task-p1-2-marker.txt", "marker\n");
+    // 이 task를 실행하는 "동안" 다른 프로세스가 origin에 push했다고 흉내낸다(§ 요구사항 5/16).
+    pushExtraCommitToOrigin(origin, "external-during-run.txt");
+    return {
+      success: true,
+      summary: "테스트: P1.2 구현 완료(하지만 remote가 그 사이 바뀜)",
+      changedFiles: ["proj/fake-task-p1-2-marker.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
+  });
+
+  check("remote-git-safety 통합: run 도중 remote 변경 → outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check("remote-git-safety 통합: reason에 REMOTE_CHANGED_DURING_RUN 코드 포함", (result.reason ?? "").includes("REMOTE_CHANGED_DURING_RUN"));
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("remote-git-safety 통합: completedTasks에 P1.2가 추가되지 않음", !finalState.completedTasks.includes("P1.2"));
+  check("remote-git-safety 통합: status='WAITING_HUMAN'", finalState.status === "WAITING_HUMAN");
+  check(
+    "remote-git-safety 통합: deferredHumanTasks에 REMOTE_GIT_CHANGED_DURING_RUN 기록됨",
+    finalState.deferredHumanTasks.some((t) => t.includes("REMOTE_GIT_CHANGED_DURING_RUN"))
+  );
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("remote-git-safety 통합: local repo에 commit이 생성되지 않음(init 1건만)", log.split("\n").length === 1);
+  // git status --porcelain(untracked-files 기본값)은 완전히 새 디렉터리를 파일 단위가 아니라
+  // "?? proj/"로 뭉쳐 보고한다(§ git-changes.ts 상단 주석과 동일한 실측 함정) — 파일 자체가
+  // 삭제되지 않고 그대로 남아있는지는 fs로 직접 확인한다.
+  check(
+    "remote-git-safety 통합: developer가 만든 변경(marker.txt)이 working tree에 그대로 보존됨(commit 안 됐지만 삭제도 안 됨)",
+    existsSync(join(repo, "proj", "fake-task-p1-2-marker.txt"))
+  );
+}
+
 async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → 다음은 P1.2
@@ -329,6 +450,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile();
     await scenarioRunAutodevOnceNotApprovedSkipsCheckpoint();
     await scenarioRunAutodevOnceNoTaskStops();
+    await scenarioRunAutodevOnceBlockedByRemoteGitAtStart();
+    await scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint();
   } finally {
     for (const dir of tempDirs) {
       try {

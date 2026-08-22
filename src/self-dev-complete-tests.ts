@@ -62,12 +62,20 @@ interface FakeRunnerConfig {
   buildOk?: boolean;
   testOkByBasename?: Record<string, boolean>;
   upstream?: { ok: boolean; hash?: string };
+  /** 지정하지 않으면 항상 성공(기존 push 시나리오는 fetch 성공을 가정) — Phase G Task G7.3의
+   *  fetch-then-compare 추가로 기존 upstream 시나리오(24~31)가 깨지지 않도록 별도 축으로
+   *  분리했다. */
+  fetchOk?: boolean;
 }
 
 function makeFakeRunner(cfg: FakeRunnerConfig, callLog?: { command: string; args: string[] }[]): CommandRunner {
   return (command, args, _cwd): CommandOutcome => {
     callLog?.push({ command, args });
     if (command === "git") {
+      if (args[0] === "fetch") {
+        const ok = cfg.fetchOk ?? true;
+        return { ok, code: ok ? 0 : 1, stdout: "", stderr: ok ? "" : "fetch failed(fixture)" };
+      }
       if (!cfg.upstream || !cfg.upstream.ok) {
         return { ok: false, code: 128, stdout: "", stderr: "fatal: no upstream configured(fixture)" };
       }
@@ -228,6 +236,23 @@ function scenarioPushRequiredMismatch(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 8.1) push 필요 + fetch 실패(Phase G Task G7.3) → upstream을 아예 확인하지 않고 fail-closed
+// ---------------------------------------------------------------------------
+function scenarioPushRequiredFetchFailed(): void {
+  const dir = makeFixtureRepo("sdc-push-fetch-failed-");
+  const actualHead = headHashOf(dir);
+  const calls: { command: string; args: string[] }[] = [];
+  const checks = runDeterministicCompletionChecks(dir, true, makeFakeRunner({ fetchOk: false, upstream: { ok: true, hash: actualHead } }, calls));
+  check("28.1) push 필요 + fetch 실패 → checks.ok=false", checks.ok === false);
+  check("28.2) push 필요 + fetch 실패 → pushPassed=false", checks.pushPassed === false);
+  check("28.3) push 필요 + fetch 실패 → reasons에 fetch 사유 포함", checks.reasons.some((r) => r.includes("fetch")));
+  check(
+    "28.4) push 필요 + fetch 실패 → fetch 실패 이후 upstream(@{u})은 조회하지 않는다(fail-closed, 낙관적 rev-parse 없음)",
+    !calls.some((c) => c.command === "git" && c.args[0] === "rev-parse" && c.args.includes("@{u}"))
+  );
+}
+
+// ---------------------------------------------------------------------------
 // 9) 정상 완료(push 필요 + push 성공 포함) → checks.ok=true, 완료 조건 전부 충족
 // ---------------------------------------------------------------------------
 function scenarioAllChecksPassWithPush(): void {
@@ -283,6 +308,7 @@ function main(): void {
   scenarioMergeInProgress();
   scenarioPushRequiredNoUpstream();
   scenarioPushRequiredMismatch();
+  scenarioPushRequiredFetchFailed();
   scenarioAllChecksPassWithPush();
   scenarioIntegrationRecordsExactlyOnce();
 

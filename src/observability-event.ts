@@ -85,7 +85,19 @@ export type AutoDevEventType =
   | "PROJECT_LOCK_RELEASED"
   | "PROJECT_LOCK_STALE_DETECTED"
   | "PROJECT_LOCK_RECOVERED"
-  | "PROJECT_LOCK_CORRUPT";
+  | "PROJECT_LOCK_CORRUPT"
+  // Phase G Task G7.3 — GitHub Sync & Remote Repository Safety. remote-git-safety.ts의 판정
+  // 결과를 "관찰"만 한다(판정 자체는 그 파일이 전담, § PROJECT_LOCK_* 이벤트와 동일한 설계).
+  // REMOTE_GIT_BLOCKED는 run 시작 전 Safety Gate가 막은 모든 사유(REMOTE_FETCH_FAILED/
+  // NO_REMOTE/NO_UPSTREAM/DETACHED_HEAD/UNEXPECTED_BRANCH/REMOTE_AHEAD/
+  // LOCAL_AHEAD_UNEXPECTED/DIVERGED/MALFORMED_GIT_OUTPUT/COMPARISON_UNCERTAIN)를
+  // metadata.remoteGitBlockedCode로 구분한다 — event type 수를 늘리지 않는다.
+  // REMOTE_GIT_CHANGED는 run 도중(checkpoint 직전) remote가 실제로 바뀐 것을 감지한 경우다.
+  | "REMOTE_GIT_CHECK_STARTED"
+  | "REMOTE_GIT_SAFE"
+  | "REMOTE_GIT_BLOCKED"
+  | "REMOTE_GIT_CHANGED"
+  | "REMOTE_PUSH_REJECTED";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -133,6 +145,11 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   PROJECT_LOCK_STALE_DETECTED: ["observability", "audit"],
   PROJECT_LOCK_RECOVERED: ["observability", "audit"],
   PROJECT_LOCK_CORRUPT: ["observability", "audit"],
+  REMOTE_GIT_CHECK_STARTED: ["observability"],
+  REMOTE_GIT_SAFE: ["observability"],
+  REMOTE_GIT_BLOCKED: ["observability", "audit"],
+  REMOTE_GIT_CHANGED: ["observability", "audit"],
+  REMOTE_PUSH_REJECTED: ["observability", "audit"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
@@ -169,6 +186,12 @@ const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDe
   // 진행을 중단한 경우(CORRUPT) 모두 보안상 중요한 사실이라 기록 실패를 조용히 넘기지 않는다.
   "PROJECT_LOCK_BLOCKED",
   "PROJECT_LOCK_CORRUPT",
+  // Phase G Task G7.3 — 오래된 local 상태 위에서 시작을 막았거나(BLOCKED), run 도중 remote가
+  // 실제로 바뀌어 commit/push를 중단했거나(CHANGED), non-fast-forward push가 거부된 사실
+  // (REJECTED) 모두 보안상 중요한 사실이라 기록 실패를 조용히 넘기지 않는다.
+  "REMOTE_GIT_BLOCKED",
+  "REMOTE_GIT_CHANGED",
+  "REMOTE_PUSH_REJECTED",
 ]);
 
 /** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/
