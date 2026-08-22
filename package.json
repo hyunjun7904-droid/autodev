@@ -62,6 +62,7 @@
     "test:project-lock": "npm run build && node dist/project-lock-tests.js",
     "test:project-lock-integration": "npm run build && node dist/project-lock-integration-tests.js",
     "test:remote-git-safety": "npm run build && node dist/remote-git-safety-tests.js",
+    "test:failure-resume-hardening": "npm run build && node dist/failure-resume-hardening-tests.js",
     "test:approval-service": "npm run build && node dist/approval-service-tests.js",
     "test:telegram-controller": "npm run build && node dist/telegram-controller-tests.js",
     "test:telegram-controller-supervisor": "npm run build && node dist/telegram-controller-supervisor-tests.js",

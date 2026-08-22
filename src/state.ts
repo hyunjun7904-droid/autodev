@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { DEFAULT_STATE_PATH } from "./project-context";
 import type { ProjectState } from "./types";
 
@@ -17,6 +18,17 @@ export function loadState(statePath: string = DEFAULT_STATE_PATH): ProjectState 
   return JSON.parse(raw) as ProjectState;
 }
 
+// Phase G Task G7.4 — Failure / Resume Hardening. project-state.json은 decideNextAction()이
+// "다음에 어떤 task를 골라야 하는가"를 판단하는 유일한 source of truth다 — 이 파일이 write 도중
+// 손상되면(프로세스가 kill/전원 차단 등으로 정확히 이 write 중간에 중단됨) 이후의 모든 재시작이
+// JSON.parse 실패로 loadState()에서 즉시 crash하고, project-state.json을 고칠 방법이 없는 채로
+// 계속 같은 실패를 반복한다. 같은 디렉터리(=같은 파일시스템)에 임시 파일로 전체 내용을 먼저
+// 쓴 뒤 renameSync로 원자적으로 교체한다 — rename은 대상 경로에 대해 "이전 파일 그대로" 또는
+// "새 파일 전체"만 관측되고 그 중간 상태가 관측되지 않는다(POSIX/Windows 둘 다 같은 볼륨 내
+// rename은 원자적 교체). 임시 파일 쓰기 자체가 실패하면(디스크/권한 등) rename을 시도하지 않고
+// 그대로 throw하므로, 기존 statePath는 항상 마지막으로 성공한 내용 그대로 보존된다.
 export function saveState(state: ProjectState, statePath: string = DEFAULT_STATE_PATH): void {
-  writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  const tmpPath = `${statePath}.${randomUUID()}.tmp`;
+  writeFileSync(tmpPath, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  renameSync(tmpPath, statePath);
 }
