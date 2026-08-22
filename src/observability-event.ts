@@ -148,12 +148,20 @@ export interface TestResultSummary {
 
 /** 향후 측정을 위한 optional 구조 — 현재 runner가 실제로 제공하지 않는 값은 절대 채우지
  *  않는다(undefined 유지). 추정값을 실제값처럼 기록하지 않는다는 요구사항을 타입 레벨에서도
- *  전부 optional로 표현한다. */
+ *  전부 optional로 표현한다.
+ *
+ *  Phase G Task G3 — actualCostUsd/estimatedCostUsd는 의도적으로 분리된 별도 필드다.
+ *  runner/billing source가 실제 청구 금액을 제공하면 actualCostUsd에, 가격표 기반 추정치는
+ *  estimatedCostUsd에만 채운다 — metrics.ts를 포함해 이 둘을 하나로 합산하거나 서로
+ *  대체하지 않는다(§ 요구사항: 실제값과 estimated 값을 혼합 금지). */
 export interface TokenUsage {
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
   estimatedCostUsd?: number;
+  /** runner/billing source가 실제로 제공한 청구 금액만 담는다 — 가격표로 역산한 값은
+   *  절대 여기에 채우지 않는다(그런 값은 estimatedCostUsd로만 남긴다). */
+  actualCostUsd?: number;
 }
 
 /** 실제 전달된 context의 "크기"만 기록한다(문자 수 등 실측 가능한 값) — 원문 자체는 담지
