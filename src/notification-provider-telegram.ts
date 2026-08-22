@@ -66,12 +66,45 @@ function buildMessageText(notification: NotificationMessage): string {
   return `${notification.title}\n${notification.shortMessage}`;
 }
 
-async function sendViaTelegram(
+// Phase G Task G6 — Telegram inline keyboard(Approve/Reject/Defer)용 최소 타입. 이 파일은
+// callback_data의 실제 형식/의미(approval.ts의 buildApprovalCallbackData)를 모른다 — 그저
+// Telegram sendMessage의 reply_markup 필드를 그대로 전달할 뿐이다.
+export interface TelegramInlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+export interface TelegramReplyMarkup {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
+}
+
+/** botToken/chatId/timeoutMs/fetchImpl 해석 로직의 단일 출처 — createTelegramNotificationProvider()와
+ *  G6의 approval-aware 전송 경로(telegram-approval-provider.ts)가 이 하나만 공유한다(중복
+ *  구현 금지). */
+export function resolveTelegramConfig(config: TelegramProviderConfig = {}): {
+  botToken?: string;
+  chatId?: string;
+  timeoutMs: number;
+  fetchImpl: typeof fetch;
+  configStatus: TelegramConfigStatus;
+} {
+  const botToken = config.botToken ?? process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  const chatId = config.chatId ?? process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const configStatus: TelegramConfigStatus = botToken && chatId ? "CONFIGURED" : "NOT_CONFIGURED";
+  return { botToken, chatId, timeoutMs, fetchImpl, configStatus };
+}
+
+/** sendMessage 호출 하나의 최하위 구현 — text + (있으면) reply_markup만 전송한다. G5.1의
+ *  기존 sendViaTelegram()과 G6의 approval 전송(§ telegram-approval-provider.ts)이 이 함수
+ *  하나만 공유한다 — timeout/AbortController/원문 미기록 정책이 두 곳에서 갈라지지 않는다. */
+export async function sendTelegramMessage(
   fetchImpl: typeof fetch,
   botToken: string,
   chatId: string,
   timeoutMs: number,
-  notification: NotificationMessage
+  text: string,
+  replyMarkup?: TelegramReplyMarkup
 ): Promise<DeliveryResult> {
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
@@ -79,9 +112,9 @@ async function sendViaTelegram(
     const response = await fetchImpl(`${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // chat_id는 항상 이 provider에 고정 설정된 값이다 — notification 인자에서 절대
+      // chat_id는 항상 호출부가 고정 설정한 값이다 — notification/approval payload에서
       // 읽지 않는다(§ Chat allowlist).
-      body: JSON.stringify({ chat_id: chatId, text: buildMessageText(notification) }),
+      body: JSON.stringify({ chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
       signal: controller.signal,
     });
 
@@ -132,11 +165,7 @@ async function sendViaTelegram(
  * 유일한 재시도 계층이다(§ 요구사항: 무한 재시도 금지, retry 정책은 G5 그대로 재사용).
  */
 export function createTelegramNotificationProvider(config: TelegramProviderConfig = {}): TelegramNotificationProvider {
-  const botToken = config.botToken ?? process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
-  const chatId = config.chatId ?? process.env.AUTODEV_TELEGRAM_CHAT_ID;
-  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const fetchImpl = config.fetchImpl ?? fetch;
-  const configStatus: TelegramConfigStatus = botToken && chatId ? "CONFIGURED" : "NOT_CONFIGURED";
+  const { botToken, chatId, timeoutMs, fetchImpl, configStatus } = resolveTelegramConfig(config);
 
   return {
     configStatus,
@@ -144,7 +173,7 @@ export function createTelegramNotificationProvider(config: TelegramProviderConfi
       if (configStatus === "NOT_CONFIGURED" || !botToken || !chatId) {
         return Promise.resolve({ ok: false, error: "TELEGRAM_NOT_CONFIGURED" });
       }
-      return sendViaTelegram(fetchImpl, botToken, chatId, timeoutMs, notification);
+      return sendTelegramMessage(fetchImpl, botToken, chatId, timeoutMs, buildMessageText(notification));
     },
   };
 }

@@ -101,6 +101,27 @@ export function getTrackedDiff(scopeDirs: string[], cwd: string = PROJECT_ROOT):
   return res.stdout || "";
 }
 
+/** 현재 HEAD commit hash(읽기 전용) — Phase G Task G6 Auto Resume의 Git Safety recheck가
+ *  "승인 생성 시점 이후 HEAD가 바뀌었는가"를 판정하는 데 재사용한다(git-changes.ts를 이
+ *  판단의 단일 출처로 유지 — auto-resume.ts가 별도 spawnSync 로직을 새로 만들지 않는다).
+ *  실패하면(예: HEAD가 아직 없는 repo) undefined — 호출부가 "알 수 없으면 진행하지 않는다"로
+ *  처리한다. */
+export function getCurrentHeadHash(cwd: string = PROJECT_ROOT): string | undefined {
+  const res = spawnSync("git", ["rev-parse", "HEAD"], { cwd, shell: false, encoding: "utf-8" });
+  if (res.status !== 0) return undefined;
+  const hash = (res.stdout || "").trim();
+  return hash.length > 0 ? hash : undefined;
+}
+
+/** 현재 branch 이름(읽기 전용) — HEAD hash와 동일한 목적(Auto Resume Git Safety recheck)으로
+ *  재사용된다. detached HEAD 등으로 이름을 알 수 없으면 undefined. */
+export function getCurrentBranch(cwd: string = PROJECT_ROOT): string | undefined {
+  const res = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, shell: false, encoding: "utf-8" });
+  if (res.status !== 0) return undefined;
+  const branch = (res.stdout || "").trim();
+  return branch.length > 0 && branch !== "HEAD" ? branch : undefined;
+}
+
 /** relPath가 allowedPathPrefixes(예: task-registry.ts TaskDefinition.allowedPathPrefixes)
  *  중 하나에 속하는지 판정한다 — checkpoint.ts(commit 대상 판정)와 gpt-reviewer.ts(review
  *  payload 범위/scope-violation 판정)가 이 하나의 구현만 공유한다(중복 구현 금지). */

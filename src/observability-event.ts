@@ -57,7 +57,23 @@ export type AutoDevEventType =
   // 실패가 checkpoint/run 진행을 막아서는 안 된다는 원칙과 동일선상이다.
   | "NOTIFICATION_CREATED"
   | "NOTIFICATION_DELIVERED"
-  | "NOTIFICATION_FAILED";
+  | "NOTIFICATION_FAILED"
+  // Phase G Task G6 — Telegram Mobile Approval, Safe Resume & Local Controller.
+  // APPROVAL_REQUESTED/RECEIVED는 진행 상황(observability)만 남긴다 — 실제 사람의 결정
+  // 자체(무엇을 승인/거절/보류했는가)는 아래 5개 결정 event가 담당한다. APPROVAL_UNAUTHORIZED/
+  // APPROVAL_STALE도 "이 요청은 소비되지 않았다"는 보안상 중요한 사실이라 결정 event와 함께
+  // audit-critical로 분류한다(§ AUDIT_CRITICAL_EVENT_TYPES).
+  | "APPROVAL_REQUESTED"
+  | "APPROVAL_RECEIVED"
+  | "APPROVAL_APPROVED"
+  | "APPROVAL_REJECTED"
+  | "APPROVAL_DEFERRED"
+  | "APPROVAL_EXPIRED"
+  | "APPROVAL_UNAUTHORIZED"
+  | "APPROVAL_STALE"
+  | "AUTO_RESUME_STARTED"
+  | "AUTO_RESUME_BLOCKED"
+  | "AUTO_RESUME_COMPLETED";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -88,6 +104,17 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   NOTIFICATION_CREATED: ["observability"],
   NOTIFICATION_DELIVERED: ["observability"],
   NOTIFICATION_FAILED: ["observability"],
+  APPROVAL_REQUESTED: ["observability"],
+  APPROVAL_RECEIVED: ["observability"],
+  APPROVAL_APPROVED: ["observability", "audit"],
+  APPROVAL_REJECTED: ["observability", "audit"],
+  APPROVAL_DEFERRED: ["observability", "audit"],
+  APPROVAL_EXPIRED: ["observability", "audit"],
+  APPROVAL_UNAUTHORIZED: ["audit"],
+  APPROVAL_STALE: ["audit"],
+  AUTO_RESUME_STARTED: ["observability"],
+  AUTO_RESUME_BLOCKED: ["observability", "audit"],
+  AUTO_RESUME_COMPLETED: ["observability"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
@@ -111,6 +138,15 @@ const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDe
   "RUN_COMPLETED",
   "RUN_BLOCKED",
   "TASK_COMPLETED",
+  // Phase G Task G6 — 사람의 원격 승인 결정(또는 그 결정이 무효/미인가로 거부됐다는 사실)과
+  // "승인은 됐지만 안전 재검사가 실행을 막았다"는 사실은 모두 감사상 반드시 남아야 한다.
+  "APPROVAL_APPROVED",
+  "APPROVAL_REJECTED",
+  "APPROVAL_DEFERRED",
+  "APPROVAL_EXPIRED",
+  "APPROVAL_UNAUTHORIZED",
+  "APPROVAL_STALE",
+  "AUTO_RESUME_BLOCKED",
 ]);
 
 /** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/
