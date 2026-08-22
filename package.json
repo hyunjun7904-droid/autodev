@@ -45,6 +45,7 @@
     "test:production-agent-integration": "npm run build && node dist/production-agent-integration-tests.js",
     "test:event-store": "npm run build && node dist/event-store-tests.js",
     "test:metrics": "npm run build && node dist/metrics-tests.js",
+    "test:usage-telemetry": "npm run build && node dist/usage-telemetry-tests.js",
     "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
   },
   "devDependencies": {

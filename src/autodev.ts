@@ -308,6 +308,11 @@ function emitAdvisoryAgentEvents(
   if (!events || !results) return;
   for (const r of results) {
     const outcome = r.status === "SUCCESS" ? "SUCCESS" : r.status === "BLOCKED" ? "BLOCKED" : r.status === "SKIPPED" ? "SKIPPED" : "FAILED";
+    // Phase G Task G3.1 — 이 agent 호출(1회) 1건당 실제로 관측된 model/tokenUsage/durationMs를
+    // AGENT_SELECTED/AGENT_STARTED(호출 전, 아직 결과 없음)가 아니라 이 terminal event
+    // (AGENT_COMPLETED/AGENT_FAILED) 하나에만 붙인다(§ 요구사항 6 double-counting 방지).
+    // r.data는 planner/research/qa/security(모두 read-only 실행모델)의 ReadOnlyAgentOutcome이다.
+    const data = r.data as { model?: { provider: string; name: string }; tokenUsage?: { inputTokens?: number; outputTokens?: number }; durationMs?: number } | undefined;
     emitEvent(events, { eventType: "AGENT_SELECTED", runId, projectId, taskId, agentId: r.agentId, agentRole: r.role, executionPhase: phase });
     emitEvent(events, { eventType: "AGENT_STARTED", runId, projectId, taskId, agentId: r.agentId, agentRole: r.role, executionPhase: phase, outcome: "PENDING" });
     emitEvent(events, {
@@ -320,6 +325,9 @@ function emitAdvisoryAgentEvents(
       executionPhase: phase,
       outcome,
       reason: r.reason,
+      model: data?.model,
+      tokenUsage: data?.tokenUsage,
+      durationMs: data?.durationMs,
     });
   }
 }

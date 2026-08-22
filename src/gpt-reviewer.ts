@@ -71,6 +71,14 @@ export interface GptReviewApiResult extends GptReviewResult {
    * 정책 위반으로 BLOCK한다"는 요구사항을 LLM 판단에만 맡기지 않기 위함.
    */
   scopeViolations?: string[];
+  /** Phase G Task G3.1 — 실제 OpenAI Responses API 응답(response.model)이 echo한 값만
+   *  담는다(요청 시 지정한 MODEL 상수가 아니라 실제로 응답한 model) — API가 실제로 호출된
+   *  경로(정상 응답, INVALID_OUTPUT)에서만 채워지고, 네트워크/인증 오류로 응답 자체가 없으면
+   *  undefined다. */
+  model?: { provider: string; name: string };
+  /** response.usage(input_tokens/output_tokens/total_tokens)를 그대로 옮긴 값 — 추정/가격
+   *  환산 없음. */
+  tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
 }
 export interface GptReviewRetryResult extends GptReviewApiResult {
   /** 실제로 수행된 API 통신 재시도 횟수(최초 시도 제외) — reviewCycle과 별개로 집계. */
@@ -289,6 +297,16 @@ export async function reviewClaudeResultOnce(
       },
     });
 
+    // 실제 API 호출이 응답을 반환한 시점부터는(파싱 성공 여부와 무관하게) 이미 실제 토큰이
+    // 소비됐다 — response.usage/response.model은 그 실제 호출 1건에 대해 정확히 한 번만
+    // 존재하므로, 아래 두 return 경로(정상/INVALID_OUTPUT) 모두에 동일하게 붙인다(§ 요구사항:
+    // 실제로 호출됐을 때 얻을 수 있는 값은 누락하지 않는다). catch 블록(네트워크/인증 오류 등
+    // 응답 자체가 없는 경우)에는 이 값이 존재하지 않는다.
+    const model = response.model ? { provider: "openai", name: response.model } : undefined;
+    const tokenUsage = response.usage
+      ? { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens, totalTokens: response.usage.total_tokens }
+      : undefined;
+
     let parsed: GptReviewResult;
     try {
       parsed = JSON.parse(response.output_text) as GptReviewResult;
@@ -301,11 +319,13 @@ export async function reviewClaudeResultOnce(
         nextTask: null,
         errorCode: "INVALID_OUTPUT",
         scopeViolations,
+        model,
+        tokenUsage,
       };
     }
 
     log("GPT 리뷰 완료", { reviewCycle, decision: parsed.decision, severity: parsed.severity });
-    return { ...parsed, scopeViolations };
+    return { ...parsed, scopeViolations, model, tokenUsage };
   } catch (e) {
     const { code: errorCode, transient } = classifyApiError(e);
     log(`GPT 리뷰 API 오류(${errorCode})`, { reviewCycle, transient });

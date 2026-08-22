@@ -74,7 +74,23 @@ export function detectUsageLimitSignal(combinedOutput: string): boolean {
   return USAGE_LIMIT_PATTERNS.some((p) => p.test(combinedOutput)) || INTERACTIVE_MENU_PATTERN.test(combinedOutput);
 }
 
-export function parseClaudeJsonOutput(stdout: string): { ok: true; summary: string } | { ok: false } {
+export interface ParsedClaudeUsage {
+  model?: { provider: string; name: string };
+  tokenUsage?: { inputTokens?: number; outputTokens?: number };
+  durationMs?: number;
+}
+
+export type ParsedClaudeJsonOutput = ({ ok: true; summary: string } & ParsedClaudeUsage) | { ok: false };
+
+// Phase G Task G3.1 — `claude -p --output-format json`의 실제 JSON 결과는 summary(result)
+// 외에도 modelUsage(model 이름을 key로 하는 실측 usage)/usage(input_tokens/output_tokens)/
+// duration_ms를 담아 반환한다(claude CLI 바이너리에 이 필드명이 실제로 존재함을 직접
+// 확인했다 — 문서/기억만으로 채우지 않았다). 이 함수는 그 구조화된 JSON 필드만 읽는다 —
+// 화면 문자열을 정규식으로 스크래핑하지 않는다(§ 요구사항: 취약한 terminal scraping 금지).
+// modelUsage에 model이 정확히 1개일 때만 채운다 — 이 developer/read-only 호출은 항상
+// `--tools ""`라 subagent가 모델을 추가로 섞을 경로 자체가 없지만, 혹시 여러 개가 관측되면
+// 추측 없이 undefined로 남긴다(§ 요구사항: 값이 여러 개면 하나를 대표로 고르지 않는다).
+export function parseClaudeJsonOutput(stdout: string): ParsedClaudeJsonOutput {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -86,7 +102,24 @@ export function parseClaudeJsonOutput(stdout: string): { ok: true; summary: stri
   const summary =
     typeof obj.result === "string" ? obj.result : typeof obj.summary === "string" ? obj.summary : null;
   if (summary === null) return { ok: false };
-  return { ok: true, summary };
+
+  const result: { ok: true; summary: string } & ParsedClaudeUsage = { ok: true, summary };
+
+  if (obj.modelUsage && typeof obj.modelUsage === "object") {
+    const modelNames = Object.keys(obj.modelUsage as Record<string, unknown>);
+    if (modelNames.length === 1) result.model = { provider: "anthropic", name: modelNames[0] };
+  }
+
+  if (obj.usage && typeof obj.usage === "object") {
+    const usage = obj.usage as Record<string, unknown>;
+    const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : undefined;
+    const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : undefined;
+    if (inputTokens !== undefined || outputTokens !== undefined) result.tokenUsage = { inputTokens, outputTokens };
+  }
+
+  if (typeof obj.duration_ms === "number") result.durationMs = obj.duration_ms;
+
+  return result;
 }
 
 function makeError(errorCode: ClaudeErrorCode, message: string, stdout = "", stderr = ""): RealClaudeResult {
@@ -186,6 +219,9 @@ export function execAndClassify(
         changedFiles: [],
         tests: [],
         rawOutput: sanitizeForLog(stdout),
+        ...(parsed.model ? { model: parsed.model } : {}),
+        ...(parsed.tokenUsage ? { tokenUsage: parsed.tokenUsage } : {}),
+        ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
       });
     });
   });

@@ -54,6 +54,12 @@ export interface DeveloperResult {
   rawOutput: string;
   errorCode?: DeveloperErrorCode;
   deferredHumanTasks?: string[];
+  /** Phase G Task G3.1 — 이 developer attempt(1회의 runDeveloperTaskViaSafeExecutor 호출)
+   *  안에서 실제로 성공한 모든 내부 round(claude CLI 호출)의 tokenUsage를 합산하고, model은
+   *  가장 최근 round에서 관측된 값을 담는다(같은 세션이라 round마다 달라지지 않는다). CLI가
+   *  값을 전혀 주지 않았으면(또는 실제 호출이 한 번도 성공하지 않았으면) undefined. */
+  model?: { provider: string; name: string };
+  tokenUsage?: { inputTokens?: number; outputTokens?: number };
 }
 
 export interface DeveloperTaskOptions {
@@ -368,6 +374,27 @@ export async function runDeveloperTaskViaSafeExecutor(
   // (두 번째부터는 PLAN_LOCK_REPEAT_MESSAGE로 거부).
   let planUsedInLock = false;
 
+  // Phase G Task G3.1 — 이 developer attempt 안에서 실제로 성공한 모든 내부 round(claude CLI
+  // 호출)의 tokenUsage를 합산한다. round마다 별도 event로 쪼개 기록하지 않고(canonical 위치는
+  // 이 함수의 반환값 하나뿐이다) 이 attempt 전체를 대표하는 값 하나로만 반환한다 — 호출부
+  // (orchestrator.ts)가 이 DeveloperResult 하나당 정확히 한 번만 event에 반영한다.
+  let accInputTokens: number | undefined;
+  let accOutputTokens: number | undefined;
+  let lastModel: { provider: string; name: string } | undefined;
+  function accumulateUsage(raw: { model?: { provider: string; name: string }; tokenUsage?: { inputTokens?: number; outputTokens?: number } }): void {
+    if (raw.model) lastModel = raw.model;
+    if (raw.tokenUsage?.inputTokens !== undefined) accInputTokens = (accInputTokens ?? 0) + raw.tokenUsage.inputTokens;
+    if (raw.tokenUsage?.outputTokens !== undefined) accOutputTokens = (accOutputTokens ?? 0) + raw.tokenUsage.outputTokens;
+  }
+  function usageFields(): Pick<DeveloperResult, "model" | "tokenUsage"> {
+    return {
+      ...(lastModel ? { model: lastModel } : {}),
+      ...(accInputTokens !== undefined || accOutputTokens !== undefined
+        ? { tokenUsage: { inputTokens: accInputTokens, outputTokens: accOutputTokens } }
+        : {}),
+    };
+  }
+
   const capTranscript = () => {
     let joined = transcript.join("\n\n---\n\n");
     while (joined.length > MAX_TRANSCRIPT_CHARS && transcript.length > 1) {
@@ -390,6 +417,7 @@ export async function runDeveloperTaskViaSafeExecutor(
       rawOutput: "",
       errorCode: "NO_PROGRESS_STAGNATION",
       deferredHumanTasks,
+      ...usageFields(),
     };
   }
 
@@ -428,6 +456,7 @@ export async function runDeveloperTaskViaSafeExecutor(
           rawOutput: claudeRaw.rawOutput,
           errorCode: "USAGE_LIMIT",
           deferredHumanTasks,
+          ...usageFields(),
         };
       }
       usageLimitRetries += 1;
@@ -437,6 +466,10 @@ export async function runDeveloperTaskViaSafeExecutor(
       await sleepFn(usageLimitWaitMs);
       claudeRaw = await claudeCall(input, timeoutMs); // 같은 input = 같은 transcript 상태 그대로 재요청
     }
+
+    // claudeRaw가 실제로 성공한 경우에만 model/tokenUsage가 채워져 있다(§ claude-runner.ts) —
+    // 실패 결과는 그대로 무시된다(추정하지 않는다).
+    accumulateUsage(claudeRaw);
 
     if (!claudeRaw.success) {
       log(`developer 라운드 ${round} Claude 호출 실패(${claudeRaw.errorCode})`);
@@ -448,6 +481,7 @@ export async function runDeveloperTaskViaSafeExecutor(
         rawOutput: claudeRaw.rawOutput,
         errorCode: claudeRaw.errorCode,
         deferredHumanTasks,
+        ...usageFields(),
       };
     }
 
@@ -472,6 +506,7 @@ export async function runDeveloperTaskViaSafeExecutor(
         tests,
         rawOutput: sanitizeForLog(claudeRaw.summary),
         deferredHumanTasks,
+        ...usageFields(),
       };
     }
 
@@ -562,5 +597,6 @@ export async function runDeveloperTaskViaSafeExecutor(
     rawOutput: "",
     errorCode: "TASK_ACTION_LIMIT",
     deferredHumanTasks,
+    ...usageFields(),
   };
 }

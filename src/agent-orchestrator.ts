@@ -104,6 +104,11 @@ export interface ReadOnlyAgentOutcome {
    *  Task 범위 밖이다(향후 Task에서 다룬다). 테스트는 fake runner로 이 필드를 직접 채워
    *  enforcement 로직 자체를 검증한다. */
   requestedPermission?: AgentPermissionKey;
+  /** Phase G Task G3.1 — 실제 Claude CLI JSON 출력이 제공한 경우만(§ claude-runner.ts
+   *  parseClaudeJsonOutput). 이 agent 호출(1회) 1건에 대해서만 채워진다. */
+  model?: { provider: string; name: string };
+  tokenUsage?: { inputTokens?: number; outputTokens?: number };
+  durationMs?: number;
 }
 
 export type ReadOnlyAgentRunner = (prompt: string, attempt: number) => Promise<ReadOnlyAgentOutcome>;
@@ -112,7 +117,14 @@ export type ReadOnlyAgentRunner = (prompt: string, attempt: number) => Promise<R
  *  실행 경로 자체가 없음)를 그대로 감싼다. 새 실행 인프라를 만들지 않는다. */
 export const realReadOnlyAgentRunner: ReadOnlyAgentRunner = async (prompt, attempt) => {
   const result = await realReadOnlyClaudeCall(prompt, attempt);
-  return { success: result.success, summary: result.summary, rawOutput: result.rawOutput };
+  return {
+    success: result.success,
+    summary: result.summary,
+    rawOutput: result.rawOutput,
+    model: result.model,
+    tokenUsage: result.tokenUsage,
+    durationMs: result.durationMs,
+  };
 };
 
 const fakeReadOnlyAgentRunner: ReadOnlyAgentRunner = async (prompt, attempt) => {

@@ -24,6 +24,9 @@ export interface GptReviewerReturn extends GptReviewResult {
   /** task.allowedPathPrefixes 밖에서 발견된 변경 파일 — 비어있지 않으면 GPT decision과
    *  무관하게 orchestrator가 BLOCK으로 강제한다(§ 요구사항 3/7, LLM 판단에만 맡기지 않음). */
   scopeViolations?: string[];
+  /** Phase G Task G3.1 — 실제 OpenAI Responses API 응답이 제공한 경우만(§ gpt-reviewer.ts). */
+  model?: { provider: string; name: string };
+  tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
 }
 
 export interface OrchestratorDeps {
@@ -217,12 +220,18 @@ export async function runOrchestrator(
     }
 
     if (claudeResult.tests.length > 0) {
+      // Phase G Task G3.1 — 이 developer 호출(claudeRunner) 1회당 실제로 관측된 model/
+      // tokenUsage를 이 cycle의 유일한 terminal event(TEST_COMPLETED)에만 붙인다 — 같은
+      // reviewCycle 안에서 DEVELOPER_RETRY_STARTED(호출 전) 등 다른 event에는 중복 기록하지
+      // 않는다(§ 요구사항 6 double-counting 방지).
       emitEvent({
         eventType: "TEST_COMPLETED",
         executionPhase: "test",
         outcome: claudeResult.tests.every((t) => t.pass) ? "SUCCESS" : "FAILED",
         reviseCycle: state.reviewCycle,
         testSummary: buildTestSummary(claudeResult.tests),
+        model: claudeResult.model,
+        tokenUsage: claudeResult.tokenUsage,
       });
     }
 
@@ -273,6 +282,10 @@ export async function runOrchestrator(
 
     state.lastGptDecision = { ...gptResult, decision };
 
+    // Phase G Task G3.1 — 이 gptReviewer() 호출(reviewCycle 1회) 1건당 실제로 관측된
+    // model/tokenUsage를 이 cycle의 결정 event(APPROVED/BLOCKED/REVISE 중 정확히 하나)에만
+    // 붙인다 — REVIEW_STARTED는 호출 이전에 이미 기록되어 있어 여기 값을 붙일 수 없고
+    // 붙이지도 않는다(§ 요구사항 6/7, 같은 호출의 usage가 여러 event에 중복 기록되지 않음).
     if (decision === "PASS") {
       setStatus("APPROVED");
       emitEvent({
@@ -283,6 +296,8 @@ export async function runOrchestrator(
         reviewSeverity: gptResult.severity,
         reviseCycle: state.reviewCycle,
         reason: gptResult.feedback,
+        model: gptResult.model,
+        tokenUsage: gptResult.tokenUsage,
       });
       break;
     }
@@ -297,6 +312,8 @@ export async function runOrchestrator(
         reviewSeverity: gptResult.severity,
         reviseCycle: state.reviewCycle,
         reason: gptResult.feedback,
+        model: gptResult.model,
+        tokenUsage: gptResult.tokenUsage,
       });
       break;
     }
@@ -310,6 +327,8 @@ export async function runOrchestrator(
       reviewSeverity: gptResult.severity,
       reviseCycle: state.reviewCycle,
       reason: gptResult.feedback,
+      model: gptResult.model,
+      tokenUsage: gptResult.tokenUsage,
     });
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
       log(`연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — WAITING_HUMAN`);

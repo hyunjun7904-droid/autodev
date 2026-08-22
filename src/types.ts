@@ -4,6 +4,11 @@ export interface ClaudeResult {
   changedFiles: string[];
   tests: { name: string; pass: boolean }[];
   rawOutput: string;
+  /** Phase G Task G3.1 — 실제 Claude CLI JSON 출력(§ claude-runner.ts parseClaudeJsonOutput)이
+   *  제공한 경우만 채운다. 제공하지 않으면 undefined(추정하지 않음). */
+  model?: { provider: string; name: string };
+  tokenUsage?: { inputTokens?: number; outputTokens?: number };
+  durationMs?: number;
 }
 
 export type GptDecision = "PASS" | "REVISE" | "HUMAN_REQUIRED" | "BLOCK";
