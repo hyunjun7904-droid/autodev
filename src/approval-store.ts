@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ApprovalRequest, ApprovalStatus } from "./approval";
+import { isProductionRuntime } from "./runtime-origin";
 
 // Approval Store — Phase G Task G6.
 //
@@ -160,9 +161,9 @@ export function createFileApprovalStore(filePath: string): ApprovalStore {
 export const RUNTIME_APPROVAL_STORE_PATH = join(__dirname, "..", "logs", "approvals.json");
 
 /** notification-store.ts의 selectDefaultNotificationStore()와 동일한 관례 —
- *  AUTOMATION_DRY_RUN이 명시적으로 "false"일 때만 실제 파일 store를 쓴다. */
+ *  isProductionRuntime()(§ runtime-origin.ts)이 참일 때만 실제 파일 store를 쓴다. */
 export function selectDefaultApprovalStore(filePath: string = RUNTIME_APPROVAL_STORE_PATH): ApprovalStore {
-  return process.env.AUTOMATION_DRY_RUN === "false" ? createFileApprovalStore(filePath) : createInMemoryApprovalStore();
+  return isProductionRuntime() ? createFileApprovalStore(filePath) : createInMemoryApprovalStore();
 }
 
 // ---------------------------------------------------------------------------
@@ -214,5 +215,5 @@ export function createFileTelegramOffsetStore(filePath: string): TelegramOffsetS
 export const RUNTIME_TELEGRAM_OFFSET_PATH = join(__dirname, "..", "logs", "telegram-offset.json");
 
 export function selectDefaultTelegramOffsetStore(filePath: string = RUNTIME_TELEGRAM_OFFSET_PATH): TelegramOffsetStore {
-  return process.env.AUTOMATION_DRY_RUN === "false" ? createFileTelegramOffsetStore(filePath) : createInMemoryTelegramOffsetStore();
+  return isProductionRuntime() ? createFileTelegramOffsetStore(filePath) : createInMemoryTelegramOffsetStore();
 }

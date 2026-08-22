@@ -355,25 +355,43 @@ function scenarioCheckAuditWritable(): void {
 // ---------------------------------------------------------------------------
 function scenarioDefaultEventStoreSelection(): void {
   // 실제 production runtime 경로(logs/events.jsonl)는 절대 건드리지 않는다 — 이
-  // 테스트에서 AUTOMATION_DRY_RUN=false 분기를 확인할 때도 임시 경로만 override로 넘긴다
+  // 테스트에서 dual-gate가 열리는 분기를 확인할 때도 임시 경로만 override로 넘긴다
   // (§ selectDefaultEventStore의 filePath 테스트 override).
+  //
+  // 2026-08-22 incident 이후 — isProductionRuntime()(§ runtime-origin.ts)은
+  // AUTOMATION_DRY_RUN="false"뿐 아니라 AUTODEV_PRODUCTION_RUNTIME="true"까지 함께
+  // 요구한다(dual-gate). 이 테스트는 그 강화된 판정을 그대로 검증한다 — 한쪽만 켜져도
+  // 여전히 in-memory여야 한다(fail-closed).
   const dir = makeTempDir();
   const tempEventLogPath = join(dir, "prod-like-events.jsonl");
-  const original = process.env.AUTOMATION_DRY_RUN;
+  const originalDryRun = process.env.AUTOMATION_DRY_RUN;
+  const originalProdRuntime = process.env.AUTODEV_PRODUCTION_RUNTIME;
   try {
     delete process.env.AUTOMATION_DRY_RUN;
+    delete process.env.AUTODEV_PRODUCTION_RUNTIME;
     const dryRunStore = selectDefaultEventStore(tempEventLogPath);
     const dryRunResult = dryRunStore.append(baseInput({ eventType: "RUN_STARTED" }));
-    check("기본 선택: AUTOMATION_DRY_RUN 미설정이면 in-memory store(같은 경로를 줘도 파일이 생기지 않음)", dryRunResult.ok === true);
+    check("기본 선택: 둘 다 미설정이면 in-memory store(같은 경로를 줘도 파일이 생기지 않음)", dryRunResult.ok === true);
     check("기본 선택: in-memory이므로 override 경로에 파일이 생성되지 않음", !existsSync(tempEventLogPath));
 
     process.env.AUTOMATION_DRY_RUN = "false";
+    delete process.env.AUTODEV_PRODUCTION_RUNTIME;
+    const halfGateStore = selectDefaultEventStore(tempEventLogPath);
+    check(
+      "기본 선택(dual-gate): AUTOMATION_DRY_RUN=false만으로는 여전히 in-memory(AUTODEV_PRODUCTION_RUNTIME 없음, fail-closed)",
+      !existsSync(tempEventLogPath) && halfGateStore.append(baseInput({ eventType: "RUN_STARTED" })).ok === true
+    );
+    check("기본 선택(dual-gate): 한쪽만 켜졌을 때는 override 경로에 파일이 생성되지 않음", !existsSync(tempEventLogPath));
+
+    process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
     const prodStore = selectDefaultEventStore(tempEventLogPath);
-    check("기본 선택: AUTOMATION_DRY_RUN=false면 실제 파일 store가 선택됨(append 성공)", prodStore.append(baseInput({ eventType: "RUN_STARTED" })).ok === true);
-    check("기본 선택: false일 때는 override 경로에 실제로 파일이 생성됨", existsSync(tempEventLogPath));
+    check("기본 선택: 둘 다 true면 실제 파일 store가 선택됨(append 성공)", prodStore.append(baseInput({ eventType: "RUN_STARTED" })).ok === true);
+    check("기본 선택: 둘 다 true일 때는 override 경로에 실제로 파일이 생성됨", existsSync(tempEventLogPath));
   } finally {
-    if (original === undefined) delete process.env.AUTOMATION_DRY_RUN;
-    else process.env.AUTOMATION_DRY_RUN = original;
+    if (originalDryRun === undefined) delete process.env.AUTOMATION_DRY_RUN;
+    else process.env.AUTOMATION_DRY_RUN = originalDryRun;
+    if (originalProdRuntime === undefined) delete process.env.AUTODEV_PRODUCTION_RUNTIME;
+    else process.env.AUTODEV_PRODUCTION_RUNTIME = originalProdRuntime;
   }
 }
 

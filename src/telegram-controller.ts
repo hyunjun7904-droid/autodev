@@ -13,6 +13,7 @@ import { createApprovalRequestsFromEvents, handleTelegramCallbackUpdate } from "
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 import { processNotifications } from "./notification-service";
 import { createTelegramApprovalAwareProvider } from "./telegram-approval-provider";
+import { isProductionRuntime } from "./runtime-origin";
 
 // Local Telegram Controller — Phase G Task G6.
 //
@@ -213,8 +214,12 @@ export async function startTelegramController(opts: TelegramControllerOptions): 
     approvalStore: opts.approvalStore ?? selectDefaultApprovalStore(),
     offsetStore: opts.offsetStore ?? selectDefaultTelegramOffsetStore(),
     allowlist: opts.allowlist ?? resolveTelegramAllowlist(),
-    botToken: opts.botToken ?? process.env.AUTODEV_TELEGRAM_BOT_TOKEN,
-    chatId: opts.chatId ?? process.env.AUTODEV_TELEGRAM_CHAT_ID,
+    // isProductionRuntime()이 참일 때만 환경변수의 실제 Bot Token/Chat ID를 읽는다(§
+    // runtime-origin.ts, 2026-08-22 incident) — opts로 명시적으로 넘기지 않는 한, 이
+    // 값이 Windows 환경변수에 영구적으로 남아있어도 test/비-production 실행에서는 절대
+    // 읽히지 않는다(fail-closed).
+    botToken: opts.botToken ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_BOT_TOKEN : undefined),
+    chatId: opts.chatId ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_CHAT_ID : undefined),
     fetchImpl: opts.fetchImpl ?? fetch,
     statePath: opts.statePath ?? opts.manifest.statePath,
     cwd: opts.cwd ?? opts.manifest.targetProjectRoot,

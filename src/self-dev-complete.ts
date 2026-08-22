@@ -90,8 +90,32 @@ export interface CommandOutcome {
  */
 export type CommandRunner = (command: string, args: string[], cwd: string) => CommandOutcome;
 
+// 2026-08-22 incident — 이 함수가 전체 회귀(각 test:*.js)를 자식 프로세스로 spawn하는
+// 유일한 지점이다. spawnSync는 env를 명시하지 않으면 현재 process.env를 자식에게 그대로
+// 물려준다 — 그래서 이 프로세스가 나중에 AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME을
+// "production" 값으로 바꾸거나, 이 Windows 환경변수에 실제 AUTODEV_TELEGRAM_BOT_TOKEN/
+// CHAT_ID가 영구적으로 존재하더라도, 그 값들이 test 자식 프로세스로 새어 들어가면
+// production 파일 store 선택/실제 Telegram 배달이 test/fixture event에 대해서까지
+// 트리거될 수 있다(실측된 사고 — F1/T1.1/P1.2/R1 fixture taskId가 실제 채널로 배달됨).
+// runtime-origin.ts의 dual-gate(순서 재배치)가 근본 원인을 막지만, 이 목록은 그와
+// 무관하게 자식 프로세스 경계 자체에서 한 번 더 방어한다(2중 방어) — 이 목록에 없는
+// 값은 그대로 상속된다(빌드/테스트에 필요한 PATH 등은 그대로 전달됨).
+const CHILD_PROCESS_ENV_DENYLIST: readonly string[] = [
+  "AUTOMATION_DRY_RUN",
+  "AUTODEV_PRODUCTION_RUNTIME",
+  "AUTODEV_TELEGRAM_BOT_TOKEN",
+  "AUTODEV_TELEGRAM_CHAT_ID",
+  "AUTODEV_TELEGRAM_USER_ID",
+];
+
+function sanitizedChildEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of CHILD_PROCESS_ENV_DENYLIST) delete env[key];
+  return env;
+}
+
 export const realCommandRunner: CommandRunner = (command, args, cwd) => {
-  const res = spawnSync(command, args, { cwd, shell: false, encoding: "utf-8" });
+  const res = spawnSync(command, args, { cwd, shell: false, encoding: "utf-8", env: sanitizedChildEnv() });
   return { ok: res.status === 0, code: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
 };
 
@@ -256,8 +280,12 @@ async function main(): Promise<void> {
 
   // 이 시점부터는 더 이상 전체 회귀를 자식 프로세스로 spawn하지 않는다 — 이제부터
   // production EventStore/NotificationStore(파일 기반)를 실제로 써야 하므로 여기서만
-  // 설정한다(§ 파일 상단 주석 — 순서를 앞당기면 안 되는 이유).
+  // 설정한다(§ 파일 상단 주석 — 순서를 앞당기면 안 되는 이유). AUTODEV_PRODUCTION_RUNTIME도
+  // 함께 설정한다 — runtime-origin.ts의 isProductionRuntime()은 두 값이 모두 명시적으로
+  // 참일 때만 실제 파일 store/Telegram credential을 활성화한다(2026-08-22 incident 이후
+  // dual-gate로 강화됨, § runtime-origin.ts).
   process.env.AUTOMATION_DRY_RUN = "false";
+  process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
 
   const manifest = loadProjectAdapter(parsed.adapterPath);
   const events = selectDefaultEventStore();

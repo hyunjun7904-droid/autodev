@@ -34,7 +34,9 @@ function ev(overrides: Partial<AutoDevEventInput> & { eventType: AutoDevEventInp
 }
 
 // ---------------------------------------------------------------------------
-// 1) 8개 필수 알림 종류가 전체 파이프라인을 통과해 실제로 delivered까지 도달한다.
+// 1) high-signal 알림 종류(2026-08-22 incident 이후 6종)가 전체 파이프라인을 통과해
+//    실제로 delivered까지 도달한다. RUN_COMPLETED/TEST_COMPLETED(failed>0)는 섞여
+//    있어도 알림을 만들지 않는다는 것을 같은 배치 안에서 함께 증명한다(§ 2 아래).
 // ---------------------------------------------------------------------------
 async function scenarioAllRequiredNotificationTypesDeliver(): Promise<void> {
   const events: AutoDevEvent[] = [
@@ -51,22 +53,22 @@ async function scenarioAllRequiredNotificationTypesDeliver(): Promise<void> {
   const provider = createFakeNotificationProvider();
   const result = await processNotifications(events, store, provider);
 
-  check("8종 이벤트: created=8", result.created.length === 8);
-  check("8종 이벤트: delivered=8", result.delivered.length === 8);
-  check("8종 이벤트: failed=0", result.failed.length === 0);
-  check("8종 이벤트: providerConfigured=true", result.providerConfigured === true);
+  check("6종 이벤트: created=6(RUN_COMPLETED/TEST_COMPLETED는 알림을 만들지 않음)", result.created.length === 6);
+  check("6종 이벤트: delivered=6", result.delivered.length === 6);
+  check("6종 이벤트: failed=0", result.failed.length === 0);
+  check("6종 이벤트: providerConfigured=true", result.providerConfigured === true);
   const types = new Set(result.delivered.map((n) => n.notificationType));
   const requiredTypes: NotificationType[] = [
     "TASK_COMPLETED",
-    "RUN_COMPLETED",
-    "TEST_FAILED",
     "WAITING_HUMAN",
     "HUMAN_APPROVAL_REQUIRED",
     "SECURITY_BLOCKED",
     "REVIEW_CYCLE_EXHAUSTED",
     "RUN_BLOCKED",
   ];
-  check("8종 이벤트: 8개 NotificationType 전부 포함", requiredTypes.every((t) => types.has(t)));
+  check("6종 이벤트: 6개 NotificationType 전부 포함", requiredTypes.every((t) => types.has(t)));
+  check("6종 이벤트: RUN_COMPLETED는 전달되지 않음", !types.has("RUN_COMPLETED"));
+  check("6종 이벤트: TEST_FAILED는 전달되지 않음", !types.has("TEST_FAILED"));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,21 +128,24 @@ async function scenarioDifferentReviewCyclesAreSeparateNotifications(): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// 5) 우선순위 — CRITICAL이 INFO보다 먼저 전달된다.
+// 5) 우선순위 — CRITICAL이 ACTION_REQUIRED/INFO보다 먼저 전달된다. 2026-08-22 incident
+//    이후 TEST_FAILED(WARNING)가 더 이상 알림을 만들지 않으므로(§ notification.ts),
+//    WARNING 대신 여전히 발생하는 ACTION_REQUIRED(HUMAN_APPROVAL_REQUIRED)로 중간
+//    우선순위를 검증한다.
 // ---------------------------------------------------------------------------
 async function scenarioPriorityOrdering(): Promise<void> {
   const events = [
     ev({ eventType: "TASK_COMPLETED", runId: "run-priority", taskId: "T1" }), // INFO
     ev({ eventType: "SECURITY_BLOCKED", runId: "run-priority", taskId: "T2" }), // CRITICAL
-    ev({ eventType: "TEST_COMPLETED", runId: "run-priority", taskId: "T3", testSummary: { total: 1, passed: 0, failed: 1 } }), // WARNING
+    ev({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "run-priority", taskId: "T3" }), // ACTION_REQUIRED
   ];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
   await processNotifications(events, store, provider);
 
   const order = provider.sent.map((n) => n.severity);
-  check("우선순위: CRITICAL이 WARNING/INFO보다 먼저 전달됨", order[0] === "CRITICAL");
-  check("우선순위: severity 순서가 CRITICAL→WARNING→INFO", order.join(",") === "CRITICAL,WARNING,INFO");
+  check("우선순위: CRITICAL이 ACTION_REQUIRED/INFO보다 먼저 전달됨", order[0] === "CRITICAL");
+  check("우선순위: severity 순서가 CRITICAL→ACTION_REQUIRED→INFO", order.join(",") === "CRITICAL,ACTION_REQUIRED,INFO");
 }
 
 // ---------------------------------------------------------------------------

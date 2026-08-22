@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { NotificationMessage } from "./notification";
+import { isProductionRuntime } from "./runtime-origin";
 
 // Notification Store — Delivery Bookkeeping Only (Phase G Task G5).
 //
@@ -194,10 +195,11 @@ export function createFileNotificationStore(filePath: string): NotificationStore
 // git commit 대상이 되지 않는다.
 export const RUNTIME_NOTIFICATION_STORE_PATH = join(__dirname, "..", "logs", "notifications.json");
 
-/** event-store.ts의 selectDefaultEventStore()와 동일한 관례 — AUTOMATION_DRY_RUN이
- *  명시적으로 "false"일 때만 실제 파일 기반 store를 쓴다. */
+/** event-store.ts의 selectDefaultEventStore()와 동일한 관례 — isProductionRuntime()(§
+ *  runtime-origin.ts)이 참일 때만 실제 파일 기반 store를 쓴다(2026-08-22 incident 이후
+ *  AUTOMATION_DRY_RUN 단독 판정에서 dual-gate로 강화됨). */
 export function selectDefaultNotificationStore(filePath: string = RUNTIME_NOTIFICATION_STORE_PATH): NotificationStore {
-  return process.env.AUTOMATION_DRY_RUN === "false" ? createFileNotificationStore(filePath) : createInMemoryNotificationStore();
+  return isProductionRuntime() ? createFileNotificationStore(filePath) : createInMemoryNotificationStore();
 }
 
 // ---------------------------------------------------------------------------

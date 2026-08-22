@@ -26,6 +26,14 @@ import { log } from "./logger";
 //
 // SIGINT(Ctrl+C)/SIGTERM 수신 시 진행 중인 tick을 끝까지 마친 뒤 graceful하게 멈추고
 // singleton ownership을 반환한다(§ telegram-controller-supervisor.ts stop(), idempotent).
+//
+// 2026-08-22 incident 이후 — 이 파일은 사람이 명시적으로 실행하는 real production
+// controller entry point이므로, self-dev-complete.ts/notify-task-completed.ts와 동일하게
+// AUTOMATION_DRY_RUN="false"와 AUTODEV_PRODUCTION_RUNTIME="true"를 자기 스스로 설정한다 —
+// runtime-origin.ts의 isProductionRuntime() dual-gate가 요구하는 두 신호를 이 실행 자체가
+// 명시적으로 선언한다(ambient 환경변수에 의존하지 않음).
+process.env.AUTOMATION_DRY_RUN = "false";
+process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
 
 function resolveAdapterPathFromArgs(): string | undefined {
   const idx = process.argv.indexOf("--project");

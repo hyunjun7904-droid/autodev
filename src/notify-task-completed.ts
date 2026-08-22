@@ -45,7 +45,10 @@ import {
 // controller가 이 event를 배달하려면 실제 file-backed EventStore/NotificationStore를 써야
 // 한다 — start-autodev.ps1과 동일하게 이 스크립트는 AUTOMATION_DRY_RUN을 명시적으로
 // "false"로 설정한다(이 값이 이미 다른 값으로 설정돼 있어도 이 스크립트 실행 중에는
-// 덮어쓴다 — production 배달이 이 도구의 유일한 목적이기 때문이다).
+// 덮어쓴다 — production 배달이 이 도구의 유일한 목적이기 때문이다). AUTODEV_PRODUCTION_RUNTIME도
+// 함께 설정한다 — runtime-origin.ts의 isProductionRuntime()이 요구하는 dual-gate 중
+// 하나이며(2026-08-22 incident 이후 강화됨), 사람이 이 CLI를 명시적으로 실행했다는
+// 신호를 AUTOMATION_DRY_RUN 하나에만 의존하지 않고 명확히 남긴다.
 //
 // projectId는 의도적으로 대상 project manifest의 projectId(예: "movan")를 쓰지 않는다 —
 // self-dev-completion.ts의 SELF_DEV_PROJECT_ID(고정값)를 그대로 쓴다. 이 event는 "AutoDev
@@ -56,6 +59,7 @@ import {
 // 해석 로직을 만들지 않는다).
 
 process.env.AUTOMATION_DRY_RUN = "false";
+process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
 
 interface ParsedArgs {
   taskId: string;

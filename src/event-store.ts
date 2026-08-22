@@ -2,6 +2,7 @@ import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdir
 import { dirname, join } from "node:path";
 import { createEvent } from "./observability-event";
 import type { AutoDevEvent, AutoDevEventInput, AutoDevEventType, AutoDevEventCategory } from "./observability-event";
+import { isProductionRuntime } from "./runtime-origin";
 
 // Append-only Event Store — Phase G Task G1/G2.
 //
@@ -247,10 +248,13 @@ export function describeAuditIntegrity(result: Pick<QueryResult, "integrityIssue
   );
 }
 
-// Phase G Task G2 — Production EventStore 연결. AUTOMATION_DRY_RUN이 명시적으로 "false"일
-// 때만(orchestrator.ts/agent-orchestrator.ts와 동일한 관례) 실제 파일 기반 store를 쓴다 —
-// 값이 없거나 그 외 무엇이든 안전한 쪽(in-memory, 파일 I/O 없음)으로 fallback한다. 이
-// 함수를 쓰면 opts.events를 지정하지 않아도(production 기본 호출부인 run.ts가 그렇다)
+// Phase G Task G2 — Production EventStore 연결. isProductionRuntime()(§ runtime-origin.ts —
+// AUTOMATION_DRY_RUN="false" *그리고* AUTODEV_PRODUCTION_RUNTIME="true" 둘 다 명시적으로
+// 참일 때만)일 때만 실제 파일 기반 store를 쓴다 — 값이 없거나 그 외 무엇이든 안전한 쪽
+// (in-memory, 파일 I/O 없음)으로 fallback한다. AUTOMATION_DRY_RUN 단독 판정이 아닌 이유(§
+// 2026-08-22 incident) — self-dev-complete.ts가 자기 own process에서 그 값만 설정한 뒤 전체
+// 회귀를 자식 프로세스로 spawn하면서 그대로 물려줘, test/fixture event가 실제 production
+// 파일에 기록된 사고가 있었다. 이 함수를 쓰면 opts.events를 지정하지 않아도(production 기본 호출부인 run.ts가 그렇다)
 // production에서는 관측이 자동으로 켜지고, test/dry-run에서는 자동으로 in-memory라
 // 어떤 test도 실제 runtime 파일을 건드리지 않는다("production과 test storage를 명확히
 // 분리"). 이 파일은 AutoDev 자신의 runtime data이지 target project(MOVAN 등) repo 안이
@@ -267,5 +271,5 @@ export const RUNTIME_EVENT_LOG_PATH = join(__dirname, "..", "logs", "events.json
 // 기본값이 실제 runtime 경로다). 이 override 자체가 있다고 해서 "false가 아닐 때 실제
 // 파일을 쓴다"는 판단 로직이 약해지는 건 아니다 — AUTOMATION_DRY_RUN 검사는 그대로다.
 export function selectDefaultEventStore(filePath: string = RUNTIME_EVENT_LOG_PATH): EventStore {
-  return process.env.AUTOMATION_DRY_RUN === "false" ? createFileEventStore(filePath) : createInMemoryEventStore();
+  return isProductionRuntime() ? createFileEventStore(filePath) : createInMemoryEventStore();
 }

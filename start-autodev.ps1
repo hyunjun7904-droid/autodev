@@ -47,7 +47,12 @@ if (-not (Test-Path $envPath)) {
 }
 Write-Output "[start-autodev] .env 존재 확인됨 (내용은 표시하지 않습니다)."
 
+# 2026-08-22 incident 이후 — runtime-origin.ts의 isProductionRuntime()은
+# AUTOMATION_DRY_RUN="false"와 AUTODEV_PRODUCTION_RUNTIME="true" 둘 다 명시적으로 참일
+# 때만 실제 파일 store/Telegram credential을 활성화한다(dual-gate). 이 wrapper가 real
+# production 실행의 유일한 표준 launcher이므로 둘 다 여기서 함께 설정한다.
 $env:AUTOMATION_DRY_RUN = "false"
+$env:AUTODEV_PRODUCTION_RUNTIME = "true"
 
 Write-Output "[start-autodev] AutoDev를 시작합니다(project adapter: $ProjectAdapter, Ctrl+C로 안전 종료 가능)."
 npm run build

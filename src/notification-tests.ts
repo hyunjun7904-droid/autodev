@@ -26,7 +26,10 @@ function ev(overrides: Partial<AutoDevEventInput> & { eventType: AutoDevEventInp
 }
 
 // ---------------------------------------------------------------------------
-// 1) 8개 필수 알림 종류 — event → NotificationType/severity/requiresHumanAction.
+// 1) high-signal 알림 종류(2026-08-22 incident 이후 6종) — event →
+//    NotificationType/severity/requiresHumanAction. RUN_COMPLETED/TEST_FAILED는 더 이상
+//    알림을 만들지 않는다(§ 아래 scenarioRunCompletedNoLongerNotifies/
+//    scenarioTestCompletedNeverNotifies가 그 부재를 명시적으로 검증).
 // ---------------------------------------------------------------------------
 function scenarioTaskCompleted(): void {
   const n = classifyEventForNotification(ev({ eventType: "TASK_COMPLETED", runId: "r1", taskId: "T1", outcome: "SUCCESS" }));
@@ -38,23 +41,22 @@ function scenarioTaskCompleted(): void {
   check("TASK_COMPLETED: shortMessage에 taskId 포함", (n?.shortMessage ?? "").includes("T1"));
 }
 
-function scenarioRunCompleted(): void {
+// 2026-08-22 incident 이후 — RUN_COMPLETED/TEST_FAILED는 더 이상 알림을 만들지 않는다(§
+// notification.ts 파일 상단 주석). RUN_COMPLETED는 TASK_COMPLETED와 중복 정보이고,
+// TEST_FAILED는 REVISE 재시도마다 반복 발생하는 중간 신호라 실제 알림 폭탄의 원인이었다.
+function scenarioRunCompletedNoLongerNotifies(): void {
   const success = classifyEventForNotification(ev({ eventType: "RUN_COMPLETED", runId: "r2", taskId: "T1", outcome: "SUCCESS" }));
-  check("RUN_COMPLETED(SUCCESS): 알림 생성됨", success !== undefined);
-  check("RUN_COMPLETED(SUCCESS): severity=INFO", success?.severity === "INFO");
-  check("RUN_COMPLETED(SUCCESS): requiresHumanAction=false", success?.requiresHumanAction === false);
+  check("RUN_COMPLETED(SUCCESS): 더 이상 알림을 만들지 않음(TASK_COMPLETED와 중복 정보)", success === undefined);
 
   const skipped = classifyEventForNotification(ev({ eventType: "RUN_COMPLETED", runId: "r2", outcome: "SKIPPED" }));
-  check("RUN_COMPLETED(SKIPPED): 알림 없음(실행할 task 없어 아무 일도 안 함)", skipped === undefined);
+  check("RUN_COMPLETED(SKIPPED): 알림 없음", skipped === undefined);
 }
 
-function scenarioTestFailed(): void {
+function scenarioTestCompletedNeverNotifies(): void {
   const failed = classifyEventForNotification(
     ev({ eventType: "TEST_COMPLETED", runId: "r3", taskId: "T1", outcome: "SUCCESS", testSummary: { total: 3, passed: 1, failed: 2 } })
   );
-  check("TEST_COMPLETED(failed>0): TEST_FAILED 알림", failed?.notificationType === "TEST_FAILED");
-  check("TEST_COMPLETED(failed>0): severity=WARNING", failed?.severity === "WARNING");
-  check("TEST_COMPLETED(failed>0): shortMessage에 실패 개수 포함", (failed?.shortMessage ?? "").includes("2개"));
+  check("TEST_COMPLETED(failed>0): 더 이상 알림을 만들지 않음(REVISE 반복마다 쌓이던 원인)", failed === undefined);
 
   const passed = classifyEventForNotification(
     ev({ eventType: "TEST_COMPLETED", runId: "r3", taskId: "T1", outcome: "SUCCESS", testSummary: { total: 3, passed: 3, failed: 0 } })
@@ -187,8 +189,8 @@ function scenarioNoTaskIdFallback(): void {
 
 async function main(): Promise<void> {
   scenarioTaskCompleted();
-  scenarioRunCompleted();
-  scenarioTestFailed();
+  scenarioRunCompletedNoLongerNotifies();
+  scenarioTestCompletedNeverNotifies();
   scenarioWaitingHuman();
   scenarioHumanApprovalRequired();
   scenarioSecurityBlocked();

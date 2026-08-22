@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
-import { runDeterministicCompletionChecks, listFullRegressionScripts } from "./self-dev-complete";
+import { runDeterministicCompletionChecks, listFullRegressionScripts, realCommandRunner } from "./self-dev-complete";
 import type { CommandRunner, CommandOutcome } from "./self-dev-complete";
 import { createInMemoryEventStore } from "./event-store";
 import { validateSelfDevCompletionEvidence, isEvidenceError, recordSelfDevTaskCompleted } from "./self-dev-completion";
@@ -85,6 +85,42 @@ function makeFakeRunner(cfg: FakeRunnerConfig, callLog?: { command: string; args
     const ok = cfg.testOkByBasename ? (cfg.testOkByBasename[base] ?? true) : true;
     return { ok, code: ok ? 0 : 1, stdout: "", stderr: ok ? "" : `${base} failed(fixture)` };
   };
+}
+
+// ---------------------------------------------------------------------------
+// 0) realCommandRunner — 2026-08-22 incident 대응. 전체 회귀를 자식 프로세스로 spawn하는
+//    이 함수가 AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME/실제 Telegram credential을
+//    자식에게 물려주지 않는지 실제 spawnSync로(fake 아님) 직접 검증한다 — 자식 프로세스가
+//    node -e로 자신이 물려받은 env를 그대로 출력하게 해서 확인한다.
+// ---------------------------------------------------------------------------
+function scenarioRealCommandRunnerSanitizesChildEnv(): void {
+  const sensitiveKeys = ["AUTOMATION_DRY_RUN", "AUTODEV_PRODUCTION_RUNTIME", "AUTODEV_TELEGRAM_BOT_TOKEN", "AUTODEV_TELEGRAM_CHAT_ID", "AUTODEV_TELEGRAM_USER_ID"];
+  const saved: Record<string, string | undefined> = {};
+  for (const k of sensitiveKeys) saved[k] = process.env[k];
+  try {
+    process.env.AUTOMATION_DRY_RUN = "false";
+    process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
+    process.env.AUTODEV_TELEGRAM_BOT_TOKEN = "123456:fake-looks-real-for-test";
+    process.env.AUTODEV_TELEGRAM_CHAT_ID = "999999";
+    process.env.AUTODEV_TELEGRAM_USER_ID = "111111";
+
+    const printEnvScript = `console.log(JSON.stringify(${JSON.stringify(sensitiveKeys)}.map((k) => process.env[k] ?? null)))`;
+    const result = realCommandRunner(process.execPath, ["-e", printEnvScript], process.cwd());
+
+    check("0-1) realCommandRunner: 자식 프로세스가 정상 실행됨", result.ok === true);
+    let values: (string | null)[] = [];
+    try {
+      values = JSON.parse(result.stdout.trim()) as (string | null)[];
+    } catch {
+      values = [];
+    }
+    check("0-2) realCommandRunner: 자식이 물려받은 민감 환경변수가 전부 null(제거됨)", values.length === sensitiveKeys.length && values.every((v) => v === null));
+  } finally {
+    for (const k of sensitiveKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +273,7 @@ function scenarioIntegrationRecordsExactlyOnce(): void {
 }
 
 function main(): void {
+  scenarioRealCommandRunnerSanitizesChildEnv();
   scenarioListFullRegressionScripts();
   scenarioTypecheckFail();
   scenarioBuildFail();

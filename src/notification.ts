@@ -9,19 +9,27 @@ import type { AutoDevEvent, AutoDevEventType } from "./observability-event";
 // 판정한다 — LLM을 호출하지 않으며, 동일 입력에는 항상 동일 출력을 반환하는 순수 함수다.
 //
 // event → notification 매핑은 이미 확정된 어휘만 쓴다:
-//   - TASK_COMPLETED/RUN_COMPLETED/HUMAN_APPROVAL_REQUIRED/SECURITY_BLOCKED/
-//     REVIEW_CYCLE_EXHAUSTED/RUN_BLOCKED event는 observability-event.ts에 이미 존재하는
-//     AutoDevEventType 값 그대로 1:1로 매핑한다(새 event type을 만들지 않는다).
+//   - TASK_COMPLETED/HUMAN_APPROVAL_REQUIRED/SECURITY_BLOCKED/REVIEW_CYCLE_EXHAUSTED/
+//     RUN_BLOCKED event는 observability-event.ts에 이미 존재하는 AutoDevEventType 값
+//     그대로 1:1로 매핑한다(새 event type을 만들지 않는다).
 //   - REVIEW_BLOCKED event(GPT reviewer가 최종 차단 — live-snapshot.ts의
 //     STATUS_TRANSITIONS가 이미 이 event를 WAITING_HUMAN LiveStatus로 분류하는 것과 동일한
-//     사실)는, 이 Task가 요구하는 8개 알림 종류 중 HUMAN_APPROVAL_REQUIRED/
-//     REVIEW_CYCLE_EXHAUSTED가 이미 전용 알림을 가지므로, 남은 "사람 확인이 필요한 나머지
-//     경로"를 대표하는 일반 WAITING_HUMAN 알림으로 매핑한다.
-//   - TEST_FAILED는 전용 event type이 없다 — TEST_COMPLETED event의 testSummary.failed > 0일
-//     때만 파생시킨다(buildTestSummary가 이미 실제 Safe Executor exitCode 기반 집계를
-//     보장한다, § observability-event.ts).
-//   - 그 외 event(*_STARTED, AGENT_*, REVIEW_STARTED/APPROVED/REVISE, CHECKPOINT_CREATED 등)는
-//     알림을 만들지 않는다 — 순수 진행 상황이거나 이미 다른 event로 대표된다.
+//     사실)는, HUMAN_APPROVAL_REQUIRED/REVIEW_CYCLE_EXHAUSTED가 이미 전용 알림을 가지므로,
+//     남은 "사람 확인이 최종적으로 필요해진 나머지 경로"를 대표하는 일반 WAITING_HUMAN
+//     알림으로 매핑한다.
+//   - 2026-08-22 incident 이후(Phase G Task G7.2.1 안전장치 강화) — RUN_COMPLETED와
+//     TEST_FAILED(TEST_COMPLETED event의 testSummary.failed>0 파생)는 더 이상 알림을
+//     만들지 않는다. 실제 Telegram 전송은 "production/self-dev 실제 Task의 high-signal
+//     최종 상태"로만 제한한다: TASK_COMPLETED, TASK_FAILED에 해당하는 최종 BLOCKED
+//     (SECURITY_BLOCKED/RUN_BLOCKED), 그리고 실제 사람 개입이 최종적으로 필요해진
+//     HUMAN_APPROVAL_REQUIRED/REVIEW_CYCLE_EXHAUSTED/WAITING_HUMAN뿐이다. RUN_COMPLETED는
+//     TASK_COMPLETED와 사실상 중복 정보이고, TEST_FAILED는 REVISE 재시도마다(회귀 실패한
+//     시도 하나하나) 반복 발생하는 중간 신호라 알림 폭탄의 실제 원인 중 하나였다(REVISE
+//     루프 자체를 반복 알림하지 않는다 — 사람 개입이 최종적으로 필요해진 경우
+//     REVIEW_CYCLE_EXHAUSTED로 정확히 1건만 알린다).
+//   - 그 외 event(*_STARTED, AGENT_*, REVIEW_STARTED/APPROVED/REVISE, CHECKPOINT_CREATED,
+//     RUN_COMPLETED, TEST_COMPLETED 등)는 알림을 만들지 않는다 — 순수 진행 상황이거나
+//     이미 다른 event로 대표되거나, 위 high-signal 정책 밖이다.
 //
 // 메시지 본문은 event.reason/error.message 같은 자유 텍스트를 절대 옮겨 담지 않는다(§
 // live-snapshot.ts CURRENT_ACTION_LABELS와 동일한 원칙) — 고정 템플릿 + runId/taskId 같은
@@ -145,12 +153,13 @@ const NOTIFICATION_CONTENT: Record<NotificationType, (event: AutoDevEvent) => No
 // 표에 명시적으로 추가한다).
 const EVENT_TO_NOTIFICATION_TYPE: Partial<Record<AutoDevEventType, NotificationType>> = {
   TASK_COMPLETED: "TASK_COMPLETED",
-  RUN_COMPLETED: "RUN_COMPLETED",
   HUMAN_APPROVAL_REQUIRED: "HUMAN_APPROVAL_REQUIRED",
   SECURITY_BLOCKED: "SECURITY_BLOCKED",
   REVIEW_CYCLE_EXHAUSTED: "REVIEW_CYCLE_EXHAUSTED",
   RUN_BLOCKED: "RUN_BLOCKED",
   REVIEW_BLOCKED: "WAITING_HUMAN",
+  // RUN_COMPLETED는 의도적으로 여기 없다(§ 파일 상단 주석 — 2026-08-22 incident 이후
+  // TASK_COMPLETED와 중복되는 중간/완료 정보는 보내지 않는다).
 };
 
 function buildDedupeKey(runId: string, taskId: string | undefined, type: NotificationType, cycle: number | undefined): string {
@@ -164,16 +173,11 @@ function buildDedupeKey(runId: string, taskId: string | undefined, type: Notific
  * secret-scanner.ts와 동일한 Core hard rule 패턴).
  */
 export function classifyEventForNotification(event: AutoDevEvent): NotificationMessage | undefined {
-  let type: NotificationType | undefined = EVENT_TO_NOTIFICATION_TYPE[event.eventType];
-
-  if (event.eventType === "TEST_COMPLETED" && (event.testSummary?.failed ?? 0) > 0) {
-    type = "TEST_FAILED";
-  }
-
+  // TEST_COMPLETED(개별 회귀/REVISE 재시도의 중간 결과, 실패 여부와 무관)는 의도적으로
+  // 알림을 만들지 않는다(§ 파일 상단 주석 — 2026-08-22 incident, REVISE 반복마다 알림이
+  // 쌓이는 문제의 실제 원인이었다).
+  const type: NotificationType | undefined = EVENT_TO_NOTIFICATION_TYPE[event.eventType];
   if (!type) return undefined;
-  // RUN_COMPLETED(outcome=SKIPPED)는 "실행할 task가 없어 아무 일도 하지 않은 run"이다(§
-  // live-snapshot.ts walkEvents의 IDLE 판정과 동일한 사실) — 알릴 만한 완료가 아니다.
-  if (type === "RUN_COMPLETED" && event.outcome === "SKIPPED") return undefined;
 
   const content = NOTIFICATION_CONTENT[type](event);
 

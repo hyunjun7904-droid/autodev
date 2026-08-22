@@ -221,6 +221,63 @@ async function scenarioNotConfiguredMakesNoNetworkCalls(): Promise<void> {
   }
 }
 
+// 2026-08-22 incident — 이 환경(이 저장소가 실제로 개발되는 Windows 머신)에는
+// AUTODEV_TELEGRAM_BOT_TOKEN/CHAT_ID가 실제로 영구 환경변수로 설정돼 있다. 이 시나리오는
+// 그 상황을 그대로 재현한다: 실제처럼 보이는(하지만 가짜) credential이 process.env에 있고,
+// opts에도 botToken/chatId를 아예 지정하지 않는다. isProductionRuntime()(§
+// runtime-origin.ts)이 dual-gate를 요구하므로, AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME
+// 둘 다 명시적으로 설정하지 않는 한(이 테스트가 절대 설정하지 않는다) controller는 그
+// credential을 전혀 읽지 않아야 하고, 실제 네트워크 호출도 없어야 한다.
+async function scenarioProductionCredentialsInEnvNeverAutoAdoptedOutsideProductionRuntime(): Promise<void> {
+  const root = makeGitRepo("controller-env-credential-leak-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {});
+  const manifest = buildManifest(root, statePath);
+  const { fetch: fetchImpl, getUpdatesCalls, sendMessageCalls } = createRoutableFakeFetch();
+
+  const prevToken = process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  const prevChatId = process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  const prevDryRun = process.env.AUTOMATION_DRY_RUN;
+  const prevProdRuntime = process.env.AUTODEV_PRODUCTION_RUNTIME;
+  process.env.AUTODEV_TELEGRAM_BOT_TOKEN = "123456:fake-looks-real-token-for-test";
+  process.env.AUTODEV_TELEGRAM_CHAT_ID = "999999";
+  delete process.env.AUTOMATION_DRY_RUN;
+  delete process.env.AUTODEV_PRODUCTION_RUNTIME;
+  try {
+    const handle = await startTelegramController({
+      manifest,
+      eventStore: createInMemoryEventStore(),
+      notificationStore: createInMemoryNotificationStore(),
+      approvalStore: createInMemoryApprovalStore(),
+      offsetStore: createInMemoryTelegramOffsetStore(),
+      fetchImpl,
+      // botToken/chatId를 의도적으로 지정하지 않는다 — env fallback 경로 자체를 검증한다.
+      tickDelayMs: 5,
+      notConfiguredRetryDelayMs: 5,
+    });
+    await waitUntil(() => (handle.getLastTickSummary()?.approvalsCreated ?? -1) >= 0);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+    check(
+      "실제 Bot Token이 env에 있어도 isProductionRuntime()이 false면 getUpdates 호출 없음",
+      getUpdatesCalls.length === 0
+    );
+    check(
+      "실제 Bot Token이 env에 있어도 isProductionRuntime()이 false면 sendMessage 호출 없음(real Telegram 전송 없음)",
+      sendMessageCalls.length === 0
+    );
+  } finally {
+    if (prevToken === undefined) delete process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+    else process.env.AUTODEV_TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevChatId === undefined) delete process.env.AUTODEV_TELEGRAM_CHAT_ID;
+    else process.env.AUTODEV_TELEGRAM_CHAT_ID = prevChatId;
+    if (prevDryRun === undefined) delete process.env.AUTOMATION_DRY_RUN;
+    else process.env.AUTOMATION_DRY_RUN = prevDryRun;
+    if (prevProdRuntime === undefined) delete process.env.AUTODEV_PRODUCTION_RUNTIME;
+    else process.env.AUTODEV_PRODUCTION_RUNTIME = prevProdRuntime;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // tick 배선: event -> approval 생성 -> notification 자동 전달 -> getUpdates -> callback 처리
 // ---------------------------------------------------------------------------
@@ -348,6 +405,7 @@ async function main(): Promise<void> {
   await scenarioInvalidManifestThrowsAndDoesNotStartLoop();
   await scenarioStartStopLifecycle();
   await scenarioNotConfiguredMakesNoNetworkCalls();
+  await scenarioProductionCredentialsInEnvNeverAutoAdoptedOutsideProductionRuntime();
   await scenarioFullTickWiring();
   await scenarioControllerRestartPreservesState();
 
