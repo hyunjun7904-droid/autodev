@@ -187,24 +187,38 @@ async function scenarioNotConfiguredMakesNoNetworkCalls(): Promise<void> {
   const manifest = buildManifest(root, statePath);
   const { fetch: fetchImpl, getUpdatesCalls, sendMessageCalls } = createRoutableFakeFetch();
 
-  const handle = await startTelegramController({
-    manifest,
-    eventStore: createInMemoryEventStore(),
-    notificationStore: createInMemoryNotificationStore(),
-    approvalStore: createInMemoryApprovalStore(),
-    offsetStore: createInMemoryTelegramOffsetStore(),
-    fetchImpl,
-    botToken: undefined,
-    chatId: undefined,
-    tickDelayMs: 5,
-    notConfiguredRetryDelayMs: 5,
-  });
-  await waitUntil(() => (handle.getLastTickSummary()?.approvalsCreated ?? -1) >= 0);
-  // tick이 여러 번 돌 시간을 준다 — 그래도 네트워크 호출은 전혀 없어야 한다.
-  await new Promise((resolve) => setTimeout(resolve, 60));
-  await handle.stop();
-  check("Bot Token 미설정 -> getUpdates 호출 자체가 없음", getUpdatesCalls.length === 0);
-  check("Bot Token 미설정 -> sendMessage 호출 자체가 없음(가짜 성공 처리 없음)", sendMessageCalls.length === 0);
+  // startTelegramController()의 botToken/chatId는 `opts.xxx ?? process.env.XXX`로 계산된다
+  // (§ telegram-controller.ts) — opts에 명시적으로 undefined를 넘겨도 `??`는 process.env를
+  // 그대로 fallback으로 쓴다. 이 테스트가 검증하려는 "미설정" 시나리오를 실제 개발자의
+  // .env(G5.1/G6 live verification용으로 실제 값이 채워져 있을 수 있다) 상태와 무관하게
+  // 결정적으로 재현하려면 이 scenario 동안만 process.env 쪽도 실제로 비워야 한다.
+  const prevToken = process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  const prevChatId = process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  delete process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  delete process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  try {
+    const handle = await startTelegramController({
+      manifest,
+      eventStore: createInMemoryEventStore(),
+      notificationStore: createInMemoryNotificationStore(),
+      approvalStore: createInMemoryApprovalStore(),
+      offsetStore: createInMemoryTelegramOffsetStore(),
+      fetchImpl,
+      botToken: undefined,
+      chatId: undefined,
+      tickDelayMs: 5,
+      notConfiguredRetryDelayMs: 5,
+    });
+    await waitUntil(() => (handle.getLastTickSummary()?.approvalsCreated ?? -1) >= 0);
+    // tick이 여러 번 돌 시간을 준다 — 그래도 네트워크 호출은 전혀 없어야 한다.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+    check("Bot Token 미설정 -> getUpdates 호출 자체가 없음", getUpdatesCalls.length === 0);
+    check("Bot Token 미설정 -> sendMessage 호출 자체가 없음(가짜 성공 처리 없음)", sendMessageCalls.length === 0);
+  } finally {
+    if (prevToken !== undefined) process.env.AUTODEV_TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevChatId !== undefined) process.env.AUTODEV_TELEGRAM_CHAT_ID = prevChatId;
+  }
 }
 
 // ---------------------------------------------------------------------------

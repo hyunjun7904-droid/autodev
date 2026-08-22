@@ -138,9 +138,24 @@ async function scenarioNoButtonsWhenNotRemotelyApprovable(): Promise<void> {
   );
 }
 async function scenarioNotConfiguredReturnsError(): Promise<void> {
-  const store: ApprovalStore = createInMemoryApprovalStore();
-  const result = await sendTelegramApprovalAwareMessage({}, store, msg());
-  check("botToken/chatId 미설정 -> TELEGRAM_NOT_CONFIGURED(가짜 성공 아님)", result.ok === false && !result.ok && result.error === "TELEGRAM_NOT_CONFIGURED");
+  // sendTelegramApprovalAwareMessage({})의 botToken/chatId는 `opts.xxx ?? process.env.XXX`로
+  // 계산된다 — 빈 opts를 넘겨도 개발자의 실제 .env(G5.1/G6 live verification용으로 실제
+  // 값이 채워져 있을 수 있다)에 값이 있으면 그 값을 그대로 쓴다. 이 시나리오가 검증하려는
+  // "미설정" 상태를 실제 .env 상태와 무관하게 결정적으로 재현하려면 이 동안만 process.env
+  // 쪽도 실제로 비워야 한다(§ telegram-controller-tests.ts scenarioNotConfiguredMakesNoNetworkCalls와
+  // 동일한 원칙).
+  const prevToken = process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  const prevChatId = process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  delete process.env.AUTODEV_TELEGRAM_BOT_TOKEN;
+  delete process.env.AUTODEV_TELEGRAM_CHAT_ID;
+  try {
+    const store: ApprovalStore = createInMemoryApprovalStore();
+    const result = await sendTelegramApprovalAwareMessage({}, store, msg());
+    check("botToken/chatId 미설정 -> TELEGRAM_NOT_CONFIGURED(가짜 성공 아님)", result.ok === false && !result.ok && result.error === "TELEGRAM_NOT_CONFIGURED");
+  } finally {
+    if (prevToken !== undefined) process.env.AUTODEV_TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevChatId !== undefined) process.env.AUTODEV_TELEGRAM_CHAT_ID = prevChatId;
+  }
 }
 async function scenarioProviderFactoryPlugsIntoNotificationProvider(): Promise<void> {
   const store: ApprovalStore = createInMemoryApprovalStore();
