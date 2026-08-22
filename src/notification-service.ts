@@ -24,6 +24,12 @@ import type { NotificationProvider } from "./notification-provider";
 // 실제 background timer/scheduler는 이 Task 범위 밖이다 — 이 함수를 호출할 때마다(예: 향후
 // polling 프로세스) 그 시점 기준으로 미전달/재시도 가능 record를 한 번 처리하는 것이
 // "retry seam"이다.
+//
+// Phase G Task G5.1 — 이 함수는 이제 async다(notification-provider.ts가 send()를
+// `DeliveryResult | Promise<DeliveryResult>`로 넓혔기 때문 — Telegram처럼 실제 네트워크
+// I/O가 필요한 provider를 동일한 retry/dedupe/우선순위 배선에 그대로 꽂기 위함). 전달은
+// 여전히 record 하나씩 순차로 처리한다(동시 발송으로 인한 순서 뒤섞임/rate limit 위반을
+// 피하기 위함 — § 우선순위 처리가 의미를 가지려면 순서가 보장돼야 한다).
 
 export const DEFAULT_MAX_DELIVERY_ATTEMPTS = 3;
 
@@ -60,12 +66,12 @@ function defaultNow(): string {
   return new Date().toISOString();
 }
 
-export function processNotifications(
+export async function processNotifications(
   events: AutoDevEvent[],
   store: NotificationStore,
   provider?: NotificationProvider,
   opts: ProcessNotificationsOptions = {}
-): ProcessNotificationsResult {
+): Promise<ProcessNotificationsResult> {
   const now = opts.now ?? defaultNow;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_DELIVERY_ATTEMPTS;
 
@@ -110,7 +116,7 @@ export function processNotifications(
     .sort((a, b) => NOTIFICATION_SEVERITY_PRIORITY[a.notification.severity] - NOTIFICATION_SEVERITY_PRIORITY[b.notification.severity]);
 
   for (const record of retryable) {
-    const result = provider.send(record.notification);
+    const result = await provider.send(record.notification);
     const at = now();
     if (result.ok) {
       store.recordDeliverySuccess(record.notification.dedupeKey, at);

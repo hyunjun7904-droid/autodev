@@ -7,10 +7,14 @@ import { createFakeNotificationProvider } from "./notification-provider";
 import { processNotifications, DEFAULT_MAX_DELIVERY_ATTEMPTS } from "./notification-service";
 import type { NotificationType } from "./notification";
 
-// Notification Delivery Orchestration 테스트(Phase G Task G5). Event/Snapshot →
+// Notification Delivery Orchestration 테스트(Phase G Task G5 / G5.1). Event/Snapshot →
 // deterministic notification 판단 → dedupe/우선순위 처리 → Delivery Provider → 전달 결과
 // 기록까지 전체 파이프라인을 검증한다. 실제 Claude/GPT 유료 호출 없음, 실제 외부
 // notification 전송 없음(전부 fake/in-memory).
+//
+// Phase G Task G5.1 — processNotifications()가 async로 바뀌었다(notification-provider.ts가
+// send()를 `DeliveryResult | Promise<DeliveryResult>`로 넓혔기 때문). 이 파일의 assertion
+// 내용/개수는 G5와 완전히 동일하다 — 모든 호출부에 await만 기계적으로 추가했다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -32,7 +36,7 @@ function ev(overrides: Partial<AutoDevEventInput> & { eventType: AutoDevEventInp
 // ---------------------------------------------------------------------------
 // 1) 8개 필수 알림 종류가 전체 파이프라인을 통과해 실제로 delivered까지 도달한다.
 // ---------------------------------------------------------------------------
-function scenarioAllRequiredNotificationTypesDeliver(): void {
+async function scenarioAllRequiredNotificationTypesDeliver(): Promise<void> {
   const events: AutoDevEvent[] = [
     ev({ eventType: "TASK_COMPLETED", runId: "run-all", taskId: "T1", outcome: "SUCCESS" }),
     ev({ eventType: "RUN_COMPLETED", runId: "run-all", taskId: "T1", outcome: "SUCCESS" }),
@@ -45,7 +49,7 @@ function scenarioAllRequiredNotificationTypesDeliver(): void {
   ];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
-  const result = processNotifications(events, store, provider);
+  const result = await processNotifications(events, store, provider);
 
   check("8종 이벤트: created=8", result.created.length === 8);
   check("8종 이벤트: delivered=8", result.delivered.length === 8);
@@ -68,15 +72,15 @@ function scenarioAllRequiredNotificationTypesDeliver(): void {
 // ---------------------------------------------------------------------------
 // 2) dedupe — 같은 event 목록을 두 번 처리해도 재전달하지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioDedupeAcrossCalls(): void {
+async function scenarioDedupeAcrossCalls(): Promise<void> {
   const events = [ev({ eventType: "SECURITY_BLOCKED", runId: "run-dedupe", taskId: "T1" })];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
 
-  const first = processNotifications(events, store, provider);
+  const first = await processNotifications(events, store, provider);
   check("dedupe: 최초 호출 → created=1, delivered=1", first.created.length === 1 && first.delivered.length === 1);
 
-  const second = processNotifications(events, store, provider);
+  const second = await processNotifications(events, store, provider);
   check("dedupe: 같은 event 재처리 → created=0", second.created.length === 0);
   check("dedupe: 같은 event 재처리 → dedupedCount=1", second.dedupedCount === 1);
   check("dedupe: 이미 DELIVERED된 알림은 재전달하지 않음(delivered=0)", second.delivered.length === 0);
@@ -86,14 +90,14 @@ function scenarioDedupeAcrossCalls(): void {
 // ---------------------------------------------------------------------------
 // 3) 서로 다른 runId — 혼합 없이 각자 독립적으로 처리된다.
 // ---------------------------------------------------------------------------
-function scenarioNoCrossRunMixing(): void {
+async function scenarioNoCrossRunMixing(): Promise<void> {
   const events = [
     ev({ eventType: "TASK_COMPLETED", runId: "run-a", taskId: "T1" }),
     ev({ eventType: "TASK_COMPLETED", runId: "run-b", taskId: "T1" }),
   ];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
-  const result = processNotifications(events, store, provider);
+  const result = await processNotifications(events, store, provider);
 
   check("cross-run: created=2(서로 다른 runId는 별도 알림)", result.created.length === 2);
   const dedupeKeys = new Set(result.created.map((n) => n.dedupeKey));
@@ -105,18 +109,18 @@ function scenarioNoCrossRunMixing(): void {
 // ---------------------------------------------------------------------------
 // 4) 서로 다른 review cycle — 의미 있는 상태 변화는 별도 알림으로 취급.
 // ---------------------------------------------------------------------------
-function scenarioDifferentReviewCyclesAreSeparateNotifications(): void {
+async function scenarioDifferentReviewCyclesAreSeparateNotifications(): Promise<void> {
   const events = [
     ev({ eventType: "REVIEW_CYCLE_EXHAUSTED", runId: "run-cycle", taskId: "T1", reviseCycle: 3 }),
     ev({ eventType: "REVIEW_CYCLE_EXHAUSTED", runId: "run-cycle", taskId: "T1", reviseCycle: 3 }),
   ];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
-  const first = processNotifications(events, store, provider);
+  const first = await processNotifications(events, store, provider);
   check("동일 cycle 반복: created=1(dedupe)", first.created.length === 1);
 
   const secondCycleEvent = [ev({ eventType: "REVIEW_CYCLE_EXHAUSTED", runId: "run-cycle", taskId: "T1", reviseCycle: 4 })];
-  const second = processNotifications(secondCycleEvent, store, provider);
+  const second = await processNotifications(secondCycleEvent, store, provider);
   check("다른 cycle: created=1(별도 알림)", second.created.length === 1);
   check("다른 cycle: 총 2건 delivered", store.list({ runId: "run-cycle" }).filter((r) => r.deliveryStatus === "DELIVERED").length === 2);
 }
@@ -124,7 +128,7 @@ function scenarioDifferentReviewCyclesAreSeparateNotifications(): void {
 // ---------------------------------------------------------------------------
 // 5) 우선순위 — CRITICAL이 INFO보다 먼저 전달된다.
 // ---------------------------------------------------------------------------
-function scenarioPriorityOrdering(): void {
+async function scenarioPriorityOrdering(): Promise<void> {
   const events = [
     ev({ eventType: "TASK_COMPLETED", runId: "run-priority", taskId: "T1" }), // INFO
     ev({ eventType: "SECURITY_BLOCKED", runId: "run-priority", taskId: "T2" }), // CRITICAL
@@ -132,7 +136,7 @@ function scenarioPriorityOrdering(): void {
   ];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
-  processNotifications(events, store, provider);
+  await processNotifications(events, store, provider);
 
   const order = provider.sent.map((n) => n.severity);
   check("우선순위: CRITICAL이 WARNING/INFO보다 먼저 전달됨", order[0] === "CRITICAL");
@@ -142,11 +146,11 @@ function scenarioPriorityOrdering(): void {
 // ---------------------------------------------------------------------------
 // 6) delivery 실패 — 성공으로 위장하지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioDeliveryFailureRecorded(): void {
+async function scenarioDeliveryFailureRecorded(): Promise<void> {
   const events = [ev({ eventType: "SECURITY_BLOCKED", runId: "run-fail", taskId: "T1" })];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider({ alwaysFail: true });
-  const result = processNotifications(events, store, provider);
+  const result = await processNotifications(events, store, provider);
 
   check("delivery 실패: delivered=0", result.delivered.length === 0);
   check("delivery 실패: failed=1", result.failed.length === 1);
@@ -159,14 +163,14 @@ function scenarioDeliveryFailureRecorded(): void {
 // ---------------------------------------------------------------------------
 // 7) 무한 재시도 금지 — 상한(DEFAULT_MAX_DELIVERY_ATTEMPTS) 도달 후 더 이상 시도하지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioNoInfiniteRetry(): void {
+async function scenarioNoInfiniteRetry(): Promise<void> {
   const events = [ev({ eventType: "SECURITY_BLOCKED", runId: "run-retry", taskId: "T1" })];
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider({ alwaysFail: true });
 
-  let lastResult = processNotifications(events, store, provider);
+  let lastResult = await processNotifications(events, store, provider);
   for (let i = 0; i < 5; i++) {
-    lastResult = processNotifications([], store, provider);
+    lastResult = await processNotifications([], store, provider);
   }
   const dedupeKey = "run-retry::T1::SECURITY_BLOCKED::-";
   const record = store.get(dedupeKey);
@@ -178,10 +182,10 @@ function scenarioNoInfiniteRetry(): void {
 // ---------------------------------------------------------------------------
 // 8) provider 없음 — 명확한 상태(PENDING 유지, 예외 없음, 성공/실패로 위장하지 않음).
 // ---------------------------------------------------------------------------
-function scenarioNoProviderConfigured(): void {
+async function scenarioNoProviderConfigured(): Promise<void> {
   const events = [ev({ eventType: "TASK_COMPLETED", runId: "run-noprovider", taskId: "T1" })];
   const store = createInMemoryNotificationStore();
-  const result = processNotifications(events, store, undefined);
+  const result = await processNotifications(events, store, undefined);
 
   check("provider 없음: providerConfigured=false", result.providerConfigured === false);
   check("provider 없음: created는 정상 계산됨(분류/dedupe는 별개 단계)", result.created.length === 1);
@@ -195,7 +199,7 @@ function scenarioNoProviderConfigured(): void {
 // 9) Audit 연결 seam — eventStore를 넘기면 NOTIFICATION_CREATED/DELIVERED/FAILED가
 //    남고, 넘기지 않으면 EventStore를 전혀 건드리지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioAuditEventSeam(): void {
+async function scenarioAuditEventSeam(): Promise<void> {
   const events = [
     ev({ eventType: "TASK_COMPLETED", runId: "run-audit", taskId: "T1" }),
     ev({ eventType: "SECURITY_BLOCKED", runId: "run-audit", taskId: "T2" }),
@@ -204,7 +208,7 @@ function scenarioAuditEventSeam(): void {
   const eventStore = createInMemoryEventStore();
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider({ alwaysFail: true }); // SECURITY_BLOCKED 알림 전달 실패 유도
-  processNotifications(events, store, provider, { eventStore });
+  await processNotifications(events, store, provider, { eventStore });
 
   const audit = eventStore.query({ runId: "run-audit" }).events;
   check("audit seam: NOTIFICATION_CREATED 2건", audit.filter((e) => e.eventType === "NOTIFICATION_CREATED").length === 2);
@@ -212,14 +216,14 @@ function scenarioAuditEventSeam(): void {
 
   const withoutEventStore = createInMemoryEventStore();
   const store2 = createInMemoryNotificationStore();
-  processNotifications([ev({ eventType: "TASK_COMPLETED", runId: "run-no-audit", taskId: "T1" })], store2, createFakeNotificationProvider());
+  await processNotifications([ev({ eventType: "TASK_COMPLETED", runId: "run-no-audit", taskId: "T1" })], store2, createFakeNotificationProvider());
   check("audit seam: eventStore를 넘기지 않으면 다른 store에 아무 영향 없음", withoutEventStore.query().events.length === 0);
 }
 
 // ---------------------------------------------------------------------------
 // 10) privacy — 파이프라인 전체를 통과해도 raw prompt/output/secret이 노출되지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioNoSensitiveDataThroughPipeline(): void {
+async function scenarioNoSensitiveDataThroughPipeline(): Promise<void> {
   const secretMarker = "ghp_SUPER_SECRET_TOKEN_MARKER_abcdef1234567890";
   const events = [
     ev({
@@ -234,7 +238,7 @@ function scenarioNoSensitiveDataThroughPipeline(): void {
   const eventStore = createInMemoryEventStore();
   const store = createInMemoryNotificationStore();
   const provider = createFakeNotificationProvider();
-  const result = processNotifications(events, store, provider, { eventStore });
+  const result = await processNotifications(events, store, provider, { eventStore });
 
   const serializedResult = JSON.stringify(result);
   const serializedAudit = JSON.stringify(eventStore.query().events);
@@ -251,7 +255,7 @@ function scenarioNoSensitiveDataThroughPipeline(): void {
 //     반환값으로도 전혀 다루지 않는다(구조적으로 건드릴 방법이 없다) — SECURITY_BLOCKED
 //     알림의 delivery가 실패해도 예외 없이 정상 반환되고, 원본 events 배열은 변경되지 않는다.
 // ---------------------------------------------------------------------------
-function scenarioDeliveryFailureDoesNotThrowOrMutateInput(): void {
+async function scenarioDeliveryFailureDoesNotThrowOrMutateInput(): Promise<void> {
   const events = [ev({ eventType: "SECURITY_BLOCKED", runId: "run-purity", taskId: "T1" })];
   const eventsCopy = JSON.stringify(events);
   const store = createInMemoryNotificationStore();
@@ -259,7 +263,7 @@ function scenarioDeliveryFailureDoesNotThrowOrMutateInput(): void {
 
   let threw = false;
   try {
-    processNotifications(events, store, provider);
+    await processNotifications(events, store, provider);
   } catch {
     threw = true;
   }
@@ -268,17 +272,17 @@ function scenarioDeliveryFailureDoesNotThrowOrMutateInput(): void {
 }
 
 async function main(): Promise<void> {
-  scenarioAllRequiredNotificationTypesDeliver();
-  scenarioDedupeAcrossCalls();
-  scenarioNoCrossRunMixing();
-  scenarioDifferentReviewCyclesAreSeparateNotifications();
-  scenarioPriorityOrdering();
-  scenarioDeliveryFailureRecorded();
-  scenarioNoInfiniteRetry();
-  scenarioNoProviderConfigured();
-  scenarioAuditEventSeam();
-  scenarioNoSensitiveDataThroughPipeline();
-  scenarioDeliveryFailureDoesNotThrowOrMutateInput();
+  await scenarioAllRequiredNotificationTypesDeliver();
+  await scenarioDedupeAcrossCalls();
+  await scenarioNoCrossRunMixing();
+  await scenarioDifferentReviewCyclesAreSeparateNotifications();
+  await scenarioPriorityOrdering();
+  await scenarioDeliveryFailureRecorded();
+  await scenarioNoInfiniteRetry();
+  await scenarioNoProviderConfigured();
+  await scenarioAuditEventSeam();
+  await scenarioNoSensitiveDataThroughPipeline();
+  await scenarioDeliveryFailureDoesNotThrowOrMutateInput();
 
   console.log("\n=== notification-service(G5) 테스트 결과 ===");
   for (const r of results) console.log(r);

@@ -9,6 +9,7 @@ const REDACT_KEYS = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
   "SUPABASE_SECRET_KEY",
+  "AUTODEV_TELEGRAM_BOT_TOKEN",
   "access_token",
   "refresh_token",
   "client_secret",

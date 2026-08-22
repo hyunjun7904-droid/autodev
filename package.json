@@ -52,7 +52,9 @@
     "test:notification": "npm run build && node dist/notification-tests.js",
     "test:notification-store": "npm run build && node dist/notification-store-tests.js",
     "test:notification-provider": "npm run build && node dist/notification-provider-tests.js",
+    "test:notification-provider-telegram": "npm run build && node dist/notification-provider-telegram-tests.js",
     "test:notification-service": "npm run build && node dist/notification-service-tests.js",
+    "telegram-smoke-test": "npm run build && node dist/telegram-smoke-test.js",
     "dashboard": "npm run build && node dist/dashboard.js",
     "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
   },
