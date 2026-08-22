@@ -39,6 +39,32 @@ export interface TaskDefinition {
   prohibitedOperations: string[];
   /** 이 task가 끝나면 "다음 task"가 없고, 남은 것은 사람이 트리거하는 실제 배포뿐이라는 뜻. */
   isHumanGate?: boolean;
+
+  // Phase F Task F4.1 — advisory agent(planner/research/qa/security)가 이 task에 실제로
+  // 필요한지를 나타내는 deterministic metadata. task 작성자(project manifest/registry)가
+  // 명시적으로 선언한다 — LLM이 프롬프트 텍스트를 다시 분류해서 정하지 않는다. 전부
+  // optional이며 지정하지 않으면 false와 동일하게 취급되어 어떤 advisory agent도 호출되지
+  // 않는다(기존 동작과 100% 동일, additive-only 확장). "Agent가 있으니 일단 호출"하는
+  // 구조를 피하기 위한 opt-in 설계 — 자세한 실행 배치는 agent-registry.ts의
+  // AdvisorySignals/buildAdvisoryRoutingPlan(), 실제 배선은 autodev.ts 참고.
+
+  /** 아키텍처/설계 판단이 필요한 task에서만 true — planner를 developer 실행 전에 advisory로
+   *  개입시킨다. 단순 구현 task는 지정하지 않는다(호출 안 함). */
+  needsPlanning?: boolean;
+  /** 공식 문서/API/MCP/외부 capability 조사가 실제로 필요한 task에서만 true — research를
+   *  developer 실행 전에 advisory로 개입시킨다(D1~D5 Discovery 경계를 그 안에서 선택적으로
+   *  사용할 수 있다). */
+  needsExternalResearch?: boolean;
+  /** deterministic required tests만으로 충분하지 않은 테스트 사각지대/추가 검증 필요성이
+   *  있는 task에서만 true — qa를 developer 완료 후(post-development, checkpoint 이전)
+   *  advisory로 개입시킨다. required tests가 이미 충분한 단순 task는 지정하지 않는다(qa는
+   *  deterministic test를 대신하지 않고 그 판정을 덮어쓰지도 않는다). */
+  needsQaAdvisory?: boolean;
+  /** security-sensitive 변경(인증/권한/시크릿 처리 등)이 있는 task에서만 true — security를
+   *  developer 완료 후(post-development, checkpoint 이전) advisory로 개입시킨다. Safe
+   *  Executor/Secret Scanner/Dependency Scanner 같은 Core Gate를 대체하지 않는 순수 참고
+   *  의견이다. */
+  needsSecurityReview?: boolean;
 }
 
 /** AutoDev 레벨 plan marker — state.status에 기록되는, OrchestratorStatus enum 밖의 값들. */

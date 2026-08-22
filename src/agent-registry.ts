@@ -451,3 +451,63 @@ function buildRolePlan(taskType: TaskType, input: RoutableTaskInput): RolePlanSt
       return [{ role: "planner", dependsOnRoles: [] }];
   }
 }
+
+// =========================================================
+// Advisory Routing — Phase F Task F4.1. task-registry.ts의 모든 task는 정의상
+// "코드를 구현하는" 작업이라, routeTask()의 taskType 기반 buildRolePlan()(하나의 taskType →
+// 하나의 고정 role 조합)은 "이 code task에 추가로 planner/research/qa/security가 필요한가"
+// 라는, taskType과 독립적으로 조합 가능한 질문에 맞지 않는다(F4는 이걸 무시하고 taskType을
+// "code_implementation"으로 강제해 실질적으로 advisory가 항상 no-op이 되는 문제가 있었다).
+//
+// 이 함수는 텍스트를 다시 분류하지 않는다 — 호출부(task-registry.ts의 TaskDefinition에
+// task 작성자가 명시한 needsPlanning/needsExternalResearch/needsQaAdvisory/
+// needsSecurityReview)가 이미 결정한 deterministic 신호만 그대로 읽는다. 신호가 없으면
+// (전부 false/undefined) steps가 빈 배열이다 — "Agent가 있으니 일단 호출"하지 않는다.
+// developer/reviewer는 이 함수가 다루지 않는다(그 역할은 여전히 orchestrator.ts 전담).
+// =========================================================
+
+export interface AdvisorySignals {
+  needsPlanning?: boolean;
+  needsExternalResearch?: boolean;
+  needsQaAdvisory?: boolean;
+  needsSecurityReview?: boolean;
+}
+
+/**
+ * AdvisorySignals에 명시된 role만, priority 순으로 deterministic하게 담은 RoutingPlan을
+ * 만든다. 각 step은 dependsOn:[](developer/reviewer를 이 plan에 포함하지 않으므로 그
+ * 어떤 role도 서로에게 의존하지 않는다 — planner/research는 pre-development, qa/security는
+ * post-development에 각자 독립적으로 advisory로 개입한다). requiresHumanApproval은 이
+ * 함수가 판단하지 않는다 — 호출부가 이미 policy.ts(classifyTaskRisk/requiresHumanApproval)
+ * 로 고위험 여부를 확인한 뒤에만 이 함수를 부른다(§ autodev.ts).
+ */
+export function buildAdvisoryRoutingPlan(taskId: string, signals: AdvisorySignals, registry: AgentRegistry = CORE_AGENT_REGISTRY): RoutingPlan {
+  const roles: AgentRole[] = [];
+  if (signals.needsPlanning) roles.push("planner");
+  if (signals.needsExternalResearch) roles.push("research");
+  if (signals.needsQaAdvisory) roles.push("qa");
+  if (signals.needsSecurityReview) roles.push("security");
+
+  const steps: RoutingStep[] = roles
+    .map((role): RoutingStep | null => {
+      const agent = findAgentByRole(registry, role);
+      return agent ? { agentId: agent.id, role, dependsOn: [] as string[] } : null;
+    })
+    .filter((s): s is RoutingStep => s !== null)
+    .sort((a, b) => {
+      const pa = findAgentByRole(registry, a.role)?.priority ?? Number.MAX_SAFE_INTEGER;
+      const pb = findAgentByRole(registry, b.role)?.priority ?? Number.MAX_SAFE_INTEGER;
+      return pa !== pb ? pa - pb : a.agentId.localeCompare(b.agentId);
+    });
+
+  return {
+    taskId,
+    taskType: "general",
+    steps,
+    requiresHumanApproval: false,
+    reason:
+      steps.length === 0
+        ? "advisory signal이 지정되지 않아 agent를 선택하지 않았습니다."
+        : `advisory signal에 따라 ${steps.map((s) => s.role).join(", ")} agent를 선택했습니다.`,
+  };
+}

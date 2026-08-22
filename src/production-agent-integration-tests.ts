@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { runAutodevOnce, runAdvisoryAgents } from "./autodev";
+import { runAutodevOnce, runPreDevelopmentAdvisory, runPostDevelopmentAdvisory } from "./autodev";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -10,15 +10,20 @@ import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 import type { ReadOnlyAgentRunner } from "./agent-orchestrator";
 
-// Production Pipeline Integration & Review Policy 단일화 테스트(Phase F Task F4). 실제
+// Production Pipeline Integration & Review Policy 단일화 테스트(Phase F Task F4/F4.1). 실제
 // Claude/GPT 유료 API를 전혀 호출하지 않는다 — claudeRunner/gptReviewer/advisoryReadOnlyRunner는
 // 항상 fake로 주입한다. MOVAN product task도 실행하지 않는다.
 //
-// 이 파일이 검증하는 것: (1) F1 routeTask() + F2 executeRoutingPlan()이 runAutodevOnce()의
-// 실제 production 경로에서 진짜로 호출되는지(§ runAdvisoryAgents), (2) developer/reviewer/
-// REVISE/checkpoint의 핵심 순서와 판정은 여전히 기존 orchestrator.ts/checkpoint.ts가
-// 전담하고 F4가 이를 대체하지 않는지, (3) review-policy.ts로 단일화된 판정(critical/high,
-// required test 실패, MAX_REVIEW_CYCLES 소진)이 production 경로에서도 동일하게 적용되는지.
+// 이 파일이 검증하는 것: (1) taskDef의 deterministic 신호(needsPlanning/
+// needsExternalResearch/needsQaAdvisory/needsSecurityReview)에 따라 advisory agent가
+// runAutodevOnce()의 실제 production 경로에서 실제 필요한 시점(pre-development:
+// planner/research, post-development/pre-checkpoint: qa/security)에만 실행되는지(§
+// F4.1), 신호가 없으면 LLM 호출이 0회인지, (2) developer/reviewer/REVISE/checkpoint의
+// 핵심 순서와 판정은 여전히 기존 orchestrator.ts/checkpoint.ts가 단일 실행축으로 전담하고
+// F3의 별도 Developer↔Reviewer REVISE loop가 production에 중복 연결되지 않았는지(§
+// scenarioF3LoopNotDuplicatedInProduction), (3) review-policy.ts로 단일화된 판정
+// (critical/high, required test 실패, MAX_REVIEW_CYCLES 소진)이 production 경로에서도
+// 동일하게 적용되는지.
 //
 // Secret/Dependency Scanner Gate, per-run Safe Executor context, Fixture E2E, F1/F2/F3
 // 자체 회귀는 이 파일에서 다시 테스트하지 않는다 — 각각의 기존 테스트 스위트(그리고 이번
@@ -123,67 +128,223 @@ function fakeClaudeRunnerWriting(repo: string, path: string, tests: { name: stri
   return { runner, callCount: () => calls };
 }
 
-// ---------------------------------------------------------------------------
-// 1) F1 routeTask() + F2 executeRoutingPlan()이 실제로 production 경로에서 호출됨을
-//    runAdvisoryAgents()로 직접 증명한다 — task-registry task는 항상 code_implementation
-//    으로 취급되므로(§ RoutableTaskInput의 "구조화된 정보가 텍스트 분류보다 우선한다"는
-//    설계를 그대로 따름), developer에 의존하지 않는 role은 이 sub-plan에 없다(qa만 존재
-//    가능하고 developer 의존성 때문에 항상 SKIPPED) — 이는 버그가 아니라 F1의 dependency
-//    선언을 그대로 따른 것임을 증명한다.
-// ---------------------------------------------------------------------------
-async function scenarioAdvisoryPipelineGenuinelyInvoked(): Promise<void> {
-  const noFixedTests = makeTaskDef({ requiredTests: [] });
-  const { routingPlan, agentAdvisory } = await runAdvisoryAgents(noFixedTests, undefined);
-  check("advisory 파이프라인: F1 routing이 실제로 계산됨(steps 존재)", routingPlan.steps.length > 0);
-  check("advisory 파이프라인: hasFixedRequiredTests=false면 qa가 routing에 포함됨", routingPlan.steps.some((s) => s.role === "qa"));
-  check(
-    "advisory 파이프라인: qa는 developer 의존성 미충족으로 자동 SKIPPED — agentAdvisory는 비어있음(실제 Agent 호출 0회)",
-    agentAdvisory === undefined
-  );
-
-  const fixedTests = makeTaskDef({ requiredTests: [{ name: "t", command: "node", args: [], cwd: "root" }] });
-  const { routingPlan: plan2 } = await runAdvisoryAgents(fixedTests, undefined);
-  check("advisory 파이프라인: hasFixedRequiredTests=true면 qa가 routing에서 아예 제외됨", !plan2.steps.some((s) => s.role === "qa"));
-  check("advisory 파이프라인: developer/reviewer만 routing됨", plan2.steps.map((s) => s.role).sort().join(",") === "developer,reviewer");
-}
-
-// ---------------------------------------------------------------------------
-// 2) high-risk task는 advisory 파이프라인 자체가 실행되지 않음(routeTask 분류와 무관하게
-//    어떤 read-only runner도 호출되지 않음) — 기존 human gate와 동일한 원칙.
-// ---------------------------------------------------------------------------
-async function scenarioHighRiskSkipsAdvisoryEntirely(): Promise<void> {
-  let calls = 0;
-  const runner: ReadOnlyAgentRunner = async () => {
-    calls += 1;
-    return { success: true, summary: "should not be called", rawOutput: "" };
+function countingReadOnlyRunner(): { runner: ReadOnlyAgentRunner; calls: { role: string; prompt: string }[] } {
+  const calls: { role: string; prompt: string }[] = [];
+  const runner: ReadOnlyAgentRunner = async (prompt) => {
+    calls.push({ role: "?", prompt });
+    return { success: true, summary: "[FAKE] advisory 완료", rawOutput: prompt };
   };
-  const highRisk = makeTaskDef({ prompt: "production DB에서 데이터를 삭제해줘", requiredTests: [] });
-  const { routingPlan, agentAdvisory } = await runAdvisoryAgents(highRisk, runner);
-  check("high-risk task: routingPlan.requiresHumanApproval=true", routingPlan.requiresHumanApproval === true);
-  check("high-risk task: agentAdvisory가 없음(advisory 실행 자체가 스킵됨)", agentAdvisory === undefined);
-  check("high-risk task: read-only runner가 전혀 호출되지 않음", calls === 0);
+  return { runner, calls };
 }
 
 // ---------------------------------------------------------------------------
-// 3) code task → production runAutodevOnce의 first-pass APPROVED 경로(developer/reviewer
-//    만 실제 실행, agentAdvisory 없음).
+// 1) plain code task(advisory 신호 없음) → advisory agent 호출 0회(pre/post 둘 다).
 // ---------------------------------------------------------------------------
-async function scenarioFirstPassApprovedNoAdvisory(): Promise<void> {
+async function scenarioPlainCodeTaskZeroAdvisoryCalls(): Promise<void> {
   const repo = makeTempGitRepo();
   const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
   const statePath = makeTempStateFile(repo);
   const manifest = buildManifest(repo, statePath, [taskDef]);
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const { runner: advisoryReadOnlyRunner, calls } = countingReadOnlyRunner();
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() } });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, advisoryReadOnlyRunner });
 
-  check("first-pass: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
-  check("first-pass: developer가 정확히 1회 호출됨", callCount() === 1);
-  check("first-pass: agentAdvisory가 없음(developer/reviewer만 필요했음)", result.agentAdvisory === undefined);
+  check("plain task: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("plain task: developer가 정확히 1회 호출됨", callCount() === 1);
+  check("plain task: agentAdvisory 필드가 없음(선택된 advisory agent 자체가 없음)", result.agentAdvisory === undefined);
+  check("plain task: advisory read-only runner가 전혀 호출되지 않음(토큰 절감 — LLM 호출 0회)", calls.length === 0);
 }
 
 // ---------------------------------------------------------------------------
-// 4) REVISE 1회 → developer 재실행(orchestrator.ts의 기존 REVISE 루프, F4가 대체하지 않음).
+// 2) architecture 판단이 필요한 task(needsPlanning=true) → planner가 pre-development에서
+//    실제로 실행되고, 그 요약이 developerContext에 추가 안내로만 덧붙는다.
+// ---------------------------------------------------------------------------
+async function scenarioArchitectureTaskRunsPlanner(): Promise<void> {
+  const taskDef = makeTaskDef({ needsPlanning: true, requiredTests: [] });
+  const { runner, calls } = countingReadOnlyRunner();
+  const preAdvisory = await runPreDevelopmentAdvisory(taskDef, runner);
+
+  check("architecture task: planner가 실제로 실행됨", preAdvisory?.some((r) => r.role === "planner" && r.status === "SUCCESS") === true);
+  check("architecture task: research는 실행되지 않음(needsExternalResearch 미지정)", !preAdvisory?.some((r) => r.role === "research"));
+  check("architecture task: read-only runner가 정확히 1회만 호출됨", calls.length === 1);
+}
+
+// ---------------------------------------------------------------------------
+// 3) 외부 API/공식 문서 조사가 필요한 task(needsExternalResearch=true) → research가
+//    pre-development에서 실제로 실행된다.
+// ---------------------------------------------------------------------------
+async function scenarioExternalResearchTaskRunsResearch(): Promise<void> {
+  const taskDef = makeTaskDef({ needsExternalResearch: true, requiredTests: [] });
+  const { runner, calls } = countingReadOnlyRunner();
+  const preAdvisory = await runPreDevelopmentAdvisory(taskDef, runner);
+
+  check("research task: research가 실제로 실행됨", preAdvisory?.some((r) => r.role === "research" && r.status === "SUCCESS") === true);
+  check("research task: planner는 실행되지 않음(needsPlanning 미지정)", !preAdvisory?.some((r) => r.role === "planner"));
+  check("research task: read-only runner가 정확히 1회만 호출됨", calls.length === 1);
+}
+
+// ---------------------------------------------------------------------------
+// 4) security-sensitive 변경(needsSecurityReview=true) → security가 post-development(
+//    developer 완료 후, checkpoint 이전)에 실제로 실행된다. Safe Executor/Secret/
+//    Dependency Scanner를 대체하지 않는 순수 참고 의견이다.
+// ---------------------------------------------------------------------------
+async function scenarioSecuritySensitiveTaskRunsSecurityPostPass(): Promise<void> {
+  const taskDef = makeTaskDef({ needsSecurityReview: true });
+  const { runner, calls } = countingReadOnlyRunner();
+  const developerResult: ClaudeResult = {
+    success: true,
+    summary: "인증 미들웨어 수정",
+    changedFiles: ["proj/auth.ts"],
+    tests: [{ name: "proj:check", pass: true }],
+    rawOutput: "RAW_SHOULD_NOT_BE_RESENT",
+  };
+  const postAdvisory = await runPostDevelopmentAdvisory(taskDef, developerResult, runner);
+
+  check("security task: security가 post-development에서 실제로 실행됨", postAdvisory?.some((r) => r.role === "security" && r.status === "SUCCESS") === true);
+  check("security task: qa는 실행되지 않음(needsQaAdvisory 미지정)", !postAdvisory?.some((r) => r.role === "qa"));
+  check("security task: read-only runner가 정확히 1회만 호출됨", calls.length === 1);
+  check("security task: prompt에 변경 파일 요약이 포함됨(최소 context)", calls[0].prompt.includes("proj/auth.ts"));
+  check("security task: prompt에 developer의 rawOutput 전체가 재전송되지 않음", !calls[0].prompt.includes("RAW_SHOULD_NOT_BE_RESENT"));
+}
+
+// ---------------------------------------------------------------------------
+// 5) required tests가 이미 충분한(hasFixedRequiredTests 개념과 무관하게, needsQaAdvisory
+//    신호 자체가 없는) 단순 task → QA가 호출되지 않는다.
+// ---------------------------------------------------------------------------
+async function scenarioFixedTestsSufficientSkipsQa(): Promise<void> {
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const { runner, calls } = countingReadOnlyRunner();
+  const developerResult: ClaudeResult = { success: true, summary: "구현 완료", changedFiles: ["proj/a.ts"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  const postAdvisory = await runPostDevelopmentAdvisory(taskDef, developerResult, runner);
+
+  check("fixed tests 충분: postAdvisory가 없음(QA 미호출)", postAdvisory === undefined);
+  check("fixed tests 충분: read-only runner가 전혀 호출되지 않음", calls.length === 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6) 테스트 사각지대/추가 검증 필요성이 명시된 task(needsQaAdvisory=true) → QA가
+//    post-development에서 실행된다. QA는 deterministic test를 대신하지 않는다(§ 9에서
+//    별도로 "덮어쓰지 못함"까지 증명).
+// ---------------------------------------------------------------------------
+async function scenarioQaAdvisorySignalRunsQaPostPass(): Promise<void> {
+  const taskDef = makeTaskDef({ needsQaAdvisory: true });
+  const { runner, calls } = countingReadOnlyRunner();
+  const developerResult: ClaudeResult = { success: true, summary: "구현 완료", changedFiles: ["proj/a.ts"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  const postAdvisory = await runPostDevelopmentAdvisory(taskDef, developerResult, runner);
+
+  check("qa 필요 signal: qa가 post-development에서 실제로 실행됨", postAdvisory?.some((r) => r.role === "qa" && r.status === "SUCCESS") === true);
+  check("qa 필요 signal: read-only runner가 정확히 1회만 호출됨", calls.length === 1);
+}
+
+// ---------------------------------------------------------------------------
+// 7) 동일 task에서 동일 Agent 중복 호출 없음 — 여러 신호(needsPlanning+
+//    needsExternalResearch, needsQaAdvisory+needsSecurityReview)가 함께 켜져도 각 role은
+//    정확히 1번씩만 호출된다(pre-pass에서 2회, post-pass에서 2회 — 합쳐서 각 role 1회).
+// ---------------------------------------------------------------------------
+async function scenarioNoDuplicateAgentCallsPerTask(): Promise<void> {
+  const taskDef = makeTaskDef({ needsPlanning: true, needsExternalResearch: true, needsQaAdvisory: true, needsSecurityReview: true });
+  const { runner: preRunner, calls: preCalls } = countingReadOnlyRunner();
+  const { runner: postRunner, calls: postCalls } = countingReadOnlyRunner();
+  const developerResult: ClaudeResult = { success: true, summary: "구현 완료", changedFiles: ["proj/a.ts"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+
+  const preAdvisory = await runPreDevelopmentAdvisory(taskDef, preRunner);
+  const postAdvisory = await runPostDevelopmentAdvisory(taskDef, developerResult, postRunner);
+
+  check("중복 호출 없음: pre-pass가 planner+research 정확히 1회씩(총 2회) 호출함", preCalls.length === 2);
+  check("중복 호출 없음: post-pass가 qa+security 정확히 1회씩(총 2회) 호출함", postCalls.length === 2);
+  check(
+    "중복 호출 없음: pre-pass 결과에 planner/research가 각각 정확히 1개씩만 존재",
+    preAdvisory?.filter((r) => r.role === "planner").length === 1 && preAdvisory?.filter((r) => r.role === "research").length === 1
+  );
+  check(
+    "중복 호출 없음: post-pass 결과에 qa/security가 각각 정확히 1개씩만 존재",
+    postAdvisory?.filter((r) => r.role === "qa").length === 1 && postAdvisory?.filter((r) => r.role === "security").length === 1
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 8) advisory agent 실패가 fail-open되지 않음 — advisory runner가 success:false를
+//    반환해도 그 사실이 checkpoint/승인 판정에 전혀 영향을 주지 않는다(순수 정보이므로
+//    "advisory가 실패했으니 사람이 이미 승인한 걸로 친다" 같은 우회가 없음을 증명).
+// ---------------------------------------------------------------------------
+async function scenarioAdvisoryFailureNotFailOpen(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ needsSecurityReview: true, requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
+  const failingAdvisoryRunner: ReadOnlyAgentRunner = async () => ({ success: false, summary: "[FAKE] security advisory 실패", rawOutput: "" });
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() },
+    advisoryReadOnlyRunner: failingAdvisoryRunner,
+  });
+
+  check("advisory 실패: outcome은 여전히 APPROVED_AND_CHECKPOINTED(advisory 실패가 checkpoint를 막지 않음)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("advisory 실패: agentAdvisory에 security의 FAILED 상태가 정직하게 기록됨", result.agentAdvisory?.some((r) => r.role === "security" && r.status === "FAILED") === true);
+}
+
+// ---------------------------------------------------------------------------
+// 9) Core required test 실패를 advisory(qa/security)가 "문제 없다"고 낙관 보고해도
+//    덮어쓰지 못한다 — 최종 판정은 여전히 review-policy.ts(hasFailedRequiredTest)가 결정.
+// ---------------------------------------------------------------------------
+async function scenarioAdvisoryCannotOverrideCoreTestFailure(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ needsQaAdvisory: true, needsSecurityReview: true, requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/marker.txt", "broken\n");
+    return { success: true, summary: "구현했지만 test 실패", changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
+  };
+  const optimisticAdvisoryRunner: ReadOnlyAgentRunner = async () => ({ success: true, summary: "[FAKE] 문제 없어 보입니다 — 전부 통과할 것 같습니다.", rawOutput: "" });
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() },
+    advisoryReadOnlyRunner: optimisticAdvisoryRunner,
+  });
+
+  check(
+    "advisory가 낙관 보고해도 Core test 실패가 최종 판정(outcome이 APPROVED_AND_CHECKPOINTED가 아님)",
+    result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+  check("advisory가 낙관 보고해도 checkpoint가 시도되지 않음", result.checkpoint === undefined);
+}
+
+// ---------------------------------------------------------------------------
+// F3의 별도 Developer↔Reviewer REVISE loop(executeReviewerStepWithRevise)가 production
+// 경로(autodev.ts)에 중복 연결되지 않았음을 소스 레벨로 증명한다 — autodev.ts는
+// agent-orchestrator.ts에서 오직 executeRoutingPlan()(advisory 실행에만 쓰임)과 타입만
+// import해야 하고, F3의 developer/reviewer REVISE 실행 함수를 직접 부르면 안 된다.
+// ---------------------------------------------------------------------------
+function scenarioF3LoopNotDuplicatedInProduction(): void {
+  const autodevSource = readFileSync(join(__dirname, "..", "src", "autodev.ts"), "utf-8");
+  const agentOrchestratorImportLine = autodevSource
+    .split("\n")
+    .filter((l) => l.includes(`from "./agent-orchestrator"`))
+    .join("\n");
+
+  check("F3 미중복 연결: autodev.ts가 agent-orchestrator.ts를 import함(advisory 실행용)", agentOrchestratorImportLine.length > 0);
+  check(
+    "F3 미중복 연결: autodev.ts가 executeReviewerStepWithRevise(F3 REVISE loop 내부 함수)를 직접 import/호출하지 않음",
+    !autodevSource.includes("executeReviewerStepWithRevise")
+  );
+  check(
+    "F3 미중복 연결: autodev.ts는 developer 실제 실행을 여전히 claude-developer.ts(runDeveloperTaskViaSafeExecutor)로만 함",
+    autodevSource.includes("runDeveloperTaskViaSafeExecutor")
+  );
+  check(
+    "F3 미중복 연결: autodev.ts는 REVISE 루프 진행을 orchestrator.ts의 runOrchestrator() 정확히 1곳에서만 실제로 호출함(주석 언급 제외)",
+    (autodevSource.match(/(?:await\s+)?runOrchestrator\(taskDef\.prompt/g) ?? []).length === 1
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 10/11) REVISE 1회 → developer 재실행 — orchestrator.ts의 기존 production REVISE 루프가
+//        F4.1 이후에도 그대로 유지됨을 증명한다.
 // ---------------------------------------------------------------------------
 async function scenarioReviseOnceThenApprove(): Promise<void> {
   const repo = makeTempGitRepo();
@@ -294,9 +455,16 @@ async function scenarioReviewerErrorNotFailOpen(): Promise<void> {
 
 async function main(): Promise<void> {
   try {
-    await scenarioAdvisoryPipelineGenuinelyInvoked();
-    await scenarioHighRiskSkipsAdvisoryEntirely();
-    await scenarioFirstPassApprovedNoAdvisory();
+    await scenarioPlainCodeTaskZeroAdvisoryCalls();
+    await scenarioArchitectureTaskRunsPlanner();
+    await scenarioExternalResearchTaskRunsResearch();
+    await scenarioSecuritySensitiveTaskRunsSecurityPostPass();
+    await scenarioFixedTestsSufficientSkipsQa();
+    await scenarioQaAdvisorySignalRunsQaPostPass();
+    await scenarioNoDuplicateAgentCallsPerTask();
+    await scenarioAdvisoryFailureNotFailOpen();
+    await scenarioAdvisoryCannotOverrideCoreTestFailure();
+    scenarioF3LoopNotDuplicatedInProduction();
     await scenarioReviseOnceThenApprove();
     await scenarioRequiredTestFailureBlocksCompletion();
     await scenarioCriticalHighBlocksApproval();
