@@ -256,7 +256,12 @@ export function describeAuditIntegrity(result: Pick<QueryResult, "integrityIssue
 // 분리"). 이 파일은 AutoDev 자신의 runtime data이지 target project(MOVAN 등) repo 안이
 // 아니다 — logger.ts의 LOG_DIR과 동일한 위치 계산(__dirname 기준)을 쓴다. 이 경로는 이미
 // .gitignore의 logs/ 패턴에 포함돼 git commit 대상이 되지 않는다.
-const RUNTIME_EVENT_LOG_PATH = join(__dirname, "..", "logs", "events.jsonl");
+//
+// export하는 이유(Phase G Task G4.1) — Dashboard(dashboard-snapshot-provider.ts)가 이
+// 파일 위치를 다시 계산(복제)하지 않고 이 상수를 그대로 읽기 전용으로 재사용하기
+// 위함이다. selectDefaultEventStore()의 AUTOMATION_DRY_RUN 분기 로직 자체는 바뀌지
+// 않는다 — 순수 export 추가일 뿐이다.
+export const RUNTIME_EVENT_LOG_PATH = join(__dirname, "..", "logs", "events.jsonl");
 
 // filePath는 테스트 전용 override다(실제 운용 호출부인 autodev.ts는 인자 없이 부른다 —
 // 기본값이 실제 runtime 경로다). 이 override 자체가 있다고 해서 "false가 아닐 때 실제
