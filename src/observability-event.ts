@@ -49,7 +49,15 @@ export type AutoDevEventType =
   | "SECURITY_BLOCKED"
   | "CHECKPOINT_CREATED"
   | "HUMAN_APPROVAL_REQUIRED"
-  | "REVIEW_CYCLE_EXHAUSTED";
+  | "REVIEW_CYCLE_EXHAUSTED"
+  // Phase G Task G5 — Notification Service & Delivery Foundation. 이 세 event는
+  // notification-service.ts가 "알림을 만들었다/전달했다/전달 실패했다"는 사실만 남긴다 —
+  // Notification Store(notification-store.ts, delivery bookkeeping)를 대체하지 않는다.
+  // audit-critical로 분류하지 않는다(§ AUDIT_CRITICAL_EVENT_TYPES) — 알림 bookkeeping 기록
+  // 실패가 checkpoint/run 진행을 막아서는 안 된다는 원칙과 동일선상이다.
+  | "NOTIFICATION_CREATED"
+  | "NOTIFICATION_DELIVERED"
+  | "NOTIFICATION_FAILED";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -77,6 +85,9 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   CHECKPOINT_CREATED: ["audit"],
   HUMAN_APPROVAL_REQUIRED: ["audit"],
   REVIEW_CYCLE_EXHAUSTED: ["audit"],
+  NOTIFICATION_CREATED: ["observability"],
+  NOTIFICATION_DELIVERED: ["observability"],
+  NOTIFICATION_FAILED: ["observability"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
