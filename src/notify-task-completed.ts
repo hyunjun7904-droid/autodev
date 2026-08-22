@@ -1,20 +1,29 @@
 import "dotenv/config";
-import { randomUUID } from "node:crypto";
 import { selectDefaultEventStore } from "./event-store";
-import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
 import { loadProjectAdapter } from "./project-adapter-loader";
-import { log } from "./logger";
+import {
+  validateSelfDevCompletionEvidence,
+  isEvidenceError,
+  recordSelfDevTaskCompleted,
+  deliverSelfDevCompletionNotification,
+} from "./self-dev-completion";
 
-// AutoDev 자체 개발(self-dev) Task 완료 알림 — Phase G Task G7.2 추가 요구사항.
+// AutoDev 자체 개발(self-dev) Task 완료 알림 — 사람이 명시적으로 실행하는 CLI(Phase G Task
+// G7.2 추가 요구사항, Phase G Task G7.2.1에서 self-dev-completion.ts 공유 서비스로 리팩터링).
 //
 // AutoDev 저장소 자체를 Claude Code 세션으로 개발하는 동안(production AutoDev runtime을
 // 실제로 돌리는 것과는 별개)에도, 이 저장소가 이미 갖춘 production notification 경로
 // (EventStore → notification-service.ts → NotificationStore/dedupe →
 // telegram-controller.ts → Telegram Provider)를 그대로 재사용해 Task 완료를 Telegram으로
-// 받을 수 있게 하는 최소 additive 연결점이다. 새 Telegram 시스템/새 큐를 만들지 않는다 —
-// 이 파일이 하는 일은 TASK_COMPLETED event 하나를 기존 EventStore에 append하고, 기존
-// telegram-controller-supervisor.ts(run.ts와 동일한 canonical entry point)로 controller가
-// 떠 있는지 확인/시작한 뒤, 그 event가 최소 한 번 전달 시도되도록 짧게 기다리는 것뿐이다.
+// 받을 수 있게 하는 최소 additive 연결점이다. 새 Telegram 시스템/새 큐를 만들지 않는다.
+//
+// "완료 evidence가 유효한가"와 "TASK_COMPLETED event를 어떻게 정확히 1회 기록하고 전달을
+// 시도하는가"는 이 파일이 아니라 self-dev-completion.ts(validateSelfDevCompletionEvidence/
+// recordSelfDevTaskCompleted/deliverSelfDevCompletionNotification)가 단일 출처로 판정한다 —
+// self-dev-complete.ts(Claude/Skill이 호출하는 자동 bridge, evidence를 저장소를 대상으로
+// 직접 재실행해 결정론적으로 만든다)와 이 CLI가 서로 다른 완료 판정 기준을 갖지 않게 하기
+// 위함이다. 이 파일이 하는 일은 (1) 호출자가 아래 flag로 evidence를 "주장"하게 하고
+// (2) 그 주장을 공유 판정 함수에 그대로 넘기는 것뿐이다.
 //
 // "Claude Code 세션 종료 = Task 완료"가 아니다 — 이 스크립트는 호출자가 아래 완료 기준을
 // 모두 명시적으로 확인했다고 주장할 때만(각 플래그를 실제로 전달했을 때만) TASK_COMPLETED를
@@ -39,13 +48,12 @@ import { log } from "./logger";
 // 덮어쓴다 — production 배달이 이 도구의 유일한 목적이기 때문이다).
 //
 // projectId는 의도적으로 대상 project manifest의 projectId(예: "movan")를 쓰지 않는다 —
-// 이 event는 "AutoDev 저장소 자신의 개발"에 대한 사실이지 대상 project의 production
-// 실행 사실이 아니다(§ 요구사항: AutoDev repo/MOVAN leakage 없음). manifest는 오직
-// controller singleton을 시작하는 데 필요한 GitSafety/cwd 컨텍스트로만 쓰인다 —
-// run.ts/telegram-controller-main.ts와 동일한 --project/AUTODEV_PROJECT_ADAPTER 해석을
-// 그대로 재사용한다(entry point마다 다른 해석 로직을 만들지 않는다).
-
-const SELF_DEV_PROJECT_ID = "autodev-core-self-dev";
+// self-dev-completion.ts의 SELF_DEV_PROJECT_ID(고정값)를 그대로 쓴다. 이 event는 "AutoDev
+// 저장소 자신의 개발"에 대한 사실이지 대상 project의 production 실행 사실이 아니다(§
+// 요구사항: AutoDev repo/MOVAN leakage 없음). manifest는 오직 controller singleton을
+// 시작하는 데 필요한 GitSafety/cwd 컨텍스트로만 쓰인다 — run.ts/telegram-controller-main.ts와
+// 동일한 --project/AUTODEV_PROJECT_ADAPTER 해석을 그대로 재사용한다(entry point마다 다른
+// 해석 로직을 만들지 않는다).
 
 process.env.AUTOMATION_DRY_RUN = "false";
 
@@ -104,41 +112,43 @@ async function main(): Promise<void> {
     return;
   }
 
-  const manifest = loadProjectAdapter(parsed.adapterPath);
-
-  const runId = randomUUID();
-  const events = selectDefaultEventStore();
-  const appendResult = events.append({
-    eventType: "TASK_COMPLETED",
-    runId,
-    projectId: SELF_DEV_PROJECT_ID,
+  const evidence = validateSelfDevCompletionEvidence({
     taskId: parsed.taskId,
-    executionPhase: "state_update",
-    outcome: "SUCCESS",
-    metadata: {
-      commitHash: parsed.commitHash,
-      testsPassed: parsed.testsPassed,
-      typecheckPassed: parsed.typecheckPassed,
-      buildPassed: parsed.buildPassed,
-      pushRequired: parsed.pushRequired,
-      pushPassed: parsed.pushRequired ? parsed.pushPassed : null,
-      source: "claude-code-self-dev",
-    },
+    commitHash: parsed.commitHash,
+    testsPassed: parsed.testsPassed,
+    typecheckPassed: parsed.typecheckPassed,
+    buildPassed: parsed.buildPassed,
+    pushRequired: parsed.pushRequired,
+    pushPassed: parsed.pushPassed,
+    source: "claude-code-self-dev-cli",
   });
-  if (!appendResult.ok) {
-    console.error(`[notify-task-completed] TASK_COMPLETED event 기록 실패: ${appendResult.error ?? "unknown"}`);
+  if (isEvidenceError(evidence)) {
+    console.error(`[notify-task-completed] ${evidence.error}`);
     process.exitCode = 1;
     return;
   }
-  log("self-dev TASK_COMPLETED event 기록됨", { taskId: parsed.taskId, runId });
-  console.log(`[notify-task-completed] TASK_COMPLETED 기록됨 taskId=${parsed.taskId} runId=${runId} commit=${parsed.commitHash}`);
 
-  const supervisor = await ensureTelegramControllerStarted(manifest);
-  const delivered = supervisor.isOwner() ? await supervisor.flushOnce() : true;
+  const manifest = loadProjectAdapter(parsed.adapterPath);
+  const events = selectDefaultEventStore();
+  const result = recordSelfDevTaskCompleted(events, evidence);
+  if (!result.ok) {
+    console.error(`[notify-task-completed] TASK_COMPLETED event 기록 실패: ${result.error ?? "unknown"}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (result.alreadyRecorded) {
+    console.log(
+      `[notify-task-completed] 이미 기록된 완료입니다(taskId=${evidence.taskId}, commit=${evidence.commitHash}) — ` +
+        `중복 event/알림 없이 종료합니다.`
+    );
+  } else {
+    console.log(`[notify-task-completed] TASK_COMPLETED 기록됨 taskId=${evidence.taskId} runId=${result.runId} commit=${evidence.commitHash}`);
+  }
+
+  const { delivered } = await deliverSelfDevCompletionNotification(manifest);
   if (!delivered) {
     console.log("[notify-task-completed] controller가 이번 event를 아직 전달하지 못했을 수 있습니다(다음 tick에서 재시도됩니다) — dedupe되어 있으니 중복 전송은 없습니다.");
   }
-  await supervisor.stop();
 }
 
 if (require.main === module) {

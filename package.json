@@ -64,9 +64,12 @@
     "test:approval-service": "npm run build && node dist/approval-service-tests.js",
     "test:telegram-controller": "npm run build && node dist/telegram-controller-tests.js",
     "test:telegram-controller-supervisor": "npm run build && node dist/telegram-controller-supervisor-tests.js",
+    "test:self-dev-completion": "npm run build && node dist/self-dev-completion-tests.js",
+    "test:self-dev-complete": "npm run build && node dist/self-dev-complete-tests.js",
     "telegram-smoke-test": "npm run build && node dist/telegram-smoke-test.js",
     "telegram-controller": "npm run build && node dist/telegram-controller-main.js",
     "notify:task-completed": "npm run build && node dist/notify-task-completed.js",
+    "self-dev:complete": "npm run build && node dist/self-dev-complete.js",
     "dashboard": "npm run build && node dist/dashboard.js",
     "autodev": "powershell -ExecutionPolicy Bypass -File start-autodev.ps1"
   },
