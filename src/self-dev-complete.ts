@@ -34,9 +34,17 @@ import {
 // 이 스크립트는 Bot Token/Chat ID를 전혀 다루지 않는다 — self-dev-completion.ts의
 // deliverSelfDevCompletionNotification()이 기존 telegram-controller-supervisor.ts로만
 // 전달을 위임한다.
-
-process.env.AUTOMATION_DRY_RUN = "false";
-
+//
+// AUTOMATION_DRY_RUN="false"는 의도적으로 모듈 top-level이 아니라 main()에서
+// runDeterministicCompletionChecks() 이후(§ 아래)에만 설정한다 — realCommandRunner의
+// spawnSync는 env를 명시하지 않으면 현재 process.env를 그대로 자식 프로세스에 물려준다.
+// 이 값을 top-level에서 먼저 설정해두면, 전체 회귀(각 test:*.js)가 자식 프로세스로 실행될
+// 때 이 값을 그대로 물려받아 orchestrator.ts/agent-orchestrator.ts의 real/fake runner
+// 선택이 real로 바뀌어버린다 — 실측된 문제: 이 순서 오류로 gpt-retry-tests.js의 시나리오가
+// 실제 `claude` CLI를 호출해 Safe Executor 미설정 예외로 죽었다("실제 Claude Developer/
+// OpenAI GPT 호출 금지" 요구사항 위반). 이 값은 오직 이후 단계(EventStore/
+// NotificationStore가 실제 파일 기반이어야 하는 시점)에만 필요하므로, 그 시점 이후로
+// 미룬다.
 const REPO_ROOT = join(__dirname, "..");
 const TSC_BIN = join(REPO_ROOT, "node_modules", "typescript", "bin", "tsc");
 
@@ -245,6 +253,11 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
+
+  // 이 시점부터는 더 이상 전체 회귀를 자식 프로세스로 spawn하지 않는다 — 이제부터
+  // production EventStore/NotificationStore(파일 기반)를 실제로 써야 하므로 여기서만
+  // 설정한다(§ 파일 상단 주석 — 순서를 앞당기면 안 되는 이유).
+  process.env.AUTOMATION_DRY_RUN = "false";
 
   const manifest = loadProjectAdapter(parsed.adapterPath);
   const events = selectDefaultEventStore();
