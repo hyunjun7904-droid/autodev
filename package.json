@@ -20,6 +20,7 @@
     "test:task-registry": "npm run build && node dist/task-registry-tests.js",
     "test:spec-intake": "npm run build && node dist/spec-intake-tests.js",
     "test:project-bootstrap": "npm run build && node dist/project-bootstrap-tests.js",
+    "test:spec-planner": "npm run build && node dist/spec-planner-tests.js",
     "test:claude-developer": "npm run build && node dist/claude-developer-tests.js",
     "test:checkpoint": "npm run build && node dist/checkpoint-tests.js",
     "test:secret-scanner": "npm run build && node dist/secret-scanner-tests.js",
