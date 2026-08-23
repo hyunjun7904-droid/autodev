@@ -18,6 +18,7 @@
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",
     "test:task-registry": "npm run build && node dist/task-registry-tests.js",
+    "test:spec-intake": "npm run build && node dist/spec-intake-tests.js",
     "test:claude-developer": "npm run build && node dist/claude-developer-tests.js",
     "test:checkpoint": "npm run build && node dist/checkpoint-tests.js",
     "test:secret-scanner": "npm run build && node dist/secret-scanner-tests.js",
