@@ -910,7 +910,12 @@ export function validatePlannerRawOutput(
 // 그대로 감싼다(agent-orchestrator.ts의 realReadOnlyAgentRunner와 동일한 재사용 원칙).
 // ---------------------------------------------------------------------------
 
-export type PlannerRawOutputOutcome = { ok: true; rawOutput: string } | { ok: false; reason: string };
+export type PlannerRawOutputOutcome =
+  | { ok: true; rawOutput: string }
+  // retryable — SI-3.2. TIMEOUT처럼 일시적일 가능성이 있는 transport failure에서만 true로
+  // 설정된다(§ createClaudeCliRawOutputSource). 지정하지 않으면(테스트 fixture 등) 항상
+  // 재시도하지 않는 것으로(fail-closed 기본값) 취급한다 — § invokeRawOutputSourceWithTransportRetry.
+  | { ok: false; reason: string; retryable?: boolean };
 export type PlannerRawOutputSource = (prompt: string) => Promise<PlannerRawOutputOutcome>;
 
 export interface ClaudeCliRawOutputSourceOptions {
@@ -918,17 +923,63 @@ export interface ClaudeCliRawOutputSourceOptions {
   timeoutMs?: number;
 }
 
+// SI-3.2 — 실제 JARVIS Master Spec Planner 실행에서 claude CLI 응답 생성이 2분(claude-runner.ts의
+// DEFAULT_TIMEOUT_MS=120000)을 넘겨 수분까지 걸리는 사례가 반복 관찰됐다. DEFAULT_TIMEOUT_MS
+// 자체는 건드리지 않는다 — agent-orchestrator.ts의 realReadOnlyAgentRunner 등 다른(짧은)
+// read-only 호출이 그 값을 그대로 공유하기 때문이다(§ .claude/CLAUDE.md). 이 값은 오직
+// Planner raw-output 호출(createClaudeCliRawOutputSource의 기본 timeoutMs)에만 적용된다 —
+// "응답을 기다리는 시간"만 늘릴 뿐, timeout이 늘었다고 fail-closed 검증
+// (validatePlannerRawOutput의 transport normalization → strict schema → semantic validation)을
+// 우회하지 않는다.
+export const PLANNER_RAW_OUTPUT_TIMEOUT_MS = 300_000;
+
+// SI-3.2 — TIMEOUT처럼 일시적일 가능성이 있는 transport failure(§ PlannerRawOutputOutcome.
+// retryable)에 한해서만 제한된 재시도를 허용한다. "추가로 허용하는 재시도 횟수"이므로 1이면
+// 최초 시도 + 재시도 1회 = 최대 2회 실제 호출이다 — 무한 retry를 금지하기 위해 항상 상수로
+// 상한을 둔다(§ invokeRawOutputSourceWithTransportRetry). CLI_NOT_FOUND/AUTH_REQUIRED/
+// USAGE_LIMIT 등 명백히 비복구이거나 즉시 재시도가 오히려 해로운(USAGE_LIMIT) 실패는
+// retryable이 설정되지 않으므로 이 재시도 대상이 아니다.
+export const PLANNER_MAX_TRANSPORT_RETRIES = 1;
+
 /** 실제 운용 기본 구현 — claude-runner.ts의 runClaudeTask(항상 --tools "")를 그대로
  *  감싼다. command override는 테스트 전용(claude-runner-tests.ts와 동일한 관례)이며
- *  실제 운용 코드는 지정하지 않는다. */
+ *  실제 운용 코드는 지정하지 않는다. timeoutMs를 지정하지 않으면 claude-runner.ts 자신의
+ *  DEFAULT_TIMEOUT_MS(120000, 다른 호출부용)가 아니라 PLANNER_RAW_OUTPUT_TIMEOUT_MS를 쓴다. */
 export function createClaudeCliRawOutputSource(opts: ClaudeCliRawOutputSourceOptions = {}): PlannerRawOutputSource {
   return async (prompt: string) => {
-    const result = await runClaudeTask(prompt, 1, { command: opts.command, timeoutMs: opts.timeoutMs });
+    const timeoutMs = opts.timeoutMs ?? PLANNER_RAW_OUTPUT_TIMEOUT_MS;
+    const result = await runClaudeTask(prompt, 1, { command: opts.command, timeoutMs });
     if (!result.success) {
-      return { ok: false, reason: `claude 호출 실패: ${result.errorCode ?? "UNKNOWN"} — ${result.summary}` };
+      return {
+        ok: false,
+        reason: `claude 호출 실패: ${result.errorCode ?? "UNKNOWN"} — ${result.summary}`,
+        // TIMEOUT만 일시적일 가능성이 있는 transport failure로 취급한다(§ 위 상수 주석) —
+        // CLI_NOT_FOUND/AUTH_REQUIRED/USAGE_LIMIT/NON_ZERO_EXIT/INVALID_OUTPUT은 재시도해도
+        // 회복 가능성이 낮거나(비복구) 재시도 자체가 해로울 수 있어(예: USAGE_LIMIT 즉시
+        // 재요청) retryable로 표시하지 않는다.
+        retryable: result.errorCode === "TIMEOUT",
+      };
     }
     return { ok: true, rawOutput: result.summary };
   };
+}
+
+// SI-3.2 — transport-level bounded retry. correction retry(PLANNER_MAX_RAW_OUTPUT_ATTEMPTS —
+// LLM이 스스로 schema 위반을 고칠 기회를 주는 재시도)와는 완전히 다른 문제를 다룬다: 여기서는
+// "응답을 아예 받지 못했다"(예: TIMEOUT)는 transport 실패만 다루고, retryable이 아닌 실패는
+// 재시도 없이 즉시 그대로 반환한다. 매 시도는 rawOutputSource(실제 운용에서는 runClaudeTask →
+// 매번 새 subprocess)를 통해 독립적으로 자신만의 timeout을 가진다 — 이전 시도의 timeout이
+// 다음 시도에 누적되지 않는다.
+async function invokeRawOutputSourceWithTransportRetry(
+  rawOutputSource: PlannerRawOutputSource,
+  prompt: string
+): Promise<PlannerRawOutputOutcome> {
+  let outcome: PlannerRawOutputOutcome = { ok: false, reason: "rawOutputSource가 한 번도 호출되지 않았습니다." };
+  for (let transportAttempt = 0; transportAttempt <= PLANNER_MAX_TRANSPORT_RETRIES; transportAttempt += 1) {
+    outcome = await rawOutputSource(prompt);
+    if (outcome.ok || !outcome.retryable) return outcome;
+  }
+  return outcome;
 }
 
 /** LLM에 전달하는 프롬프트 — Master Spec(WHAT, 정규화됨) + Fixed Constraints + Output
@@ -1802,7 +1853,7 @@ async function runPlannerLocked(
     for (let attempt = 1; attempt <= PLANNER_MAX_RAW_OUTPUT_ATTEMPTS; attempt += 1) {
       const prompt =
         attempt === 1 ? buildPlannerPrompt(normalized, identity) : buildPlannerCorrectionPrompt(normalized, identity, lastIssues);
-      const sourceResult = await rawOutputSource(prompt);
+      const sourceResult = await invokeRawOutputSourceWithTransportRetry(rawOutputSource, prompt);
       if (!sourceResult.ok) {
         return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: sourceResult.reason };
       }

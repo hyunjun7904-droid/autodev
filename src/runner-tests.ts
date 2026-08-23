@@ -91,6 +91,20 @@ async function main(): Promise<void> {
   const plainTimeout = await execAndClassify("powershell", ["-NoProfile", "-Command", "Start-Sleep -Seconds 5"], 500);
   check("일반 TIMEOUT은 여전히 TIMEOUT으로 분류(과다 재분류 방지 회귀)", plainTimeout.errorCode === "TIMEOUT");
 
+  // SI-3.2 — spec-planner.ts가 Planner raw-output 호출에 더 긴 timeout(PLANNER_RAW_OUTPUT_
+  // TIMEOUT_MS=300000)을 쓰도록 바뀌었어도, 빠르게 끝나는 정상 응답은 여전히 그 timeout보다
+  // 훨씬 먼저 성공 처리돼야 한다(회귀 방지 — timeout 값을 키운 것이 정상 경로를 늦추거나
+  // 깨뜨리지 않는지 확인).
+  const fastOkWithLargeTimeout = await execAndClassify(
+    "powershell",
+    ["-NoProfile", "-Command", "Write-Output '{\"result\":\"ok-fast\"}'"],
+    300_000
+  );
+  check(
+    "정상 응답은 큰 timeout(Planner 기본값 300000ms) 안에서도 즉시 성공 처리됨",
+    fastOkWithLargeTimeout.success === true && fastOkWithLargeTimeout.summary === "ok-fast"
+  );
+
   console.log("\n=== runner 단위 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;

@@ -16,6 +16,7 @@ import {
   buildPlannerPrompt,
   createClaudeCliRawOutputSource,
   PLANNER_MAX_RAW_OUTPUT_ATTEMPTS,
+  PLANNER_MAX_TRANSPORT_RETRIES,
 } from "./spec-planner";
 import type { PlannerRawOutput, PlannerRawOutputSource, NormalizedMasterSpec, PlannerOutcome } from "./spec-planner";
 import type { TaskDefinition } from "./task-registry";
@@ -1234,6 +1235,182 @@ async function scenarioGeneratedFileSymlinkIsRejected(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// SI-3.2 — Transport-level bounded retry(§ spec-planner.ts의
+// invokeRawOutputSourceWithTransportRetry). 실제 JARVIS Master Spec Planner 실행에서 claude
+// CLI 응답 생성이 기존 DEFAULT_TIMEOUT_MS(120000)를 넘겨 실제 TIMEOUT으로 BLOCKED된 관찰에
+// 대한 방어 — TIMEOUT처럼 일시적일 가능성이 있는 transport failure만 제한된 횟수
+// (PLANNER_MAX_TRANSPORT_RETRIES)로 재시도하고, 그 외 명백히 비복구인 실패는 재시도 없이
+// 즉시 BLOCKED한다. 여기서 쓰는 rawOutputSource fake는 실제 claude CLI를 호출하지 않는다 —
+// createClaudeCliRawOutputSource() 자신의 실제 CLI 배선 검증은 scenarioClaudeCliWiringIsReal이
+// 이미 담당한다.
+// ---------------------------------------------------------------------------
+async function scenarioTransportTimeoutThenSuccessRecovers(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-retry-success) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const goodRaw = buildGoodRawOutput(normalized, identity);
+
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return { ok: false, reason: "claude 호출 실패: TIMEOUT — timeout 300000ms 초과로 강제 종료됨", retryable: true };
+    }
+    return { ok: true, rawOutput: JSON.stringify(goodRaw) };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-retry-success) 첫 호출 TIMEOUT 후 재시도로 회복되어 HUMAN_REVIEW_REQUIRED까지 진행됨", result.status === "HUMAN_REVIEW_REQUIRED");
+  check("transport-retry-success) rawOutputSource가 정확히 2번(최초 시도 + 재시도 1회)만 호출됨", calls === 2);
+}
+
+async function scenarioTransportTimeoutRepeatedBlocks(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-retry-exhaust) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    return { ok: false, reason: "claude 호출 실패: TIMEOUT — timeout 300000ms 초과로 강제 종료됨", retryable: true };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-retry-exhaust) TIMEOUT이 반복되면 최종 BLOCKED(RAW_OUTPUT_SOURCE_FAILED)", result.status === "BLOCKED" && result.code === "RAW_OUTPUT_SOURCE_FAILED");
+  check(
+    "transport-retry-exhaust) 무한 retry 금지 — 정확히 PLANNER_MAX_TRANSPORT_RETRIES+1번만 호출되고 correction retry로 이어지지 않음",
+    calls === PLANNER_MAX_TRANSPORT_RETRIES + 1
+  );
+}
+
+async function scenarioNonRetryableCliNotFoundBlocksImmediately(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-cli-not-found) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    return { ok: false, reason: "claude 호출 실패: CLI_NOT_FOUND — subprocess 생성 실패", retryable: false };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-cli-not-found) CLI_NOT_FOUND(COMMAND_NOT_FOUND)는 즉시 BLOCKED(RAW_OUTPUT_SOURCE_FAILED)", result.status === "BLOCKED" && result.code === "RAW_OUTPUT_SOURCE_FAILED");
+  check("transport-cli-not-found) 재시도 없이 정확히 1번만 호출됨", calls === 1);
+}
+
+async function scenarioNonRetryableAuthRequiredBlocksImmediately(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-auth-required) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    return { ok: false, reason: "claude 호출 실패: AUTH_REQUIRED — not authenticated", retryable: false };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-auth-required) 인증/설정성 비복구 오류는 즉시 BLOCKED(RAW_OUTPUT_SOURCE_FAILED)", result.status === "BLOCKED" && result.code === "RAW_OUTPUT_SOURCE_FAILED");
+  check("transport-auth-required) 재시도 없이 정확히 1번만 호출됨", calls === 1);
+}
+
+// retryable 필드를 아예 지정하지 않은(undefined) 실패 — 안전한 기본값(재시도 안 함, fail
+// closed)으로 처리되는지 확인한다. 알 수 없는 실패를 함부로 재시도하지 않는다는 원칙 검증.
+async function scenarioUnspecifiedRetryableDefaultsToNoRetry(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-retryable-default) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    return { ok: false, reason: "claude 호출 실패: NON_ZERO_EXIT — exit code 1" };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-retryable-default) retryable 미지정 실패는 기본값으로 재시도하지 않음(fail-closed)", result.status === "BLOCKED" && result.code === "RAW_OUTPUT_SOURCE_FAILED");
+  check("transport-retryable-default) 정확히 1번만 호출됨", calls === 1);
+}
+
+async function scenarioTransportFailureDoesNotPersistPartialState(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-no-partial-state) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const alwaysTimeout: PlannerRawOutputSource = async () => ({
+    ok: false,
+    reason: "claude 호출 실패: TIMEOUT — timeout 300000ms 초과로 강제 종료됨",
+    retryable: true,
+  });
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: alwaysTimeout });
+  check("transport-no-partial-state) TIMEOUT 소진 후 BLOCKED", result.status === "BLOCKED");
+  check(
+    "transport-no-partial-state) 3개 생성 파일이 전혀 만들어지지 않음",
+    !existsSync(join(outcome.projectRoot, ".autodev", "project-manifest.json")) &&
+      !existsSync(join(outcome.projectRoot, ".autodev", "task-registry.json")) &&
+      !existsSync(join(outcome.projectRoot, ".autodev", "execution-policy.json"))
+  );
+
+  const plannerStatePath = join(outcome.projectRoot, ".autodev", "planner-state.json");
+  const state = JSON.parse(readFileSync(plannerStatePath, "utf-8"));
+  check("transport-no-partial-state) planner-state.json에 rawPlannerOutput이 저장되지 않음(부분 산출물 미저장)", state.rawPlannerOutput === undefined);
+  check("transport-no-partial-state) stage가 ARCHITECTURE_PLANNED 이상으로 진행되지 않음", state.stage === "REQUIREMENTS_NORMALIZED");
+
+  // 부분 산출물이 저장되지 않았으므로, 이후 같은 identity로 정상 응답을 주면 correction retry
+  // 예산을 온전히 다시 쓰며 문제없이 회복돼야 한다(resume-safe 성질 유지).
+  const normalized = normalizeMasterSpec(content);
+  const goodRaw = buildGoodRawOutput(normalized, identity);
+  const resumed = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: fixedSource(goodRaw) });
+  check("transport-no-partial-state) 이후 정상 재시도는 문제없이 회복됨(HUMAN_REVIEW_REQUIRED)", resumed.status === "HUMAN_REVIEW_REQUIRED");
+}
+
+async function scenarioTransportRetrySucceedsThenMalformedJsonIsRejected(): Promise<void> {
+  const content = buildMasterSpecContent();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("transport-retry-then-malformed) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  let calls = 0;
+  const source: PlannerRawOutputSource = async () => {
+    calls += 1;
+    // 최초 시도는 TIMEOUT(transport retry로 회복) → 회복된 응답 자체가 malformed JSON이다 —
+    // transport retry가 fail-closed 검증(strict schema validator)을 우회시키지 않는지 확인한다.
+    if (calls === 1) {
+      return { ok: false, reason: "claude 호출 실패: TIMEOUT — timeout 300000ms 초과로 강제 종료됨", retryable: true };
+    }
+    return { ok: true, rawOutput: "explanation only, never valid JSON, always fails" };
+  };
+
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("transport-retry-then-malformed) transport retry로 응답을 받아도 malformed JSON은 기존 strict validator가 REJECT함", result.status === "REJECTED");
+  if (result.status === "REJECTED") {
+    check("transport-retry-then-malformed) MALFORMED_JSON 이슈 포함", result.issues.some((i) => i.code === "MALFORMED_JSON"));
+  }
+  // attempt 1: transport retry 2회(TIMEOUT + malformed) + attempt 2,3: correction retry 각 1회.
+  check(
+    "transport-retry-then-malformed) 무한 retry 금지 — transport retry + 남은 correction retry 합만큼만 호출됨",
+    calls === PLANNER_MAX_TRANSPORT_RETRIES + 1 + (PLANNER_MAX_RAW_OUTPUT_ATTEMPTS - 1)
+  );
+}
+
+// ---------------------------------------------------------------------------
 // normalizeMasterSpec 단위 검증 — id 채번/mustHave 분류가 기대대로인지.
 // ---------------------------------------------------------------------------
 function scenarioNormalizeMasterSpecUnitChecks(): void {
@@ -1310,6 +1487,13 @@ async function main(): Promise<void> {
     await scenarioCorruptedRawPlannerOutputOnResumeIsHandled();
     await scenarioNoteTamperingDoesNotBypassGate();
     await scenarioGeneratedFileSymlinkIsRejected();
+    await scenarioTransportTimeoutThenSuccessRecovers();
+    await scenarioTransportTimeoutRepeatedBlocks();
+    await scenarioNonRetryableCliNotFoundBlocksImmediately();
+    await scenarioNonRetryableAuthRequiredBlocksImmediately();
+    await scenarioUnspecifiedRetryableDefaultsToNoRetry();
+    await scenarioTransportFailureDoesNotPersistPartialState();
+    await scenarioTransportRetrySucceedsThenMalformedJsonIsRejected();
   } finally {
     for (const dir of tempDirs) {
       try {
