@@ -43,6 +43,11 @@ export interface SelfDevTaskContext {
   /** 선언 시점의 git HEAD commit hash — stale context 재사용 방지(위 주석 참고). */
   baseHeadHash: string;
   declaredAt: string;
+  /** Phase G Task G7.5 — 이 Task가 상위 Task/Phase의 진짜 최종 완료라는 명시적 선언(§
+   *  self-dev-begin.ts --final, self-dev-completion.ts SelfDevCompletionEvidence.
+   *  isFinal). self-dev-completion-hook.ts가 이 값을 그대로 self-dev-complete.ts에
+   *  --final로 전달한다 — hook 자신은 추측하지 않는다. 기본값 false(하위 Task). */
+  isFinal: boolean;
 }
 
 export interface TaskContextError {
@@ -86,8 +91,20 @@ export function readSelfDevTaskContext(repoRoot: string): SelfDevTaskContext | T
   if (typeof r.declaredAt !== "string" || r.declaredAt.trim().length === 0) {
     return { error: `${path}의 declaredAt이 없습니다.` };
   }
+  // Phase G Task G7.5 — 기존(이 필드가 생기기 전) context 파일과의 호환을 위해 필드
+  // 부재는 false로 취급한다(이전에 self-dev:begin으로 선언된 context는 --final을 몰랐다
+  // — "하위 Task"가 안전한 기본값이다). 값이 있는데 boolean이 아니면 손상으로 거부한다.
+  if (r.isFinal !== undefined && typeof r.isFinal !== "boolean") {
+    return { error: `${path}의 isFinal이 boolean이 아닙니다.` };
+  }
 
-  return { taskId: r.taskId, pushRequired: r.pushRequired, baseHeadHash: r.baseHeadHash, declaredAt: r.declaredAt };
+  return {
+    taskId: r.taskId,
+    pushRequired: r.pushRequired,
+    baseHeadHash: r.baseHeadHash,
+    declaredAt: r.declaredAt,
+    isFinal: r.isFinal === true,
+  };
 }
 
 /**
@@ -97,7 +114,7 @@ export function readSelfDevTaskContext(repoRoot: string): SelfDevTaskContext | T
  */
 export function writeSelfDevTaskContext(
   repoRoot: string,
-  input: { taskId: string; pushRequired: boolean }
+  input: { taskId: string; pushRequired: boolean; isFinal?: boolean }
 ): SelfDevTaskContext | TaskContextError {
   if (typeof input.taskId !== "string" || !TASK_ID_PATTERN.test(input.taskId)) {
     return { error: `taskId 형식이 올바르지 않습니다(영숫자로 시작, 영숫자/._- 만 허용, 1~64자): ${input.taskId}` };
@@ -112,6 +129,7 @@ export function writeSelfDevTaskContext(
     pushRequired: input.pushRequired === true,
     baseHeadHash,
     declaredAt: new Date().toISOString(),
+    isFinal: input.isFinal === true,
   };
   const path = selfDevTaskContextPath(repoRoot);
   mkdirSync(dirname(path), { recursive: true });

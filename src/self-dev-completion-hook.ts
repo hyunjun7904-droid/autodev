@@ -31,7 +31,7 @@ export interface HookDecisionInput {
 
 export type HookDecision =
   | { trigger: false; reason: string }
-  | { trigger: true; taskId: string; pushRequired: boolean; reason: string };
+  | { trigger: true; taskId: string; pushRequired: boolean; isFinal: boolean; reason: string };
 
 /**
  * 순수 판정 함수 — git/파일 시스템을 읽기만 하고(HEAD 조회, context 파일 읽기) 아무 것도
@@ -72,7 +72,13 @@ export function decideSelfDevCompletionTrigger(input: HookDecisionInput): HookDe
   // 걸러졌고, 최종적으로는 self-dev-complete.ts의 deterministic 재검증(commit/push가 실제로
   // 반영됐는지까지 포함)이 완료 여부를 판정하므로 여기서 추가 추측을 하지 않는다.
 
-  return { trigger: true, taskId: context.taskId, pushRequired: context.pushRequired, reason: "completion workflow 트리거 조건을 충족했습니다." };
+  return {
+    trigger: true,
+    taskId: context.taskId,
+    pushRequired: context.pushRequired,
+    isFinal: context.isFinal,
+    reason: "completion workflow 트리거 조건을 충족했습니다.",
+  };
 }
 
 export interface CommandOutcome {
@@ -123,7 +129,13 @@ export function runSelfDevCompletionHook(input: HookDecisionInput, runner: Comma
     };
   }
 
-  const args = [entry, "--task-id", decision.taskId, ...(decision.pushRequired ? ["--push"] : [])];
+  const args = [
+    entry,
+    "--task-id",
+    decision.taskId,
+    ...(decision.pushRequired ? ["--push"] : []),
+    ...(decision.isFinal ? ["--final"] : []),
+  ];
   const result = runner(process.execPath, args, input.repoRoot);
 
   if (result.ok) {

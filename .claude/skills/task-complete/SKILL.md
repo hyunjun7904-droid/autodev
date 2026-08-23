@@ -1,6 +1,6 @@
 ---
 name: task-complete
-description: Use when a Task on the AutoDev standalone repository itself (self-dev — developing AutoDev's own source under src/, not a target project it executes) appears finished and you are about to report it as complete. Runs the canonical verification → commit → push → Self-Dev Task Completion Bridge sequence so TASK_COMPLETED / the Telegram "Task 완료" notification is only ever created after real, freshly re-verified evidence — never from a Claude Code session simply stopping.
+description: Use when a Task on the AutoDev standalone repository itself (self-dev — developing AutoDev's own source under src/, not a target project it executes) appears finished and you are about to report it as complete. Runs the canonical verification → commit → push → Self-Dev Task Completion Bridge sequence so TASK_COMPLETED / the Telegram "🟡 작업 단계 완료" (or, only with explicit --final, "✅ 최종 완료") notification is only ever created after real, freshly re-verified evidence — never from a Claude Code session simply stopping.
 ---
 
 # AutoDev Self-Dev Task Completion
@@ -99,7 +99,7 @@ uncommitted 작업이 있는지 먼저 확인한다 — 사용자의 명시적 �
 **5) Self-Dev Task Context 선언 — commit 전후 아무 때나(늦어도 push 전까지).**
 
 ```
-npm run self-dev:begin -- --task-id <TaskId> [--push]
+npm run self-dev:begin -- --task-id <TaskId> [--push] [--final]
 ```
 
 - `<TaskId>`는 이 저장소의 Task 식별자(예: `G7.3.1b`)다. 추측/생략 금지 — 명시적으로 알고 있는
@@ -111,6 +111,13 @@ npm run self-dev:begin -- --task-id <TaskId> [--push]
   commit(+push)이 이 taskId에 대응한다"는 사실과 현재 HEAD(baseline)만 남긴다(§
   `self-dev-task-context.ts`). 실제 완료 판정은 여전히 아래 자동 트리거가 호출하는
   `self-dev-complete.ts`가 전담한다.
+- **`--final`(Phase G Task G7.5)은 기본적으로 붙이지 않는다.** 붙이지 않으면 이 Task는 항상 🟡
+  "작업 단계 완료"(다음 프로젝트 시작 가능: 아니오)로만 알린다 — 대부분의 Task는 이 기본값이
+  맞다. **`--final`은 이 Task가 끝나면 지금 진행 중인 상위 Task/Phase(또는 지시받은 전체 작업)가
+  정말로 더 기다릴 것 없이 끝난다고 사용자/Task Prompt가 명시적으로 확인했을 때만** 붙인다 —
+  세션이 끝나간다거나 "이 정도면 충분히 한 것 같다"는 자체 판단으로 붙이지 않는다(추측 금지).
+  `--final`을 붙여도 typecheck/build/전체 회귀/commit/(필요시)push 재검증 요건은 전혀 완화되지
+  않는다 — `--final`이 하는 일은 오직 "재검증을 전부 통과하면 ✅ 최종 완료로 알린다"는 표시뿐이다.
 
 **6) 변경 파일만 정확히 stage하고 commit.** `git add -A`/`git add .` 금지 — 이번 Task에서 실제로
 바뀐 파일만 경로를 지정해 stage한다. `git status`로 예상치 못한 파일이 섞이지 않았는지 확인한 뒤
@@ -122,14 +129,18 @@ commit한다. **push가 필요 없는 Task라면 이 commit이 성공하는 순�
 이후 아무 것도 수동으로 실행하지 않는다.
 
 **8) 완료 신호는 자동이다 — 확인만 한다.** step 5에서 선언한 context와, step 6/7의 commit(또는
-push)이 성공하면, PostToolUse hook이 `dist/self-dev-complete.js --task-id <TaskId> [--push]`를
-자동으로 호출한다(§ 아래 "자동 트리거 아키텍처"). Claude는 다음 turn에 나타나는
+push)이 성공하면, PostToolUse hook이 `dist/self-dev-complete.js --task-id <TaskId> [--push]
+[--final]`를 자동으로 호출한다(§ 아래 "자동 트리거 아키텍처"). Claude는 다음 turn에 나타나는
 `[self-dev completion hook] ...` systemMessage로 결과만 확인한다:
 
-- 성공 메시지가 보이면 완료다(다음 절차 없음).
+- 성공 메시지가 보이면 완료다(다음 절차 없음) — Telegram은 step 5에서 `--final`을 붙이지 않았으면
+  🟡 "작업 단계 완료"(다음 프로젝트 시작 가능: 아니오), `--final`을 붙였으면 ✅ "최종 완료"(다음
+  프로젝트 시작 가능: 예)로 온다.
 - `FAILED`가 보이면 완료 조건을 충족하지 못한 것이다(원인은 메시지에 그대로 담겨 있다 —
   typecheck/build/전체 회귀/push 중 하나) — 문제를 고치고 다시 step 6/7(commit 또는 push)을
-  반복한다. context는 실패 시 그대로 유지되므로 step 5를 다시 실행할 필요는 없다.
+  반복한다. context는 실패 시 그대로 유지되므로 step 5를 다시 실행할 필요는 없다. Phase G Task
+  G7.5부터는 이 실패도 ❌ "최종 미완료" Telegram으로 함께 통보된다(§ `self-dev-terminal-status.ts`
+  `SelfDevTerminalStatus="FAILED"`) — 콘솔 메시지만 보고 넘어가지 않아도 된다.
 - 아무 메시지도 보이지 않으면(가장 흔한 원인) step 5를 빼먹었거나 `--push` 지정이 step 7과
   어긋난 것이다 — 이 경우에만 원인을 재확인하고, **임의로 `npm run self-dev:complete`를 대신
   실행하지 않는다**(사람에게 알리고 상태를 `BLOCKED`/`WAITING_HUMAN`으로 보고한 뒤 STOP —
@@ -139,7 +150,7 @@ push)이 성공하면, PostToolUse hook이 `dist/self-dev-complete.js --task-id 
 
 이 저장소가 아닌 다른 환경(hooks가 비활성화된 세션 등)에서 부득이하게 수동으로 완료 신호를
 만들어야 한다면, 사람에게 그 사실을 명시적으로 알리고 승인을 받은 뒤에만
-`npm run self-dev:complete -- --task-id <TaskId> [--push]`를 직접 실행한다. 이것은 예외
+`npm run self-dev:complete -- --task-id <TaskId> [--push] [--final]`를 직접 실행한다. 이것은 예외
 경로이지 정상 경로가 아니다 — 정상 경로에서 이 명령을 Claude가 스스로 판단해서 직접 실행하면 이
 Task(G7.3.1b)가 검증하려는 것(자동 트리거가 실제로 동작하는가)을 증명할 수 없다.
 

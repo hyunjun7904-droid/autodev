@@ -27,17 +27,41 @@ import type { AutoDevEvent, AutoDevEventType } from "./observability-event";
 //     시도 하나하나) 반복 발생하는 중간 신호라 알림 폭탄의 실제 원인 중 하나였다(REVISE
 //     루프 자체를 반복 알림하지 않는다 — 사람 개입이 최종적으로 필요해진 경우
 //     REVIEW_CYCLE_EXHAUSTED로 정확히 1건만 알린다).
+//   - Phase G Task G7.5(Telegram 알림 UX Hardening) — 위 high-signal 정책은 유지하되,
+//     "하위 Task 완료"와 "상위 Task/Phase 진짜 최종 완료"를 서로 다른 판정 근거로
+//     구분한다(§ 요구사항 8 — 단순 문자열만 바꾸지 않는다):
+//       - 🟡 TASK_COMPLETED(기본값) — 이 task의 checkpoint는 성공했지만 아직 상위
+//         작업(production task-registry 전체 또는 self-dev의 명시적 --final 선언)이
+//         끝났다는 authoritative 신호가 없는 상태. "다음 프로젝트 시작 가능: 아니오".
+//       - ✅ FINAL_COMPLETED — production에서는 별도 event PROJECT_COMPLETED로만(§
+//         autodev.ts, task-registry.getNextTask()가 다음 task 없음 + isHumanGate
+//         아님으로 판정하고 project-state.json PROJECT_COMPLETE 저장 + administrative
+//         commit이 성공한 *이후*에만 발생), self-dev에서는 TASK_COMPLETED.metadata.
+//         completionScope==="FINAL"(§ self-dev-completion.ts의 evidence.isFinal, 같은
+//         재검증 파이프라인을 거친 뒤에만 세팅됨)로만 만들어진다 — 세션 종료/마지막
+//         메시지 같은 추측으로 만들어지지 않는다.
+//       - ⛔ 사람 확인이 필요한 6+1종(WAITING_HUMAN/HUMAN_APPROVAL_REQUIRED/
+//         SECURITY_BLOCKED/REVIEW_CYCLE_EXHAUSTED/RUN_BLOCKED/SELF_DEV_WAITING_HUMAN/
+//         DEPLOYMENT_WAITING_HUMAN)는 이제 공통된 "[AutoDev] 사용자 확인 필요" 형태로
+//         통일하되, 사유 줄로 서로 구분한다.
+//       - ❌ SELF_DEV_TASK_FAILED — self-dev 완료 재검증이 실패로 끝난 사실(오늘까지는
+//         콘솔에만 남고 Telegram이 전혀 오지 않던 gap).
 //   - 그 외 event(*_STARTED, AGENT_*, REVIEW_STARTED/APPROVED/REVISE, CHECKPOINT_CREATED,
 //     RUN_COMPLETED, TEST_COMPLETED 등)는 알림을 만들지 않는다 — 순수 진행 상황이거나
 //     이미 다른 event로 대표되거나, 위 high-signal 정책 밖이다.
 //
-// 메시지 본문은 event.reason/error.message 같은 자유 텍스트를 절대 옮겨 담지 않는다(§
-// live-snapshot.ts CURRENT_ACTION_LABELS와 동일한 원칙) — 고정 템플릿 + runId/taskId 같은
-// 순수 식별자, 그리고 testSummary.failed 같은 이미 집계된 숫자만 채운다. raw prompt/
-// Claude·GPT 출력/secret/전체 source는 이 파일이 다루는 AutoDevEvent 자체에 애초에 담기지
-// 않는다(§ observability-event.ts sanitizeEventInput) — 이 파일은 그 사실을 재확인하지
-// 않고 그대로 신뢰하되, 자유 텍스트 필드를 옮겨 담는 코드 경로 자체를 만들지 않아 이중으로
-// 안전하다.
+// 메시지 본문은 원칙적으로 고정 템플릿 + runId/taskId 같은 순수 식별자 + testSummary.failed
+// 같은 이미 집계된 숫자만 채운다(§ live-snapshot.ts CURRENT_ACTION_LABELS와 동일한 원칙).
+// event.reason은 observability-event.ts의 createEvent()가 저장 시점에 이미 secret-shape
+// 값을 redact했지만(§ sanitizeEventInput), 그 사실만으로 "어떤 reason이든 그대로 노출해도
+// 안전하다"고 보지 않는다 — WAITING_HUMAN/HUMAN_APPROVAL_REQUIRED/SECURITY_BLOCKED/
+// REVIEW_CYCLE_EXHAUSTED는 여전히 고정 문구만 쓴다(그 reason들은 orchestrator status 문자열/
+// audit store 에러 메시지처럼 이 파일이 형태를 통제할 수 없는 값이 섞여 있을 수 있다).
+// RUN_BLOCKED/SELF_DEV_WAITING_HUMAN/SELF_DEV_TASK_FAILED만 예외다 — 그 reason은 각각
+// checkpoint.ts의 고정 템플릿 문자열이거나 self-dev-terminal-status.ts의
+// validateSelfDevTerminalReason()(길이/줄바꿈/secret-shape를 사전 거부하는 전용 검증)을
+// 이미 통과한 값이라는 것을 소스에서 직접 확인했다 — 그래서 boundedReason()으로 한 번 더
+// 방어적으로(길이 상한 + 한 줄로 접기) 다듬어서만 사유 줄에 노출한다.
 
 export type NotificationSeverity = "INFO" | "WARNING" | "ACTION_REQUIRED" | "CRITICAL";
 
@@ -55,7 +79,19 @@ export type NotificationType =
   // 이 type은 requiresHumanAction=true이지만 approval-service.ts가 명시적으로 ApprovalRequest
   // 생성 대상에서 제외한다(실제 resumable production action이 없으므로 버튼을 절대 만들지
   // 않는다).
-  | "SELF_DEV_WAITING_HUMAN";
+  | "SELF_DEV_WAITING_HUMAN"
+  // Phase G Task G7.5 — 하위 Task 완료(🟡, 기존 TASK_COMPLETED)와 명확히 구분되는 "진짜
+  // 최종 완료"(✅). production PROJECT_COMPLETED event 또는 self-dev
+  // TASK_COMPLETED.metadata.completionScope==="FINAL"에서만 만들어진다(§ 파일 상단 주석).
+  | "FINAL_COMPLETED"
+  // production task-registry의 모든 자동 task는 끝났지만 마지막 task가 isHumanGate라 실제
+  // 배포는 사람이 트리거해야 하는 상태(⛔) — SELF_DEV_WAITING_HUMAN과 동일하게 실제
+  // resumable action이 없으므로 approval-service.ts가 버튼을 만들지 않는다(§ 그 파일).
+  | "DEPLOYMENT_WAITING_HUMAN"
+  // self-dev-complete.ts의 deterministic 재검증(typecheck/build/전체 회귀/commit/push)이
+  // 실패로 끝났다는 사실(❌) — "사람 확인 필요"가 아니라 "이번 시도는 최종적으로 완료되지
+  // 못했다"는 별도 의미다(버튼 없음, 문제를 고쳐 같은 taskId로 다시 시도하면 된다).
+  | "SELF_DEV_TASK_FAILED";
 
 export interface NotificationMessage {
   id: string;
@@ -94,6 +130,9 @@ const NOTIFICATION_SEVERITY: Record<NotificationType, NotificationSeverity> = {
   RUN_BLOCKED: "CRITICAL",
   SECURITY_BLOCKED: "CRITICAL",
   SELF_DEV_WAITING_HUMAN: "ACTION_REQUIRED",
+  FINAL_COMPLETED: "INFO",
+  DEPLOYMENT_WAITING_HUMAN: "ACTION_REQUIRED",
+  SELF_DEV_TASK_FAILED: "WARNING",
 };
 
 const REQUIRES_HUMAN_ACTION: Record<NotificationType, boolean> = {
@@ -112,6 +151,17 @@ const REQUIRES_HUMAN_ACTION: Record<NotificationType, boolean> = {
   // (RUN_BLOCKED와 동일한 "requiresHumanAction=true지만 approval-service.ts가 별도 차단"
   // 패턴).
   SELF_DEV_WAITING_HUMAN: true,
+  // "진짜 최종 완료" 자체는 사람이 확인/승인할 대상이 아니다(이미 모든 필수 검증을 통과한
+  // 완료 사실의 통보) — TASK_COMPLETED와 동일하게 false, 버튼 없음.
+  FINAL_COMPLETED: false,
+  // RUN_BLOCKED/SELF_DEV_WAITING_HUMAN과 동일한 "requiresHumanAction=true지만
+  // approval-service.ts가 별도 차단" 패턴 — 실제 배포 트리거는 이 파이프라인의 remotely
+  // approvable action이 아니다(§ approval-service.ts exclusion).
+  DEPLOYMENT_WAITING_HUMAN: true,
+  // "최종적으로 완료되지 못했다"는 사실 자체는 버튼이 있는 승인 요청이 아니다 — 문제를
+  // 고쳐 같은 taskId로 다시 시도하면 된다(정보성 알림, TASK_COMPLETED/FINAL_COMPLETED와
+  // 동일하게 false).
+  SELF_DEV_TASK_FAILED: false,
 };
 
 interface NotificationContent {
@@ -123,13 +173,35 @@ function taskLabel(event: Pick<AutoDevEvent, "taskId" | "runId">): string {
   return event.taskId ?? event.runId;
 }
 
-// 모든 메시지는 고정 템플릿이다 — event의 자유 텍스트 필드(reason/error.message/metadata)를
-// 읽지 않는다(§ 파일 상단 주석). testSummary.failed만 예외적으로 쓰는데, 이는 자유 텍스트가
-// 아니라 이미 집계된 숫자다(§ observability-event.ts buildTestSummary).
+const MAX_DISPLAY_REASON_LENGTH = 200;
+
+/** event.reason을 Telegram 표시용으로 안전하게 다듬는다 — secret-shape 값 제거는 이미
+ *  observability-event.ts의 createEvent()가 저장 시점에 항상 수행했으므로(§
+ *  redactSecretLikeText), 여기서는 순수 표시 목적의 방어적 변환만 한다: 줄바꿈을 공백으로
+ *  접어 항상 한 줄로 만들고, 길이를 제한한다. 값이 없거나 공백뿐이면 undefined를 반환해
+ *  호출부가 고정 fallback 문구를 쓰게 한다(§ 이 함수를 쓰는 notification type만 개별 문서
+ *  참고 — 아무 notification type이나 이 함수로 event.reason을 노출하지 않는다). */
+function boundedReason(reason: string | undefined): string | undefined {
+  if (!reason) return undefined;
+  const singleLine = reason.replace(/\s+/g, " ").trim();
+  if (singleLine.length === 0) return undefined;
+  return singleLine.length > MAX_DISPLAY_REASON_LENGTH
+    ? `${singleLine.slice(0, MAX_DISPLAY_REASON_LENGTH)}…`
+    : singleLine;
+}
+
+const CONFIRM_TITLE = "⛔ [AutoDev] 사용자 확인 필요";
+const CONFIRM_FOOTER = "다음 프로젝트 시작 가능: 아니오";
+
+// 모든 메시지는 고정 템플릿 뼈대를 쓴다 — event의 자유 텍스트 필드는 원칙적으로 읽지 않고,
+// boundedReason()을 거치는 RUN_BLOCKED/SELF_DEV_WAITING_HUMAN/SELF_DEV_TASK_FAILED만
+// 예외다(§ 파일 상단 주석에서 그 세 reason이 왜 안전한지 소스 근거를 남겼다).
+// testSummary.failed 같은 이미 집계된 숫자도 자유 텍스트가 아니다(§ observability-event.ts
+// buildTestSummary).
 const NOTIFICATION_CONTENT: Record<NotificationType, (event: AutoDevEvent) => NotificationContent> = {
   TASK_COMPLETED: (e) => ({
-    title: "[AutoDev] Task 완료",
-    shortMessage: `Task ${taskLabel(e)}가 완료되었습니다.`,
+    title: "🟡 [AutoDev] 작업 단계 완료",
+    shortMessage: `작업: ${taskLabel(e)}\n상태: 전체 작업 진행 중\n${CONFIRM_FOOTER}`,
   }),
   RUN_COMPLETED: (e) => ({
     title: "[AutoDev] Run 완료",
@@ -140,28 +212,40 @@ const NOTIFICATION_CONTENT: Record<NotificationType, (event: AutoDevEvent) => No
     shortMessage: `Task ${taskLabel(e)} / ${e.testSummary?.failed ?? "?"}개 테스트 실패`,
   }),
   WAITING_HUMAN: (e) => ({
-    title: "[AutoDev] 승인 필요",
-    shortMessage: `Task ${taskLabel(e)}가 WAITING_HUMAN 상태입니다.`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: GPT 리뷰가 최종적으로 사람 확인을 요구했습니다.\n${CONFIRM_FOOTER}`,
   }),
   HUMAN_APPROVAL_REQUIRED: (e) => ({
-    title: "[AutoDev] 승인 필요",
-    shortMessage: `Task ${taskLabel(e)}에 사람 승인이 필요합니다.`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: 사람 승인이 필요한 고위험 작업입니다.\n${CONFIRM_FOOTER}`,
   }),
   SECURITY_BLOCKED: (e) => ({
-    title: "[AutoDev] 보안 차단",
-    shortMessage: `Task ${taskLabel(e)}에서 보안 게이트가 checkpoint를 차단했습니다.`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: 보안 게이트가 checkpoint를 차단했습니다.\n${CONFIRM_FOOTER}`,
   }),
   REVIEW_CYCLE_EXHAUSTED: (e) => ({
-    title: "[AutoDev] 리뷰 반복 한도 도달",
-    shortMessage: `Task ${taskLabel(e)}의 REVISE 반복이 한도에 도달했습니다.`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: REVISE 반복이 한도에 도달했습니다.\n${CONFIRM_FOOTER}`,
   }),
   RUN_BLOCKED: (e) => ({
-    title: "[AutoDev] 실행 차단",
-    shortMessage: `Run ${e.runId}이 Task ${taskLabel(e)}에서 차단되어 중단되었습니다.`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: ${boundedReason(e.reason) ?? "실행이 차단되어 중단되었습니다."}\n${CONFIRM_FOOTER}`,
   }),
   SELF_DEV_WAITING_HUMAN: (e) => ({
-    title: "[AutoDev] 사용자 확인 필요",
-    shortMessage: `Task ${taskLabel(e)}가 사용자 확인이 필요한 상태입니다(Telegram 원격 승인으로 재개할 수 없습니다).`,
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: ${boundedReason(e.reason) ?? "사용자 확인이 필요한 상태입니다."}(Telegram 원격 승인으로 재개할 수 없습니다)\n${CONFIRM_FOOTER}`,
+  }),
+  FINAL_COMPLETED: (e) => ({
+    title: "✅ [AutoDev] 최종 완료",
+    shortMessage: `작업: ${taskLabel(e)}\n결과: 모든 필수 검증 통과\n최종보고: 완료\n다음 프로젝트 시작 가능: 예`,
+  }),
+  DEPLOYMENT_WAITING_HUMAN: (e) => ({
+    title: CONFIRM_TITLE,
+    shortMessage: `작업: ${taskLabel(e)}\n사유: 모든 자동 Task가 완료되어 실제 배포는 사람이 직접 트리거해야 합니다.\n${CONFIRM_FOOTER}`,
+  }),
+  SELF_DEV_TASK_FAILED: (e) => ({
+    title: "❌ [AutoDev] 최종 미완료",
+    shortMessage: `작업: ${taskLabel(e)}\n사유: ${boundedReason(e.reason) ?? "완료 조건을 충족하지 못했습니다."}\n${CONFIRM_FOOTER}`,
   }),
 };
 
@@ -182,6 +266,14 @@ const EVENT_TO_NOTIFICATION_TYPE: Partial<Record<AutoDevEventType, NotificationT
   // 위에서 매핑돼 있고, self-dev-terminal-status.ts가 그 기존 eventType을 그대로 재사용
   // 한다 — 새 event type 없음).
   SELF_DEV_WAITING_HUMAN: "SELF_DEV_WAITING_HUMAN",
+  // Phase G Task G7.5 — production의 "진짜 최종 완료"/"배포 대기"는 TASK_COMPLETED와
+  // 시점이 다른 별도 event다(§ 파일 상단 주석 — state 저장/administrative commit 성공
+  // *이후*에만 발생, autodev.ts). self-dev의 "진짜 최종 완료"는 별도 event가 아니라
+  // TASK_COMPLETED.metadata.completionScope로 표현되므로(§ classifyEventForNotification
+  // 아래) 여기 없다.
+  PROJECT_COMPLETED: "FINAL_COMPLETED",
+  DEPLOYMENT_WAITING_HUMAN: "DEPLOYMENT_WAITING_HUMAN",
+  SELF_DEV_TASK_FAILED: "SELF_DEV_TASK_FAILED",
 };
 
 function buildDedupeKey(runId: string, taskId: string | undefined, type: NotificationType, cycle: number | undefined): string {
@@ -198,7 +290,28 @@ export function classifyEventForNotification(event: AutoDevEvent): NotificationM
   // TEST_COMPLETED(개별 회귀/REVISE 재시도의 중간 결과, 실패 여부와 무관)는 의도적으로
   // 알림을 만들지 않는다(§ 파일 상단 주석 — 2026-08-22 incident, REVISE 반복마다 알림이
   // 쌓이는 문제의 실제 원인이었다).
-  const type: NotificationType | undefined = EVENT_TO_NOTIFICATION_TYPE[event.eventType];
+  let type: NotificationType | undefined = EVENT_TO_NOTIFICATION_TYPE[event.eventType];
+
+  // Phase G Task G7.5 — TASK_COMPLETED(하위 Task/subtask)는 기본값이지만, 이 event 자체가
+  // "이 task 완료 직후 상위 작업이 확정될 예정/이미 확정됐다"는 사실을 이미 알고 있으면
+  // (§ autodev.ts/self-dev-completion.ts가 채우는 metadata.completionScope) 다르게
+  // 처리한다:
+  //   - "PENDING_FINAL"/"PENDING_DEPLOYMENT_GATE"(production) — 이 event 자체는 알림을
+  //     만들지 않는다. production의 최종 판정은 project-state.json 저장 + administrative
+  //     commit이 실제로 성공한 *이후*에만 별도 event(PROJECT_COMPLETED/
+  //     DEPLOYMENT_WAITING_HUMAN)로 알린다 — "TASK_COMPLETED 발생 → 최종 완료 Telegram
+  //     → 그 뒤 최종 검증/보고" 순서를 구조적으로 금지한다(§ 요구사항 5). 그렇게 하지
+  //     않으면 같은 task에 대해 🟡와 ✅/⛔ 두 알림이 동시에 나가 사용자를 혼란스럽게 만든다.
+  //   - "FINAL"(self-dev --final) — self-dev는 이 TASK_COMPLETED 자체가 이미 "완료
+  //     evidence 재검증 + 최종 보고 생성 이후" 시점에만 기록되므로(§
+  //     self-dev-completion.ts recordSelfDevTaskCompleted), 별도 event 없이 곧바로
+  //     FINAL_COMPLETED로 승격한다.
+  if (event.eventType === "TASK_COMPLETED") {
+    const scope = event.metadata?.completionScope;
+    if (scope === "PENDING_FINAL" || scope === "PENDING_DEPLOYMENT_GATE") return undefined;
+    if (scope === "FINAL") type = "FINAL_COMPLETED";
+  }
+
   if (!type) return undefined;
 
   const content = NOTIFICATION_CONTENT[type](event);

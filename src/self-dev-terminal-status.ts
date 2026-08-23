@@ -39,11 +39,17 @@ import { log } from "./logger";
 // 알림 본문에 옮기지 않는다는 기존 불변식을 이 Task를 위해 약화시키지 않는다). reason은
 // event.reason/metadata에만 남아 EventStore/Dashboard 감사 기록으로 쓰인다.
 
-export type SelfDevTerminalStatus = "BLOCKED" | "WAITING_HUMAN";
+// Phase G Task G7.5 — "FAILED"는 self-dev-complete.ts의 deterministic 재검증
+// (typecheck/build/전체 회귀/commit/push)이 실패로 끝났다는 사실이다. BLOCKED(구조적으로
+//더 진행할 수 없음)/WAITING_HUMAN(사람의 선택이 필요함)과 다르다 — 문제를 고쳐 같은
+// taskId로 다시 시도하면 되는, "이번 시도가 최종적으로 완료되지 못했다"는 별도 의미다(§
+// notification.ts SELF_DEV_TASK_FAILED, requiresHumanAction=false, 버튼 없음).
+export type SelfDevTerminalStatus = "BLOCKED" | "WAITING_HUMAN" | "FAILED";
 
-const TERMINAL_STATUS_EVENT_TYPE: Record<SelfDevTerminalStatus, "RUN_BLOCKED" | "SELF_DEV_WAITING_HUMAN"> = {
+const TERMINAL_STATUS_EVENT_TYPE: Record<SelfDevTerminalStatus, "RUN_BLOCKED" | "SELF_DEV_WAITING_HUMAN" | "SELF_DEV_TASK_FAILED"> = {
   BLOCKED: "RUN_BLOCKED",
   WAITING_HUMAN: "SELF_DEV_WAITING_HUMAN",
+  FAILED: "SELF_DEV_TASK_FAILED",
 };
 
 export const MAX_SELF_DEV_TERMINAL_REASON_LENGTH = 200;
@@ -163,7 +169,7 @@ export interface RecordSelfDevTerminalStatusResult {
    *  뜻이다 — 새 event를 append하지 않았다(§ dedupe). */
   alreadyRecorded: boolean;
   runId: string;
-  eventType: "RUN_BLOCKED" | "SELF_DEV_WAITING_HUMAN";
+  eventType: "RUN_BLOCKED" | "SELF_DEV_WAITING_HUMAN" | "SELF_DEV_TASK_FAILED";
   error?: string;
 }
 
@@ -199,7 +205,7 @@ export function recordSelfDevTerminalStatus(
     projectId: SELF_DEV_PROJECT_ID,
     taskId: input.taskId,
     executionPhase: "state_update",
-    outcome: input.terminalStatus === "BLOCKED" ? "BLOCKED" : "PENDING",
+    outcome: input.terminalStatus === "BLOCKED" ? "BLOCKED" : input.terminalStatus === "FAILED" ? "FAILED" : "PENDING",
     reason: input.reason,
     metadata: { source: "claude-code-self-dev-bridge", terminalStatus: input.terminalStatus },
   });

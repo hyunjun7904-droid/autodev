@@ -49,6 +49,18 @@ export interface SelfDevCompletionEvidence {
    *  저장소를 대상으로 직접 재실행/검증한 결과). TASK_COMPLETED event의 metadata.source에
    *  그대로 남아 사후 구분 가능하다. */
   source: SelfDevCompletionSource;
+  /**
+   * Phase G Task G7.5 — 이 Task가 "하위 Task(🟡)"가 아니라 "상위 Task/Phase의 진짜 최종
+   * 완료(✅)"라는 명시적 선언(§ self-dev-begin.ts --final, self-dev-completion-hook.ts가
+   * context를 통해 그대로 전달). 기본값 false — 추측하지 않는다(§ 요구사항: 최종 완료
+   * 여부를 추측하지 말 것). true라고 해서 검증 요건이 하나라도 완화되지 않는다 — 나머지
+   * testsPassed/typecheckPassed/buildPassed/(필요시) pushPassed 조건은 이 값과 무관하게
+   * 동일하게 전부 충족해야 한다(§ validateSelfDevCompletionEvidence). 이 값 하나만으로
+   * "최종 완료" Telegram이 나가지 않는다 — recordSelfDevTaskCompleted()가 이 값이 true일
+   * 때만 buildSelfDevFinalReportSummary()로 최종 보고를 함께 생성해 event에 담고, 그 이후
+   * (§ deliverSelfDevCompletionNotification)에만 전달을 시도한다(§ 요구사항 5 순서).
+   */
+  isFinal: boolean;
 }
 
 export interface EvidenceValidationError {
@@ -122,7 +134,26 @@ export function validateSelfDevCompletionEvidence(
     pushRequired,
     pushPassed: pushRequired ? true : false,
     source: source as SelfDevCompletionSource,
+    isFinal: candidate.isFinal === true,
   };
+}
+
+/**
+ * evidence(이미 재검증을 통과한 값)로부터 결정론적 최종 보고 요약을 만든다 — Claude가
+ * 자유 텍스트로 "다 됐습니다"라고 주장하는 것이 아니라, 이 함수가 이미 검증된 필드만
+ * 조합해서 만드는 짧은 한 줄 요약이다(§ 요구사항 8 — 최종 완료 여부를 추측하지 않는다).
+ * evidence.isFinal이 true일 때만 recordSelfDevTaskCompleted()가 이 값을 호출해 event
+ * metadata에 남긴다 — "최종 보고가 생성된 이후에만 최종 Telegram을 보낸다"는 순서(§
+ * 요구사항 5)를 이 함수 호출이 recordSelfDevTaskCompleted()(state 기록) 이전에, 그리고
+ * deliverSelfDevCompletionNotification()(Telegram 전달) 이전에 이뤄지는 것으로 만족시킨다.
+ */
+export function buildSelfDevFinalReportSummary(evidence: SelfDevCompletionEvidence): string {
+  const parts = [
+    `commit ${evidence.commitHash}`,
+    "tests/typecheck/build 통과",
+    evidence.pushRequired ? "push 반영 확인" : undefined,
+  ].filter((p): p is string => Boolean(p));
+  return parts.join(", ");
 }
 
 /**
@@ -173,6 +204,11 @@ export function recordSelfDevTaskCompleted(
     return { ok: true, alreadyRecorded: true, runId };
   }
 
+  // Phase G Task G7.5 — isFinal일 때만(§ 요구사항 5 순서) 최종 보고를 이 시점에 생성해
+  // event에 함께 남긴다 — TASK_COMPLETED.metadata.completionScope="FINAL"이 있어야만
+  // notification.ts가 이 event를 🟡가 아니라 ✅ FINAL_COMPLETED로 승격한다(§ 그 파일).
+  const finalReportSummary = evidence.isFinal ? buildSelfDevFinalReportSummary(evidence) : undefined;
+
   const appendResult = events.append({
     eventType: "TASK_COMPLETED",
     runId,
@@ -188,6 +224,8 @@ export function recordSelfDevTaskCompleted(
       pushRequired: evidence.pushRequired,
       pushPassed: evidence.pushRequired ? evidence.pushPassed : null,
       source: evidence.source,
+      completionScope: evidence.isFinal ? "FINAL" : "SUBTASK",
+      ...(finalReportSummary !== undefined ? { finalReportGenerated: true, finalReportSummary } : {}),
     },
   });
   if (!appendResult.ok) {

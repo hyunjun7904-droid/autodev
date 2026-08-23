@@ -9,6 +9,8 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
+import { createInMemoryEventStore } from "./event-store";
+import { classifyEventForNotification } from "./notification";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -417,6 +419,153 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
   check("runAutodevOnce 미승인: MAX_REVIEW_CYCLES(5) 초과하지 않고 Claude 호출됨", claudeCalls > 0 && claudeCalls <= 5);
 }
 
+// ---------------------------------------------------------------------------
+// D) Phase G Task G7.5 — Telegram 알림 UX Hardening. 중간 task 완료(SUBTASK, 🟡)와
+//    task-registry 전체가 진짜 최종 완료되는 순간(PENDING_FINAL → PROJECT_COMPLETED, ✅)/
+//    마지막 task가 isHumanGate라 배포는 사람이 트리거해야 하는 순간(PENDING_DEPLOYMENT_GATE
+//    → DEPLOYMENT_WAITING_HUMAN, ⛔)을 각각 실제 EventStore로 구분해서 검증한다 — 세
+//    시나리오 모두 같은 orchestrator/checkpoint 배선을 그대로 타므로 이 event들이 실제
+//    production 코드 경로에서 만들어지는지 증명한다(단순 notification.ts 단위 테스트만으로는
+//    "autodev.ts가 실제로 이 metadata/event를 만드는가"를 증명하지 못한다).
+// ---------------------------------------------------------------------------
+
+// P1.2는 registry의 중간 task다(다음은 P2.1) — 반드시 SUBTASK(🟡)여야 하고, PROJECT_COMPLETED/
+// DEPLOYMENT_WAITING_HUMAN 최종 event는 절대 만들어지면 안 된다.
+async function scenarioRunAutodevOnceMidRegistryTaskIsSubtaskOnly(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → 다음은 P1.2(중간 task)
+  const manifest = buildPlannerManifest(repo, statePath);
+  const events = createInMemoryEventStore();
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/fake-task-p1-2-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/fake-task-p1-2-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  const all = events.query().events;
+  const taskCompleted = all.find((e) => e.eventType === "TASK_COMPLETED");
+  check("D) 중간 task: TASK_COMPLETED.metadata.completionScope='SUBTASK'", taskCompleted?.metadata?.completionScope === "SUBTASK");
+  check("D) 중간 task: PROJECT_COMPLETED event 없음", !all.some((e) => e.eventType === "PROJECT_COMPLETED"));
+  check("D) 중간 task: DEPLOYMENT_WAITING_HUMAN event 없음", !all.some((e) => e.eventType === "DEPLOYMENT_WAITING_HUMAN"));
+
+  const n = taskCompleted ? classifyEventForNotification(taskCompleted) : undefined;
+  check("D) 중간 task: notification 🟡 TASK_COMPLETED로 분류(최종 완료 아님)", n?.notificationType === "TASK_COMPLETED");
+}
+
+// P2.1까지 완료한 뒤 마지막(P2.2, isHumanGate=true)을 완료 → 모든 자동 task는 끝났지만 실제
+// 배포는 사람이 트리거해야 하는 상태(⛔ DEPLOYMENT_WAITING_HUMAN) — ✅ PROJECT_COMPLETED가
+// 아니어야 한다(배포가 안 끝났으므로 "최종 완료"가 아니다).
+async function scenarioRunAutodevOnceFinalHumanGateEmitsDeploymentWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: idsUpTo("P2.1") }); // 다음은 P2.2(마지막, human gate)
+  const manifest = buildPlannerManifest(repo, statePath);
+  const events = createInMemoryEventStore();
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/fake-task-p2-2-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/fake-task-p2-2-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  check("D) 마지막(human gate) task: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("D) 마지막(human gate) task: status='DEPLOYMENT_WAITING_HUMAN'", (finalState.status as unknown as string) === "DEPLOYMENT_WAITING_HUMAN");
+
+  const all = events.query().events;
+  const taskCompleted = all.find((e) => e.eventType === "TASK_COMPLETED");
+  check(
+    "D) 마지막(human gate) task: TASK_COMPLETED.metadata.completionScope='PENDING_DEPLOYMENT_GATE'",
+    taskCompleted?.metadata?.completionScope === "PENDING_DEPLOYMENT_GATE"
+  );
+  check(
+    "D) 마지막(human gate) task: 이 TASK_COMPLETED 자체는 알림을 만들지 않음(중복 방지)",
+    taskCompleted ? classifyEventForNotification(taskCompleted) === undefined : false
+  );
+
+  const deploymentEvent = all.find((e) => e.eventType === "DEPLOYMENT_WAITING_HUMAN");
+  check("D) 마지막(human gate) task: DEPLOYMENT_WAITING_HUMAN event 생성됨", deploymentEvent !== undefined);
+  check("D) 마지막(human gate) task: PROJECT_COMPLETED event 없음(배포 미완료)", !all.some((e) => e.eventType === "PROJECT_COMPLETED"));
+  const n = deploymentEvent ? classifyEventForNotification(deploymentEvent) : undefined;
+  check("D) 마지막(human gate) task: notification ⛔ DEPLOYMENT_WAITING_HUMAN", n?.notificationType === "DEPLOYMENT_WAITING_HUMAN");
+  check("D) 마지막(human gate) task: requiresHumanAction=true(그러나 버튼 없음, § approval-service.ts)", n?.requiresHumanAction === true);
+}
+
+// 마지막 task가 human gate가 아닌 작은 별도 registry로 "진짜 최종 완료"(✅ PROJECT_COMPLETED)를
+// 검증한다 — PLANNER_FIXTURE_REGISTRY는 마지막이 항상 isHumanGate라 이 경로를 만들 수 없다.
+const FINAL_NO_GATE_REGISTRY: TaskDefinition[] = [
+  { id: "N1", phase: 1, taskNumber: 1, title: "최종 완료 fixture Task1", prompt: "N1 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  { id: "N2", phase: 1, taskNumber: 2, title: "최종 완료 fixture Task2(마지막, human gate 아님)", prompt: "N2 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+];
+
+function buildFinalNoGateManifest(root: string, statePath: string): ProjectManifest {
+  return {
+    projectId: "final-no-gate-fixture-project",
+    projectName: "Final No-Gate Fixture Project",
+    targetProjectRoot: root,
+    statePath,
+    taskRegistry: FINAL_NO_GATE_REGISTRY,
+    developerInstructions: "허용 범위: proj/**. 이 fixture 프로젝트는 진짜 최종 완료(PROJECT_COMPLETED)만 다룹니다.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: PLANNER_EXECUTION_POLICY,
+  };
+}
+
+async function scenarioRunAutodevOnceFinalNonGateTaskEmitsProjectCompleted(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: ["N1"] }); // 다음은 N2(마지막, gate 아님)
+  const manifest = buildFinalNoGateManifest(repo, statePath);
+  const events = createInMemoryEventStore();
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/fake-task-n2-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/fake-task-n2-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  check("D) 마지막(non-gate) task: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("D) 마지막(non-gate) task: status='PROJECT_COMPLETE'", (finalState.status as unknown as string) === "PROJECT_COMPLETE");
+
+  const all = events.query().events;
+  const taskCompleted = all.find((e) => e.eventType === "TASK_COMPLETED");
+  check(
+    "D) 마지막(non-gate) task: TASK_COMPLETED.metadata.completionScope='PENDING_FINAL'",
+    taskCompleted?.metadata?.completionScope === "PENDING_FINAL"
+  );
+  check(
+    "D) 마지막(non-gate) task: 이 TASK_COMPLETED 자체는 알림을 만들지 않음(🟡와 ✅ 동시 발송 방지)",
+    taskCompleted ? classifyEventForNotification(taskCompleted) === undefined : false
+  );
+
+  const projectCompletedEvent = all.find((e) => e.eventType === "PROJECT_COMPLETED");
+  check("D) 마지막(non-gate) task: PROJECT_COMPLETED event 생성됨", projectCompletedEvent !== undefined);
+  check("D) 마지막(non-gate) task: DEPLOYMENT_WAITING_HUMAN event 없음", !all.some((e) => e.eventType === "DEPLOYMENT_WAITING_HUMAN"));
+
+  // 순서(§ 요구사항 5) — PROJECT_COMPLETED는 project-state.json 저장 + administrative
+  // commit이 끝난 뒤에만 만들어진다는 사실을 event.sequence로 방증한다: TASK_COMPLETED보다
+  // 항상 나중 sequence다(그 사이에 admin commit이 있었다는 것은 위 git log/상태로 이미
+  // 별도 검증됨 — 여기서는 event 순서만 확인).
+  check(
+    "D) 마지막(non-gate) task: PROJECT_COMPLETED가 TASK_COMPLETED보다 나중 event(순서 보장)",
+    (projectCompletedEvent?.sequence ?? -1) > (taskCompleted?.sequence ?? Number.MAX_SAFE_INTEGER)
+  );
+
+  const n = projectCompletedEvent ? classifyEventForNotification(projectCompletedEvent) : undefined;
+  check("D) 마지막(non-gate) task: notification ✅ FINAL_COMPLETED", n?.notificationType === "FINAL_COMPLETED");
+  check(
+    "D) 마지막(non-gate) task: '다음 프로젝트 시작 가능: 예'",
+    (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 예")
+  );
+
+  const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
+  check("D) 마지막(non-gate) task: product commit + administrative commit 2건 생성(+init 1건=3건)", log.trim().split("\n").length === 3);
+}
+
 async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: allTaskIds() });
@@ -450,6 +599,9 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile();
     await scenarioRunAutodevOnceNotApprovedSkipsCheckpoint();
     await scenarioRunAutodevOnceNoTaskStops();
+    await scenarioRunAutodevOnceMidRegistryTaskIsSubtaskOnly();
+    await scenarioRunAutodevOnceFinalHumanGateEmitsDeploymentWaitingHuman();
+    await scenarioRunAutodevOnceFinalNonGateTaskEmitsProjectCompleted();
     await scenarioRunAutodevOnceBlockedByRemoteGitAtStart();
     await scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint();
   } finally {

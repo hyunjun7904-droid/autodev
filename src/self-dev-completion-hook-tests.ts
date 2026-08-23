@@ -237,6 +237,47 @@ function scenarioRunHookCommitOnlyOmitsPushFlag(): void {
   check("14) pushRequired=false → 호출 인자에 --push 없음", !(calls[0]?.args.includes("--push") ?? true));
 }
 
+// ---------------------------------------------------------------------------
+// 15) Phase G Task G7.5 — isFinal(--final)이 그대로 전달된다(hook 자신은 추측하지 않는다)
+// ---------------------------------------------------------------------------
+function scenarioIsFinalPassedThroughToTriggerDecision(): void {
+  const dir = makeGitRepo("sdch-isfinal-decision-");
+  writeSelfDevTaskContext(dir, { taskId: "G7.5", pushRequired: false, isFinal: true });
+  commitMore(dir, "a.txt");
+  const decision = decideSelfDevCompletionTrigger({ command: 'git commit -m "a"', repoRoot: dir });
+  check("15) isFinal:true로 선언된 context → decision.isFinal=true", decision.trigger === true && decision.isFinal === true);
+}
+
+function scenarioIsFinalDefaultsFalseInTriggerDecision(): void {
+  const dir = makeGitRepo("sdch-isfinal-default-decision-");
+  writeSelfDevTaskContext(dir, { taskId: "G7.5b", pushRequired: false });
+  commitMore(dir, "a.txt");
+  const decision = decideSelfDevCompletionTrigger({ command: 'git commit -m "a"', repoRoot: dir });
+  check("16) isFinal 미지정 -> decision.isFinal=false(기본값)", decision.trigger === true && decision.isFinal === false);
+}
+
+function scenarioRunHookPassesFinalFlagToRunner(): void {
+  const dir = makeGitRepo("sdch-run-final-");
+  makeDistEntry(dir);
+  writeSelfDevTaskContext(dir, { taskId: "G7.5", pushRequired: true, isFinal: true });
+  commitMore(dir, "a.txt");
+  const calls: { command: string; args: string[] }[] = [];
+  const runner = makeFakeRunner({ ok: true, code: 0, stdout: "", stderr: "" }, calls);
+  runSelfDevCompletionHook({ command: "git push origin main", repoRoot: dir }, runner);
+  check("17) isFinal:true -> runner 호출 인자에 --final 포함", calls[0]?.args.includes("--final"));
+}
+
+function scenarioRunHookOmitsFinalFlagByDefault(): void {
+  const dir = makeGitRepo("sdch-run-notfinal-");
+  makeDistEntry(dir);
+  writeSelfDevTaskContext(dir, { taskId: "G7.5b", pushRequired: false });
+  commitMore(dir, "a.txt");
+  const calls: { command: string; args: string[] }[] = [];
+  const runner = makeFakeRunner({ ok: true, code: 0, stdout: "", stderr: "" }, calls);
+  runSelfDevCompletionHook({ command: 'git commit -m "a"', repoRoot: dir }, runner);
+  check("18) isFinal 미지정(기본 하위 Task) -> 호출 인자에 --final 없음", !(calls[0]?.args.includes("--final") ?? true));
+}
+
 function main(): void {
   scenarioIrrelevantCommandNeverTriggers();
   scenarioNoContextNeverTriggers();
@@ -252,6 +293,10 @@ function main(): void {
   scenarioRunHookSuccessClearsContext();
   scenarioRunHookFailureKeepsContext();
   scenarioRunHookCommitOnlyOmitsPushFlag();
+  scenarioIsFinalPassedThroughToTriggerDecision();
+  scenarioIsFinalDefaultsFalseInTriggerDecision();
+  scenarioRunHookPassesFinalFlagToRunner();
+  scenarioRunHookOmitsFinalFlagByDefault();
 
   console.log("\n=== self-dev-completion-hook.ts(G7.3.1b) 테스트 결과 ===");
   for (const r of results) console.log(r);

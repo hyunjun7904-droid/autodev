@@ -66,6 +66,12 @@ export function createApprovalRequestsFromEvents(
     // 않는다(버튼이 안 보이는 것만으로는 부족하다, § telegram-approval-provider.ts와는
     // 별개로 store에 request가 0건이어야 한다).
     if (notification.notificationType === "SELF_DEV_WAITING_HUMAN") continue;
+    // Phase G Task G7.5 — production task-registry가 모두 끝났지만 마지막 task가
+    // isHumanGate라 실제 배포를 사람이 직접 트리거해야 하는 상태다. 이 파이프라인에는
+    // "배포를 원격으로 승인/실행"하는 resumable action이 없으므로(§ 요구사항 — 실제
+    // 배포는 사람 몫), SELF_DEV_WAITING_HUMAN과 동일한 이유로 ApprovalRequest 자체를
+    // 만들지 않는다.
+    if (notification.notificationType === "DEPLOYMENT_WAITING_HUMAN") continue;
 
     if (approvalStore.getByDedupeKey(notification.dedupeKey)) continue;
 

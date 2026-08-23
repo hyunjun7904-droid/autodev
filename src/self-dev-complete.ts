@@ -12,6 +12,12 @@ import {
   deliverSelfDevCompletionNotification,
 } from "./self-dev-completion";
 import { clearSelfDevTaskContext } from "./self-dev-task-context";
+import {
+  validateSelfDevTerminalReason,
+  isReasonValidationError,
+  recordSelfDevTerminalStatus,
+  MAX_SELF_DEV_TERMINAL_REASON_LENGTH,
+} from "./self-dev-terminal-status";
 
 // Self-Dev Task Completion Bridge — 자동 경로(Phase G Task G7.2.1).
 //
@@ -53,6 +59,11 @@ const TSC_BIN = join(REPO_ROOT, "node_modules", "typescript", "bin", "tsc");
 interface CliArgs {
   taskId: string;
   pushRequired: boolean;
+  /** Phase G Task G7.5 — 이 Task가 상위 Task/Phase의 진짜 최종 완료라는 명시적 선언(§
+   *  self-dev-completion.ts SelfDevCompletionEvidence.isFinal). self-dev:begin --final로
+   *  선언된 뒤 이 스크립트가 자동/수동으로 호출될 때만 true가 될 수 있다 — 이 스크립트
+   *  자신이 추측해서 채우지 않는다. */
+  isFinal: boolean;
   adapterPath?: string;
 }
 
@@ -63,6 +74,7 @@ function parseArgs(argv: string[]): CliArgs | { error: string } {
     return { error: "--task-id <id>가 필요합니다." };
   }
   const pushRequired = argv.includes("--push");
+  const isFinal = argv.includes("--final");
   const projIdx = argv.indexOf("--project");
   const adapterPath =
     projIdx !== -1 && typeof argv[projIdx + 1] === "string" && argv[projIdx + 1].length > 0
@@ -70,7 +82,7 @@ function parseArgs(argv: string[]): CliArgs | { error: string } {
       : process.env.AUTODEV_PROJECT_ADAPTER && process.env.AUTODEV_PROJECT_ADAPTER.trim().length > 0
         ? process.env.AUTODEV_PROJECT_ADAPTER
         : undefined;
-  return { taskId, pushRequired, adapterPath };
+  return { taskId, pushRequired, isFinal, adapterPath };
 }
 
 export interface CommandOutcome {
@@ -270,6 +282,47 @@ async function main(): Promise<void> {
   if (!checks.ok) {
     console.error("[self-dev-complete] 완료 조건을 충족하지 못했습니다 — TASK_COMPLETED event를 만들지 않습니다.");
     for (const r of checks.reasons) console.error(`  - ${r}`);
+
+    // Phase G Task G7.5 — 오늘까지는 여기서 콘솔 에러만 남기고 종료해 Telegram이 전혀
+    // 오지 않았다(§ 요구사항 3/9D — "최종 실패/미완료"도 사람이 폰으로 알 수 있어야 한다).
+    // checks.reasons는 전부 이 저장소 코드가 만든 고정/결정론적 문자열(typecheck/build/
+    // 회귀 실패 메시지, § runDeterministicCompletionChecks)이라 Claude의 자유 텍스트가
+    // 아니다 — 그래도 self-dev-terminal-status.ts의 동일한 안전 검증(길이/줄바꿈/
+    // secret-shape 거부)을 그대로 통과시킨다(단일 출처 재사용, 별도 검증 로직을 만들지
+    // 않는다). context는 소비하지 않는다(§ self-dev-blocked.ts와 동일 — 문제를 고쳐 같은
+    // taskId로 다시 시도할 수 있어야 한다).
+    process.env.AUTOMATION_DRY_RUN = "false";
+    process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
+    const joinedReasons = checks.reasons.join("; ") || "완료 조건을 충족하지 못했습니다.";
+    const truncatedReasons =
+      joinedReasons.length > MAX_SELF_DEV_TERMINAL_REASON_LENGTH
+        ? `${joinedReasons.slice(0, MAX_SELF_DEV_TERMINAL_REASON_LENGTH - 3)}...`
+        : joinedReasons;
+    const reasonSummary = validateSelfDevTerminalReason(truncatedReasons);
+    if (!isReasonValidationError(reasonSummary)) {
+      const manifest = loadProjectAdapter(parsed.adapterPath);
+      const events = selectDefaultEventStore();
+      const result = recordSelfDevTerminalStatus(events, { taskId: parsed.taskId, terminalStatus: "FAILED", reason: reasonSummary });
+      if (result.ok) {
+        console.error(
+          result.alreadyRecorded
+            ? `[self-dev-complete] 이미 기록된 동일 FAILED입니다(taskId=${parsed.taskId}) — 중복 event/알림 없이 종료합니다.`
+            : `[self-dev-complete] FAILED 기록됨 taskId=${parsed.taskId} runId=${result.runId}`
+        );
+        const { delivered } = await deliverSelfDevCompletionNotification(manifest);
+        if (!delivered) {
+          console.error("[self-dev-complete] controller가 이번 event를 아직 전달하지 못했을 수 있습니다(dedupe되어 있으니 중복 전송은 없습니다).");
+        }
+      } else {
+        console.error(`[self-dev-complete] FAILED event 기록 실패: ${result.error ?? "unknown"}`);
+      }
+    } else {
+      // 실패 사유 문자열이 표시 안전 검증(길이/줄바꿈/secret-shape)을 통과하지 못한
+      // 극단적인 경우 — 완료가 아니므로 exitCode는 어차피 1이지만, Telegram 없이도 콘솔
+      // 로그(위 for문)로 사유를 이미 전부 남겼으므로 진행을 막지 않는다.
+      console.error(`[self-dev-complete] 실패 사유 요약이 안전 검증을 통과하지 못해 Telegram 알림을 만들지 않았습니다: ${reasonSummary.error}`);
+    }
+
     process.exitCode = 1;
     return;
   }
@@ -283,6 +336,7 @@ async function main(): Promise<void> {
     pushRequired: parsed.pushRequired,
     pushPassed: checks.pushPassed,
     source: "claude-code-self-dev-bridge",
+    isFinal: parsed.isFinal,
   });
   if ("error" in evidence) {
     console.error(`[self-dev-complete] ${evidence.error}`);

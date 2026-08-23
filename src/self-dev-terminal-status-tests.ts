@@ -30,7 +30,7 @@ function check(label: string, cond: boolean): void {
 const TASK_ID = "G7.3.2-fixture";
 
 function makeContext(overrides: Partial<SelfDevTaskContext> = {}): SelfDevTaskContext {
-  return { taskId: TASK_ID, pushRequired: false, baseHeadHash: "abc1234", declaredAt: new Date().toISOString(), ...overrides };
+  return { taskId: TASK_ID, pushRequired: false, baseHeadHash: "abc1234", declaredAt: new Date().toISOString(), isFinal: false, ...overrides };
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ function scenarioWaitingHumanNotificationGenerated(): void {
   const notification = classifyEventForNotification(event);
   check("30) WAITING_HUMAN -> informational notification 정상 생성됨", notification !== undefined);
   check("31) WAITING_HUMAN -> notificationType=SELF_DEV_WAITING_HUMAN", notification?.notificationType === "SELF_DEV_WAITING_HUMAN");
-  check("32) WAITING_HUMAN -> title 고정 템플릿(사용자 확인 필요)", notification?.title === "[AutoDev] 사용자 확인 필요");
+  check("32) WAITING_HUMAN -> title 고정 템플릿(사용자 확인 필요)", notification?.title === "⛔ [AutoDev] 사용자 확인 필요");
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +320,57 @@ function scenarioNoTelegramCredentialInEventMetadata(): void {
   check("53) event.metadata는 정확히 기대한 필드만 담는다(추가 secret 필드 없음)", JSON.stringify(Object.keys(metadata).sort()) === JSON.stringify(expectedKeys));
 }
 
+// ---------------------------------------------------------------------------
+// 10) Phase G Task G7.5 — "FAILED"(self-dev-complete.ts의 deterministic 재검증 실패,
+//     ❌ 최종 미완료). BLOCKED/WAITING_HUMAN과 동일한 패턴(신규 eventType/notification/
+//     dedupe/approval 제외)을 그대로 검증한다.
+// ---------------------------------------------------------------------------
+function scenarioFailedRecordsNewEventType(): void {
+  const events = createInMemoryEventStore();
+  const result = recordSelfDevTerminalStatus(events, {
+    taskId: TASK_ID,
+    terminalStatus: "FAILED",
+    reason: "typecheck 실패(exit 1)(fixture)",
+  });
+  check("54) FAILED -> ok:true, alreadyRecorded:false", result.ok === true && result.alreadyRecorded === false);
+  check("55) FAILED -> 신규 SELF_DEV_TASK_FAILED eventType", result.eventType === "SELF_DEV_TASK_FAILED");
+
+  const { events: stored } = events.query({ taskId: TASK_ID, eventType: "SELF_DEV_TASK_FAILED" });
+  check("56) FAILED -> 정확히 1건의 event", stored.length === 1);
+  check("57) FAILED -> event.projectId는 self-dev 전용 상수", stored[0]?.projectId === SELF_DEV_PROJECT_ID);
+  check("58) FAILED -> event.outcome='FAILED'", stored[0]?.outcome === "FAILED");
+}
+
+function scenarioFailedNotificationGenerated(): void {
+  const events = createInMemoryEventStore();
+  recordSelfDevTerminalStatus(events, { taskId: TASK_ID, terminalStatus: "FAILED", reason: "빌드 실패(fixture)" });
+  const [event] = events.query({ taskId: TASK_ID, eventType: "SELF_DEV_TASK_FAILED" }).events;
+  const notification = classifyEventForNotification(event);
+  check("59) FAILED -> notification 정상 생성됨", notification !== undefined);
+  check("60) FAILED -> notificationType=SELF_DEV_TASK_FAILED", notification?.notificationType === "SELF_DEV_TASK_FAILED");
+  check("61) FAILED -> title에 ❌ 최종 미완료", notification?.title === "❌ [AutoDev] 최종 미완료");
+  check("62) FAILED -> requiresHumanAction=false(버튼 없음)", notification?.requiresHumanAction === false);
+  check("63) FAILED -> 사유에 reason 반영", (notification?.shortMessage ?? "").includes("빌드 실패(fixture)"));
+}
+
+function scenarioFailedApprovalRequestZero(): void {
+  const events = createInMemoryEventStore();
+  const approvalStore = createInMemoryApprovalStore();
+  recordSelfDevTerminalStatus(events, { taskId: TASK_ID, terminalStatus: "FAILED", reason: "회귀 실패(fixture)" });
+  const result = createApprovalRequestsFromEvents(events.query().events, approvalStore, { eventStore: events });
+  check("64) FAILED -> ApprovalRequest 0건", result.created.length === 0);
+  check("65) FAILED -> ApprovalStore에도 request 없음", approvalStore.list().length === 0);
+}
+
+function scenarioFailedRepeatDedupe(): void {
+  const events = createInMemoryEventStore();
+  recordSelfDevTerminalStatus(events, { taskId: TASK_ID, terminalStatus: "FAILED", reason: "동일 사유(fixture)" });
+  const second = recordSelfDevTerminalStatus(events, { taskId: TASK_ID, terminalStatus: "FAILED", reason: "동일 사유(fixture)" });
+  check("66) FAILED -> 동일 taskId+reason 재실행은 alreadyRecorded:true", second.alreadyRecorded === true);
+  const { events: stored } = events.query({ taskId: TASK_ID, eventType: "SELF_DEV_TASK_FAILED" });
+  check("67) FAILED -> event는 여전히 1건뿐(중복 없음)", stored.length === 1);
+}
+
 async function main(): Promise<void> {
   scenarioReasonHappyPath();
   scenarioReasonMissing();
@@ -350,6 +401,10 @@ async function main(): Promise<void> {
   scenarioWaitingHumanThenCompletedBothAllowed();
   scenarioAppendFailurePropagates();
   scenarioNoTelegramCredentialInEventMetadata();
+  scenarioFailedRecordsNewEventType();
+  scenarioFailedNotificationGenerated();
+  scenarioFailedApprovalRequestZero();
+  scenarioFailedRepeatDedupe();
 
   console.log("\n=== self-dev-terminal-status.ts(G7.3.2) 테스트 결과 ===");
   for (const r of results) console.log(r);

@@ -893,7 +893,37 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     },
     auditFailures
   );
-  emitEvent(events, { eventType: "TASK_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" }, auditFailures);
+  // Phase G Task G7.5 — Telegram 알림 UX Hardening. 이 task 완료가 "하위 Task(🟡)"인지
+  // "상위 task-registry 전체가 진짜 최종 완료될 예정(PENDING_FINAL)"인지 "모든 자동 task는
+  // 끝났지만 이 task가 isHumanGate라 배포는 사람이 트리거해야 하는지(PENDING_DEPLOYMENT_
+  // GATE)"인지를, 실제로 state에 반영하기 전에 미리 계산한다(getNextTask는 순수 함수라
+  // 부수효과 없이 두 번 호출해도 안전하다 — 아래 909번째 줄의 실제 판정과 동일한 로직).
+  // TASK_COMPLETED 이 event 자체에는 "PENDING_*"만 남기고, notification.ts가 이 값을 보고
+  // 알림을 만들지 않는다(§ 그 파일) — 실제 "최종 완료" Telegram은 project-state.json 저장 +
+  // administrative commit이 성공한 뒤에만(§ 아래) 별도 event로 보낸다. 이 순서를 지키지
+  // 않으면(예: 여기서 바로 최종 완료를 알리면) "TASK_COMPLETED 발생 → 최종 완료 Telegram →
+  // 그 뒤 최종 검증/보고" 순서가 되어 요구사항이 명시적으로 금지하는 잘못된 순서가 된다.
+  const completedTasksAfterThis = [...(state.completedTasks ?? []), taskDef.id];
+  const willHaveNextTask = getNextTask(manifest.taskRegistry, completedTasksAfterThis) !== null;
+  const taskCompletionScope: "SUBTASK" | "PENDING_FINAL" | "PENDING_DEPLOYMENT_GATE" = willHaveNextTask
+    ? "SUBTASK"
+    : taskDef.isHumanGate
+      ? "PENDING_DEPLOYMENT_GATE"
+      : "PENDING_FINAL";
+
+  emitEvent(
+    events,
+    {
+      eventType: "TASK_COMPLETED",
+      runId,
+      projectId: manifest.projectId,
+      taskId: taskDef.id,
+      executionPhase: "state_update",
+      outcome: "SUCCESS",
+      metadata: { completionScope: taskCompletionScope },
+    },
+    auditFailures
+  );
   emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "state_update", outcome: "SUCCESS" }, auditFailures);
 
   // product commit(위 performTaskCheckpoint)이 끝난 뒤에만 project-state.json을 갱신하고
@@ -931,6 +961,49 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     afterAdmin.deferredHumanTasks.push(`PROJECT_STATE_COMMIT_FAILED(${taskDef.id}): ${adminCommit.reason}`);
     saveState(afterAdmin, statePath);
     log("project-state administrative commit 실패", { taskId: taskDef.id, reason: adminCommit.reason });
+  }
+
+  // Phase G Task G7.5 — 위에서 계산한 taskCompletionScope가 SUBTASK가 아니면, project-state
+  // 저장(saveState) + administrative commit이 이미 끝난 *이후*인 지금에서야 authoritative
+  // 최종 event를 남긴다(§ 요구사항 5 순서 — "실행 → 검증 → state/completion 처리 →
+  // 최종보고 확정 → 최종 Telegram"). administrative commit이 실패했으면(adminCommit.ok===
+  // false) "최종 state 기록 성공"이라는 완료 조건 자체를 충족하지 못한 것이므로, 어떤
+  // scope였든 ✅/⛔ 최종 event 대신 기존 RUN_BLOCKED(사람 확인 필요, § notification.ts)로
+  // 남긴다 — product commit(코드 변경)은 이미 안전하게 커밋됐고 project-state.json도
+  // working tree에는 올바른 최종 상태로 저장돼 있으므로, 이 실패가 코드 변경 자체를
+  // 위험하게 만들지는 않는다.
+  if (taskCompletionScope !== "SUBTASK") {
+    if (!adminCommit.ok) {
+      emitEvent(events, {
+        eventType: "RUN_BLOCKED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "state_update",
+        outcome: "BLOCKED",
+        reason: "project-state 최종 기록(commit)에 실패해 최종 완료를 확정하지 못했습니다.",
+      });
+    } else if (taskCompletionScope === "PENDING_FINAL") {
+      emitEvent(events, {
+        eventType: "PROJECT_COMPLETED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "state_update",
+        outcome: "SUCCESS",
+        metadata: { commitHash: checkpoint.commitHash ?? null },
+      });
+    } else {
+      emitEvent(events, {
+        eventType: "DEPLOYMENT_WAITING_HUMAN",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "state_update",
+        outcome: "SUCCESS",
+        humanInterventionRequired: true,
+      });
+    }
   }
 
   console.log(`[autodev] task ${taskDef.id} APPROVED + checkpoint 완료 (commit ${checkpoint.commitHash ?? "?"})`);

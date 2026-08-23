@@ -8,6 +8,7 @@ import {
   recordSelfDevTaskCompleted,
 } from "./self-dev-completion";
 import type { SelfDevCompletionEvidence } from "./self-dev-completion";
+import { classifyEventForNotification } from "./notification";
 
 // Self-Dev Task Completion Bridge — 공유 판정/기록 서비스 테스트(Phase G Task G7.2.1).
 // 실제 Claude/GPT 유료 호출, 실제 Telegram 네트워크 전송 없음(전부 in-memory/순수 함수 검증).
@@ -201,11 +202,60 @@ function scenarioNoTelegramCredentialInEventMetadata(): void {
   const noTokenLeak = !/BOT_TOKEN|CHAT_ID|telegram/i.test(serialized);
 
   const metadata = (stored[0]?.metadata ?? {}) as Record<string, unknown>;
-  const expectedKeys = ["commitHash", "testsPassed", "typecheckPassed", "buildPassed", "pushRequired", "pushPassed", "source"].sort();
+  const expectedKeys = [
+    "commitHash",
+    "testsPassed",
+    "typecheckPassed",
+    "buildPassed",
+    "pushRequired",
+    "pushPassed",
+    "source",
+    "completionScope",
+  ].sort();
   const actualKeys = Object.keys(metadata).sort();
 
   check("28) 기록된 TASK_COMPLETED event에 Telegram Bot Token/Chat ID 관련 문자열이 없다", noTokenLeak);
   check("29) event.metadata는 정확히 기대한 필드만 담는다(추가 secret 필드 없음)", JSON.stringify(actualKeys) === JSON.stringify(expectedKeys));
+}
+
+// ---------------------------------------------------------------------------
+// 5) Phase G Task G7.5 — isFinal(--final)이 completionScope/최종 보고 메타데이터를 만든다.
+// ---------------------------------------------------------------------------
+function scenarioIsFinalDefaultsToSubtask(): void {
+  const events = createInMemoryEventStore();
+  const evidence = requireValid(baseEvidence({ taskId: "G7.5-default", commitHash: VALID_COMMIT }));
+  check("30) isFinal 미지정 -> evidence.isFinal=false(기본값)", evidence.isFinal === false);
+
+  recordSelfDevTaskCompleted(events, evidence);
+  const [event] = events.query({ taskId: evidence.taskId, eventType: "TASK_COMPLETED" }).events;
+  check("31) isFinal=false -> metadata.completionScope='SUBTASK'", event?.metadata?.completionScope === "SUBTASK");
+  check("32) isFinal=false -> metadata.finalReportGenerated 없음", event?.metadata?.finalReportGenerated === undefined);
+}
+
+function scenarioIsFinalTrueProducesFinalReport(): void {
+  const events = createInMemoryEventStore();
+  const evidence = requireValid(baseEvidence({ taskId: "G7.5-final", commitHash: VALID_COMMIT, isFinal: true }));
+  check("33) --final 지정 -> evidence.isFinal=true", evidence.isFinal === true);
+
+  const result = recordSelfDevTaskCompleted(events, evidence);
+  check("34) isFinal=true -> record ok:true", result.ok === true);
+  const [event] = events.query({ taskId: evidence.taskId, eventType: "TASK_COMPLETED" }).events;
+  check("35) isFinal=true -> metadata.completionScope='FINAL'", event?.metadata?.completionScope === "FINAL");
+  check("36) isFinal=true -> metadata.finalReportGenerated=true", event?.metadata?.finalReportGenerated === true);
+  check(
+    "37) isFinal=true -> metadata.finalReportSummary에 commitHash 포함(추측 아닌 재검증된 값)",
+    typeof event?.metadata?.finalReportSummary === "string" && (event.metadata.finalReportSummary as string).includes(VALID_COMMIT)
+  );
+
+  const notification = event ? classifyEventForNotification(event) : undefined;
+  check("38) isFinal=true -> notification ✅ FINAL_COMPLETED로 승격", notification?.notificationType === "FINAL_COMPLETED");
+}
+
+// isFinal이 true여도 나머지 검증 요건(tests/typecheck/build)이 전혀 완화되지 않는다는 것을
+// 재확인한다 — "--final을 붙이면 검증이 느슨해진다"는 우회가 없다.
+function scenarioIsFinalDoesNotRelaxValidation(): void {
+  const result = validateSelfDevCompletionEvidence({ ...baseEvidence({ testsPassed: false }), isFinal: true });
+  check("39) isFinal=true여도 testsPassed=false면 여전히 실패", isEvidenceError(result));
 }
 
 function main(): void {
@@ -229,6 +279,9 @@ function main(): void {
   scenarioRecordNewEventForDifferentCommit();
   scenarioRecordAppendFailurePropagates();
   scenarioNoTelegramCredentialInEventMetadata();
+  scenarioIsFinalDefaultsToSubtask();
+  scenarioIsFinalTrueProducesFinalReport();
+  scenarioIsFinalDoesNotRelaxValidation();
 
   console.log("\n=== self-dev-completion.ts(G7.2.1) 테스트 결과 ===");
   for (const r of results) console.log(r);

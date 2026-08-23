@@ -37,8 +37,9 @@ function scenarioTaskCompleted(): void {
   check("TASK_COMPLETED: type", n?.notificationType === "TASK_COMPLETED");
   check("TASK_COMPLETED: severity=INFO", n?.severity === "INFO");
   check("TASK_COMPLETED: requiresHumanAction=false", n?.requiresHumanAction === false);
-  check("TASK_COMPLETED: title 고정 템플릿", n?.title === "[AutoDev] Task 완료");
+  check("TASK_COMPLETED: title 고정 템플릿(하위 Task, 🟡)", n?.title === "🟡 [AutoDev] 작업 단계 완료");
   check("TASK_COMPLETED: shortMessage에 taskId 포함", (n?.shortMessage ?? "").includes("T1"));
+  check("TASK_COMPLETED: shortMessage에 '다음 프로젝트 시작 가능: 아니오' 포함", (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 아니오"));
 }
 
 // 2026-08-22 incident 이후 — RUN_COMPLETED/TEST_FAILED는 더 이상 알림을 만들지 않는다(§
@@ -108,7 +109,113 @@ function scenarioSelfDevWaitingHuman(): void {
   check("SELF_DEV_WAITING_HUMAN: 기존 WAITING_HUMAN(REVIEW_BLOCKED)과 다른 type", n?.notificationType !== "WAITING_HUMAN");
   check("SELF_DEV_WAITING_HUMAN: severity=ACTION_REQUIRED", n?.severity === "ACTION_REQUIRED");
   check("SELF_DEV_WAITING_HUMAN: requiresHumanAction=true", n?.requiresHumanAction === true);
-  check("SELF_DEV_WAITING_HUMAN: title 고정 템플릿", n?.title === "[AutoDev] 사용자 확인 필요");
+  check("SELF_DEV_WAITING_HUMAN: title 고정 템플릿", n?.title === "⛔ [AutoDev] 사용자 확인 필요");
+}
+
+// ---------------------------------------------------------------------------
+// 1b) Phase G Task G7.5 — 하위 Task 완료 vs 상위 Task/Phase 진짜 최종 완료 구분.
+// ---------------------------------------------------------------------------
+
+// 9A — 하위 Task/fixture/internal run 완료 → 🟡, 다음 프로젝트 시작 가능: 아니오.
+function scenarioSubtaskCompletionIsNotFinal(): void {
+  const n = classifyEventForNotification(
+    ev({ eventType: "TASK_COMPLETED", runId: "r20", taskId: "T1", outcome: "SUCCESS", metadata: { completionScope: "SUBTASK" } })
+  );
+  check("9A) SUBTASK completionScope: 🟡 TASK_COMPLETED로 분류", n?.notificationType === "TASK_COMPLETED");
+  check("9A) SUBTASK completionScope: title에 🟡 포함", (n?.title ?? "").startsWith("🟡"));
+  check("9A) SUBTASK completionScope: '다음 프로젝트 시작 가능: 아니오'", (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 아니오"));
+
+  // metadata 자체가 없는(production의 예전 event 형태와 동일한) 경우도 안전하게 SUBTASK
+  // 기본값으로 처리된다(§ 하위호환 — completionScope가 없으면 항상 🟡).
+  const noMeta = classifyEventForNotification(ev({ eventType: "TASK_COMPLETED", runId: "r20b", taskId: "T1", outcome: "SUCCESS" }));
+  check("9A) completionScope 없음(구버전 event) -> 여전히 🟡 TASK_COMPLETED", noMeta?.notificationType === "TASK_COMPLETED");
+}
+
+// 9B — 상위 작업 최종 완료(production: PROJECT_COMPLETED event / self-dev: TASK_COMPLETED
+// metadata.completionScope="FINAL") → ✅, 다음 프로젝트 시작 가능: 예.
+function scenarioFinalCompletion(): void {
+  const projectCompleted = classifyEventForNotification(
+    ev({ eventType: "PROJECT_COMPLETED", runId: "r21", taskId: "P.10", outcome: "SUCCESS" })
+  );
+  check("9B) PROJECT_COMPLETED -> FINAL_COMPLETED로 분류", projectCompleted?.notificationType === "FINAL_COMPLETED");
+  check("9B) PROJECT_COMPLETED -> title에 ✅ 포함", (projectCompleted?.title ?? "").startsWith("✅"));
+  check(
+    "9B) PROJECT_COMPLETED -> '다음 프로젝트 시작 가능: 예'",
+    (projectCompleted?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 예")
+  );
+  check("9B) PROJECT_COMPLETED -> requiresHumanAction=false(버튼 없음)", projectCompleted?.requiresHumanAction === false);
+
+  const selfDevFinal = classifyEventForNotification(
+    ev({ eventType: "TASK_COMPLETED", runId: "r22", taskId: "G7.5", outcome: "SUCCESS", metadata: { completionScope: "FINAL" } })
+  );
+  check("9B) self-dev TASK_COMPLETED(completionScope=FINAL) -> FINAL_COMPLETED로 승격", selfDevFinal?.notificationType === "FINAL_COMPLETED");
+  check(
+    "9B) self-dev FINAL -> '다음 프로젝트 시작 가능: 예'",
+    (selfDevFinal?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 예")
+  );
+}
+
+// production에서 마지막 task의 TASK_COMPLETED(PENDING_FINAL/PENDING_DEPLOYMENT_GATE)는
+// 그 자체로 알림을 만들지 않는다 — 뒤이은 PROJECT_COMPLETED/DEPLOYMENT_WAITING_HUMAN이
+// state 저장 이후에만 최종 알림을 만든다(§ 요구사항 5 순서, autodev.ts). 이 event 하나에
+// 대해 🟡와 ✅/⛔ 두 알림이 동시에 나가지 않는다는 것을 확인한다.
+function scenarioPendingFinalSuppressed(): void {
+  const pendingFinal = classifyEventForNotification(
+    ev({ eventType: "TASK_COMPLETED", runId: "r23", taskId: "P.10", outcome: "SUCCESS", metadata: { completionScope: "PENDING_FINAL" } })
+  );
+  check("PENDING_FINAL: 이 event 자체는 알림을 만들지 않음(중복 방지)", pendingFinal === undefined);
+
+  const pendingGate = classifyEventForNotification(
+    ev({ eventType: "TASK_COMPLETED", runId: "r24", taskId: "P.9", outcome: "SUCCESS", metadata: { completionScope: "PENDING_DEPLOYMENT_GATE" } })
+  );
+  check("PENDING_DEPLOYMENT_GATE: 이 event 자체는 알림을 만들지 않음(중복 방지)", pendingGate === undefined);
+}
+
+// 9C — WAITING_HUMAN/BLOCKED류(사람 확인 필요) → ⛔, 다음 프로젝트 시작 가능: 아니오.
+// production의 DEPLOYMENT_WAITING_HUMAN도 같은 ⛔ 버킷에 속한다.
+function scenarioDeploymentWaitingHuman(): void {
+  const n = classifyEventForNotification(
+    ev({ eventType: "DEPLOYMENT_WAITING_HUMAN", runId: "r25", taskId: "P.9", outcome: "SUCCESS", humanInterventionRequired: true })
+  );
+  check("9C) DEPLOYMENT_WAITING_HUMAN: type 일치", n?.notificationType === "DEPLOYMENT_WAITING_HUMAN");
+  check("9C) DEPLOYMENT_WAITING_HUMAN: title에 ⛔ 포함", (n?.title ?? "").startsWith("⛔"));
+  check("9C) DEPLOYMENT_WAITING_HUMAN: requiresHumanAction=true", n?.requiresHumanAction === true);
+  check(
+    "9C) DEPLOYMENT_WAITING_HUMAN: '다음 프로젝트 시작 가능: 아니오'",
+    (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 아니오")
+  );
+}
+
+function scenarioAllConfirmRequiredTypesShareIcon(): void {
+  const confirmTypes: [import("./observability-event").AutoDevEventType, boolean][] = [
+    ["REVIEW_BLOCKED", false],
+    ["HUMAN_APPROVAL_REQUIRED", false],
+    ["SECURITY_BLOCKED", false],
+    ["REVIEW_CYCLE_EXHAUSTED", false],
+    ["RUN_BLOCKED", false],
+    ["SELF_DEV_WAITING_HUMAN", false],
+    ["DEPLOYMENT_WAITING_HUMAN", false],
+  ];
+  const allShareIcon = confirmTypes.every(([eventType]) => {
+    const n = classifyEventForNotification(ev({ eventType, runId: `r-icon-${eventType}`, taskId: "T1" }));
+    return (n?.title ?? "").startsWith("⛔ [AutoDev] 사용자 확인 필요") && (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 아니오");
+  });
+  check("9C) 사람 확인 필요 6+1종 모두 ⛔ [AutoDev] 사용자 확인 필요 + '다음 프로젝트 시작 가능: 아니오'", allShareIcon);
+}
+
+// 9D — 최종 실패/미완료 → ❌, 다음 프로젝트 시작 가능: 아니오.
+function scenarioSelfDevTaskFailed(): void {
+  const n = classifyEventForNotification(
+    ev({ eventType: "SELF_DEV_TASK_FAILED", runId: "r26", taskId: "G7.5", outcome: "FAILED", reason: "typecheck 실패(exit 1)." })
+  );
+  check("9D) SELF_DEV_TASK_FAILED: type 일치", n?.notificationType === "SELF_DEV_TASK_FAILED");
+  check("9D) SELF_DEV_TASK_FAILED: title에 ❌ 포함", (n?.title ?? "").startsWith("❌"));
+  check("9D) SELF_DEV_TASK_FAILED: requiresHumanAction=false(버튼 없음)", n?.requiresHumanAction === false);
+  check("9D) SELF_DEV_TASK_FAILED: 사유에 reason 반영됨", (n?.shortMessage ?? "").includes("typecheck 실패(exit 1)."));
+  check(
+    "9D) SELF_DEV_TASK_FAILED: '다음 프로젝트 시작 가능: 아니오'",
+    (n?.shortMessage ?? "").includes("다음 프로젝트 시작 가능: 아니오")
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +278,10 @@ function scenarioNoSensitiveDataLeak(): void {
   const n = classifyEventForNotification(event);
   const serialized = JSON.stringify(n);
   check("SECURITY_BLOCKED: reason/error/metadata 원문이 알림에 노출되지 않음", !serialized.includes(secretMarker));
-  check("SECURITY_BLOCKED: title/shortMessage는 고정 템플릿만 포함", n?.shortMessage === "Task T1에서 보안 게이트가 checkpoint를 차단했습니다.");
+  check(
+    "SECURITY_BLOCKED: title/shortMessage는 고정 템플릿만 포함(event.reason 미노출)",
+    n?.shortMessage === "작업: T1\n사유: 보안 게이트가 checkpoint를 차단했습니다.\n다음 프로젝트 시작 가능: 아니오"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +311,12 @@ function scenarioNoTaskIdFallback(): void {
 
 async function main(): Promise<void> {
   scenarioTaskCompleted();
+  scenarioSubtaskCompletionIsNotFinal();
+  scenarioFinalCompletion();
+  scenarioPendingFinalSuppressed();
+  scenarioDeploymentWaitingHuman();
+  scenarioAllConfirmRequiredTypesShareIcon();
+  scenarioSelfDevTaskFailed();
   scenarioRunCompletedNoLongerNotifies();
   scenarioTestCompletedNeverNotifies();
   scenarioWaitingHuman();

@@ -164,6 +164,42 @@ function scenarioRedeclareAfterNewCommitUpdatesBaseline(): void {
   check("9) 재선언된 taskId가 새 값으로 덮어써진다", second.taskId === "G7.3.2");
 }
 
+// ---------------------------------------------------------------------------
+// 10) Phase G Task G7.5 — isFinal(--final) round trip + 기본값/하위호환
+// ---------------------------------------------------------------------------
+function scenarioIsFinalRoundTrip(): void {
+  const dir = makeGitRepo("sdtc-isfinal-");
+  const written = writeSelfDevTaskContext(dir, { taskId: "G7.5", pushRequired: false, isFinal: true });
+  check("10) isFinal:true로 write 성공", !isTaskContextError(written));
+  if (isTaskContextError(written)) return;
+  check("10) write된 isFinal이 true", written.isFinal === true);
+
+  const read = readSelfDevTaskContext(dir);
+  check("10) read가 isFinal=true를 그대로 반환(round trip)", !isTaskContextError(read) && !!read && read.isFinal === true);
+}
+
+function scenarioIsFinalDefaultsToFalse(): void {
+  const dir = makeGitRepo("sdtc-isfinal-default-");
+  const written = writeSelfDevTaskContext(dir, { taskId: "G7.5b", pushRequired: false });
+  check("11) isFinal 미지정 -> write된 isFinal은 false(기본값, 추측 금지)", !isTaskContextError(written) && written.isFinal === false);
+}
+
+// 이 필드가 생기기 전에 저장된(isFinal 필드 자체가 없는) context 파일도 여전히 read 가능해야
+// 한다 — false로 안전하게 취급한다(§ self-dev-task-context.ts 주석).
+function scenarioIsFinalMissingFieldBackwardCompatible(): void {
+  const dir = makeGitRepo("sdtc-isfinal-legacy-");
+  const path = selfDevTaskContextPath(dir);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({ taskId: "G7.3.1b", pushRequired: false, baseHeadHash: headHashOf(dir), declaredAt: new Date().toISOString() }),
+    "utf-8"
+  );
+  const result = readSelfDevTaskContext(dir);
+  check("12) isFinal 필드 없는 기존 context → read 성공(하위호환)", !isTaskContextError(result));
+  check("13) isFinal 필드 없는 기존 context → isFinal=false로 안전하게 처리", !isTaskContextError(result) && !!result && result.isFinal === false);
+}
+
 function main(): void {
   scenarioNoContextIsUndefined();
   scenarioInvalidTaskIdFailsClosed();
@@ -174,6 +210,9 @@ function main(): void {
   scenarioClearRemovesContext();
   scenarioClearWithoutContextDoesNotThrow();
   scenarioRedeclareAfterNewCommitUpdatesBaseline();
+  scenarioIsFinalRoundTrip();
+  scenarioIsFinalDefaultsToFalse();
+  scenarioIsFinalMissingFieldBackwardCompatible();
 
   console.log("\n=== self-dev-task-context.ts(G7.3.1b) 테스트 결과 ===");
   for (const r of results) console.log(r);

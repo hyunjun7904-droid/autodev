@@ -103,7 +103,32 @@ export type AutoDevEventType =
   // 버튼으로 재개할 수 없는 상태)에 도달했다는 사실만 담는다(§ self-dev-terminal-status.ts).
   // self-dev BLOCKED는 새 event type을 만들지 않고 기존 RUN_BLOCKED를 그대로 재사용한다
   // (§ approval-service.ts의 기존 RUN_BLOCKED 제외 규칙을 그대로 재사용하기 위함).
-  | "SELF_DEV_WAITING_HUMAN";
+  | "SELF_DEV_WAITING_HUMAN"
+  // Phase G Task G7.5 — Telegram 알림 UX Hardening(하위 Task 완료 vs 상위 Task/Phase 진짜
+  // 최종 완료 구분). 이 세 event는 TASK_COMPLETED(하위 Task/subtask, 이미 존재)와 명확히
+  // 구분되는 "authoritative final" 신호다 — 추측(session 종료/마지막 메시지 등)이 아니라
+  // 이미 코드가 갖고 있는 구조적 사실로만 판정한다(§ autodev.ts/self-dev-completion.ts).
+  //   - PROJECT_COMPLETED: production task-registry(getNextTask)가 "다음 task 없음 +
+  //     isHumanGate 아님"으로 판정한 이후에만(project-state.json PROJECT_COMPLETE 저장 +
+  //     administrative commit 성공 이후) 발생한다 — self-dev의 --final(§
+  //     self-dev-completion.ts SelfDevCompletionEvidence.isFinal)도 같은 "진짜 최종
+  //     완료" 의미를 이 event가 아니라 TASK_COMPLETED.metadata.completionScope="FINAL"로
+  //     표현한다(self-dev는 별도 registry가 없어 이 event를 쓰지 않는다).
+  //   - DEPLOYMENT_WAITING_HUMAN: production task-registry의 모든 자동 task는 끝났지만
+  //     마지막 task가 isHumanGate라 실제 배포는 사람이 트리거해야 하는 상태(기존
+  //     PLAN_MARKERS.DEPLOYMENT_WAITING_HUMAN과 동일한 사실의 event화). "최종 완료"가
+  //     아니라 "사람 확인 필요" 쪽으로 분류된다(§ notification.ts) — remotelyApprovable
+  //     버튼을 만들지 않는다(§ approval-service.ts, RUN_BLOCKED/SELF_DEV_WAITING_HUMAN과
+  //     동일한 명시적 제외 패턴).
+  //   - SELF_DEV_TASK_FAILED: self-dev-complete.ts의 deterministic 재검증
+  //     (typecheck/build/전체 회귀/commit/push)이 실패로 끝났다는 사실 — 오늘은 콘솔
+  //     에러만 남기고 Telegram이 전혀 오지 않던 gap을 메운다(§ self-dev-terminal-status.ts
+  //     SelfDevTerminalStatus="FAILED"). REVISE 루프 내부 재시도가 아니라 실제 git commit/
+  //     push 시점에만 발생하므로 2026-08-22 incident가 금지한 "REVISE마다 반복되는 알림"과
+  //     다르다.
+  | "PROJECT_COMPLETED"
+  | "DEPLOYMENT_WAITING_HUMAN"
+  | "SELF_DEV_TASK_FAILED";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -157,6 +182,9 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   REMOTE_GIT_CHANGED: ["observability", "audit"],
   REMOTE_PUSH_REJECTED: ["observability", "audit"],
   SELF_DEV_WAITING_HUMAN: ["observability", "audit"],
+  PROJECT_COMPLETED: ["observability", "audit"],
+  DEPLOYMENT_WAITING_HUMAN: ["observability", "audit"],
+  SELF_DEV_TASK_FAILED: ["observability", "audit"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
@@ -202,6 +230,12 @@ const AUDIT_CRITICAL_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set<AutoDe
   // Phase G Task G7.3.2 — self-dev가 사람 확인이 필요한 상태로 멈췄다는 사실 자체가 감사상
   // 중요하다(§ HUMAN_APPROVAL_REQUIRED/REVIEW_BLOCKED와 동일한 근거).
   "SELF_DEV_WAITING_HUMAN",
+  // Phase G Task G7.5 — 진짜 최종 완료/배포 대기/self-dev 최종 실패는 모두 "다음 프로젝트를
+  // 시작해도 되는가"를 사람이 판단하는 근거가 되는 최종 상태 사실이라 RUN·TASK 최종 상태와
+  // 동일하게 기록 실패를 조용히 넘기지 않는다.
+  "PROJECT_COMPLETED",
+  "DEPLOYMENT_WAITING_HUMAN",
+  "SELF_DEV_TASK_FAILED",
 ]);
 
 /** true면 이 event의 append 실패를 조용히 넘기면 안 된다(§ event-store.ts/autodev.ts/

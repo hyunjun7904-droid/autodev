@@ -36,6 +36,10 @@ import {
 //   --push               origin/main fast-forward push까지 요구되는 Task였다면 지정
 //                         (지정하면 --push-passed도 함께 요구한다)
 //   --push-passed        push 성공 확인(--push가 있을 때만 검사)
+//   --final              이 Task가 상위 Task/Phase의 진짜 최종 완료라고 명시적으로 주장할
+//                         때만 지정(§ Phase G Task G7.5, self-dev-completion.ts
+//                         SelfDevCompletionEvidence.isFinal) — 지정하지 않으면(기본값)
+//                         🟡 하위 Task 완료로만 알린다.
 // FAILED/WAITING_HUMAN/BLOCKED/중간 checkpoint에는 이 스크립트를 쓰지 않는다 — 그런
 // 상태에는 이미 같은 파이프라인에 연결된 기존 notification type(HUMAN_APPROVAL_REQUIRED/
 // RUN_BLOCKED/SECURITY_BLOCKED 등, § notification.ts)이 있고, 그 event들은 이미
@@ -69,6 +73,12 @@ interface ParsedArgs {
   buildPassed: boolean;
   pushRequired: boolean;
   pushPassed: boolean;
+  /** Phase G Task G7.5 — self-dev-complete.ts와 동일한 의미(§ self-dev-completion.ts
+   *  SelfDevCompletionEvidence.isFinal) — 이 CLI를 실행하는 사람이 "이 Task가 상위
+   *  Task/Phase의 진짜 최종 완료"라고 명시적으로 주장할 때만 지정한다. 다른 evidence
+   *  플래그와 마찬가지로 이 CLI는 이 값도 그대로 신뢰한다(§ 파일 상단 주석 — 이 CLI의
+   *  기존 신뢰 모델). */
+  isFinal: boolean;
   adapterPath?: string;
 }
 
@@ -96,6 +106,7 @@ function parseArgs(argv: string[]): ParsedArgs | { error: string } {
   const pushRequired = flag(argv, "--push");
   const pushPassed = flag(argv, "--push-passed");
   if (pushRequired && !pushPassed) return { error: "--push가 지정되었으면 --push-passed도 필요합니다(fast-forward push 성공 확인)." };
+  const isFinal = flag(argv, "--final");
 
   const idx = argv.indexOf("--project");
   const adapterPath =
@@ -105,7 +116,7 @@ function parseArgs(argv: string[]): ParsedArgs | { error: string } {
         ? process.env.AUTODEV_PROJECT_ADAPTER
         : undefined;
 
-  return { taskId, commitHash, testsPassed, typecheckPassed, buildPassed, pushRequired, pushPassed, adapterPath };
+  return { taskId, commitHash, testsPassed, typecheckPassed, buildPassed, pushRequired, pushPassed, isFinal, adapterPath };
 }
 
 async function main(): Promise<void> {
@@ -125,6 +136,7 @@ async function main(): Promise<void> {
     pushRequired: parsed.pushRequired,
     pushPassed: parsed.pushPassed,
     source: "claude-code-self-dev-cli",
+    isFinal: parsed.isFinal,
   });
   if (isEvidenceError(evidence)) {
     console.error(`[notify-task-completed] ${evidence.error}`);
