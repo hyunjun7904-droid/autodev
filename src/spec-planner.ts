@@ -488,17 +488,106 @@ function structuralGuard(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+// ---------------------------------------------------------------------------
+// A. Transport Normalization — LLM이 "JSON만 출력하라"는 지시를 어기고 설명문을 앞뒤에
+// 붙이거나 markdown ```json fence로 감싸는 경우를 다룬다. 원본 raw JSON은 항상 그대로
+// 허용하고, 정확히 하나의 markdown 코드 펜스만 존재하며 그 언어 태그가 비어있거나 "json"일
+// 때만 그 안의 내용을 후보로 추출한다 — 코드 펜스가 0개/2개 이상이거나(여러 JSON 후보/
+// 애매함) 언어 태그가 다른 경우(예: ```yaml)는 추출을 포기하고 원문 그대로 strict
+// JSON.parse에 맡겨 실패시킨다(느슨하게 만들지 않는다 — 애매하면 거부). 이 함수는 key/값을
+// 전혀 들여다보지 않는다(schema validation과 완전히 분리) — 순수하게 "어디까지가 JSON
+// 텍스트인가"만 판정하는 순수 함수다.
+// ---------------------------------------------------------------------------
+const MARKDOWN_FENCE_RE = /```([A-Za-z0-9_-]*)[ \t]*\r?\n([\s\S]*?)```/g;
+
+function extractJsonPayload(rawText: string): { ok: true; jsonText: string } | { ok: false; reason: string } {
+  const trimmedFull = rawText.trim();
+  try {
+    JSON.parse(trimmedFull);
+    return { ok: true, jsonText: trimmedFull };
+  } catch {
+    // raw 전체가 바로 JSON이 아니면 아래에서 코드 펜스 추출을 시도한다.
+  }
+
+  const fences = [...rawText.matchAll(MARKDOWN_FENCE_RE)];
+  if (fences.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        fences.length === 0
+          ? "raw JSON도 아니고 markdown 코드 펜스도 없습니다."
+          : `markdown 코드 펜스가 ${fences.length}개 발견되어 어떤 것이 실제 출력인지 모호합니다.`,
+    };
+  }
+  const [, tag, body] = fences[0];
+  const normalizedTag = tag.trim().toLowerCase();
+  if (normalizedTag !== "" && normalizedTag !== "json") {
+    return { ok: false, reason: `단일 코드 펜스의 언어 태그가 json이 아닙니다(태그: ${normalizedTag.slice(0, 20)}).` };
+  }
+  return { ok: true, jsonText: body.trim() };
+}
+
+// ---------------------------------------------------------------------------
+// B. 엄격한 key/type 스키마 — 허용된 key만 통과시킨다. 추가/오타/깨진(garbled) key나 누락된
+// 필수 key, 잘못된 타입을 자동으로 보정하지 않고 그대로 거부한다(§ issues.push만 하고 계속
+// 진행 — validatePlannerRawOutput() 전체 원칙과 동일하게 첫 위반에서 멈추지 않는다).
+// ---------------------------------------------------------------------------
+const TOP_LEVEL_KEYS = [
+  "projectId", "specVersion", "architectureSummary", "technologyChoices",
+  "fixedConstraintAcknowledgement", "modulesOrComponents", "integrations",
+  "securityRequirementsSummary", "testingRequirementsSummary", "deliveryConstraintsSummary",
+  "phases", "tasks", "executionPolicy",
+] as const;
+const TECH_CHOICE_KEYS = ["area", "decision", "reason", "source", "status"] as const;
+const ACK_KEYS = ["id", "value"] as const;
+const PHASE_KEYS = ["phaseId", "name", "objective", "dependsOn", "completionCriteria"] as const;
+const TASK_KEYS = [
+  "taskId", "phaseId", "title", "objective", "scope", "constraints", "dependsOn",
+  "expectedModules", "requiredTests", "acceptanceCriteria", "reqIds",
+  "securityConsiderations", "completionGate",
+] as const;
+const REQUIRED_TEST_KEYS = ["name", "command", "args", "cwd"] as const;
+const EXECUTION_POLICY_KEYS = ["allowedReadPrefixes", "allowedWritePrefixes", "commandCwdAliases", "allowedCommands"] as const;
+const ALLOWED_COMMAND_KEYS = ["cwd", "command", "args"] as const;
+
+function checkExactKeys(container: string, obj: Record<string, unknown>, allowed: readonly string[], issues: PlannerValidationIssue[]): void {
+  const unknown = Object.keys(obj).filter((k) => !allowed.includes(k));
+  if (unknown.length > 0) {
+    issues.push({
+      code: "INVALID_STRUCTURE",
+      detail: `${container}에 허용되지 않는 key가 있습니다: ${unknown.map((k) => String(k).slice(0, 60)).join(", ")}`,
+    });
+  }
+}
+function checkRequiredString(container: string, obj: Record<string, unknown>, key: string, issues: PlannerValidationIssue[]): void {
+  if (!isNonEmptyString(obj[key])) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: `${container}.${key}가 비어있거나 문자열이 아닙니다.` });
+  }
+}
+function checkRequiredStringArray(container: string, obj: Record<string, unknown>, key: string, issues: PlannerValidationIssue[]): void {
+  if (!isStringArray(obj[key])) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: `${container}.${key}가 문자열 배열이 아닙니다.` });
+  }
+}
+
 /**
  * rawText(LLM/fixture가 반환한 JSON 문자열)를 normalized(WHAT)와 trusted identity 기준으로
  * 검증한다 — 첫 실패에서 멈추지 않고 발견한 위반을 전부 모아 반환한다(spec-intake.ts와 동일
- * 원칙). 통과해야만 { ok: true, value }를 반환한다. 이 함수는 파일시스템/네트워크에 전혀
- * 접근하지 않는 순수 함수다.
+ * 원칙). 통과해야만 { ok: true, value, normalizedJsonText }를 반환한다. 이 함수는
+ * 파일시스템/네트워크에 전혀 접근하지 않는 순수 함수다.
+ *
+ * normalizedJsonText는 extractJsonPayload()가 rawText(설명문/markdown fence가 섞여 있을 수
+ * 있는 원문)에서 뽑아낸 "순수 JSON 텍스트"다 — 호출부(runPlanner)는 원본 rawText가 아니라
+ * 반드시 이 값을 다음 단계(rawPlannerOutput 저장/JSON.parse)에 써야 한다. 원본 rawText를
+ * 그대로 저장하면, transport normalization이 이 함수 안에서만 일어나고 저장은 fence가 섞인
+ * 원문으로 되어 나중에(EXECUTION_DATA_GENERATED 생성 시점) 다시 strict JSON.parse가 실패하는
+ * 모순이 생긴다.
  */
 export function validatePlannerRawOutput(
   rawText: string,
   normalized: NormalizedMasterSpec,
   trusted: { projectId: string; specVersion: string }
-): { ok: true; value: PlannerRawOutput } | { ok: false; issues: PlannerValidationIssue[] } {
+): { ok: true; value: PlannerRawOutput; normalizedJsonText: string } | { ok: false; issues: PlannerValidationIssue[] } {
   const issues: PlannerValidationIssue[] = [];
 
   // secret 패턴은 구조 파싱보다 먼저 원문 그대로 검사한다 — JSON 파싱 실패로 조기 반환해도
@@ -511,11 +600,19 @@ export function validatePlannerRawOutput(
     });
   }
 
+  const extraction = extractJsonPayload(rawText);
+  if (!extraction.ok) {
+    issues.push({
+      code: "MALFORMED_JSON",
+      detail: `Planner 출력에서 신뢰할 수 있는 단일 JSON을 찾지 못했습니다: ${extraction.reason}`,
+    });
+    return { ok: false, issues };
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(rawText);
+    parsed = JSON.parse(extraction.jsonText);
   } catch {
-    issues.push({ code: "MALFORMED_JSON", detail: "Planner 출력이 올바른 JSON이 아닙니다." });
+    issues.push({ code: "MALFORMED_JSON", detail: "추출된 JSON 후보가 올바른 JSON이 아닙니다." });
     return { ok: false, issues };
   }
   if (!structuralGuard(parsed)) {
@@ -523,6 +620,32 @@ export function validatePlannerRawOutput(
     return { ok: false, issues };
   }
   const raw = parsed as Record<string, unknown>;
+
+  checkExactKeys("Planner 출력", raw, TOP_LEVEL_KEYS, issues);
+  checkRequiredStringArray("Planner 출력", raw, "modulesOrComponents", issues);
+  checkRequiredStringArray("Planner 출력", raw, "integrations", issues);
+  checkRequiredStringArray("Planner 출력", raw, "securityRequirementsSummary", issues);
+  checkRequiredStringArray("Planner 출력", raw, "testingRequirementsSummary", issues);
+  checkRequiredStringArray("Planner 출력", raw, "deliveryConstraintsSummary", issues);
+
+  if (!Array.isArray(raw.technologyChoices)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "technologyChoices가 배열이 아닙니다." });
+  } else {
+    raw.technologyChoices.forEach((tc, idx) => {
+      if (!structuralGuard(tc)) {
+        issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}]가 객체가 아닙니다.` });
+        return;
+      }
+      checkExactKeys(`technologyChoices[${idx}]`, tc, TECH_CHOICE_KEYS, issues);
+      checkRequiredString(`technologyChoices[${idx}]`, tc, "area", issues);
+      checkRequiredString(`technologyChoices[${idx}]`, tc, "decision", issues);
+      checkRequiredString(`technologyChoices[${idx}]`, tc, "reason", issues);
+      checkRequiredString(`technologyChoices[${idx}]`, tc, "source", issues);
+      if (tc.status !== "proposed" && tc.status !== "confirmed") {
+        issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}].status가 "proposed"/"confirmed"가 아닙니다.` });
+      }
+    });
+  }
 
   if (raw.projectId !== trusted.projectId) {
     issues.push({ code: "PROJECT_ID_MISMATCH", detail: "Planner 출력의 projectId가 신뢰된 identity와 일치하지 않습니다." });
@@ -558,6 +681,13 @@ export function validatePlannerRawOutput(
       issues.push({ code: "INVALID_STRUCTURE", detail: `phase id 형식이 올바르지 않습니다: ${safeEchoValue(p?.phaseId)}` });
       continue;
     }
+    const pObj = p as unknown as Record<string, unknown>;
+    checkExactKeys(`phase "${p.phaseId}"`, pObj, PHASE_KEYS, issues);
+    checkRequiredString(`phase "${p.phaseId}"`, pObj, "name", issues);
+    checkRequiredString(`phase "${p.phaseId}"`, pObj, "objective", issues);
+    checkRequiredStringArray(`phase "${p.phaseId}"`, pObj, "dependsOn", issues);
+    checkRequiredStringArray(`phase "${p.phaseId}"`, pObj, "completionCriteria", issues);
+
     if (phaseIds.has(p.phaseId)) {
       issues.push({ code: "DUPLICATE_PHASE_ID", detail: `phaseId가 중복됩니다: ${p.phaseId}` });
     }
@@ -600,8 +730,33 @@ export function validatePlannerRawOutput(
     if (t.phaseId !== phasePrefix || !phaseIds.has(String(t.phaseId))) {
       issues.push({ code: "UNKNOWN_PHASE_REFERENCE", detail: `task "${t.taskId}"가 알 수 없는 phase를 참조합니다: ${safeEchoValue(t.phaseId, PHASE_ID_ECHO_SHAPE)}` });
     }
-    if (!isNonEmptyString(t.title) || !Array.isArray(t.scope) || !Array.isArray(t.requiredTests)) {
-      issues.push({ code: "INVALID_STRUCTURE", detail: `task "${t.taskId}"의 title/scope/requiredTests가 올바르지 않습니다.` });
+
+    const tObj = t as unknown as Record<string, unknown>;
+    checkExactKeys(`task "${t.taskId}"`, tObj, TASK_KEYS, issues);
+    checkRequiredString(`task "${t.taskId}"`, tObj, "title", issues);
+    checkRequiredString(`task "${t.taskId}"`, tObj, "objective", issues);
+    checkRequiredString(`task "${t.taskId}"`, tObj, "completionGate", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "scope", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "constraints", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "dependsOn", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "expectedModules", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "acceptanceCriteria", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "reqIds", issues);
+    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "securityConsiderations", issues);
+    if (!Array.isArray(t.requiredTests)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `task "${t.taskId}".requiredTests가 배열이 아닙니다.` });
+    } else {
+      t.requiredTests.forEach((rt, idx) => {
+        if (!structuralGuard(rt)) {
+          issues.push({ code: "INVALID_STRUCTURE", detail: `task "${t.taskId}".requiredTests[${idx}]가 객체가 아닙니다.` });
+          return;
+        }
+        checkExactKeys(`task "${t.taskId}".requiredTests[${idx}]`, rt, REQUIRED_TEST_KEYS, issues);
+        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "name", issues);
+        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "command", issues);
+        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "cwd", issues);
+        checkRequiredStringArray(`task "${t.taskId}".requiredTests[${idx}]`, rt, "args", issues);
+      });
     }
 
     for (const reqId of isStringArray(t.reqIds) ? t.reqIds : []) {
@@ -657,10 +812,20 @@ export function validatePlannerRawOutput(
   // fixedConstraints는 이 ack가 아니라 항상 normalized.fixedConstraints(코드가 직접 채움)로
   // 채워지므로, LLM이 실제로 manifest 내용을 바꿀 방법은 없다 — 이 검사는 LLM이 "다른 값으로
   // 잘못 이해한 채" 그 위에 phase/task를 설계하지 않았는지 확인하는 안전장치다.
-  const ack = Array.isArray(raw.fixedConstraintAcknowledgement)
-    ? (raw.fixedConstraintAcknowledgement as PlannerRawFixedConstraintAck[])
-    : [];
-  const ackById = new Map(ack.filter((a) => structuralGuard(a as unknown as Record<string, unknown>)).map((a) => [a.id, a.value]));
+  const ackRaw = Array.isArray(raw.fixedConstraintAcknowledgement) ? (raw.fixedConstraintAcknowledgement as unknown[]) : [];
+  const ackById = new Map<string, string>();
+  ackRaw.forEach((a, idx) => {
+    if (!structuralGuard(a)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement[${idx}]가 객체가 아닙니다.` });
+      return;
+    }
+    checkExactKeys(`fixedConstraintAcknowledgement[${idx}]`, a, ACK_KEYS, issues);
+    if (!isNonEmptyString(a.id) || typeof a.value !== "string") {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement[${idx}]의 id/value 형식이 올바르지 않습니다.` });
+      return;
+    }
+    ackById.set(a.id, a.value);
+  });
   for (const fc of normalized.fixedConstraints) {
     if (!ackById.has(fc.id)) {
       issues.push({ code: "FIXED_CONSTRAINT_ACKNOWLEDGEMENT_MISSING", detail: `Fixed constraint(${fc.id})를 Planner 출력이 확인(acknowledge)하지 않았습니다.` });
@@ -672,6 +837,15 @@ export function validatePlannerRawOutput(
   // 안전하지 않은 Execution Policy — 최소 권한 위반(전체 파일시스템 허용) + Core가 전담하는
   // 명령(git)/파괴적 명령/배포 명령 요구를 거부한다.
   if (structuralGuard(raw.executionPolicy)) {
+    const epObj = raw.executionPolicy as Record<string, unknown>;
+    checkExactKeys("executionPolicy", epObj, EXECUTION_POLICY_KEYS, issues);
+    if (epObj.commandCwdAliases !== undefined) {
+      const aliases = epObj.commandCwdAliases;
+      if (!structuralGuard(aliases) || Array.isArray(aliases) || !Object.values(aliases).every((v) => typeof v === "string")) {
+        issues.push({ code: "INVALID_STRUCTURE", detail: "executionPolicy.commandCwdAliases가 문자열 값을 가진 객체가 아닙니다." });
+      }
+    }
+
     const ep = raw.executionPolicy as unknown as PlannerRawExecutionPolicy;
     const allPrefixes = [...(Array.isArray(ep.allowedReadPrefixes) ? ep.allowedReadPrefixes : []), ...(Array.isArray(ep.allowedWritePrefixes) ? ep.allowedWritePrefixes : [])];
     if (!Array.isArray(ep.allowedReadPrefixes) || ep.allowedReadPrefixes.length === 0 || !ep.allowedReadPrefixes.every(isSafeScopePrefix)) {
@@ -686,8 +860,19 @@ export function validatePlannerRawOutput(
     if (!Array.isArray(ep.allowedCommands)) {
       issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedCommands가 배열이 아닙니다." });
     } else {
-      for (const c of ep.allowedCommands) {
-        if (!structuralGuard(c as unknown as Record<string, unknown>) || typeof c.command !== "string") continue;
+      ep.allowedCommands.forEach((c, idx) => {
+        if (!structuralGuard(c as unknown as Record<string, unknown>)) {
+          issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}]가 객체가 아닙니다.` });
+          return;
+        }
+        const cObj = c as unknown as Record<string, unknown>;
+        checkExactKeys(`executionPolicy.allowedCommands[${idx}]`, cObj, ALLOWED_COMMAND_KEYS, issues);
+        checkRequiredString(`executionPolicy.allowedCommands[${idx}]`, cObj, "cwd", issues);
+        checkRequiredStringArray(`executionPolicy.allowedCommands[${idx}]`, cObj, "args", issues);
+        if (typeof c.command !== "string" || c.command.length === 0) {
+          issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}].command가 비어있거나 문자열이 아닙니다.` });
+          return;
+        }
         // GPT Independent Reviewer 지적(SI-3 REVISE 1회차, HIGH) — 이름 목록만 소문자
         // 비교하면 "git.exe"/절대경로("C:\...\git.exe")/별칭 같은 사소한 변형으로 이 검사
         // 단계를 우회할 수 있었다. 다만 이 검사가 유일한 방어선은 아니다 — 실제 실행 시점의
@@ -701,7 +886,7 @@ export function validatePlannerRawOutput(
             code: "UNSAFE_EXECUTION_POLICY",
             detail: `executionPolicy.allowedCommands의 command는 경로가 아닌 실행 파일 이름이어야 합니다: ${safeEchoValue(c.command)}`,
           });
-          continue;
+          return;
         }
         const cmd = c.command.trim().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
         if (DANGEROUS_COMMAND_NAMES.has(cmd)) {
@@ -711,12 +896,12 @@ export function validatePlannerRawOutput(
         if (DEPLOY_COMMAND_NAMES.has(cmd) || (cmd === "npm" && (args.includes("publish") || args.includes("deploy")))) {
           issues.push({ code: "PRODUCTION_DEPLOY_REQUESTED", detail: `executionPolicy.allowedCommands가 배포 관련 명령을 요청합니다: ${safeEchoValue(cmd, COMMAND_NAME_SHAPE)} ${safeEchoValue(args.join(" "))}` });
         }
-      }
+      });
     }
   }
 
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: raw as unknown as PlannerRawOutput };
+  return { ok: true, value: raw as unknown as PlannerRawOutput, normalizedJsonText: extraction.jsonText };
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +969,37 @@ export function buildPlannerPrompt(normalized: NormalizedMasterSpec, trusted: { 
       "- Deferred/Out-of-scope 항목을 task의 reqIds/acceptanceCriteria로 참조하지 마세요.",
       '- executionPolicy에 "./"(프로젝트 전체) 접근이나 git/rm 등 위험한 명령, 배포 명령을 포함하지 마세요.',
       "- secret/API key/token/password로 보이는 어떤 값도 출력에 포함하지 마세요.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
+// GPT Independent Reviewer 지적(SI-3 REVISE 4회차 — 실제 JARVIS 실행 관찰) — 실제 claude CLI가
+// "JSON only" 지시를 어기고 설명문을 앞뒤에 붙이거나 markdown ```json fence로 감싸는 경우,
+// 또는 허용되지 않는/깨진 key를 만드는 경우가 관찰됐다. buildPlannerPrompt()의 최초 프롬프트는
+// 이미 통과된 spec/schema를 그대로 두되(느슨하게 만들지 않음), validatePlannerRawOutput()가
+// 실제로 발견한 위반(§ PlannerValidationIssue)을 그대로 되돌려주며 Planner에게 같은 요청을
+// 다시 한다 — 값을 이쪽에서 임의로 보정하지 않고, "무엇이 왜 거부됐는지"만 정확히 알려서
+// Planner 스스로 고치게 한다(§ 요구사항: correction retry). issues[].detail은 이미
+// safeEchoValue()로 원문 secret/긴 임의 문자열을 노출하지 않도록 정제돼 있으므로 그대로
+// 프롬프트에 포함해도 안전하다.
+export function buildPlannerCorrectionPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  issues: PlannerValidationIssue[]
+): string {
+  const base = buildPlannerPrompt(normalized, trusted);
+  const issueLines = issues.length > 0 ? issues.map((i) => `- [${i.code}] ${i.detail}`).join("\n") : "(기록된 위반 없음)";
+  return [
+    base,
+    [
+      "# 이전 시도가 거부되었습니다 — 아래 이유를 반드시 수정해서 다시 출력하세요",
+      issueLines,
+      "",
+      "# 출력 형식 — 절대 예외 없이 지킬 것",
+      "- 응답 전체가 정확히 하나의 JSON 객체여야 합니다. 첫 글자는 반드시 '{', 마지막 글자는 반드시 '}'여야 합니다.",
+      "- 설명, 인사말, 여는/닫는 문장을 절대 포함하지 마세요.",
+      "- markdown 코드 펜스(```)로 감싸지 마세요.",
+      "- 위에 정의된 Output 스키마에 없는 key를 추가하지 마세요.",
     ].join("\n"),
   ].join("\n\n");
 }
@@ -985,6 +1201,13 @@ function assembleProjectManifest(data: GeneratedExecutionData): ProjectManifest 
 // ---------------------------------------------------------------------------
 
 export const PLANNER_STATE_SCHEMA_VERSION = 1 as const;
+
+// GPT Independent Reviewer 지적(SI-3 REVISE 4회차 — 실제 JARVIS 실행 관찰) — 실제 claude
+// CLI가 MALFORMED_JSON/schema 위반을 반복 생성한 관찰에 대한 방어. rawOutputSource가 매번
+// 같은(또는 더 나쁜) 출력을 반복해도 무한 재시도하지 않도록 상한을 둔다 — buildGoodRawOutput류
+// fixture가 아닌 실제 LLM은 correction prompt(§ buildPlannerCorrectionPrompt)를 받으면 보통
+// 1~2회 안에 수정하므로, 3회(최초 1회 + correction 2회)면 충분하다.
+export const PLANNER_MAX_RAW_OUTPUT_ATTEMPTS = 3;
 
 export type PlannerStage =
   | "SPEC_VERIFIED"
@@ -1569,18 +1792,37 @@ async function runPlannerLocked(
   }
 
   if (cur.stage === "REQUIREMENTS_NORMALIZED") {
-    const prompt = buildPlannerPrompt(normalized, identity);
-    const sourceResult = await rawOutputSource(prompt);
-    if (!sourceResult.ok) {
-      return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: sourceResult.reason };
+    // Correction retry(§ 요구사항 C) — MALFORMED_JSON/schema 위반이면 validatePlannerRawOutput()이
+    // 찾은 실제 issues를 그대로 buildPlannerCorrectionPrompt()에 실어 같은 rawOutputSource를
+    // 다시 부른다(§ 새 provider/우회 경로 없음). 값을 임의로 보정하지 않는다 — 매 시도는 여전히
+    // validatePlannerRawOutput() 전체를 다시 통과해야 한다. PLANNER_MAX_RAW_OUTPUT_ATTEMPTS로
+    // 상한을 둬 무한 재시도를 금지한다 — 모든 시도가 실패하면 마지막 시도의 issues로 REJECTED한다.
+    let lastIssues: PlannerValidationIssue[] = [];
+    let acceptedRawOutput: string | null = null;
+    for (let attempt = 1; attempt <= PLANNER_MAX_RAW_OUTPUT_ATTEMPTS; attempt += 1) {
+      const prompt =
+        attempt === 1 ? buildPlannerPrompt(normalized, identity) : buildPlannerCorrectionPrompt(normalized, identity, lastIssues);
+      const sourceResult = await rawOutputSource(prompt);
+      if (!sourceResult.ok) {
+        return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: sourceResult.reason };
+      }
+      const validation = validatePlannerRawOutput(sourceResult.rawOutput, normalized, identity);
+      if (validation.ok) {
+        // § validatePlannerRawOutput 상단 주석 — 반드시 normalizedJsonText(순수 JSON)를
+        // 저장한다. 원본 sourceResult.rawOutput을 저장하면 설명문/markdown fence가 섞인
+        // 원문이 rawPlannerOutput에 남아, 다음 stage(EXECUTION_DATA_GENERATED)에서 다시
+        // JSON.parse(cur.rawPlannerOutput)가 실패한다.
+        acceptedRawOutput = validation.normalizedJsonText;
+        break;
+      }
+      lastIssues = validation.issues;
     }
-    const validation = validatePlannerRawOutput(sourceResult.rawOutput, normalized, identity);
-    if (!validation.ok) {
-      const withDiagnostics: PlannerStateFile = { ...cur, lastValidationIssues: validation.issues, updatedAt: new Date().toISOString() };
+    if (acceptedRawOutput === null) {
+      const withDiagnostics: PlannerStateFile = { ...cur, lastValidationIssues: lastIssues, updatedAt: new Date().toISOString() };
       writeJsonAtomic(plannerStateFilePath(resolvedRoot), withDiagnostics); // best-effort — 실패해도 REJECTED 반환 자체는 막지 않는다.
-      return { status: "REJECTED", issues: validation.issues };
+      return { status: "REJECTED", issues: lastIssues };
     }
-    cur = { ...cur, stage: "ARCHITECTURE_PLANNED", rawPlannerOutput: sourceResult.rawOutput, lastValidationIssues: undefined, updatedAt: new Date().toISOString() };
+    cur = { ...cur, stage: "ARCHITECTURE_PLANNED", rawPlannerOutput: acceptedRawOutput, lastValidationIssues: undefined, updatedAt: new Date().toISOString() };
     const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
