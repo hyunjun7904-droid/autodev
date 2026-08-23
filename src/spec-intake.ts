@@ -125,7 +125,9 @@ const KNOWN_INTEGRITY_ALGORITHMS: ReadonlySet<SpecIntegrity["algorithm"]> = new 
 // 먼저 확인한다. 상한을 넘기면 "판단 불가"로 REJECT한다(관대한 fallback 없음).
 const MAX_ENVELOPE_JSON_CHARS = 6_000_000;
 const MAX_OBJECT_TOP_LEVEL_KEYS = 64;
-const MAX_SPEC_CONTENT_CHARS = 2_000_000;
+// Phase D(SI-2) — export된다: project-bootstrap.ts가 specContentRef 실제 파일 검증에서
+// 이 상한을 재사용한다(값을 복제하지 않는다).
+export const MAX_SPEC_CONTENT_CHARS = 2_000_000;
 const MAX_SPEC_CONTENT_REF_CHARS = 1024;
 const MAX_SPEC_VERSION_CHARS = 32;
 const UNKNOWN_FIELD_NAME_MAX_LEN = 64;
@@ -133,7 +135,9 @@ const UNKNOWN_FIELD_NAME_MAX_LEN = 64;
 // 정규식 비용이 입력 크기에 비례해 커지지 않게 한다).
 const FIELD_NAME_RAW_PREFIX_LEN = 256;
 
-const RESERVED_WINDOWS_DEVICE_NAMES = new Set([
+// Phase D(SI-2) — export된다: project-bootstrap.ts가 project root 폴더명(projectId) 방어에
+// 이 목록을 재사용한다(값을 복제하지 않는다).
+export const RESERVED_WINDOWS_DEVICE_NAMES = new Set([
   "con", "prn", "aux", "nul",
   "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
   "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
@@ -263,8 +267,10 @@ function isNonNegativeInteger(value: unknown): value is number {
 
 /** project-adapter-loader.ts와 동일한 상대경로 규칙(절대경로/드라이브/UNC/".." 거부) +
  *  길이 상한/NUL·제어문자/NTFS ADS("name:stream")/Windows 예약 장치명 거부 — 나중에(SI-2)
- *  실제 파일 경로로 resolve될 수 있는 참조라서 미리 형식만 걸러낸다(파일시스템 접근 없음). */
-function isSafeRelativeSpecRef(value: unknown): value is string {
+ *  실제 파일 경로로 resolve될 수 있는 참조라서 미리 형식만 걸러낸다(파일시스템 접근 없음).
+ *  Phase D(SI-2) — export된다: project-bootstrap.ts가 specContentRef를 실제로 resolve하기
+ *  전에 이 동일한 형식 검증을 재사용한다(정규식/규칙을 복제하지 않는다, defense-in-depth). */
+export function isSafeRelativeSpecRef(value: unknown): value is string {
   if (typeof value !== "string") return false;
   if (value.length === 0 || value.length > MAX_SPEC_CONTENT_REF_CHARS) return false;
   if (value.trim().length === 0) return false;
