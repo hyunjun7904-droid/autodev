@@ -1,6 +1,7 @@
-import { execAndClassify } from "./claude-runner";
+import { resolveTrustedClaudeCommand, classifySubprocessOutcome } from "./claude-runner";
 import type { ClaudeErrorCode } from "./claude-runner";
-import { validateAndExecute } from "./safe-executor";
+import { runSubprocessWithTimeout } from "./subprocess-runner";
+import { validateAndExecute, PROJECT_ROOT } from "./safe-executor";
 import type { ExecutorAction, SafeExecutorContext } from "./safe-executor";
 import { getWorkingTreeChanges } from "./git-changes";
 import type { RequiredTestCommand } from "./task-registry";
@@ -251,7 +252,7 @@ async function runRequiredTests(
   return results;
 }
 
-async function callClaude(input: string, timeoutMs: number, systemPrompt: string) {
+async function callClaude(input: string, timeoutMs: number, systemPrompt: string, projectRoot?: string) {
   // 프롬프트를 CLI 인자로 넘기지 않고 stdin으로 전달한다 — 라운드가 쌓여 프롬프트가 커지면
   // OS 명령행 길이 제한(Windows에서 실제로 ENAMETOOLONG 발생 확인)에 걸리기 때문이다.
   // "claude -p"(positional prompt 생략)가 stdin에서 읽는 것은 실제 호출로 직접 검증했다.
@@ -265,7 +266,14 @@ async function callClaude(input: string, timeoutMs: number, systemPrompt: string
     "--system-prompt",
     systemPrompt,
   ];
-  return execAndClassify("claude", args, timeoutMs, input);
+  // SI-3.6(Executable Identity Trust) — bare "claude" 문자열을 더 이상 spawn에 직접 넘기지
+  // 않는다(§ claude-runner.ts resolveTrustedClaudeCommand 상단 설명 — 이 호출부가 실제로
+  // 개발 대상 project 내용을 다루는 가장 공격 표면이 큰 경로다). projectRoot를 함께
+  // 넘겨 project-local 가짜 claude 실행 파일도 PATH 탐색 후보에서 제외한다.
+  const trusted = resolveTrustedClaudeCommand(projectRoot ? [projectRoot] : []);
+  if (!trusted.ok) return trusted.result;
+  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input);
+  return classifySubprocessOutcome(outcome, timeoutMs);
 }
 
 function actionKey(action: ExecutorAction): string {
@@ -327,7 +335,15 @@ export async function runDeveloperTaskViaSafeExecutor(
   const changeScopeDirs = opts.changeScopeDirs ?? NO_SCOPE_CONFIGURED;
   const projectContext = opts.projectContext ?? DEFAULT_PROJECT_CONTEXT;
   const systemPrompt = buildProtocolSystemPrompt(projectContext);
-  const claudeCall = opts.claudeCaller ?? ((input: string, callTimeoutMs: number) => callClaude(input, callTimeoutMs, systemPrompt));
+  // SI-3.6 bounded review(chunk1 HIGH) 지적 반영 — executor가 지정되지 않은 호출(하위 호환
+  // module-level singleton 경로)도 target project root를 빠뜨리지 않는다. PROJECT_ROOT는
+  // configureSafeExecutor()가 갱신하는 살아있는 재-export 바인딩이라(§ checkpoint.ts/git-
+  // changes.ts/gpt-reviewer.ts가 이미 같은 방식으로 참조) executor가 없을 때도 실제 활성
+  // project root를 반영한다.
+  const claudeCall =
+    opts.claudeCaller ??
+    ((input: string, callTimeoutMs: number) =>
+      callClaude(input, callTimeoutMs, systemPrompt, opts.executor?.projectRoot ?? PROJECT_ROOT));
   const sleepFn = opts.sleep ?? defaultDeveloperSleep;
   const usageLimitWaitMs = opts.usageLimitWaitMs ?? DEVELOPER_USAGE_LIMIT_WAIT_MS;
   const usageLimitMaxRetries = opts.usageLimitMaxRetries ?? DEVELOPER_USAGE_LIMIT_MAX_RETRIES;

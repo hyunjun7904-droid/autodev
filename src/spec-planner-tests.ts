@@ -2234,9 +2234,24 @@ function scenarioNormalizeMasterSpecUnitChecks(): void {
 // 감싼다.
 // ---------------------------------------------------------------------------
 async function scenarioClaudeCliWiringIsReal(): Promise<void> {
-  const source = createClaudeCliRawOutputSource({ command: "autodev-si33-nonexistent-claude-binary-xyz", timeoutMs: 5000 });
-  const result = await source("무시되는 테스트 prompt");
-  check("wiring) 실제 존재하지 않는 바이너리로 실제 subprocess spawn을 시도하고 실패를 올바르게 매핑함", result.ok === false);
+  // SI-3.6(Executable Identity Trust) — createClaudeCliRawOutputSource()는 이제 RunOptions.command
+  // 같은 우회 채널을 전혀 받지 않는다(§ claude-runner.ts, bounded review chunk1 HIGH 3라운드
+  // 지적 반영으로 제거됨 — production API에 trust resolution을 건너뛸 방법이 없다). 대신
+  // trusted-executable-resolver.ts가 이미 구조적으로 검증하는 명시적 override 채널
+  // (AUTODEV_TRUSTED_CLAUDE_PATH)을 존재하지 않는 경로로 설정해, createClaudeCliRawOutputSource가
+  // fixture가 아니라 실제 runClaudeTask/resolveTrustedClaudeCommand/에러 매핑 코드를 그대로
+  // 통과한다는 것을 증명한다(이 경로는 resolver 검증 단계에서 이미 거부되므로 execAndClassify의
+  // 실제 spawn/ENOENT 분류 자체는 runner-tests.ts가 별도로 직접 검증한다).
+  const originalOverride = process.env.AUTODEV_TRUSTED_CLAUDE_PATH;
+  process.env.AUTODEV_TRUSTED_CLAUDE_PATH = "C:\\autodev-si33-nonexistent-claude-binary-xyz.exe";
+  try {
+    const source = createClaudeCliRawOutputSource({ timeoutMs: 5000 });
+    const result = await source("무시되는 테스트 prompt");
+    check("wiring) 실제 runClaudeTask 배선을 통해 신뢰 해석 실패가 올바르게 실패로 매핑됨", result.ok === false);
+  } finally {
+    if (originalOverride === undefined) delete process.env.AUTODEV_TRUSTED_CLAUDE_PATH;
+    else process.env.AUTODEV_TRUSTED_CLAUDE_PATH = originalOverride;
+  }
 }
 
 // ===========================================================================

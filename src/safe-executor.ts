@@ -1,11 +1,15 @@
 import { resolve, sep, dirname, basename, relative } from "node:path";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { sanitizeForLog } from "./logger";
 import { TARGET_PROJECT_ROOT } from "./project-context";
 import { validateProjectExecutionPolicy } from "./project-policy";
 import type { ProjectExecutionPolicy } from "./project-policy";
+import { resolveTrustedExecutable } from "./trusted-executable-resolver";
+import type { TrustedExecutableResult } from "./trusted-executable-resolver";
+import { parseLockfileJson, checkIntegrity } from "./dependency-scanner";
 
 // Safe Executor — Claude에게 built-in Read/Edit/Write/Bash를 주지 않고, 이 모듈을 통해서만
 // 검증된 파일/명령 작업을 수행하게 한다. 모든 하드 경계는 여기 코드로 강제되며, LLM 프롬프트
@@ -766,20 +770,181 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
     return { ok: true, action: "APPLY_PATCH", data: { path: v.rel, beforeHash, occurrences: replaceAll ? occurrences : 1 } };
   }
 
+  // SI-3.6(Executable Identity Trust) — validateCommand()(Core Command Safety Gate +
+  // policy.allowedCommands)를 통과했다는 것은 "이 이름/인자 조합이 허용됐다"는 뜻일 뿐,
+  // "실제로 무엇이 실행될지"는 여전히 별도 질문이다(§ trusted-executable-resolver.ts 상단
+  // 설명). tsc만 이 파일에서 직접 해석한다 — project 자신의 node_modules/typescript(devDependency,
+  // 이미 Dependency Scanner Gate(C5)가 lockfile/manifest 일관성·설치 출처를 검증하는 대상)
+  // 안에 있는 것이 정상이라, git/claude(원천적으로 project 밖에 있어야 하는 외부 도구)와는
+  // 반대로 project root *안*을 신뢰 위치로 다룬다 — self-dev-complete.ts의 TSC_BIN(이미
+  // 검증된 "node로 tsc bin JS를 직접 실행" 패턴)을 그대로 재사용한다.
+  //
+  // SI-3.6 bounded review(chunk1 HIGH) 지적 — "Dependency Scanner가 과거에 실행됐다는 사실과
+  // 지금 이 파일이 실제로 그 검증을 통과한 typescript 패키지의 일부라는 사실이 암호학적으로
+  // 결속돼 있지 않다"는 지적은 정확하다. 다만 이 경로(node_modules/**)는 Claude Developer의
+  // WRITE_FILE/APPLY_PATCH로는 애초에 도달할 수 없다 — DENY_PATH_PATTERNS(Core hard rule,
+  // 어떤 project policy도 약화 불가)가 node_modules 전체를 write 대상에서 무조건 제외하기
+  // 때문이다(§ 파일 상단 DENY_PATH_PATTERNS). 즉 이 경로에 실제로 파일을 채울 수 있는 유일한
+  // 정상 경로는 legitimate `npm install`/`npm ci`(package-lock.json 기반, C5가 commit 시점에
+  // 검증)뿐이다 — 파일 시스템에 대한 직접 접근이 필요한 host-level 변조는 SI-3.5의 Portable
+  // Core Boundary와 동일하게 이 Task의 선언된 범위 밖이다. 그래도 "이 정확한 파일이 진짜
+  // typescript 패키지의 일부인가"를 감사 가능한 최소 비용으로 한 번 더 확인한다 —
+  // node_modules/typescript/package.json이 존재하고 name 필드가 정확히 "typescript"인지만
+  // 본다(전체 무결성 서명/해시 검증은 새 subsystem이 필요해 이 Task 범위 밖이다).
+  function resolveTrustedTsc(): TrustedExecutableResult {
+    const tscRel = ["node_modules", "typescript", "bin", "tsc"].join(sep);
+    const abs = resolve(projectRoot, tscRel);
+    if (!existsSync(abs)) {
+      return {
+        ok: false,
+        code: "TRUSTED_EXECUTABLE_NOT_FOUND",
+        reason: `프로젝트에 devDependency로 설치된 typescript(${tscRel})를 찾지 못했습니다.`,
+      };
+    }
+    const pkgJsonAbs = resolve(projectRoot, "node_modules", "typescript", "package.json");
+    if (!existsSync(pkgJsonAbs)) {
+      return {
+        ok: false,
+        code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+        reason: "node_modules/typescript/package.json이 없어 typescript 패키지임을 확인할 수 없습니다.",
+      };
+    }
+    let installedVersion: string | undefined;
+    try {
+      const pkgJson = JSON.parse(readFileSync(pkgJsonAbs, "utf-8")) as { name?: unknown; version?: unknown };
+      if (pkgJson.name !== "typescript") {
+        return {
+          ok: false,
+          code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+          reason: `node_modules/typescript/package.json의 name이 "typescript"가 아닙니다(${String(pkgJson.name)}).`,
+        };
+      }
+      installedVersion = typeof pkgJson.version === "string" ? pkgJson.version : undefined;
+    } catch {
+      return { ok: false, code: "EXECUTABLE_IDENTITY_UNTRUSTED", reason: "node_modules/typescript/package.json 파싱 실패." };
+    }
+
+    // SI-3.6 bounded review(chunk1 HIGH, 2라운드) 지적 반영 — package.json.name 확인만으로는
+    // "임의의 project가 { name: \"typescript\" }를 자칭하며 악성 bin/tsc를 심는" 공격까지 막지
+    // 못한다는 지적은 정확하다. 이 project의 package-lock.json(C5 Dependency Scanner Gate가
+    // 이미 manifest-lockfile 일관성/integrity 형식을 commit 시점에 검증하는 대상, § dependency-
+    // scanner.ts)에 typescript 항목이 실제로 등록돼 있고, 그 lock 항목의 version이 지금 설치된
+    // package.json의 version과 일치하며, integrity 필드가 유효한 형식인지까지 확인한다 —
+    // dependency-scanner.ts의 기존 검증 함수(parseLockfileJson/checkIntegrity)를 그대로
+    // 재사용한다(판정 로직 복제 없음). tarball 내용 자체의 SRI 해시를 여기서 재계산하지는
+    // 않는다(재다운로드가 필요해 새 subsystem 없이는 이 Task 범위 안에서 할 수 없다) — 그래도
+    // 공격자는 이제 이름뿐 아니라 버전이 정확히 일치하는 lockfile 항목까지 이미 commit된
+    // 상태로 통과시켜야 하므로, 공격 표면이 C5가 이미 감사하는 대상 안으로 좁혀진다.
+    const lockJsonAbs = resolve(projectRoot, "package-lock.json");
+    if (!existsSync(lockJsonAbs)) {
+      return {
+        ok: false,
+        code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+        reason: "package-lock.json이 없어 typescript devDependency 출처를 확인할 수 없습니다.",
+      };
+    }
+    const lockParsed = parseLockfileJson(readFileSync(lockJsonAbs, "utf-8"));
+    if (!lockParsed.ok) {
+      return { ok: false, code: "EXECUTABLE_IDENTITY_UNTRUSTED", reason: `package-lock.json 확인 실패: ${lockParsed.reason}` };
+    }
+    const lockEntry = lockParsed.data.packages["node_modules/typescript"];
+    if (!lockEntry) {
+      return {
+        ok: false,
+        code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+        reason: "package-lock.json에 node_modules/typescript 항목이 없습니다.",
+      };
+    }
+    if (!installedVersion || lockEntry.version !== installedVersion) {
+      return {
+        ok: false,
+        code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+        reason: `설치된 typescript 버전(${String(installedVersion)})이 package-lock.json에 기록된 버전(${String(lockEntry.version)})과 다릅니다.`,
+      };
+    }
+    const integrityFinding = checkIntegrity("node_modules/typescript", lockEntry);
+    if (integrityFinding) {
+      return {
+        ok: false,
+        code: "EXECUTABLE_IDENTITY_UNTRUSTED",
+        reason: `package-lock.json의 typescript integrity 검증 실패: ${integrityFinding.detail}`,
+      };
+    }
+
+    let st;
+    try {
+      st = statSync(abs);
+    } catch {
+      return { ok: false, code: "EXECUTABLE_IDENTITY_UNTRUSTED", reason: "tsc 진입 파일 상태 확인 실패." };
+    }
+    if (!st.isFile()) {
+      return { ok: false, code: "EXECUTABLE_IDENTITY_UNTRUSTED", reason: "tsc 진입 파일이 일반 파일이 아닙니다." };
+    }
+    let real: string;
+    try {
+      real = realpathSync(abs);
+    } catch {
+      return { ok: false, code: "EXECUTABLE_IDENTITY_UNTRUSTED", reason: "tsc realpath 확인 실패." };
+    }
+    const realLower = real.toLowerCase();
+    const rootRealLower = projectRootReal.toLowerCase();
+    if (realLower !== rootRealLower && !realLower.startsWith(rootRealLower + sep)) {
+      return { ok: false, code: "EXECUTABLE_SHADOWING_DETECTED", reason: "tsc가 symlink로 project root 밖을 가리킵니다." };
+    }
+    const nodeResolved = resolveTrustedExecutable("node", { excludedRoots: [] });
+    if (!nodeResolved.ok) return nodeResolved;
+    return {
+      ok: true,
+      requestedName: "tsc",
+      executableKind: "tsc",
+      trustSource: "project_local_dependency",
+      verified: true,
+      spawnCommand: nodeResolved.spawnCommand,
+      spawnArgsPrefix: [real],
+      canonicalPath: real,
+    };
+  }
+
+  function resolveTrustedRunExecutable(base: string, cwdAbs: string): TrustedExecutableResult {
+    if (base === "node" || base === "nodejs") return resolveTrustedExecutable("node", { excludedRoots: [] });
+    if (base === "tsc") return resolveTrustedTsc();
+    const excludedRoots = [projectRoot, projectRootReal, cwdAbs, tmpdir()];
+    if (base === "git") return resolveTrustedExecutable("git", { excludedRoots });
+    if (base === "npm" || base === "npx") return resolveTrustedExecutable(base, { excludedRoots });
+    // 도달 불가 — CORE_ALLOWED_EXECUTABLE_FAMILIES가 이 다섯 개 밖의 base를 이미 걸러낸다.
+    return { ok: false, code: "TRUSTED_EXECUTABLE_NOT_FOUND", reason: `인식되지 않은 executable family: ${base}` };
+  }
+
   function executeRunCommand(command: string, args: string[], cwd: string): ExecutorResult {
     const v = validateCommand(command, args, cwd);
     if (!v.ok) return { ok: false, action: "RUN_COMMAND", denyReason: v.reason };
     const cwdResolved = cwdToPath(cwd);
     if (!cwdResolved.ok) return { ok: false, action: "RUN_COMMAND", denyReason: cwdResolved.reason };
+
+    const base = normalizeExecutableBase(command);
+    // SI-3.6 — Trusted Executable Resolution. Command Safety Gate(이름/인자 allow-list)를
+    // 통과한 뒤에도, 실제 spawn 대상은 이 해석 결과(검증된 canonical absolute path)만
+    // 쓴다 — command 문자열을 그대로 spawnSync에 넘기지 않는다(PATH/cwd 탐색에 위임하지
+    // 않음 — § trusted-executable-resolver.ts).
+    const trusted = resolveTrustedRunExecutable(base, cwdResolved.path);
+    if (!trusted.ok) {
+      return {
+        ok: false,
+        action: "RUN_COMMAND",
+        denyReason: `Executable Identity Trust(${trusted.code}): ${trusted.reason}`,
+      };
+    }
+
     // SI-3.3~3.5 4-chunk 최종 리뷰 지적(HIGH) — git은 validateCommand()를 통과했다는
     // 사실만으로는(명령줄 플래그 검사만 거쳤을 뿐) 여전히 repo 자신의 config/gitattributes를
     // 통해 외부 프로그램을 실행할 수 있다(§ buildHardenedGitArgs 상단 주석). 실제 spawn
     // 직전에만(위 validateCommand의 args 자체는 건드리지 않음) 안전 override를 추가한다 —
     // git이 아닌 명령에는 전혀 영향 없다.
-    const isGit = normalizeExecutableBase(command) === "git";
-    const spawnArgs = isGit ? buildHardenedGitArgs(args) : args;
+    const isGit = base === "git";
+    const coreArgs = isGit ? buildHardenedGitArgs(args) : args;
+    const spawnArgs = [...trusted.spawnArgsPrefix, ...coreArgs];
     const spawnEnv = isGit ? hardenedGitSpawnEnv(process.env) : process.env;
-    const res = spawnSync(command, spawnArgs, {
+    const res = spawnSync(trusted.spawnCommand, spawnArgs, {
       cwd: cwdResolved.path,
       shell: false,
       encoding: "utf-8",

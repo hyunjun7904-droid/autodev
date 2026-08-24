@@ -1,5 +1,18 @@
-import { classifyFailureText, parseClaudeJsonOutput, execAndClassify, detectUsageLimitSignal } from "./claude-runner";
+import { classifyFailureText, parseClaudeJsonOutput, classifySubprocessOutcome, detectUsageLimitSignal } from "./claude-runner";
+import { runSubprocessWithTimeout } from "./subprocess-runner";
 import { sanitizeForLog } from "./logger";
+
+// SI-3.6(Executable Identity Trust) bounded review(chunk1 HIGH, 4라운드) 지적 반영 — 이
+// 파일은 더 이상 claude-runner.ts의 exported "임의 command를 spawn하는" 함수를 쓰지 않는다
+// (그 함수 자체가 제거됐다 — § claude-runner.ts execAndClassify). 대신 claude 신뢰와 무관한
+// 범용 subprocess-runner.ts(runSubprocessWithTimeout)로 실제 subprocess를 실행하고, claude-
+// runner.ts의 순수 분류 함수(classifySubprocessOutcome)로 결과를 해석한다 — 운용 코드
+// (runClaudeTask)가 내부적으로 두 조각을 조합하는 것과 동일한 조합을 테스트 코드가 그대로
+// 재현할 뿐, "claude를 신뢰 없이 실행하는" 별도 exported 지름길은 어디에도 없다.
+async function execAndClassify(command: string, args: string[], timeoutMs: number, stdinInput?: string) {
+  const outcome = await runSubprocessWithTimeout(command, args, timeoutMs, stdinInput);
+  return classifySubprocessOutcome(outcome, timeoutMs);
+}
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {

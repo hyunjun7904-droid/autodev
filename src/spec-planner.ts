@@ -1550,8 +1550,11 @@ export type PlannerRawOutputOutcome =
 export type PlannerRawOutputSource = (prompt: string) => Promise<PlannerRawOutputOutcome>;
 
 export interface ClaudeCliRawOutputSourceOptions {
-  command?: string;
   timeoutMs?: number;
+  /** SI-3.6 bounded review(chunk1 HIGH) 지적 반영 — 이 Planner 호출이 다루는 target project
+   *  root(들)을 넘기면 claude-runner.ts의 Trusted Executable Resolution이 그 경로 안의 가짜
+   *  claude 실행 파일도 PATH 탐색에서 배제한다. */
+  excludedRoots?: string[];
 }
 
 export const PLANNER_RAW_OUTPUT_TIMEOUT_MS = 300_000;
@@ -1560,7 +1563,7 @@ export const PLANNER_MAX_TRANSPORT_RETRIES = 1;
 export function createClaudeCliRawOutputSource(opts: ClaudeCliRawOutputSourceOptions = {}): PlannerRawOutputSource {
   return async (prompt: string) => {
     const timeoutMs = opts.timeoutMs ?? PLANNER_RAW_OUTPUT_TIMEOUT_MS;
-    const result = await runClaudeTask(prompt, 1, { command: opts.command, timeoutMs });
+    const result = await runClaudeTask(prompt, 1, { timeoutMs, excludedRoots: opts.excludedRoots });
     if (!result.success) {
       return {
         ok: false,
@@ -3205,7 +3208,7 @@ async function runPlannerLocked(
   }
 
   const now = config.now ? config.now() : new Date();
-  const rawOutputSource = config.rawOutputSource ?? createClaudeCliRawOutputSource();
+  const rawOutputSource = config.rawOutputSource ?? createClaudeCliRawOutputSource({ excludedRoots: [resolvedRoot] });
   const nowIso = () => new Date().toISOString();
   const persist = (next: PlannerStateFile): { ok: true } | { ok: false; detail: string } => writeJsonAtomic(plannerStateFilePath(resolvedRoot), next, projectRootReal);
 

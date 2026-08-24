@@ -1,6 +1,9 @@
-import { spawn } from "node:child_process";
+import { tmpdir } from "node:os";
 import type { ClaudeResult } from "./types";
 import { log, sanitizeForLog } from "./logger";
+import { resolveTrustedExecutable } from "./trusted-executable-resolver";
+import { runSubprocessWithTimeout } from "./subprocess-runner";
+import type { SubprocessOutcome } from "./subprocess-runner";
 
 // 실제 Claude Code CLI subprocess runner. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
 // 이 모듈을 선택한다(§ orchestrator.ts). task는 절대 shell 문자열로 이어붙이지 않고,
@@ -14,20 +17,38 @@ export type ClaudeErrorCode =
   | "USAGE_LIMIT"
   | "TIMEOUT"
   | "NON_ZERO_EXIT"
-  | "INVALID_OUTPUT";
+  | "INVALID_OUTPUT"
+  // SI-3.6(Executable Identity Trust) — trusted-executable-resolver.ts의 실패 코드를 그대로
+  // 재사용한다(목록을 복제하지 않음) — "claude"라는 이름이 허용됐다는 사실과 "실제로 어떤
+  // 파일이 실행될지 신뢰할 수 있는가"는 별개 질문이다(§ trusted-executable-resolver.ts).
+  | "TRUSTED_EXECUTABLE_NOT_FOUND"
+  | "EXECUTABLE_IDENTITY_UNTRUSTED"
+  | "EXECUTABLE_SHADOWING_DETECTED";
 
 export interface RealClaudeResult extends ClaudeResult {
   errorCode?: ClaudeErrorCode;
 }
 
+// SI-3.6 bounded review(chunk1 HIGH, 3라운드 미해결) 지적 반영 — 브랜드 타입(2라운드에서
+// 도입)은 "실수로" 우회하는 것만 막았을 뿐, createTestOnlyCommandOverride() 자체가 여전히
+// production 모듈에서 exported된 정상 함수라 어떤 production 코드도 이를 import해 의도적으로
+// 호출하면 trust resolution을 완전히 우회할 수 있었다("정상 API가 제공하는 우회"라는 정확한
+// 지적). 이 override 메커니즘 자체를 완전히 제거한다 — runClaudeTask()는 이제 항상
+// resolveTrustedClaudeCommand()가 결정한 경로만 쓴다. "존재하지 않는 claude 바이너리"를
+// 실제 subprocess로 재현해야 하는 테스트(spec-planner-tests.ts)는 AUTODEV_TRUSTED_CLAUDE_PATH
+// (trusted-executable-resolver.ts가 이미 구조적 검증을 거치는 명시적 override 채널, § 파일
+// 상단 EXPLICIT_OVERRIDE_ENV_VARS)를 존재하지 않는 경로로 설정해 동일한 "실제 subprocess
+// 실행 시도 → 실패 분류" 경로를 재현한다 — 새 우회 채널을 만들지 않고 기존에 이미 검증된
+// 채널 하나만 쓴다.
 export interface RunOptions {
   timeoutMs?: number;
-  /** 테스트 전용 override — 기본값은 항상 "claude". 실제 운용 코드는 절대 바꾸지 않는다. */
-  command?: string;
+  /** SI-3.6 bounded review(chunk1 HIGH) 지적 반영 — 호출부가 알고 있는 target project
+   *  root(들)을 명시적으로 넘기면 resolveTrustedClaudeCommand()의 PATH 탐색에서 그 경로도
+   *  함께 배제한다. 지정하지 않으면 process.cwd()/OS temp만 배제한다(§ 아래 함수 설명). */
+  excludedRoots?: string[];
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // stdout/stderr 각각 2MB로 제한
 
 const USAGE_LIMIT_PATTERNS = [
   /usage limit/i,
@@ -134,97 +155,84 @@ function makeError(errorCode: ClaudeErrorCode, message: string, stdout = "", std
   };
 }
 
-// command/args를 그대로 받는 하위 레벨 실행기 — 테스트에서 실제 "claude" 바이너리를
-// 호출하지 않고도(존재하지 않는 커맨드, 짧게 도는 더미 커맨드 등으로) spawn 실패/timeout
-// 경로를 실제로 검증할 수 있도록 분리했다. 운용 코드(runClaudeTask)는 항상 command="claude"로만 호출한다.
-export function execAndClassify(
-  command: string,
-  args: string[],
-  timeoutMs: number,
-  stdinInput?: string
-): Promise<RealClaudeResult> {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(command, args, { shell: false });
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException)?.code;
-      const errorCode = code === "ENOENT" ? "CLI_NOT_FOUND" : "NON_ZERO_EXIT";
-      resolve(makeError(errorCode, `subprocess 생성 실패: ${sanitizeForLog(String(e))}`));
-      return;
-    }
+/**
+ * subprocess-runner.ts의 범용 SubprocessOutcome(신뢰 여부와 무관, spawn/timeout/출력만 관측)을
+ * claude CLI 전용 판정(RealClaudeResult)으로 변환하는 순수 함수 — 실제 spawn을 전혀 하지
+ * 않는다. runner-tests.ts가 이 함수와 runSubprocessWithTimeout()을 직접 조합해, claude-
+ * runner.ts에서 "임의 command를 spawn하는 exported 함수"를 노출하지 않고도 CLI_NOT_FOUND/
+ * TIMEOUT/USAGE_LIMIT/NON_ZERO_EXIT 분류를 실제 subprocess로 검증할 수 있다(§ SI-3.6 bounded
+ * review chunk1 HIGH, 4라운드 지적 반영).
+ */
+export function classifySubprocessOutcome(outcome: SubprocessOutcome, timeoutMs: number): RealClaudeResult {
+  if (outcome.spawnErrorCode !== undefined) {
+    const errorCode = outcome.spawnErrorCode === "ENOENT" ? "CLI_NOT_FOUND" : "NON_ZERO_EXIT";
+    return makeError(
+      errorCode,
+      `subprocess 시작 실패: ${sanitizeForLog(outcome.spawnErrorMessage ?? "")}`,
+      outcome.stdout,
+      outcome.stderr
+    );
+  }
 
-    // 프롬프트가 큰 경우 CLI 인자로 넘기면 OS 명령행 길이 제한(Windows 등)에 걸릴 수 있다
-    // (실제로 ENAMETOOLONG 발생 확인) — stdin으로 전달해 이 제한을 피한다.
-    if (stdinInput !== undefined) {
-      child.stdin?.write(stdinInput, "utf-8");
-      child.stdin?.end();
-    }
+  if (outcome.timedOut) {
+    // stdin은 이미 즉시 닫았으므로 대화형 프롬프트가 떠도 응답할 방법이 없다 — 그대로면
+    // timeoutMs까지 hang하다 강제 종료된다. 그 hang의 원인이 usage-limit/대화형 선택 메뉴로
+    // 보이면 TIMEOUT이 아니라 USAGE_LIMIT으로 분류해 재시도 로직(orchestrator의
+    // WAITING_CLAUDE_LIMIT)이 정확히 잡게 한다.
+    const errorCode = detectUsageLimitSignal(`${outcome.stdout}\n${outcome.stderr}`) ? "USAGE_LIMIT" : "TIMEOUT";
+    return makeError(errorCode, `timeout ${timeoutMs}ms 초과로 강제 종료됨`, outcome.stdout, outcome.stderr);
+  }
+  if (outcome.code !== 0) {
+    const errorCode = classifyFailureText(`${outcome.stdout}\n${outcome.stderr}`);
+    return makeError(errorCode, `exit code ${outcome.code}`, outcome.stdout, outcome.stderr);
+  }
 
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
+  const parsed = parseClaudeJsonOutput(outcome.stdout);
+  if (!parsed.ok) {
+    return makeError("INVALID_OUTPUT", "JSON 결과 파싱 실패", outcome.stdout, outcome.stderr);
+  }
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, timeoutMs);
+  log("claude CLI 호출 완료", { exitCode: outcome.code });
+  return {
+    success: true,
+    summary: parsed.summary,
+    changedFiles: [],
+    tests: [],
+    rawOutput: sanitizeForLog(outcome.stdout),
+    ...(parsed.model ? { model: parsed.model } : {}),
+    ...(parsed.tokenUsage ? { tokenUsage: parsed.tokenUsage } : {}),
+    ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
+  };
+}
 
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const code = err.code === "ENOENT" ? "CLI_NOT_FOUND" : "NON_ZERO_EXIT";
-      resolve(makeError(code, `subprocess 시작 실패: ${sanitizeForLog(err.message)}`));
-    });
+// SI-3.6(Executable Identity Trust) bounded review(chunk1 HIGH, 4라운드) 지적 반영 — 이 함수는
+// 더 이상 export되지 않는다. runClaudeTask()만 이 함수를 쓰고, 항상 resolveTrustedClaudeCommand()가
+// 결정한 경로만 넘긴다 — 다른 어떤 파일도 이 함수를 통해 임의 command를 spawn할 방법이 없다
+// (subprocess-runner.ts의 runSubprocessWithTimeout()은 claude 신뢰와 무관한 범용 유틸리티라
+// 이 우려 대상이 아니다 — § 그 파일 상단 설명).
+async function execAndClassify(command: string, args: string[], timeoutMs: number, stdinInput?: string): Promise<RealClaudeResult> {
+  const outcome = await runSubprocessWithTimeout(command, args, timeoutMs, stdinInput);
+  return classifySubprocessOutcome(outcome, timeoutMs);
+}
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (stdout.length < MAX_OUTPUT_BYTES) stdout += chunk.toString("utf-8");
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString("utf-8");
-    });
-
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-
-      if (timedOut) {
-        // stdin은 이미 즉시 닫았으므로(§ 위 write/end) 대화형 프롬프트가 떠도 응답할 방법이
-        // 없다 — 그대로면 timeoutMs까지 hang하다 여기서 강제 종료된다. 그 hang의 원인이
-        // usage-limit/대화형 선택 메뉴로 보이면 TIMEOUT이 아니라 USAGE_LIMIT으로 분류해
-        // 재시도 로직(orchestrator의 WAITING_CLAUDE_LIMIT)이 정확히 잡게 한다.
-        const errorCode = detectUsageLimitSignal(`${stdout}\n${stderr}`) ? "USAGE_LIMIT" : "TIMEOUT";
-        resolve(makeError(errorCode, `timeout ${timeoutMs}ms 초과로 강제 종료됨`, stdout, stderr));
-        return;
-      }
-      if (code !== 0) {
-        const errorCode = classifyFailureText(`${stdout}\n${stderr}`);
-        resolve(makeError(errorCode, `exit code ${code}`, stdout, stderr));
-        return;
-      }
-
-      const parsed = parseClaudeJsonOutput(stdout);
-      if (!parsed.ok) {
-        resolve(makeError("INVALID_OUTPUT", "JSON 결과 파싱 실패", stdout, stderr));
-        return;
-      }
-
-      log("claude CLI 호출 완료", { exitCode: code });
-      resolve({
-        success: true,
-        summary: parsed.summary,
-        changedFiles: [],
-        tests: [],
-        rawOutput: sanitizeForLog(stdout),
-        ...(parsed.model ? { model: parsed.model } : {}),
-        ...(parsed.tokenUsage ? { tokenUsage: parsed.tokenUsage } : {}),
-        ...(parsed.durationMs !== undefined ? { durationMs: parsed.durationMs } : {}),
-      });
-    });
+// SI-3.6(Executable Identity Trust) — RunOptions.command가 지정되지 않은 실제 운용 경로는
+// bare "claude" 문자열을 spawn에 그대로 넘기지 않는다(그동안은 PATH/cwd 탐색에 전적으로
+// 위임했다 — project root/cwd/OS temp에 심어진 가짜 claude.exe가 대신 실행될 수 있는
+// 구조였다). claude-developer.ts의 callClaude()도 동일한 위험을 가진 별도 호출부라 이
+// 함수를 그대로 재사용한다(판정 로직을 두 곳에 복제하지 않는다).
+export function resolveTrustedClaudeCommand(
+  excludedRoots: string[] = []
+): { ok: true; command: string } | { ok: false; result: RealClaudeResult } {
+  const resolved = resolveTrustedExecutable("claude", {
+    excludedRoots: [process.cwd(), tmpdir(), ...excludedRoots],
   });
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      result: makeError(resolved.code, `신뢰된 claude CLI 실행 파일을 확인하지 못했습니다: ${resolved.reason}`),
+    };
+  }
+  return { ok: true, command: resolved.spawnCommand };
 }
 
 export async function runClaudeTask(
@@ -233,7 +241,8 @@ export async function runClaudeTask(
   opts: RunOptions = {}
 ): Promise<RealClaudeResult> {
   void attempt;
-  const command = opts.command ?? "claude";
   const args = ["-p", task, "--output-format", "json", "--tools", "", "--no-session-persistence"];
-  return execAndClassify(command, args, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const trusted = resolveTrustedClaudeCommand(opts.excludedRoots ?? []);
+  if (!trusted.ok) return trusted.result;
+  return execAndClassify(trusted.command, args, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 }
