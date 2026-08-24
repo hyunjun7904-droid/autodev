@@ -24,6 +24,7 @@
     "test:provider-security-gate": "npm run build && node dist/provider-security-gate-tests.js",
     "test:provider-pool": "npm run build && node dist/provider-pool-tests.js",
     "test:provider-pool-security-metadata": "npm run build && node dist/provider-pool-security-metadata-tests.js",
+    "test:provider-routing": "npm run build && node dist/provider-routing-tests.js",
     "test:review-provider-adapters": "npm run build && node dist/review-provider-adapters-tests.js",
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",
