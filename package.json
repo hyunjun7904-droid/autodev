@@ -15,6 +15,8 @@
     "test:safe-executor": "npm run build && node dist/safe-executor-tests.js",
     "test:safe-executor-context": "npm run build && node dist/safe-executor-context-tests.js",
     "test:trusted-executable-resolver": "npm run build && node dist/trusted-executable-resolver-tests.js",
+    "test:gradle-capability": "npm run build && node dist/gradle-capability-tests.js",
+    "test:execution-contract": "npm run build && node dist/execution-contract-tests.js",
     "test:gpt-retry": "npm run build && node dist/gpt-retry-tests.js",
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",

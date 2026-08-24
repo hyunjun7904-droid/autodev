@@ -10,6 +10,7 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import { resolveTrustedExecutable } from "./trusted-executable-resolver";
 import type { TrustedExecutableResult } from "./trusted-executable-resolver";
 import { parseLockfileJson, checkIntegrity } from "./dependency-scanner";
+import { coreGradleCommandSafetyGate, resolveTrustedGradleWrapper } from "./gradle-capability";
 
 // Safe Executor — Claude에게 built-in Read/Edit/Write/Bash를 주지 않고, 이 모듈을 통해서만
 // 검증된 파일/명령 작업을 수행하게 한다. 모든 하드 경계는 여기 코드로 강제되며, LLM 프롬프트
@@ -347,7 +348,9 @@ function buildHardenedGitArgs(args: string[]): string[] {
 // 빌드/테스트/개발 도구 표면(.claude/CLAUDE.md 검증 절차 — npx tsc --noEmit / npm run
 // build / npm run test:<module> — 그리고 claude-developer.ts가 실제 만들어내는
 // RUN_COMMAND의 실제 사용례 — node <script>.test.js / git 조회)과 정확히 일치하는 닫힌
-// (closed) 5개 executable family다. 이 목록에 없는 executable은 그것이 무엇이든(알려진
+// (closed) 5개 executable family다(SI-3.7이 project-owned Gradle Wrapper capability로
+// gradlew를 추가해 현재는 6개다 — § 아래 CORE_ALLOWED_EXECUTABLE_FAMILIES). 이 목록에
+// 없는 executable은 그것이 무엇이든(알려진
 // wrapper든 이전에 한 번도 본 적 없는 새 wrapper든) 무조건 거부된다 — bash/sh/zsh/dash/
 // ksh/ash/pwsh/powershell/cmd/python/ruby/perl/php/deno/bun은 물론 nice/timeout/stdbuf/
 // busybox/env/nohup/setsid 같은 실행 위임 wrapper, 그리고 이 목록에 없는 임의의 다른
@@ -362,8 +365,8 @@ function buildHardenedGitArgs(args: string[]): string[] {
 //
 // 이 allow-list는 policy.allowedCommands(project 소유)보다 항상 먼저, 그리고 그것과
 // 무관하게 적용된다(요구사항 3: 프로젝트가 arbitrary shell string으로 이 경계를 우회할 수
-// 없다) — 이 함수는 policy를 인자로 받지 않으므로 어떤 project도 이 5개 목록을 확장할
-// 방법이 없다.
+// 없다) — 이 함수는 policy를 인자로 받지 않으므로 어떤 project도 이 목록(SI-3.4가 정한
+// git/npm/npx/node/tsc 5개 + SI-3.7이 추가한 gradlew, 총 6개 family)을 확장할 방법이 없다.
 //
 // family 허용은 "이 실행 파일 자체를 실행할 자격이 있다"는 판정일 뿐, "어떤 인자로도
 // 실행해도 된다"는 뜻이 아니다 — family 허용 뒤에 각 family별 추가 검사가 적용된다: git은
@@ -374,6 +377,13 @@ function buildHardenedGitArgs(args: string[]): string[] {
 // 코드·패키지를 그대로 실행하는 위임 executor라 node의 eval 플래그와 동일한 클래스의
 // 위험이다). tsc만 인자로 넘긴 내용을 코드로 즉시 실행하는 표준 플래그/서브커맨드가 없어
 // family 허용만으로 충분하다.
+// SI-3.7(Execution Contract Closure, EP-2) — "gradlew"를 이 닫힌 목록에 추가한다. tsc와
+// 마찬가지로 "family 허용 = 사실상 전체 신뢰"가 아니다 — family 허용 뒤에 gradlew 전용
+// 추가 검사(coreGradleCommandSafetyGate: 정확히 하나의 allow-listed Gradle task 인자만
+// 허용, § gradle-capability.ts)와 project-owned 코드라는 별도 trust boundary(Trusted
+// Gradle Wrapper Resolution)가 반드시 함께 적용된다. "./gradlew"/"../gradlew"/외부 경로 등
+// 경로가 포함된 형태는 family 판정 이전(§ coreCommandSafetyGate 0번)에 이미 차단되므로
+// bare "gradlew"/"gradlew.bat" 이름만 이 목록에 실제로 도달한다.
 const CORE_ALLOWED_EXECUTABLE_FAMILIES: ReadonlySet<string> = new Set([
   "git",
   "npm",
@@ -381,6 +391,7 @@ const CORE_ALLOWED_EXECUTABLE_FAMILIES: ReadonlySet<string> = new Set([
   "node",
   "nodejs", // 일부 Linux 배포판(Debian/Ubuntu 계열)에서 쓰이는 node의 대체 실행 파일 이름.
   "tsc",
+  "gradlew",
 ]);
 
 /** command에서 디렉터리/확장자를 제거한 실행 파일 이름(소문자)만 남긴다 — 이 파일 전체가
@@ -388,7 +399,7 @@ const CORE_ALLOWED_EXECUTABLE_FAMILIES: ReadonlySet<string> = new Set([
  *  모두 이 함수 하나만 쓴다). 호스트 OS와 무관하게 "/"와 "\\" 둘 다 항상 구분자로
  *  인식한다(POSIX 호스트에서도 Windows 경로 형태의 basename을 놓치지 않는다).
  */
-function normalizeExecutableBase(command: string): string {
+export function normalizeExecutableBase(command: string): string {
   const withoutDir = command.trim().split(/[\\/]/).pop() ?? command.trim();
   return withoutDir.toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
 }
@@ -399,8 +410,9 @@ function normalizeExecutableBase(command: string): string {
 // --experimental-loader(모듈 loader 등록)를 추가한다 — 이 넷 모두 entry script 실행 전에
 // 임의 로컬 모듈을 먼저 로드해 그 모듈의 top-level 코드를 즉시 실행시킨다는 점에서
 // -e/--eval과 같은 클래스의 위험이다(그 모듈 파일 내용은 이 gate가 검증할 방법이 없다).
-// family 범위가 5개로 줄어 python/ruby/perl/php/deno/bun/bash 등은 이제 위 allow-list
-// 단계에서 이미 차단되므로 그 언어들의 개별 eval 플래그 형태를 더는 나열할 필요가 없다.
+// family 범위가 닫힌 소수(git/npm/npx/node/tsc/gradlew)로 줄어 python/ruby/perl/php/deno/
+// bun/bash 등은 이제 위 allow-list 단계에서 이미 차단되므로 그 언어들의 개별 eval 플래그
+// 형태를 더는 나열할 필요가 없다.
 const NODE_EVAL_FLAG_PATTERNS: RegExp[] = [
   /^(-c|-e|-r|-p|--eval|--print|--require|--import|--loader|--experimental-loader)$/i,
   /^--(eval|print|require|import|loader|experimental-loader)=/i,
@@ -427,9 +439,9 @@ const NPX_ALLOWED_PACKAGE_NAMES: ReadonlySet<string> = new Set(["tsc"]);
  * RUN_COMMAND의 Core Command Safety Gate — validateCommand()가 policy.allowedCommands를
  * 확인하기 전에 항상 먼저 통과해야 한다.
  *   1) 실행 파일(normalizeExecutableBase 기준)이 CORE_ALLOWED_EXECUTABLE_FAMILIES(git/npm/
- *      npx/node/tsc) 밖이면 무조건 거부한다(위 설명 — SI-3.4, 이 다섯 개 밖은 그것이
- *      wrapper인지 여부와 무관하게 전부 차단이라 bash/sh/env/nice/timeout/stdbuf/busybox 등
- *      개별 이름을 알 필요가 없다).
+ *      npx/node/tsc/gradlew) 밖이면 무조건 거부한다(위 설명 — SI-3.4가 정한 5개 + SI-3.7이
+ *      추가한 gradlew, 이 목록 밖은 그것이 wrapper인지 여부와 무관하게 전부 차단이라
+ *      bash/sh/env/nice/timeout/stdbuf/busybox 등 개별 이름을 알 필요가 없다).
  *   2) 대상이 node/nodejs이고 인자에 코드/표현식을 즉시 실행하거나 모듈을 preload하는 플래그
  *      (-c/-e/-r/-p/--eval/--print/--require/--import/--loader 등)가 있으면 무조건
  *      거부한다(위 설명).
@@ -437,6 +449,8 @@ const NPX_ALLOWED_PACKAGE_NAMES: ReadonlySet<string> = new Set(["tsc"]);
  *      첫 인자가 NPX_ALLOWED_PACKAGE_NAMES(tsc) 밖일 때 무조건 거부한다(위 설명 — npm
  *      exec/x, npx의 임의 패키지 실행은 node의 eval 플래그와 같은 클래스의 위험이다).
  *   3) 대상이 git이면 read-only 서브커맨드가 아닌 한 무조건 거부(위 설명).
+ *   3-1) 대상이 gradlew면 coreGradleCommandSafetyGate(정확히 하나의 allow-listed Gradle
+ *      task 인자만 허용, § gradle-capability.ts)를 통과하지 못하는 한 무조건 거부한다(SI-3.7).
  *   0) command 문자열 자체에 경로 구분자("/"·"\\")나 드라이브 문자(":")가 있으면 무조건
  *      거부한다(위 1)보다도 먼저 — SI-3.4 bounded GPT Independent Review 2차(CRITICAL)
  *      지적: normalizeExecutableBase()가 경로를 벗겨내고 basename만으로 family를 판정하기
@@ -474,7 +488,7 @@ export function coreCommandSafetyGate(command: string, args: string[]): { ok: bo
       ok: false,
       reason:
         "Core Command Safety Gate: 인식되지 않은 executable입니다 — Core가 허용하는 command family" +
-        "(git/npm/npx/node/tsc) 밖의 명령은 어떤 프로젝트 정책으로도 실행할 수 없습니다" +
+        "(git/npm/npx/node/tsc/gradlew) 밖의 명령은 어떤 프로젝트 정책으로도 실행할 수 없습니다" +
         "(shell/interpreter wrapper 포함, 알려진 wrapper 여부와 무관).",
     };
   }
@@ -510,6 +524,12 @@ export function coreCommandSafetyGate(command: string, args: string[]): { ok: bo
         "Core Command Safety Gate: read-only로 확인되지 않은 git 서브커맨드는 어떤 프로젝트 정책으로도 " +
         "허용되지 않습니다(reset/clean/rebase/push/checkout/restore/commit/stash push·pop·drop 등).",
     };
+  }
+  if (base === "gradlew") {
+    const gradleGate = coreGradleCommandSafetyGate(command, args);
+    if (!gradleGate.ok) {
+      return { ok: false, reason: gradleGate.reason };
+    }
   }
   for (const raw of args) {
     const a = raw.split("\\").join("/");
@@ -911,7 +931,14 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
     const excludedRoots = [projectRoot, projectRootReal, cwdAbs, tmpdir()];
     if (base === "git") return resolveTrustedExecutable("git", { excludedRoots });
     if (base === "npm" || base === "npx") return resolveTrustedExecutable(base, { excludedRoots });
-    // 도달 불가 — CORE_ALLOWED_EXECUTABLE_FAMILIES가 이 다섯 개 밖의 base를 이미 걸러낸다.
+    // SI-3.7 — gradlew도 tsc처럼 project root 기준으로 직접 해석해야 한다(§ gradle-
+    // capability.ts 파일 상단 trust boundary 설명). cwdAbs는 이미 validateCommand()가 통과한
+    // cwd(commandCwdAliases로 project root 내부로 확정됨)를 cwdToPath()로 해석한 절대경로다 —
+    // 이것이 곧 Gradle module 디렉터리다.
+    if (base === "gradlew") {
+      return resolveTrustedGradleWrapper({ moduleAbs: cwdAbs, projectRootReal, excludedRootsForJava: excludedRoots });
+    }
+    // 도달 불가 — CORE_ALLOWED_EXECUTABLE_FAMILIES가 이 여섯 개 밖의 base를 이미 걸러낸다.
     return { ok: false, code: "TRUSTED_EXECUTABLE_NOT_FOUND", reason: `인식되지 않은 executable family: ${base}` };
   }
 

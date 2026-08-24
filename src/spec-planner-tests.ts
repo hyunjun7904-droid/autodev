@@ -11,6 +11,7 @@ import { PROJECT_LOCK_SCHEMA_VERSION, RUNTIME_LOCK_DIR, resolveCanonicalProjectP
 import type { ProjectLockMetadata } from "./project-lock";
 import {
   runPlanner,
+  reassembleExecutionContract,
   normalizeMasterSpec,
   validateArchitectureRawOutput,
   validatePhasePlanRawOutput,
@@ -3143,6 +3144,327 @@ async function scenarioPartialGenerationIsDetected(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// SI-3.7(Execution Contract Closure) — EP-1/EP-2 회귀 테스트.
+// ---------------------------------------------------------------------------
+
+// EP-1: requiredTest 명령이 Core Command Safety Gate를 통과하지 못하면(예: shell wrapper)
+// 최종 조립 전에 즉시 BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)되어야 한다 — READY_FOR_AUTODEV/
+// HUMAN_REVIEW_REQUIRED를 만들지 않는다.
+async function scenarioRequiredTestUnsupportedCommandBlocksAssembly(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-unsupported-command) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const badTasks = buildGoodTaskPlanRaw(identity, "1");
+  badTasks.tasks[0].requiredTests = [{ name: "shell", command: "bash", args: ["-c", "echo hi"], cwd: "root" }];
+  const source = buildMultiStageGoodSource(normalized, identity, { task: () => fixedSource(badTasks) });
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check(
+    "si37-unsupported-command) Core Command Safety Gate를 통과하지 못하는 requiredTest는 BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)",
+    result.status === "BLOCKED" && result.code === "REQUIRED_TEST_NOT_EXECUTABLE"
+  );
+}
+
+// EP-1 실제 수정: STAGE 1이 제안한 executionPolicy.allowedCommands에는 없는 명령(npx tsc)을
+// task의 requiredTest가 요구해도, Core가 requiredTests로부터 deterministic하게 파생해
+// 최종 executionPolicy.allowedCommands에 자동으로 포함시켜야 한다(exact-match 불일치를
+// 구조적으로 제거).
+async function scenarioRequiredTestAutoDerivesIntoAllowedCommands(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-auto-derive) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  // buildGoodArchitectureRaw()의 executionPolicy.allowedCommands는 npm run test:unit뿐이다
+  // (§ 위 fixture) — task 2의 requiredTest를 그 목록에 없는 npx tsc로 바꾼다.
+  const tasks = buildGoodTaskPlanRaw(identity, "1");
+  tasks.tasks[1].requiredTests = [{ name: "typecheck", command: "npx", args: ["tsc"], cwd: "root" }];
+  const source = buildMultiStageGoodSource(normalized, identity, { task: () => fixedSource(tasks) });
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("si37-auto-derive) EP-1 불일치가 있어도 최종 조립은 성공(READY_FOR_AUTODEV)", result.status === "READY_FOR_AUTODEV");
+  if (result.status !== "READY_FOR_AUTODEV") return;
+  const executionPolicy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  const commands: { cwd: string; command: string; args: string[] }[] = executionPolicy.allowedCommands;
+  check(
+    "si37-auto-derive) STAGE 1이 제안한 npm run test:unit이 그대로 보존됨",
+    commands.some((c) => c.command === "npm" && JSON.stringify(c.args) === JSON.stringify(["run", "test:unit"]))
+  );
+  check(
+    "si37-auto-derive) requiredTest에서 파생된 npx tsc가 자동으로 추가됨(EP-1 exact-match 불일치 해소)",
+    commands.some((c) => c.command === "npx" && JSON.stringify(c.args) === JSON.stringify(["tsc"]))
+  );
+}
+
+// EP-2: 정상적인 Gradle Wrapper capability(test)는 cwd alias만 정의돼 있으면 requiredTest로
+// 계획 가능해야 한다.
+async function scenarioGradleRequiredTestSucceeds(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-gradle-ok) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const architecture = buildGoodArchitectureRaw(normalized, identity);
+  architecture.executionPolicy.commandCwdAliases = { android: "android/" };
+  const tasks = buildGoodTaskPlanRaw(identity, "1");
+  tasks.tasks[0].requiredTests = [{ name: "android-unit", command: "gradlew", args: ["test"], cwd: "android" }];
+  const source = buildMultiStageGoodSource(normalized, identity, { architecture: fixedSource(architecture), task: () => fixedSource(tasks) });
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("si37-gradle-ok) 정상 Gradle test requiredTest는 READY_FOR_AUTODEV로 성공", result.status === "READY_FOR_AUTODEV");
+  if (result.status !== "READY_FOR_AUTODEV") return;
+  const executionPolicy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  check(
+    "si37-gradle-ok) execution-policy.json에 gradlew test @ android가 자동 파생되어 포함됨",
+    (executionPolicy.allowedCommands as { cwd: string; command: string; args: string[] }[]).some(
+      (c) => c.cwd === "android" && c.command === "gradlew" && JSON.stringify(c.args) === JSON.stringify(["test"])
+    )
+  );
+  check("si37-gradle-ok) commandCwdAliases.android가 보존됨", executionPolicy.commandCwdAliases?.android === "android/");
+}
+
+// EP-2: 임의 ./gradlew, 외부 path, custom init script 등은 여전히 거부되어야 한다.
+async function scenarioGradleDangerousVariantsBlockAssembly(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const normalized = normalizeMasterSpec(content);
+
+  async function expectBlocked(label: string, mutate: (t: ReturnType<typeof buildGoodTaskPlanRaw>) => void): Promise<void> {
+    const { outcome, identity } = runFullBootstrap(content);
+    if (outcome.status !== "COMPLETE") {
+      check(`${label}) setup) bootstrap COMPLETE`, false);
+      return;
+    }
+    const architecture = buildGoodArchitectureRaw(normalized, identity);
+    architecture.executionPolicy.commandCwdAliases = { android: "android/" };
+    const tasks = buildGoodTaskPlanRaw(identity, "1");
+    mutate(tasks);
+    const source = buildMultiStageGoodSource(normalized, identity, { architecture: fixedSource(architecture), task: () => fixedSource(tasks) });
+    const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+    check(`${label}) BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)`, result.status === "BLOCKED" && result.code === "REQUIRED_TEST_NOT_EXECUTABLE");
+  }
+
+  await expectBlocked("si37-gradle-dotslash) \"./gradlew\" 형태", (t) => {
+    t.tasks[0].requiredTests = [{ name: "android-unit", command: "./gradlew", args: ["test"], cwd: "android" }];
+  });
+  await expectBlocked("si37-gradle-init-script) 인자 2개(--init-script 포함)", (t) => {
+    t.tasks[0].requiredTests = [{ name: "android-unit", command: "gradlew", args: ["test", "--init-script=evil.gradle"], cwd: "android" }];
+  });
+  await expectBlocked("si37-gradle-unsupported-task) 지원되지 않는 task(publish)", (t) => {
+    t.tasks[0].requiredTests = [{ name: "android-publish", command: "gradlew", args: ["publish"], cwd: "android" }];
+  });
+  await expectBlocked("si37-gradle-no-cwd-alias) cwd 별칭이 정의되지 않음", (t) => {
+    t.tasks[0].requiredTests = [{ name: "android-unit", command: "gradlew", args: ["test"], cwd: "ios" }];
+  });
+  await expectBlocked("si37-gradle-shell-wrapper) shell wrapper로 우회 시도", (t) => {
+    t.tasks[0].requiredTests = [{ name: "android-unit", command: "sh", args: ["-c", "./gradlew test"], cwd: "android" }];
+  });
+}
+
+// Resume 탐지: 이미 hash-consistent하게 완료된 checkpoint라도, 저장된 task-registry.json이
+// 저장된 execution-policy.json과 exact-match로 어긋나면 idempotent 재확인에서 매번 다시
+// 잡혀야 한다(§ reloadAndValidateGeneratedData의 SI-3.7 추가 검증) — 이 Task 이전 코드가
+// 만든 오래된 checkpoint를 흉내낸다.
+async function scenarioStaleCheckpointContractViolationDetectedOnReload(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-stale-detect) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const source = buildMultiStageGoodSource(normalized, identity);
+  const first = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  if (first.status !== "READY_FOR_AUTODEV") {
+    check("si37-stale-detect) setup) 최초 실행 READY_FOR_AUTODEV", false);
+    return;
+  }
+
+  // task-registry.json에 execution-policy.json의 allowedCommands와 어긋나는 requiredTest를
+  // 가진 task를 직접 추가한 뒤, generation.json의 taskRegistrySha256만 그 새 내용에 맞게
+  // 재계산한다(다른 두 파일은 손대지 않음) — "3개 파일이 hash-consistent하지만 계약을
+  // 위반"하는 상태를 정밀하게 재현한다(§ scenarioPartialGenerationIsDetected와 동일한 기법).
+  const taskRegistry = JSON.parse(readFileSync(first.taskRegistryPath, "utf-8"));
+  taskRegistry.push({
+    ...taskRegistry[0],
+    id: "1.99",
+    requiredTests: [{ name: "typecheck", command: "npx", args: ["tsc"], cwd: "root" }],
+  });
+  const newContent = JSON.stringify(taskRegistry, null, 2) + "\n";
+  writeFileSync(first.taskRegistryPath, newContent, "utf-8");
+  const generationPath = join(outcome.projectRoot, ".autodev", "generation.json");
+  const generation = JSON.parse(readFileSync(generationPath, "utf-8"));
+  generation.taskRegistrySha256 = sha256Hex(newContent);
+  writeFileSync(generationPath, JSON.stringify(generation, null, 2) + "\n", "utf-8");
+
+  const second = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: neverCalledSource() });
+  check(
+    "si37-stale-detect) requiredTests/allowedCommands 불일치가 있는 checkpoint는 idempotent 재확인에서 BLOCKED(GENERATED_DATA_INVALID)",
+    second.status === "BLOCKED" && second.code === "GENERATED_DATA_INVALID"
+  );
+}
+
+// Resume 수정: 이미 COMPLETED된(architecture/phasePlan/phaseTaskPlans는 그대로) checkpoint의
+// execution 계약 레이어만 LLM 재호출 없이 재조립한다.
+async function scenarioReassembleFixesStaleCompletedCheckpoint(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-reassemble-fix) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const architecture = buildGoodArchitectureRaw(normalized, identity);
+  // STAGE 1이 제안한 allowedCommands는 npm run test:unit뿐 — "이 Task 이전 코드"가 만들었을
+  // 법한, task의 실제 requiredTest(npx tsc)와 어긋나는 조합을 그대로 흉내낸다.
+  const phasePlanValidation = validatePhasePlanRawOutput(JSON.stringify(buildGoodPhasePlanRaw(identity)), normalized, identity);
+  if (!phasePlanValidation.ok) {
+    check("si37-reassemble-fix) setup) phase plan valid", false);
+    return;
+  }
+  const phasePlan = phasePlanValidation.value;
+  const phase1 = phasePlan.find((p) => p.phaseId === "1")!;
+  const rawTasks = buildGoodTaskPlanRaw(identity, "1");
+  rawTasks.tasks[1].requiredTests = [{ name: "typecheck", command: "npx", args: ["tsc"], cwd: "root" }];
+  const taskValidation = validatePhaseTaskRawOutput(JSON.stringify(rawTasks), normalized, identity, phase1, new Set());
+  if (!taskValidation.ok) {
+    check("si37-reassemble-fix) setup) task plan valid", false);
+    return;
+  }
+  const tasks = taskValidation.value;
+
+  // planner-state.json을 직접 COMPLETED로 만든다 — 실제 generated 파일(project-manifest.json
+  // 등)은 전혀 쓰지 않는다(§ scenarioTraceabilityValidatedResumeBypassIsBlocked와 동일한
+  // 기법 — reassembleExecutionContract는 이 파일들을 사전 조건으로 요구하지 않고 그 자리에
+  // 새로 만든다).
+  const plannerStatePath = join(outcome.projectRoot, ".autodev", "planner-state.json");
+  mkdirSync(join(outcome.projectRoot, ".autodev"), { recursive: true });
+  const state = {
+    schemaVersion: 2,
+    identity,
+    stage: "COMPLETED",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    architecture,
+    phasePlan,
+    phaseTaskPlans: { "1": tasks },
+  };
+  writeFileSync(plannerStatePath, JSON.stringify(state, null, 2), "utf-8");
+
+  const result = await reassembleExecutionContract(outcome.projectRoot, identity);
+  check("si37-reassemble-fix) EXECUTION_CONTRACT_REASSEMBLED", result.status === "EXECUTION_CONTRACT_REASSEMBLED");
+  if (result.status !== "EXECUTION_CONTRACT_REASSEMBLED") return;
+
+  const executionPolicy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  check(
+    "si37-reassemble-fix) 재조립된 execution-policy.json에 npx tsc가 파생되어 포함됨",
+    (executionPolicy.allowedCommands as { cwd: string; command: string; args: string[] }[]).some(
+      (c) => c.command === "npx" && JSON.stringify(c.args) === JSON.stringify(["tsc"])
+    )
+  );
+
+  const stateAfter = JSON.parse(readFileSync(plannerStatePath, "utf-8"));
+  check("si37-reassemble-fix) planner-state.json의 stage는 여전히 COMPLETED(재전이 없음)", stateAfter.stage === "COMPLETED");
+
+  const rerun = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: neverCalledSource() });
+  check("si37-reassemble-fix) 재조립 이후 runPlanner()는 LLM 재호출 없이 ALREADY_READY", rerun.status === "ALREADY_READY");
+}
+
+// bounded code-review 지적(HIGH) 회귀 테스트 — reassembleExecutionContract()도
+// runPlanner()의 TRACEABILITY_VALIDATED resume 경로(§ scenarioResumedArchitectureTamperIsDetected)와
+// 동일하게, planner-state.json에 직접 주입된 변조된 architecture(secret-shaped 값/
+// projectId·specVersion 불일치/unsafe executionPolicy)를 곧장 신뢰해 쓰지 않고 재검증에서
+// 잡아야 한다.
+async function scenarioReassembleTamperedArchitectureIsBlocked(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const normalized = normalizeMasterSpec(content);
+
+  async function runWithTamperedArchitecture(label: string, mutate: (a: ArchitectureRawOutput) => void): Promise<void> {
+    const { outcome, identity } = runFullBootstrap(content);
+    if (outcome.status !== "COMPLETE") {
+      check(`${label}) setup) bootstrap COMPLETE`, false);
+      return;
+    }
+    const architecture = buildGoodArchitectureRaw(normalized, identity);
+    mutate(architecture);
+    const phasePlanValidation = validatePhasePlanRawOutput(JSON.stringify(buildGoodPhasePlanRaw(identity)), normalized, identity);
+    if (!phasePlanValidation.ok) {
+      check(`${label}) setup) phase plan valid`, false);
+      return;
+    }
+    const phasePlan = phasePlanValidation.value;
+    const phase1 = phasePlan.find((p) => p.phaseId === "1")!;
+    const taskValidation = validatePhaseTaskRawOutput(JSON.stringify(buildGoodTaskPlanRaw(identity, "1")), normalized, identity, phase1, new Set());
+    if (!taskValidation.ok) {
+      check(`${label}) setup) task plan valid`, false);
+      return;
+    }
+    const plannerStatePath = join(outcome.projectRoot, ".autodev", "planner-state.json");
+    mkdirSync(join(outcome.projectRoot, ".autodev"), { recursive: true });
+    const state = {
+      schemaVersion: 2,
+      identity,
+      stage: "COMPLETED",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      architecture,
+      phasePlan,
+      phaseTaskPlans: { "1": taskValidation.value },
+    };
+    writeFileSync(plannerStatePath, JSON.stringify(state, null, 2), "utf-8");
+
+    const result = await reassembleExecutionContract(outcome.projectRoot, identity);
+    check(`${label}) reassembleExecutionContract가 tampered architecture를 감지해 BLOCKED(PLANNER_STATE_CORRUPT)`, result.status === "BLOCKED" && result.code === "PLANNER_STATE_CORRUPT");
+  }
+
+  await runWithTamperedArchitecture("reassemble-arch-tamper-secret", (a) => {
+    a.architectureSummary = "tampered sk-ant-abcdefghijklmnopqrstuvwxyz1234567890";
+  });
+  await runWithTamperedArchitecture("reassemble-arch-tamper-unsafe-policy", (a) => {
+    a.executionPolicy.allowedWritePrefixes = ["./"];
+  });
+  await runWithTamperedArchitecture("reassemble-arch-tamper-nested-project-id", (a) => {
+    a.projectId = "different-project-injected-via-checkpoint";
+  });
+}
+
+// stage가 COMPLETED가 아니면 재조립 대상이 아니다 — 조용히 아무것도 바꾸지 않는다.
+async function scenarioReassembleNotApplicableWhenNotCompleted(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-reassemble-not-applicable) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const architecture = buildGoodArchitectureRaw(normalized, identity);
+  const phasePlanValidation = validatePhasePlanRawOutput(JSON.stringify(buildGoodPhasePlanRaw(identity)), normalized, identity);
+  if (!phasePlanValidation.ok) {
+    check("si37-reassemble-not-applicable) setup) phase plan valid", false);
+    return;
+  }
+  const plannerStatePath = join(outcome.projectRoot, ".autodev", "planner-state.json");
+  mkdirSync(join(outcome.projectRoot, ".autodev"), { recursive: true });
+  const state = {
+    schemaVersion: 2,
+    identity,
+    stage: "PHASE_PLANNED",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    architecture,
+    phasePlan: phasePlanValidation.value,
+  };
+  writeFileSync(plannerStatePath, JSON.stringify(state, null, 2), "utf-8");
+
+  const result = await reassembleExecutionContract(outcome.projectRoot, identity);
+  check("si37-reassemble-not-applicable) stage!=COMPLETED면 REASSEMBLY_NOT_APPLICABLE", result.status === "REASSEMBLY_NOT_APPLICABLE");
+}
+
 async function main(): Promise<void> {
   scenarioSI1RejectMeansNoPlanner();
   scenarioNormalizeMasterSpecUnitChecks();
@@ -3218,6 +3540,15 @@ async function main(): Promise<void> {
     await scenarioStageArtifactInvariantRejectsCorruptCombos();
     await scenarioLongLlmCallRevalidatesTrustedInput();
     await scenarioPartialGenerationIsDetected();
+
+    await scenarioRequiredTestUnsupportedCommandBlocksAssembly();
+    await scenarioRequiredTestAutoDerivesIntoAllowedCommands();
+    await scenarioGradleRequiredTestSucceeds();
+    await scenarioGradleDangerousVariantsBlockAssembly();
+    await scenarioStaleCheckpointContractViolationDetectedOnReload();
+    await scenarioReassembleFixesStaleCompletedCheckpoint();
+    await scenarioReassembleTamperedArchitectureIsBlocked();
+    await scenarioReassembleNotApplicableWhenNotCompleted();
   } finally {
     for (const dir of tempDirs) {
       try {

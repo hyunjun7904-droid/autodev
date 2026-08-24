@@ -27,6 +27,13 @@ import { getNextTask } from "./task-registry";
 import type { TaskDefinition, RequiredTestCommand } from "./task-registry";
 import { runClaudeTask } from "./claude-runner";
 import { acquireProjectLock, releaseProjectLock } from "./project-lock";
+import {
+  validateRequiredTestExecutionContract,
+  deriveAllowedCommandsFromRequiredTests,
+  mergeAllowedCommands,
+  filterAllowedCommandsByCoreCapability,
+} from "./execution-contract";
+import type { ExecutionContractIssue, RequiredTestOwner } from "./execution-contract";
 
 // AutoDev Core 선행 업그레이드 — Incremental / Chunked Planner (SI-3.3).
 //
@@ -2080,12 +2087,31 @@ function buildTaskRegistry(raw: PlannerRawOutput): TaskDefinition[] {
   });
 }
 
+function toRequiredTestOwners(tasks: readonly PlannerRawTask[]): RequiredTestOwner[] {
+  return tasks.map((t) => ({ taskId: t.taskId, requiredTests: t.requiredTests }));
+}
+
+function describeExecutionContractIssues(issues: readonly ExecutionContractIssue[]): string {
+  return issues.map((i) => i.reason).join(" | ");
+}
+
+// SI-3.7(Execution Contract Closure, EP-1) — allowedCommands는 더 이상 STAGE 1 LLM 출력을
+// 그대로 신뢰하지 않는다. Core가 deterministic하게 (a) STAGE 1이 제안한 후보 중 Core Command
+// Safety Gate를 통과하는 것만 남기고(§ filterAllowedCommandsByCoreCapability), (b) 모든
+// task의 requiredTests에서 파생된(§ deriveAllowedCommandsFromRequiredTests — 이 함수를
+// 호출하는 시점에는 이미 validateRequiredTestExecutionContract가 그 requiredTests 전체를
+// 검증했다는 전제 위에서만 안전하다, § runPlannerLocked/reassembleExecutionContractLocked의
+// 호출 순서) 최소 명령을 더해 최종 allowedCommands를 만든다 — task-registry.requiredTests와
+// execution-policy.allowedCommands가 서로 다른 stage의 독립적인 LLM 출력이라 어긋날 수
+// 있었던 구조적 원인(EP-1)을 "requiredTests가 곧 allowedCommands의 근거"로 만들어 제거한다.
 function buildExecutionPolicy(raw: PlannerRawOutput): ProjectExecutionPolicy {
+  const safeAuthoredCommands = filterAllowedCommandsByCoreCapability(raw.executionPolicy.allowedCommands, raw.executionPolicy.commandCwdAliases);
+  const derivedFromRequiredTests = deriveAllowedCommandsFromRequiredTests(toRequiredTestOwners(raw.tasks));
   return {
     allowedReadPrefixes: raw.executionPolicy.allowedReadPrefixes,
     allowedWritePrefixes: raw.executionPolicy.allowedWritePrefixes,
     commandCwdAliases: raw.executionPolicy.commandCwdAliases,
-    allowedCommands: raw.executionPolicy.allowedCommands,
+    allowedCommands: mergeAllowedCommands(safeAuthoredCommands, derivedFromRequiredTests),
   };
 }
 
@@ -2688,7 +2714,12 @@ export type PlannerBlockedCode =
   | "RAW_OUTPUT_SOURCE_FAILED"
   | "GENERATED_DATA_INVALID"
   | "STATE_WRITE_FAILED"
-  | "CONCURRENT_PLANNER_RUN_IN_PROGRESS";
+  | "CONCURRENT_PLANNER_RUN_IN_PROGRESS"
+  // SI-3.7(Execution Contract Closure) — 하나 이상의 requiredTest가 최종 execution-policy +
+  // Core Command Safety + Trusted Executable Resolution을 통과할 수 없다(§ execution-
+  // contract.ts validateRequiredTestExecutionContract). READY_FOR_AUTODEV/
+  // HUMAN_REVIEW_REQUIRED를 만들지 않고 항상 이 코드로 중단한다.
+  | "REQUIRED_TEST_NOT_EXECUTABLE";
 
 interface TrustedPlannerInput {
   identity: BootstrapRequestIdentity;
@@ -3047,6 +3078,23 @@ function reloadAndValidateGeneratedData(
     const manifest = assembleProjectManifest({ manifestFile, taskRegistry, executionPolicy });
     validateProjectManifest(manifest);
     validateProjectExecutionPolicy(executionPolicy, projectId);
+    // SI-3.7 — 저장된 task-registry.json의 requiredTests가 저장된 execution-policy.json의
+    // allowedCommands와 여전히 정확히 일치하는지 매 resume/idempotent 재확인마다 다시
+    // 검증한다. 이 함수는 EXECUTION_DATA_GENERATED→VALIDATED 전이, COMPLETED 이후 모든
+    // idempotent 재실행(readyOutcome)에서 항상 호출되므로, 이 Task 이전 코드가 만든 오래된
+    // checkpoint(예: 기존 JARVIS COMPLETED 산출물)를 포함해 어떤 generation이든 이 계약을
+    // 위반하면 조용히 READY_FOR_AUTODEV/HUMAN_REVIEW_REQUIRED로 흘려보내지 않는다.
+    const executionContractIssuesOnReload = validateRequiredTestExecutionContract(
+      taskRegistry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests })),
+      executionPolicy.commandCwdAliases,
+      executionPolicy.allowedCommands
+    );
+    if (executionContractIssuesOnReload.length > 0) {
+      return {
+        ok: false,
+        detail: `저장된 task-registry.json/execution-policy.json이 Required Test Execution Contract를 통과하지 못했습니다: ${describeExecutionContractIssues(executionContractIssuesOnReload)}`,
+      };
+    }
     const ids = new Set<string>();
     for (const t of taskRegistry) {
       if (ids.has(t.id)) throw new Error(`재확인 중 중복 task id 발견: ${t.id}`);
@@ -3412,6 +3460,22 @@ async function runPlannerLocked(
         detail: `저장된 phasePlan/phaseTaskPlans checkpoint가 Global Traceability 재검증을 통과하지 못했습니다: ${traceabilityIssuesAtAssembly.map((i) => i.code).join(", ")}`,
       };
     }
+    // SI-3.7 — Required Test Execution Contract(§ execution-contract.ts). 모든 task의 모든
+    // requiredTest가 실제로 실행 가능한 구조인지(Core Command Safety Gate/cwd alias 유효성)를
+    // 여기서 deterministic하게 재검증한다 — 통과하지 못하면 최종 executionPolicy를 만들기
+    // 전에 즉시 BLOCKED한다(§ .claude/CLAUDE.md "requiredTests에 적혀 있다는 이유만으로 위험한
+    // 명령을 자동 허용하면 안 된다" — Core-supported capability validation이 항상 먼저다).
+    const executionContractIssuesAtAssembly = validateRequiredTestExecutionContract(
+      toRequiredTestOwners(allTasksAtAssembly),
+      cur.architecture.executionPolicy.commandCwdAliases
+    );
+    if (executionContractIssuesAtAssembly.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "REQUIRED_TEST_NOT_EXECUTABLE",
+        detail: `저장된 phaseTaskPlans의 requiredTests가 Required Test Execution Contract를 통과하지 못했습니다: ${describeExecutionContractIssues(executionContractIssuesAtAssembly)}`,
+      };
+    }
     let manifest: ProjectManifest;
     let generated: ReturnType<typeof buildGeneratedExecutionData>;
     try {
@@ -3421,6 +3485,19 @@ async function runPlannerLocked(
       manifest = assembleProjectManifest(generated);
       validateProjectManifest(manifest);
       validateProjectExecutionPolicy(generated.executionPolicy, identity.projectId);
+      // 위 buildExecutionPolicy()가 requiredTests로부터 allowedCommands를 파생/병합했으므로
+      // 아래는 구성상 항상 통과해야 하는 tautology 재확인이다(defense-in-depth — 파생 로직
+      // 자체의 회귀를 잡기 위함이지, 새로운 실패 모드를 기대하는 것이 아니다).
+      const finalContractIssues = validateRequiredTestExecutionContract(
+        toRequiredTestOwners(allTasks),
+        generated.executionPolicy.commandCwdAliases,
+        generated.executionPolicy.allowedCommands
+      );
+      if (finalContractIssues.length > 0) {
+        throw new Error(
+          `재조립된 executionPolicy.allowedCommands가 자체 Required Test Execution Contract 최종 검증을 통과하지 못했습니다: ${describeExecutionContractIssues(finalContractIssues)}`
+        );
+      }
     } catch (e) {
       return { status: "BLOCKED", code: "GENERATED_DATA_INVALID", detail: `생성된 실행 데이터가 Core 검증을 통과하지 못했습니다: ${e instanceof Error ? e.message : String(e)}` };
     }
@@ -3617,4 +3694,320 @@ async function runPlannerLocked(
   }
 
   return readyOutcome("FRESH", resolvedRoot, identity.projectId, hasFixedConstraints);
+}
+
+// =========================================================================
+// SI-3.7 — EXECUTION_CONTRACT_REASSEMBLY.
+// =========================================================================
+//
+// runPlannerLocked()의 "stage === COMPLETED" 분기(§ 위 runPlannerLocked 앞부분)는 곧장
+// readyOutcome("IDEMPOTENT", ...)로 이어진다 — reloadAndValidateGeneratedData()가 이제 새
+// Required Test Execution Contract를 재검증하므로(§ 위 함수 안의 SI-3.7 추가분), 이 Task
+// 이전 코드가 만든 오래된 COMPLETED checkpoint(예: 기존 JARVIS 산출물)를 대상으로 다시
+// runPlanner()를 호출하면 이제 조용히 통과하지 않고 BLOCKED(GENERATED_DATA_INVALID)로
+// 정확히 막힌다 — 이것만으로 EP-1/EP-2를 "탐지"하기에는 충분하지만, Architecture/Phase/
+// Task LLM을 다시 호출하지 않고 그 checkpoint를 "고치는" 명시적 경로는 아니다.
+//
+// reassembleExecutionContract()가 그 경로다: 이미 COMPLETED된 checkpoint의
+// architecture/phasePlan/phaseTaskPlans(LLM 산출물)는 그대로 재사용하고(재호출 없음),
+// execution 계약 레이어(project-manifest.json/task-registry.json/execution-policy.json/
+// generation.json)만 SI-3.7의 새 deterministic 로직(buildExecutionPolicy의 derive/merge +
+// validateRequiredTestExecutionContract)으로 다시 조립한다. planner-state.json의 stage는
+// COMPLETED로 유지되며 이 함수는 그 값을 바꾸지 않는다 — 이미 완료된 상태를 조용히
+// 되돌리거나 재전이시키지 않는다. 명시적으로 이 함수가 호출됐을 때만 동작하는 opt-in
+// migration 경로다(§ .claude/CLAUDE.md "명시적 EXECUTION_CONTRACT_REASSEMBLY") — 어떤
+// 자동 트리거도 이 함수를 대신 호출하지 않는다.
+//
+// stage!==COMPLETED(아직 진행 중이거나 시작 전)인 project는 이 함수의 대상이 아니다 —
+// 일반 runPlanner()가 이어서 진행하면 final assembly 시점에 어차피 동일한 Execution
+// Contract 검증을 거친다(§ 위 runPlannerLocked TRACEABILITY_VALIDATED 블록). 이 함수는
+// runPlannerLocked의 초기 신뢰 입력 검증(project root 안전성/bootstrap 신뢰 경계/identity
+// 대조)을 동일하게 반복한다 — 코드는 의도적으로 병렬(로직 복제)이지 리팩터링으로 공유
+// 경로를 새로 만들지 않았다: runPlannerLocked는 이미 여러 차례의 bounded GPT Independent
+// Review를 거친 security-critical 함수라, 이 Task 범위에서 그 함수의 제어 흐름 자체를
+// 바꾸는 리스크를 지지 않기 위함이다(§ 요구사항 "Core-wide 예상 외 변경이 필요하면 임의
+// 확대하지 말고 BLOCKED STOP").
+
+export type ExecutionContractReassemblyOutcome =
+  | { status: "BLOCKED"; code: PlannerBlockedCode; detail: string }
+  | { status: "CONFLICT"; detail: string; existingIdentity: BootstrapRequestIdentity; requestedIdentity: BootstrapRequestIdentity }
+  | { status: "REASSEMBLY_NOT_APPLICABLE"; detail: string }
+  | {
+      status: "EXECUTION_CONTRACT_REASSEMBLED";
+      projectRoot: string;
+      plannerStatePath: string;
+      projectManifestPath: string;
+      taskRegistryPath: string;
+      executionPolicyPath: string;
+      firstRunnableTask: TaskDefinition | null;
+      fixedConstraintComplianceNote: string | null;
+    };
+
+function reassembleExecutionContractLocked(
+  resolvedRoot: string,
+  expectedIdentity: BootstrapRequestIdentity,
+  config: PlannerTrustedConfig
+): ExecutionContractReassemblyOutcome {
+  let projectRootReal: string;
+  let projectRootIdentity: { dev: number; ino: number };
+  try {
+    projectRootReal = realpathSync(resolvedRoot);
+    // § runPlannerLocked의 동일 목적 캡처(위 "projectRootIdentity" 주석)와 동일한 이유 —
+    // 경로 문자열만으로는 "같은 경로에 원래 디렉터리가 rename되고 다른 디렉터리가 새로
+    // 설치됨"을 잡지 못한다. dev+ino를 write 직전 재확인의 기준으로 여기서 캡처한다.
+    const rootStat = statSync(projectRootReal);
+    projectRootIdentity = { dev: rootStat.dev, ino: rootStat.ino };
+  } catch (e) {
+    return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot realpath 확인 실패: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  const trustedInputResult = evaluateTrustedPlannerInput(resolvedRoot, projectRootReal, expectedIdentity);
+  if (!trustedInputResult.ok) {
+    return { status: "BLOCKED", code: trustedInputResult.code, detail: trustedInputResult.detail };
+  }
+  const { identity, projectName, specContent } = trustedInputResult.input;
+  const normalized = normalizeMasterSpec(specContent);
+  if (normalized.unrecognizedHeaders.length > 0) {
+    return {
+      status: "BLOCKED",
+      code: "UNRECOGNIZED_MASTER_SPEC_SECTION",
+      detail: `Master Spec에 알려지지 않은 "## " 섹션 헤더가 있어 WHAT이 조용히 누락될 위험이 있습니다: ${normalized.unrecognizedHeaders.join(", ")}`,
+    };
+  }
+  const hasFixedConstraints = normalized.fixedConstraints.length > 0;
+
+  const autodevDir = join(resolvedRoot, ".autodev");
+  if (existsSync(autodevDir)) {
+    let autodevReal: string;
+    try {
+      autodevReal = realpathSync(autodevDir);
+    } catch (e) {
+      return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: `.autodev 확인 실패: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (!isRealPathWithin(autodevReal, projectRootReal)) {
+      return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: ".autodev가 symlink/junction을 통해 project root 밖을 가리킵니다." };
+    }
+  }
+
+  const stateRead = readPlannerState(resolvedRoot, projectRootReal);
+  if (stateRead.kind === "corrupt") {
+    return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: stateRead.detail };
+  }
+  if (stateRead.kind === "unsupported_migration") {
+    return { status: "BLOCKED", code: "PLANNER_STATE_SCHEMA_MIGRATION_UNSUPPORTED", detail: stateRead.detail };
+  }
+  if (stateRead.kind === "absent") {
+    return { status: "REASSEMBLY_NOT_APPLICABLE", detail: "planner-state.json이 없습니다 — 재조립할 완료된 checkpoint가 없습니다." };
+  }
+  const cur = stateRead.state;
+  if (!identitiesMatch(cur.identity, identity)) {
+    return { status: "CONFLICT", detail: "같은 project root에 다른 identity(specVersion/specIntegrity 등)의 Planner 상태가 이미 존재합니다.", existingIdentity: cur.identity, requestedIdentity: identity };
+  }
+  if (cur.stage !== "COMPLETED") {
+    return {
+      status: "REASSEMBLY_NOT_APPLICABLE",
+      detail: `현재 stage(${cur.stage})가 COMPLETED가 아닙니다 — 일반 runPlanner()로 이어서 진행하세요(final assembly에서 동일한 Execution Contract 검증을 거칩니다).`,
+    };
+  }
+  // stage=COMPLETED 불변식(§ isPlannerStageArtifactInvariantSatisfied)이 architecture/
+  // phasePlan/phaseTaskPlans 존재를 이미 보장하지만, 방어적으로 다시 확인한다.
+  if (!cur.architecture || !cur.phasePlan || !cur.phaseTaskPlans) {
+    return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=COMPLETED인데 architecture/phasePlan/phaseTaskPlans가 저장돼 있지 않습니다." };
+  }
+  // bounded code-review 지적(HIGH) — runPlannerLocked()의 TRACEABILITY_VALIDATED 진입
+  // 직전(§ 위 resumedArchIssuesAtPhasePlanned)과 동일하게, 이 함수도 cur.architecture를 곧장
+  // 신뢰해 쓰기 전에 반드시 재검증해야 한다. validateGlobalTraceability(아래)는
+  // phasePlan/allTasks만 재검증할 뿐 architecture 자체(secret-shaped 값/projectId·
+  // specVersion 불일치/변조된 fixedConstraintAcknowledgement/안전하지 않은 executionPolicy
+  // 등)는 검사하지 않는다 — 이 재검증 없이는 tampered planner-state.json이 runPlanner()에서는
+  // BLOCKED(PLANNER_STATE_CORRUPT)로 잡히던 것이 이 별도 진입점에서는 그대로 통과할 수 있었다.
+  const resumedArchIssues = validateResumedArchitecture(cur.architecture, normalized, identity);
+  if (resumedArchIssues.length > 0) {
+    return {
+      status: "BLOCKED",
+      code: "PLANNER_STATE_CORRUPT",
+      detail: `저장된 architecture checkpoint가 신뢰할 수 없는 내용을 담고 있습니다: ${resumedArchIssues.map((i) => i.code).join(", ")}`,
+    };
+  }
+
+  let allTasks: PlannerRawTask[];
+  try {
+    allTasks = flattenPhaseTaskPlans(cur.phasePlan, cur.phaseTaskPlans);
+  } catch (e) {
+    return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: e instanceof Error ? e.message : String(e) };
+  }
+  const traceabilityIssues = validateGlobalTraceability(normalized, cur.phasePlan, allTasks);
+  if (traceabilityIssues.length > 0) {
+    return {
+      status: "BLOCKED",
+      code: "PLANNER_STATE_CORRUPT",
+      detail: `저장된 phasePlan/phaseTaskPlans checkpoint가 Global Traceability 재검증을 통과하지 못했습니다: ${traceabilityIssues.map((i) => i.code).join(", ")}`,
+    };
+  }
+  const contractIssues = validateRequiredTestExecutionContract(toRequiredTestOwners(allTasks), cur.architecture.executionPolicy.commandCwdAliases);
+  if (contractIssues.length > 0) {
+    return {
+      status: "BLOCKED",
+      code: "REQUIRED_TEST_NOT_EXECUTABLE",
+      detail: `저장된 phaseTaskPlans의 requiredTests가 Required Test Execution Contract를 통과하지 못했습니다: ${describeExecutionContractIssues(contractIssues)}`,
+    };
+  }
+
+  const now = config.now ? config.now() : new Date();
+  let manifest: ProjectManifest;
+  let generated: ReturnType<typeof buildGeneratedExecutionData>;
+  try {
+    const raw = synthesizeLegacyRawOutput(identity, cur.architecture, cur.phasePlan, allTasks);
+    generated = buildGeneratedExecutionData(raw, normalized, identity, projectName, resolvedRoot, now);
+    manifest = assembleProjectManifest(generated);
+    validateProjectManifest(manifest);
+    validateProjectExecutionPolicy(generated.executionPolicy, identity.projectId);
+    const finalContractIssues = validateRequiredTestExecutionContract(
+      toRequiredTestOwners(allTasks),
+      generated.executionPolicy.commandCwdAliases,
+      generated.executionPolicy.allowedCommands
+    );
+    if (finalContractIssues.length > 0) {
+      throw new Error(`재조립된 executionPolicy.allowedCommands가 자체 Required Test Execution Contract 최종 검증을 통과하지 못했습니다: ${describeExecutionContractIssues(finalContractIssues)}`);
+    }
+  } catch (e) {
+    return { status: "BLOCKED", code: "GENERATED_DATA_INVALID", detail: `재조립된 실행 데이터가 Core 검증을 통과하지 못했습니다: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  // write 직전 재검증 — runPlannerLocked의 동일 목적 재검증(§ 위 "write 직전 재확인 재검증"
+  // 주석)과 동일한 이유: LLM stage 없이도 evaluateTrustedPlannerInput() 자체가 파일 I/O를
+  // 하므로, 그 사이 신뢰 입력이 바뀌지 않았는지 되돌릴 수 없는 최종 write 직전에 다시 확인한다.
+  const revalidated = evaluateTrustedPlannerInput(resolvedRoot, projectRootReal, expectedIdentity);
+  if (!revalidated.ok) {
+    return { status: "BLOCKED", code: revalidated.code, detail: `write 직전 재검증 실패(실행 도중 신뢰 입력이 바뀐 것으로 의심됨): ${revalidated.detail}` };
+  }
+  if (!identitiesMatch(revalidated.input.identity, identity) || revalidated.input.projectName !== projectName) {
+    return { status: "BLOCKED", code: "EXPECTED_IDENTITY_MISMATCH", detail: "write 직전 재검증한 신뢰 입력이 이 실행이 시작할 때와 다릅니다 — 실행 도중 신뢰 입력이 바뀐 것으로 보여 중단합니다." };
+  }
+  // bounded code-review 지적(HIGH) — 위 evaluateTrustedPlannerInput() 재검증만으로는
+  // "project root 경로 문자열은 같지만 실제 파일시스템 객체(inode)가 바뀜"(rename 후 같은
+  // 경로에 새 디렉터리 설치, symlink 없이도 가능)까지는 잡지 못한다 — runPlannerLocked의
+  // write-guard(§ 위 projectRootIdentityNow)와 동일하게 realpath+dev/ino를 다시 파생해
+  // 재확인한다(캡처해둔 값을 재사용하지 않는다).
+  let projectRootRealNow: string;
+  try {
+    projectRootRealNow = realpathSync(resolvedRoot);
+  } catch (e) {
+    return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: `write 직전 project root 재확인 실패: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (projectRootRealNow !== projectRootReal) {
+    return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: "project root의 실제 대상이 처리 도중 바뀐 것으로 보여 안전하게 중단했습니다." };
+  }
+  let projectRootIdentityNow: { dev: number; ino: number };
+  try {
+    const rootStatNow = statSync(projectRootRealNow);
+    projectRootIdentityNow = { dev: rootStatNow.dev, ino: rootStatNow.ino };
+  } catch (e) {
+    return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: `write 직전 project root 객체 재확인 실패: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (projectRootIdentityNow.dev !== projectRootIdentity.dev || projectRootIdentityNow.ino !== projectRootIdentity.ino) {
+    return {
+      status: "BLOCKED",
+      code: "PROJECT_ROOT_ESCAPE",
+      detail: "project root 경로 문자열은 같지만 실제 파일시스템 객체(inode)가 실행 도중 바뀐 것으로 보여 안전하게 중단했습니다.",
+    };
+  }
+
+  const writeSteps: Array<{ path: string; data: unknown }> = [
+    { path: generatedManifestPath(resolvedRoot), data: generated.manifestFile },
+    { path: generatedTaskRegistryPath(resolvedRoot), data: generated.taskRegistry },
+    { path: generatedExecutionPolicyPath(resolvedRoot), data: generated.executionPolicy },
+  ];
+  const writtenSoFar: string[] = [];
+  let writeFailure: { ok: false; detail: string } | undefined;
+  for (const step of writeSteps) {
+    const w = writeJsonAtomic(step.path, step.data, projectRootRealNow);
+    if (!w.ok) {
+      writeFailure = w;
+      break;
+    }
+    writtenSoFar.push(step.path);
+  }
+  if (writeFailure) {
+    for (const p of writtenSoFar) safeUnlinkWithinRoot(p, projectRootRealNow);
+    return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: writeFailure.detail };
+  }
+
+  const writtenManifest = readTrustedGeneratedFile(generatedManifestPath(resolvedRoot), projectRootRealNow);
+  const writtenTaskRegistry = readTrustedGeneratedFile(generatedTaskRegistryPath(resolvedRoot), projectRootRealNow);
+  const writtenExecutionPolicy = readTrustedGeneratedFile(generatedExecutionPolicyPath(resolvedRoot), projectRootRealNow);
+  if (!writtenManifest.ok || !writtenTaskRegistry.ok || !writtenExecutionPolicy.ok) {
+    return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: "write 직후 재조립된 파일을 신뢰할 수 있게 재확인하지 못했습니다." };
+  }
+
+  const revalidatedBeforePublish = evaluateTrustedPlannerInput(resolvedRoot, projectRootRealNow, expectedIdentity);
+  const identityStillMatches =
+    revalidatedBeforePublish.ok && identitiesMatch(revalidatedBeforePublish.input.identity, identity) && revalidatedBeforePublish.input.projectName === projectName;
+  if (!identityStillMatches) {
+    for (const p of [generatedManifestPath(resolvedRoot), generatedTaskRegistryPath(resolvedRoot), generatedExecutionPolicyPath(resolvedRoot)]) {
+      safeUnlinkWithinRoot(p, projectRootRealNow);
+    }
+    return {
+      status: "BLOCKED",
+      code: revalidatedBeforePublish.ok ? "EXPECTED_IDENTITY_MISMATCH" : revalidatedBeforePublish.code,
+      detail: "재조립 파일 write 직후 재검증한 신뢰 입력이 이 실행이 시작할 때와 다릅니다 — 실행 도중 신뢰 입력이 바뀐 것으로 보여 방금 쓴 파일을 정리하고 중단합니다.",
+    };
+  }
+
+  const generationManifest: GenerationManifest = {
+    generationId: randomUUID(),
+    manifestSha256: sha256Hex(writtenManifest.content),
+    taskRegistrySha256: sha256Hex(writtenTaskRegistry.content),
+    executionPolicySha256: sha256Hex(writtenExecutionPolicy.content),
+  };
+  const generationWrite = writeJsonAtomic(generationManifestPath(resolvedRoot), generationManifest, projectRootRealNow);
+  if (!generationWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: generationWrite.detail };
+
+  // planner-state.json 자체는 건드리지 않는다 — stage는 이미 COMPLETED였고 그대로 COMPLETED다
+  // (재전이 없음, § 파일 상단 설명).
+  const reloaded = reloadAndValidateGeneratedData(resolvedRoot, identity.projectId);
+  if (!reloaded.ok) {
+    return { status: "BLOCKED", code: "GENERATED_DATA_INVALID", detail: `재조립 직후 재확인 실패: ${reloaded.detail}` };
+  }
+
+  return {
+    status: "EXECUTION_CONTRACT_REASSEMBLED",
+    projectRoot: resolvedRoot,
+    plannerStatePath: plannerStateFilePath(resolvedRoot),
+    projectManifestPath: generatedManifestPath(resolvedRoot),
+    taskRegistryPath: generatedTaskRegistryPath(resolvedRoot),
+    executionPolicyPath: generatedExecutionPolicyPath(resolvedRoot),
+    firstRunnableTask: getNextTask(reloaded.taskRegistry, []),
+    fixedConstraintComplianceNote: reloaded.manifestFile.fixedConstraintComplianceNote,
+  };
+}
+
+/**
+ * 이미 COMPLETED된 Planner checkpoint의 execution 계약 레이어(project-manifest.json/
+ * task-registry.json/execution-policy.json/generation.json)만 SI-3.7의 새 deterministic
+ * Required Test Execution Contract로 재조립한다 — Architecture/Phase/Task LLM은 다시
+ * 호출하지 않는다(§ 파일 상단 설명). runPlanner()와 동일하게 projectId 단위 Project Lock
+ * 위에서 실행된다.
+ */
+export async function reassembleExecutionContract(
+  projectRoot: string,
+  expectedIdentity: BootstrapRequestIdentity,
+  config: PlannerTrustedConfig = {}
+): Promise<ExecutionContractReassemblyOutcome> {
+  const resolvedRoot = resolve(projectRoot);
+  if (!existsSync(resolvedRoot) || !statSync(resolvedRoot).isDirectory()) {
+    return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot가 존재하지 않거나 디렉터리가 아닙니다: ${resolvedRoot}` };
+  }
+  if (lstatSync(resolvedRoot).isSymbolicLink()) {
+    return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot 자체가 symlink/junction/reparse point입니다: ${resolvedRoot}` };
+  }
+  const lockAcquire = acquireProjectLock({ projectId: expectedIdentity.projectId, targetProjectRoot: resolvedRoot, ownerKind: "autodev" });
+  if (!lockAcquire.ok) {
+    return { status: "BLOCKED", code: "CONCURRENT_PLANNER_RUN_IN_PROGRESS", detail: `${lockAcquire.reason} (code=${lockAcquire.code})` };
+  }
+  try {
+    return reassembleExecutionContractLocked(resolvedRoot, expectedIdentity, config);
+  } finally {
+    releaseProjectLock(lockAcquire.lock);
+  }
 }

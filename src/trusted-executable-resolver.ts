@@ -102,7 +102,14 @@ function pathForPlatform(platform: NodeJS.Platform): { join: typeof join; sep: s
 // node_modules 안을 신뢰 위치로 다뤄야 해서 project root를 아는 safe-executor.ts의
 // SafeExecutorContext가 직접 해석한다 — § safe-executor.ts resolveTrustedTsc) — 다만 타입/
 // trustSource는 이 파일에 함께 정의해 두 kind 체계가 갈라지지 않게 한다(단일 출처).
-export type TrustedExecutableKind = "node" | "git" | "npm" | "npx" | "claude" | "tsc";
+//
+// SI-3.7 — "gradlew"도 동일한 이유로 이 파일의 resolveTrustedExecutable()이 직접 다루지
+// 않는다(gradlew는 tsc와 마찬가지로 project-owned 코드를 실행하는 것이라 신뢰 모델이
+// git/npm/node와 근본적으로 다르다 — § gradle-capability.ts 파일 상단 trust boundary 설명).
+// resolveTrustedGradleWrapper()(gradle-capability.ts)가 이 kind의 실제 해석을 담당하되,
+// 이 파일이 정의한 TrustedExecutableResult/ExecutableTrustSource/ExecutableTrustErrorCode
+// shape을 그대로 재사용한다(병렬 타입 체계를 만들지 않음).
+export type TrustedExecutableKind = "node" | "git" | "npm" | "npx" | "claude" | "tsc" | "gradlew";
 
 export type ExecutableTrustSource =
   | "process_exec_path"
@@ -192,8 +199,10 @@ function toLowerNormalized(p: string): string {
 }
 
 /** candidate가 roots 중 하나이거나 그 하위 경로인지 확인한다(safe-executor.ts의 resolveSafe와
- *  동일한 대소문자 무시 containment 스타일 — 이 저장소 전체의 기존 관례를 그대로 따른다). */
-function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
+ *  동일한 대소문자 무시 containment 스타일 — 이 저장소 전체의 기존 관례를 그대로 따른다).
+ *  SI-3.7 — gradle-capability.ts가 java(외부 신뢰 도구) 판정에 이 함수를 그대로 재사용한다
+ *  (로직 복제 없음) — export는 순수 추가일 뿐 이 파일의 기존 동작을 바꾸지 않는다. */
+export function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
   const c = toLowerNormalized(candidate);
   return roots.some((r) => {
     const rl = toLowerNormalized(r);
@@ -201,7 +210,7 @@ function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
   });
 }
 
-interface FsDeps {
+export interface FsDeps {
   exists: (p: string) => boolean;
   stat: (p: string) => { isFile(): boolean };
   realpath: (p: string) => string;
@@ -215,7 +224,10 @@ function fsDepsFrom(testDeps?: TrustedExecutableTestDeps): FsDeps {
   };
 }
 
-function verifyRegularFileOutsideExcluded(
+/** SI-3.7 — gradle-capability.ts가 Windows에서 java.exe(JAVA_HOME 기준, git/claude와 동일한
+ *  "project 밖 외부 신뢰 도구" 모델)를 검증할 때 이 함수를 그대로 재사용한다(로직 복제 없음).
+ *  export는 순수 추가일 뿐 이 파일의 기존 동작을 바꾸지 않는다. */
+export function verifyRegularFileOutsideExcluded(
   candidate: string,
   excludedRoots: string[],
   fs: FsDeps
@@ -424,9 +436,10 @@ function resolveViaPathSearch(
   };
 }
 
-/** "tsc"는 이 함수가 다루지 않는다(§ TrustedExecutableKind 주석) — safe-executor.ts가
- *  project root 기준으로 직접 해석한다. */
-export type ResolvableExecutableKind = Exclude<TrustedExecutableKind, "tsc">;
+/** "tsc"/"gradlew"는 이 함수가 다루지 않는다(§ TrustedExecutableKind 주석) — 둘 다 project
+ *  root 기준으로 직접 해석해야 해서 safe-executor.ts(tsc)/gradle-capability.ts(gradlew)가
+ *  각자 담당한다. */
+export type ResolvableExecutableKind = Exclude<TrustedExecutableKind, "tsc" | "gradlew">;
 
 // SI-3.6 bounded review(chunk1 MEDIUM) 지적 반영 — excludedRoots 자체를 realpath로
 // canonicalize하지 않으면, excludedRoot가 symlink/junction/reparse alias를 가질 때 후보의
