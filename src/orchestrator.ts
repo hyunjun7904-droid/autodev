@@ -338,7 +338,10 @@ export async function runOrchestrator(
       gptResult.errorCode === "AUTH_ERROR" ||
       gptResult.errorCode === "QUOTA_EXCEEDED" ||
       gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" ||
-      gptResult.errorCode === "BUDGET_EXCEEDED"
+      gptResult.errorCode === "BUDGET_EXCEEDED" ||
+      // SI-3.8E Security Ordering Correction — Provider Security Gate BLOCK도 Budget Guard
+      // BLOCK과 동일한 성격(사람 개입이 필요한 preflight 차단)이므로 동일하게 기록한다.
+      gptResult.errorCode === "PROVIDER_SECURITY_BLOCKED"
     ) {
       state.deferredHumanTasks.push(`${gptResult.errorCode}: ${gptResult.feedback}`);
     }

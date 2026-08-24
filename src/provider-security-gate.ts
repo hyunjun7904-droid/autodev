@@ -147,17 +147,17 @@ function validateProviderSecurityMetadataShape(metadata: ProviderSecurityMetadat
 // Retention 충분성 — CONFIDENTIAL 이상 등급에만 적용된다.
 // =========================================================
 
-// CONFIDENTIAL/RESTRICTED 등급 데이터를 허용하려면 "짧게 제한된" 보존만 인정한다. 30일은
-// 이 Gate의 Core 기본 상한이며, provider metadata로 이보다 완화(연장)할 수 없다 — 오직
-// 이 값 이하로 더 짧게 보고된 provider만 통과한다.
-const MAX_RETENTION_DAYS_FOR_HIGHER_CLASSIFICATION = 30;
-
+// SI-3.8E Security Ordering Correction — CONFIDENTIAL/RESTRICTED 등급 데이터를 허용하려면
+// zero retention만 인정한다. 이전(SI-3.8C)에는 "짧게 제한된"(bounded <= 30일) 보존도
+// 허용했으나, 실제 production wiring 검토 결과 이 기준은 AutoDev의 최종 보안 원칙(§
+// review-provider.ts DEFAULT_REVIEWER_DATA_CLASSIFICATION 상단 주석 — "Task text/rules/
+// source diff/code context는 기본적으로 CONFIDENTIAL로 취급하고, CONFIDENTIAL은
+// trainingPolicy===no-training AND effective retention===zero(ZDR verified)가 모두
+// 충족되어야 PASS"와 맞지 않아 zero-only로 강화한다. bounded(며칠이든)는 더 이상 어떤
+// 상한으로도 충분하지 않다 — RESTRICTED는 기존에도 이 검사를 그대로 통과해야 했으므로
+// 이 변경은 RESTRICTED를 약화시키지 않는다(오히려 CONFIDENTIAL과 동일하게 더 엄격해진다).
 function isRetentionSufficientForHigherClassification(metadata: ProviderSecurityMetadata): boolean {
-  if (metadata.retentionPolicy === "zero") return true;
-  if (metadata.retentionPolicy === "bounded") {
-    return typeof metadata.maxRetentionDays === "number" && metadata.maxRetentionDays <= MAX_RETENTION_DAYS_FOR_HIGHER_CLASSIFICATION;
-  }
-  return false; // "unbounded"/"unknown"은 여기 도달하지 않지만(unknown은 이전 단계에서 이미 BLOCK) 방어적으로 false.
+  return metadata.retentionPolicy === "zero";
 }
 
 // =========================================================
@@ -269,7 +269,7 @@ function evaluateSingleProviderForClassification(
     };
   }
 
-  // 요구사항 3: CONFIDENTIAL 이상 → 학습 미사용 + 짧게 제한된 보존만 인정한다.
+  // 요구사항 3(SI-3.8E 강화) — CONFIDENTIAL 이상 → 학습 미사용 + zero retention만 인정한다.
   if (CLASSIFICATION_LEVEL[classification] >= CLASSIFICATION_LEVEL.CONFIDENTIAL) {
     if (metadata.trainingPolicy !== "no-training") {
       return {
@@ -284,7 +284,7 @@ function evaluateSingleProviderForClassification(
         providerId,
         verdict: "BLOCK",
         blockCode: "RETENTION_POLICY_INSUFFICIENT",
-        reason: `provider(${providerId})의 retention 정책(${metadata.retentionPolicy}${metadata.maxRetentionDays !== undefined ? `, ${metadata.maxRetentionDays}일` : ""})이 ${classification} 등급에 요구되는 보존 상한(zero 또는 ${MAX_RETENTION_DAYS_FOR_HIGHER_CLASSIFICATION}일 이하 bounded)을 만족하지 않습니다.`,
+        reason: `provider(${providerId})의 retention 정책(${metadata.retentionPolicy}${metadata.maxRetentionDays !== undefined ? `, ${metadata.maxRetentionDays}일` : ""})이 ${classification} 등급에 요구되는 zero retention을 만족하지 않습니다(bounded는 며칠이든 허용되지 않습니다).`,
       };
     }
   }

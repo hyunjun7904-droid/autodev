@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reviewClaudeResultOnce, reviewClaudeResultWithRetry, reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { GptReviewApiResult, ReviewProjectContext } from "./gpt-reviewer";
+import { openAIReviewProvider, OPENAI_REVIEW_PROVIDER_ID } from "./openai-review-provider";
+import type { ProviderSecurityMetadata } from "./provider-security-gate";
 import { runOrchestrator } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
 import { executeRoutingPlan } from "./agent-orchestrator";
@@ -48,6 +50,26 @@ const FAKE_CLAUDE_RESULT: ClaudeResult = {
 // ---------------------------------------------------------------------------
 // A) reviewClaudeResultOnce 직접 호출 — BLOCK vs ALLOW 대조.
 // ---------------------------------------------------------------------------
+// Phase SI-3.8E Security Ordering Correction — Provider Security Gate가 Budget Guard 통과
+// 이후 항상 실행되므로(§ gpt-reviewer.ts), SMALL_TASK 대조군도 이제 기본 registry(ZDR 미검증,
+// CONFIDENTIAL 기본 등급)에서는 Security Gate가 먼저 BLOCK한다 — Budget Guard 통과 이후에도
+// "실제 client 생성을 시도하다 API_ERROR로 실패"하는 이 대조군 자체를 계속 증명하려면 Security
+// Gate를 통과하는 compliant registry를 명시적으로 주입해야 한다(이 값 자체가 production
+// 기본값을 바꾸지 않는다 — 이 테스트 파일 안에서만 쓰이는 override).
+const COMPLIANT_OPENAI_SECURITY_OVERRIDES = {
+  registry: {
+    [OPENAI_REVIEW_PROVIDER_ID]: {
+      providerId: OPENAI_REVIEW_PROVIDER_ID,
+      trainingPolicy: "no-training",
+      retentionPolicy: "zero",
+      supportsZeroDataRetention: true,
+      trustLevel: "high",
+      allowedDataClassifications: ["CONFIDENTIAL"],
+      policyVerifiedAt: "2026-08-25T00:00:00.000Z",
+    } as ProviderSecurityMetadata,
+  },
+};
+
 async function scenarioA_directGuardBlocksBeforeClient(): Promise<void> {
   const blocked = await reviewClaudeResultOnce(FAKE_CLAUDE_RESULT, 1, HUGE_TASK);
   check("A) 거대 payload는 즉시 BUDGET_EXCEEDED로 반환됨(OpenAI 클라이언트 생성 없음)", blocked.errorCode === "BUDGET_EXCEEDED");
@@ -55,7 +77,19 @@ async function scenarioA_directGuardBlocksBeforeClient(): Promise<void> {
   check("A) BLOCK 결과의 transient=false(재시도 대상 아님)", blocked.transient === false);
   check("A) BLOCK 결과에 model/tokenUsage가 없음(API 응답을 받은 적이 없음)", blocked.model === undefined && blocked.tokenUsage === undefined);
 
-  const allowed = await reviewClaudeResultOnce(FAKE_CLAUDE_RESULT, 1, SMALL_TASK);
+  const allowed = await reviewClaudeResultOnce(
+    FAKE_CLAUDE_RESULT,
+    1,
+    SMALL_TASK,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    openAIReviewProvider,
+    COMPLIANT_OPENAI_SECURITY_OVERRIDES
+  );
   check(
     "A) 작은 payload는 guard를 통과해 실제로 클라이언트 생성을 시도하다 API_ERROR로 실패함(대조군 — 유효한 키가 없을 뿐 guard 때문이 아님)",
     allowed.errorCode === "API_ERROR"

@@ -64,7 +64,9 @@ function scenario4_confidentialTrainingAllowedBlocks(): void {
   check("4) blockCode === TRAINING_POLICY_DISALLOWS_CLASSIFICATION", result.blockCode === "TRAINING_POLICY_DISALLOWS_CLASSIFICATION");
 }
 
-// 5) CONFIDENTIAL + no-training이지만 retention이 상한(30일)을 초과 → BLOCK
+// 5) CONFIDENTIAL + no-training이지만 retention이 zero가 아님(bounded는 며칠이든) → BLOCK
+//    (SI-3.8E Security Ordering Correction — CONFIDENTIAL은 zero retention만 인정한다.
+//    이전 SI-3.8C 기준은 bounded<=30일도 허용했으나, 이제 그 대조군도 BLOCK이어야 한다.)
 function scenario5_confidentialInsufficientRetentionBlocks(): void {
   const registry = registryOf(
     provider({ providerId: "long-retention", trainingPolicy: "no-training", retentionPolicy: "bounded", maxRetentionDays: 90 })
@@ -73,12 +75,18 @@ function scenario5_confidentialInsufficientRetentionBlocks(): void {
   check("5) CONFIDENTIAL no-training + insufficient retention → BLOCK", result.verdict === "BLOCK");
   check("5) blockCode === RETENTION_POLICY_INSUFFICIENT", result.blockCode === "RETENTION_POLICY_INSUFFICIENT");
 
-  // 대조군: 30일 이하 bounded는 통과해야 한다(과도하게 엄격하지 않은지 확인).
-  const okRegistry = registryOf(
+  // SI-3.8E 강화 확인 — 이전에는 통과하던 "30일 이하 bounded"도 이제는 zero가 아니므로 BLOCK.
+  const boundedShortRegistry = registryOf(
     provider({ providerId: "short-retention", trainingPolicy: "no-training", retentionPolicy: "bounded", maxRetentionDays: 30 })
   );
-  const okResult = evaluateProviderSecurity({ classification: "CONFIDENTIAL", providerId: "short-retention" }, okRegistry);
-  check("5) 대조군: 30일 이하 bounded retention은 CONFIDENTIAL PASS", okResult.verdict === "PASS");
+  const boundedShortResult = evaluateProviderSecurity({ classification: "CONFIDENTIAL", providerId: "short-retention" }, boundedShortRegistry);
+  check("5) SI-3.8E 강화: 30일 이하 bounded retention도 CONFIDENTIAL BLOCK(zero-only)", boundedShortResult.verdict === "BLOCK");
+  check("5) blockCode === RETENTION_POLICY_INSUFFICIENT(bounded short)", boundedShortResult.blockCode === "RETENTION_POLICY_INSUFFICIENT");
+
+  // 대조군: zero retention만 CONFIDENTIAL PASS.
+  const zeroRegistry = registryOf(provider({ providerId: "zero-retention", trainingPolicy: "no-training", retentionPolicy: "zero" }));
+  const zeroResult = evaluateProviderSecurity({ classification: "CONFIDENTIAL", providerId: "zero-retention" }, zeroRegistry);
+  check("5) 대조군: zero retention은 CONFIDENTIAL PASS", zeroResult.verdict === "PASS");
 }
 
 // 6) RESTRICTED + trustLevel 부족(high 아님) → BLOCK

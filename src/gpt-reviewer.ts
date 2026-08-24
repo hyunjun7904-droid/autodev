@@ -1,8 +1,6 @@
 import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import OpenAI from "openai";
-import { AuthenticationError, RateLimitError, APIConnectionTimeoutError, APIConnectionError, APIError } from "openai";
 import type { ClaudeResult, GptReviewResult, GptErrorCode } from "./types";
 import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, isPathInScope } from "./git-changes";
 import type { WorkingTreeChanges } from "./git-changes";
@@ -14,6 +12,12 @@ import { resolveGptBudgetGuardConfig, evaluateGptBudgetGuard } from "./gpt-budge
 import { resolvePricing, calculateEstimatedCost } from "./pricing-catalog";
 import type { UsageLedgerEntryInput } from "./usage-ledger";
 import { isProductionRuntime } from "./runtime-origin";
+import type { ReviewProvider, ReviewProviderResult } from "./review-provider";
+import { DEFAULT_REVIEWER_DATA_CLASSIFICATION } from "./review-provider";
+import { openAIReviewProvider } from "./openai-review-provider";
+import { evaluateProviderSecurity } from "./provider-security-gate";
+import type { DataClassification, ProviderSecurityRegistry } from "./provider-security-gate";
+import { resolveOpenAiProviderSecurityRegistry } from "./openai-provider-security-metadata";
 import {
   buildTaskIdentity,
   buildScopeKey,
@@ -26,9 +30,12 @@ import {
 } from "./review-baseline";
 import type { ReviewBaseline, ReviewPayloadMode, FileContentReader, ReviewFileState } from "./review-baseline";
 
-// 실제 OpenAI Responses API 기반 리뷰어. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
-// 이 모듈을 선택한다. OPENAI_API_KEY는 client 생성자가 process.env에서 자동으로 읽는다 —
-// 이 파일 어디에서도 키 값을 직접 읽거나 로그로 남기지 않는다.
+// Reviewer Core — 실제 AI review provider의 SDK/transport를 직접 알지 못한다(Phase SI-3.8E,
+// Reviewer Provider Abstraction). AUTOMATION_DRY_RUN=false일 때만 orchestrator가 이 모듈을
+// 선택한다. 실제 provider transport(현재는 OpenAI Responses API 하나)는
+// openai-review-provider.ts로 분리되어 있고, 이 파일은 review-provider.ts의 ReviewProvider
+// contract만으로 그 provider를 호출한다 — provider가 API key를 어떻게 읽는지, 실제 요청을
+// 어떻게 만드는지는 이 파일이 몰라도 된다.
 //
 // AutoDev 범용화 Phase A Task A6 — 이 파일(Core)은 이제 어떤 프로젝트를 리뷰하고 있는지
 // 전혀 모른다. "MOVAN ERP 프로젝트의 리뷰어"라고 가정하지 않고, 프로젝트 이름/검토
@@ -36,7 +43,6 @@ import type { ReviewBaseline, ReviewPayloadMode, FileContentReader, ReviewFileSt
 // 조립해 주입하는 ReviewProjectContext를 통해서만 얻는다. 실제 MOVAN 운용에서는
 // autodev.ts가 항상 명시적으로 MOVAN_PROJECT_MANIFEST 기반 context를 넘기므로 기존
 // 동작은 그대로 보존된다.
-const MODEL = "gpt-5.6";
 // PROJECT_ROOT를 이 파일에서 독자적으로 다시 계산하지 않는다 — Safe Executor가
 // project-context.ts의 TARGET_PROJECT_ROOT로부터 export하는 값을 그대로 재사용해,
 // reviewer와 safe executor가 항상 동일한 target project root를 보게 한다(Phase A Task A1).
@@ -125,47 +131,9 @@ export interface GptReviewRetryResult extends GptReviewApiResult {
   gptTransportRetry: number;
 }
 
-// 30초는 실제로 너무 짧다는 것이 확인됐다 — 구조화 출력(json_schema)으로 diff를 검토하는
-// 실제 호출이 정상적으로도 30초를 종종 넘겨, 매 시도가 진짜 API 오류가 아니라 클라이언트
-// 타임아웃 자체 때문에 실패하고 있었다(재시도 5회 전부 소진되는 것을 실제로 관찰). SDK
-// 자체 재시도(maxRetries)는 여전히 0으로 유지하고 재시도는 reviewClaudeResultWithRetry가
-// 전담한다.
-//
-// AutoDev 범용화 Phase A Task A6 — lazy initialization(기존 backlog 해결). 이전에는 이
-// client를 모듈 최상단에서 즉시 생성해, OPENAI_API_KEY가 없으면 "실제 API를 전혀 호출하지
-// 않는" fake/injected reviewer 테스트조차 이 파일을 import하는 순간(new OpenAI() 생성자가
-// 즉시 throw) 실패했다. 이제 실제로 API를 호출하는 시점(getClient() 최초 호출)에만
-// 생성한다 — deps.attempt를 주입하는 테스트는 reviewClaudeResultOnce/getClient를 전혀
-// 거치지 않으므로 OPENAI_API_KEY 없이도 정상 동작한다. 실제 호출 시 key가 없으면 SDK
-// 생성자가 그 시점에 명확히 실패한다(조용한 fallback 없음). 키 값은 여기서도 절대 읽거나
-// 로그로 남기지 않는다 — SDK가 process.env에서 자동으로 읽을 뿐이다. 재시도/구조화 출력
-// 동작은 그대로 유지한다.
-let cachedClient: OpenAI | null = null;
-function getClient(): OpenAI {
-  if (!cachedClient) cachedClient = new OpenAI({ timeout: 120_000, maxRetries: 0 });
-  return cachedClient;
-}
-
-const RESULT_SCHEMA = {
-  type: "object",
-  properties: {
-    decision: { type: "string", enum: ["PASS", "REVISE", "HUMAN_REQUIRED", "BLOCK"] },
-    severity: {
-      type: "object",
-      properties: {
-        critical: { type: "integer" },
-        high: { type: "integer" },
-        medium: { type: "integer" },
-      },
-      required: ["critical", "high", "medium"],
-      additionalProperties: false,
-    },
-    feedback: { type: "string" },
-    nextTask: { type: ["string", "null"] },
-  },
-  required: ["decision", "severity", "feedback", "nextTask"],
-  additionalProperties: false,
-} as const;
+// Phase SI-3.8E — 실제 API client/구조화 출력 schema/lazy initialization은 이제
+// openai-review-provider.ts(OpenAIReviewProvider)의 책임이다(값/동작 변경 없이 그대로 이동—
+// § openai-review-provider.ts 상단 주석). 이 파일은 ReviewProvider.review()만 호출한다.
 
 // Phase C Task C2 — Per-Run Execution Context. 이 파일이 실제로 파일을 읽는 지점
 // (getRulesSummary/readUntrackedFiles)은 executor(SafeExecutorContext)가 지정되면 그
@@ -511,24 +479,7 @@ medium만 있고 진행을 막을 정도가 아니면 PASS해도 됩니다.
 ${projectRules}`;
 }
 
-// transient=true: 같은 입력으로 다시 시도하면 성공할 가능성이 있는 오류(네트워크/일시적
-// 서버 문제). transient=false: 재시도로 해결되지 않는 오류(인증/쿼터/잘못된 응답 형식).
-function classifyApiError(e: unknown): { code: GptErrorCode; transient: boolean } {
-  if (e instanceof AuthenticationError) return { code: "AUTH_ERROR", transient: false };
-  if (e instanceof RateLimitError) {
-    if (e.code === "insufficient_quota") return { code: "QUOTA_EXCEEDED", transient: false };
-    return { code: "RATE_LIMIT", transient: true };
-  }
-  if (e instanceof APIConnectionTimeoutError) return { code: "TIMEOUT", transient: true };
-  if (e instanceof APIConnectionError) return { code: "API_ERROR", transient: true }; // 네트워크 연결 오류
-  if (e instanceof APIError) {
-    const status = e.status;
-    return { code: "API_ERROR", transient: typeof status === "number" && status >= 500 };
-  }
-  return { code: "API_ERROR", transient: false };
-}
-
-// 실제 OpenAI API를 정확히 1회만 호출하는 하위 레벨 함수 — 재시도 로직은 아래
+// 실제 review provider를 정확히 1회만 호출하는 하위 레벨 함수 — 재시도 로직은 아래
 // reviewClaudeResultWithRetry()에서 감싼다. 테스트에서 이 함수를 직접 fake로 대체해
 // 재시도 로직만 독립적으로 검증할 수 있게 이름을 분리했다.
 export async function reviewClaudeResultOnce(
@@ -545,7 +496,21 @@ export async function reviewClaudeResultOnce(
   /** Phase SI-3.8D — 직전 round가 반환한 GptReviewApiResult.reviewBaseline을 호출부가 그대로
    *  넘긴다. 지정하지 않으면(첫 review, 또는 baseline 개념이 없는 기존 호출부) 항상 FULL로
    *  동작한다 — 기존 동작을 바꾸지 않는다. */
-  baseline?: ReviewBaseline
+  baseline?: ReviewBaseline,
+  /** Phase SI-3.8E — Reviewer Provider Abstraction. 지정하지 않으면 production default인
+   *  OpenAIReviewProvider(§ openai-review-provider.ts)를 쓴다. tests가 실제 OpenAI 호출 없이
+   *  Reviewer Core(payload 구성/Budget Guard/baseline/Final Consistency Cross-check)를
+   *  검증하기 위한 주입 지점이다 — provider 선택/routing 로직이 아니다(§ 요구사항 6 Provider
+   *  Selection, 이 Task는 production default를 바꾸지 않는다). */
+  provider: ReviewProvider = openAIReviewProvider,
+  /** Phase SI-3.8E Security Ordering Correction — Provider Security Gate(provider-security-gate.ts)
+   *  override 지점. 지정하지 않으면 production default(§ 요구사항 1/2/3): classification은
+   *  항상 DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL), registry는
+   *  resolveOpenAiProviderSecurityRegistry()(OpenAI 하나만 아는 registry, ZDR verified 여부에
+   *  따라 zero/bounded)를 쓴다. tests가 fake provider를 위한 호환 metadata를 주입하거나(§
+   *  요구사항 6 테스트), Security Gate가 실제로 BLOCK하는 경로를 검증하기 위한 seam이다 —
+   *  provider 선택/routing과 마찬가지로 이 값 자체는 production 기본값을 바꾸지 않는다. */
+  securityGateOverrides?: { classification?: DataClassification; registry?: ProviderSecurityRegistry }
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
   const { input, scopeViolations, reviewMode, newBaseline } = buildReviewInput(
@@ -592,27 +557,71 @@ export async function reviewClaudeResultOnce(
     };
   }
 
-  // Claude code-review(SI-3.8B) 지적 — getClient()(OpenAI SDK 클라이언트 생성자, 예:
-  // OPENAI_API_KEY 미설정 시 동기적으로 throw)를 responses.create() 호출과 같은 try 블록에
-  // 두면, "실제 요청을 한 번도 보내지 못한 로컬 실패"와 "요청을 보냈지만 서버/네트워크에서
-  // 실패한 경우"가 아래 catch 하나로 합쳐져 classifyApiError()가 둘 다 API_ERROR로 분류할 수
-  // 있다 — Usage Ledger의 requestCount가 실제로 나가지 않은 요청까지 세게 된다(§ 요구사항
-  // 4 requestCount 정확성). 클라이언트 생성을 별도 try로 분리해 이 두 실패를
-  // requestAttempted로 구분한다.
-  let client: OpenAI;
-  try {
-    client = getClient();
-  } catch (e) {
-    const { code: errorCode } = classifyApiError(e);
-    log(`GPT 리뷰 클라이언트 생성 실패(${errorCode}) — 실제 요청은 전송되지 않음`, { reviewCycle });
+  // Phase SI-3.8E Security Ordering Correction — Provider Security Gate(SI-3.8C)는 Budget
+  // Guard를 통과한 뒤, provider.review()를 호출하기 전에 항상 실행된다(payload build → Budget
+  // Guard → Provider Security Gate → provider.review()). registry에 이 provider.id가 없거나
+  // (예: 테스트 fake provider, 향후 다른 provider가 명시적으로 등록되지 않은 경우) metadata가
+  // 불완전하면 evaluateProviderSecurity()가 PROVIDER_UNKNOWN/PROVIDER_METADATA_INCOMPLETE로
+  // BLOCK한다 — 어떤 provider도 이 registry에 없다는 이유만으로 자동 allow되지 않는다(§
+  // 요구사항 5 Provider identity). classification 판정 자체는 이 함수가 임의로 하지 않는다 —
+  // 지정하지 않으면 review-provider.ts의 DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL)을
+  // 그대로 쓴다.
+  const dataClassification = securityGateOverrides?.classification ?? DEFAULT_REVIEWER_DATA_CLASSIFICATION;
+  const securityRegistry = securityGateOverrides?.registry ?? resolveOpenAiProviderSecurityRegistry();
+  const securityResult = evaluateProviderSecurity({ classification: dataClassification, providerId: provider.id }, securityRegistry);
+  if (securityResult.verdict === "BLOCK") {
+    log(`GPT Provider Security Gate BLOCK(${securityResult.blockCode}) — provider 호출 생략`, {
+      reviewCycle,
+      reviewMode,
+      providerId: provider.id,
+      classification: dataClassification,
+    });
     return {
       decision: "HUMAN_REQUIRED",
       severity: { critical: 0, high: 0, medium: 0 },
-      feedback: `GPT API 오류: ${errorCode}`,
+      feedback: `GPT Provider Security Gate: ${securityResult.reason}`,
       nextTask: null,
-      errorCode,
+      errorCode: "PROVIDER_SECURITY_BLOCKED",
       transient: false,
       scopeViolations,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
+    };
+  }
+
+  // Phase SI-3.8E — Reviewer Provider Abstraction. Budget Guard와 Provider Security Gate를
+  // 모두 통과한 뒤에만 provider를 호출한다(§ 요구사항 7 Budget Guard Ordering, § 요구사항 4
+  // Provider Security Gate Ordering) — provider.review()가 호출되는 유일한 지점이다. provider가
+  // 실제로 client를 어떻게 생성/호출하는지(예: OpenAI SDK 자격증명 누락으로 인한 로컬 실패 vs
+  // 실제로 전송된 요청의 실패)는 ReviewProviderResult.requestAttempted가 이미 구분해 알려준다
+  // (§ review-provider.ts) — 이 파일은 그 구분을 그대로 옮길 뿐 다시 판단하지 않는다.
+  //
+  // Claude code-review 지적 — review-provider.ts의 contract는 provider가 항상 resolve하고
+  // (절대 throw/reject하지 않고) ok:true/false로만 결과를 표현하라고 문서화하지만, 이 Core는
+  // 그 계약을 강제할 방법이 없다(TypeScript는 런타임에 이를 보장하지 않는다). 삭제된 이전
+  // 코드는 client 생성/API 호출 전체를 try/catch로 감싸 어떤 실패도 항상 HUMAN_REQUIRED로
+  // 안전하게 수렴시켰다 — provider 구현이 계약을 어기고 throw/reject하는 경우에도 동일하게
+  // 안전한 방향으로 수렴하도록 이 호출도 try/catch로 감싼다(provider 신뢰도와 무관하게 Core가
+  // 최종 방어선이 되게 한다).
+  let providerResult: ReviewProviderResult;
+  try {
+    providerResult = await provider.review({ instructions, input });
+  } catch (e) {
+    log(`GPT 리뷰 provider 예외 발생(provider가 review-provider.ts 계약을 위반함) — ${sanitizeForLog(String(e)).slice(0, 200)}`, { reviewCycle });
+    return {
+      decision: "HUMAN_REQUIRED",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: "GPT API 오류: PROVIDER_THREW",
+      nextTask: null,
+      errorCode: "API_ERROR",
+      transient: false,
+      scopeViolations,
+      // Claude code-review 지적 — provider가 계약을 어기고 throw하면 실제로 요청이 나갔는지
+      // 알 방법이 없다(provider 내부 상태를 신뢰할 수 없으므로). "확인되지 않으면 실제 사용량
+      // 으로 세지 않는다"는 이 파일의 기존 원칙(§ client 생성 실패 분기와 동일)을 그대로
+      // 적용해 requestAttempted=false로 남긴다 — Usage Ledger가 이 요청을 실제 API 호출로
+      // 과다 집계하지 않게 한다.
       requestAttempted: false,
       reviewMode,
       reviewBaseline: newBaseline,
@@ -620,47 +629,73 @@ export async function reviewClaudeResultOnce(
     };
   }
 
+  if (!providerResult.ok) {
+    if (providerResult.requestAttempted === false) {
+      log(`GPT 리뷰 클라이언트 생성 실패(${providerResult.errorCode}) — 실제 요청은 전송되지 않음`, { reviewCycle });
+    } else {
+      log(`GPT 리뷰 API 오류(${providerResult.errorCode})`, { reviewCycle, transient: providerResult.transient });
+    }
+    return {
+      decision: "HUMAN_REQUIRED",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: `GPT API 오류: ${providerResult.errorCode}`,
+      nextTask: null,
+      errorCode: providerResult.errorCode,
+      transient: providerResult.transient,
+      scopeViolations,
+      requestAttempted: providerResult.requestAttempted === false ? false : undefined,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
+    };
+  }
+
+  // 실제 provider 호출이 응답을 반환한 시점부터는(파싱 성공 여부와 무관하게) 이미 실제 토큰이
+  // 소비됐다 — model/tokenUsage는 그 실제 호출 1건에 대해 정확히 한 번만 존재하므로, 아래 두
+  // return 경로(정상/INVALID_OUTPUT) 모두에 동일하게 붙인다(§ 요구사항: 실제로 호출됐을 때
+  // 얻을 수 있는 값은 누락하지 않는다). 실패 분기(위 !providerResult.ok)에는 이 값이 존재하지
+  // 않는다.
+  const { outputText, model, tokenUsage } = providerResult;
+
+  let parsed: GptReviewResult;
   try {
-    const response = await client.responses.create({
-      model: MODEL,
-      instructions,
-      input,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "gpt_review_result",
-          schema: RESULT_SCHEMA,
-          strict: true,
-        },
-      },
-    });
+    parsed = JSON.parse(outputText) as GptReviewResult;
+  } catch {
+    log("GPT 리뷰 오류(INVALID_OUTPUT)", { reviewCycle });
+    return {
+      decision: "HUMAN_REQUIRED",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: "GPT 응답 JSON 파싱 실패",
+      nextTask: null,
+      errorCode: "INVALID_OUTPUT",
+      scopeViolations,
+      model,
+      tokenUsage,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
+    };
+  }
 
-    // 실제 API 호출이 응답을 반환한 시점부터는(파싱 성공 여부와 무관하게) 이미 실제 토큰이
-    // 소비됐다 — response.usage/response.model은 그 실제 호출 1건에 대해 정확히 한 번만
-    // 존재하므로, 아래 두 return 경로(정상/INVALID_OUTPUT) 모두에 동일하게 붙인다(§ 요구사항:
-    // 실제로 호출됐을 때 얻을 수 있는 값은 누락하지 않는다). catch 블록(네트워크/인증 오류 등
-    // 응답 자체가 없는 경우)에는 이 값이 존재하지 않는다.
-    const model = response.model ? { provider: "openai", name: response.model } : undefined;
-    const tokenUsage = response.usage
-      ? {
-          inputTokens: response.usage.input_tokens,
-          cachedInputTokens: response.usage.input_tokens_details?.cached_tokens,
-          outputTokens: response.usage.output_tokens,
-          totalTokens: response.usage.total_tokens,
-        }
-      : undefined;
-
-    let parsed: GptReviewResult;
-    try {
-      parsed = JSON.parse(response.output_text) as GptReviewResult;
-    } catch {
-      log("GPT 리뷰 오류(INVALID_OUTPUT)", { reviewCycle });
+  // Final Consistency Cross-check(§ 요구사항 9) — decision=PASS를 그대로 신뢰하기 직전에,
+  // "이번 round의 payload를 만든 시점"의 snapshot(newBaseline.fileHashes)과 "지금(provider
+  // round-trip 이후) 다시 계산한 snapshot"이 완전히 같은지 로컬 hash 비교만으로 재확인한다
+  // (provider를 다시 호출하지 않는다). working tree가 review 도중 실제로 달라졌다면 PASS를
+  // 그대로 반환하지 않고 HUMAN_REQUIRED로 강제 전환한다 — "previous PASS를 단순히 신뢰하지
+  // 않는다"는 원칙을 APPROVED 후보 시점에도 동일하게 적용한다.
+  if (parsed.decision === "PASS") {
+    if (hasWorkingTreeDriftedSincePayload(projectContext.scopeDirs, newBaseline, executor)) {
+      log("GPT 리뷰 Final Consistency Cross-check 실패 — working tree가 review 도중 변경됨, PASS를 신뢰하지 않음", {
+        reviewCycle,
+        reviewMode,
+      });
       return {
         decision: "HUMAN_REQUIRED",
-        severity: { critical: 0, high: 0, medium: 0 },
-        feedback: "GPT 응답 JSON 파싱 실패",
-        nextTask: null,
-        errorCode: "INVALID_OUTPUT",
+        severity: parsed.severity,
+        feedback: `Final Consistency Cross-check 실패: review payload를 만든 시점과 decision을 받은 시점 사이에 working tree가 변경되었습니다. 원래 GPT feedback: ${parsed.feedback}`,
+        nextTask: parsed.nextTask,
+        errorCode: "REVIEW_CONSISTENCY_CHECK_FAILED",
+        transient: false,
         scopeViolations,
         model,
         tokenUsage,
@@ -669,62 +704,18 @@ export async function reviewClaudeResultOnce(
         payloadChars: budgetGuardResult.payloadChars,
       };
     }
-
-    // Final Consistency Cross-check(§ 요구사항 9) — decision=PASS를 그대로 신뢰하기 직전에,
-    // "이번 round의 payload를 만든 시점"의 snapshot(newBaseline.fileHashes)과 "지금(OpenAI
-    // round-trip 이후) 다시 계산한 snapshot"이 완전히 같은지 로컬 hash 비교만으로 재확인한다
-    // (OpenAI를 다시 호출하지 않는다). working tree가 review 도중 실제로 달라졌다면 PASS를
-    // 그대로 반환하지 않고 HUMAN_REQUIRED로 강제 전환한다 — "previous PASS를 단순히 신뢰하지
-    // 않는다"는 원칙을 APPROVED 후보 시점에도 동일하게 적용한다.
-    if (parsed.decision === "PASS") {
-      if (hasWorkingTreeDriftedSincePayload(projectContext.scopeDirs, newBaseline, executor)) {
-        log("GPT 리뷰 Final Consistency Cross-check 실패 — working tree가 review 도중 변경됨, PASS를 신뢰하지 않음", {
-          reviewCycle,
-          reviewMode,
-        });
-        return {
-          decision: "HUMAN_REQUIRED",
-          severity: parsed.severity,
-          feedback: `Final Consistency Cross-check 실패: review payload를 만든 시점과 decision을 받은 시점 사이에 working tree가 변경되었습니다. 원래 GPT feedback: ${parsed.feedback}`,
-          nextTask: parsed.nextTask,
-          errorCode: "REVIEW_CONSISTENCY_CHECK_FAILED",
-          transient: false,
-          scopeViolations,
-          model,
-          tokenUsage,
-          reviewMode,
-          reviewBaseline: newBaseline,
-          payloadChars: budgetGuardResult.payloadChars,
-        };
-      }
-    }
-
-    log("GPT 리뷰 완료", { reviewCycle, decision: parsed.decision, severity: parsed.severity, reviewMode });
-    return {
-      ...parsed,
-      scopeViolations,
-      model,
-      tokenUsage,
-      reviewMode,
-      reviewBaseline: newBaseline,
-      payloadChars: budgetGuardResult.payloadChars,
-    };
-  } catch (e) {
-    const { code: errorCode, transient } = classifyApiError(e);
-    log(`GPT 리뷰 API 오류(${errorCode})`, { reviewCycle, transient });
-    return {
-      decision: "HUMAN_REQUIRED",
-      severity: { critical: 0, high: 0, medium: 0 },
-      feedback: `GPT API 오류: ${errorCode}`,
-      nextTask: null,
-      errorCode,
-      transient,
-      scopeViolations,
-      reviewMode,
-      reviewBaseline: newBaseline,
-      payloadChars: budgetGuardResult.payloadChars,
-    };
   }
+
+  log("GPT 리뷰 완료", { reviewCycle, decision: parsed.decision, severity: parsed.severity, reviewMode });
+  return {
+    ...parsed,
+    scopeViolations,
+    model,
+    tokenUsage,
+    reviewMode,
+    reviewBaseline: newBaseline,
+    payloadChars: budgetGuardResult.payloadChars,
+  };
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -770,6 +761,16 @@ export interface ReviewRetryOptions {
    *  보낼 뿐, 새 round로 진행하지 않는다 — § 요구사항 21 "retry wrapper does not bypass
    *  baseline/budget failure"). */
   baseline?: ReviewBaseline;
+  /** Phase SI-3.8E — Reviewer Provider Abstraction. attempt마다(재시도 포함) 이 provider를
+   *  그대로 재사용한다. 지정하지 않으면 reviewClaudeResultOnce의 production default
+   *  (OpenAIReviewProvider)가 쓰인다 — tests가 실제 OpenAI 호출 없이 재시도/오류 분류
+   *  semantics를 검증하기 위한 주입 지점이다(§ 요구사항 12 Dependency Injection). */
+  provider?: ReviewProvider;
+  /** Phase SI-3.8E Security Ordering Correction — attempt마다(재시도 포함) 이 override를
+   *  그대로 재사용한다. 지정하지 않으면 reviewClaudeResultOnce의 production default
+   *  (CONFIDENTIAL classification + OpenAI-only registry)가 쓰인다 — tests가 fake provider용
+   *  호환 metadata를 주입하거나 Security Gate의 실제 BLOCK 경로를 검증하기 위한 주입 지점이다. */
+  securityGateOverrides?: { classification?: DataClassification; registry?: ProviderSecurityRegistry };
 }
 
 export async function reviewClaudeResultWithRetry(
@@ -793,7 +794,9 @@ export async function reviewClaudeResultWithRetry(
       opts.executor,
       opts.gptCallCount,
       opts.gptRawCallTotal,
-      opts.baseline
+      opts.baseline,
+      opts.provider,
+      opts.securityGateOverrides
     );
     if (!r.transient) {
       return { ...r, gptTransportRetry: i };
@@ -866,12 +869,27 @@ export function buildGptReviewLedgerEntryInput(
   },
   fields: GptReviewLedgerContextFields
 ): UsageLedgerEntryInput {
-  const isBudgetBlocked = result.errorCode === "BUDGET_EXCEEDED";
-  const requestNeverSent = isBudgetBlocked || result.requestAttempted === false;
+  // Phase SI-3.8E Security Ordering Correction — Provider Security Gate BLOCK도 Budget Guard
+  // BLOCK과 동일하게 provider.review()를 전혀 호출하지 않은 상태다. errorCode만으로 두 preflight
+  // BLOCK을 하나의 "실제 API 호출 아님" 판정으로 묶되, status 필드(아래 `result.errorCode ??
+  // "SUCCESS"`)는 여전히 BUDGET_EXCEEDED/PROVIDER_SECURITY_BLOCKED를 그대로 구분해서 남긴다
+  // (§ 요구사항 9/11 — Security BLOCK을 provider API error로 잘못 기록하지 않음, Budget BLOCK과
+  // Provider Error를 혼동하지 않음).
+  const isPreflightBlocked = result.errorCode === "BUDGET_EXCEEDED" || result.errorCode === "PROVIDER_SECURITY_BLOCKED";
+  const requestNeverSent = isPreflightBlocked || result.requestAttempted === false;
   const requestCount = requestNeverSent ? 0 : 1 + (result.gptTransportRetry ?? 0);
   const status = result.errorCode ?? "SUCCESS";
 
-  const pricing = resolvePricing("openai", result.model?.name);
+  // Phase SI-3.8E(Claude code-review 지적) — Reviewer Provider Abstraction 이후
+  // GptReviewApiResult.model.provider가 실제로 응답한 provider 식별자를 담을 수 있게 됐다.
+  // 이 Ledger 매핑이 여전히 "openai"를 하드코딩하면, 향후(이번 Task 범위 밖) 다른
+  // ReviewProvider가 실제로 연결됐을 때 Usage Ledger의 provider 필드와 가격 조회가 실제
+  // 호출된 provider와 다른 값으로 조용히 잘못 기록된다 — 실제로 응답한 provider가 있으면 그
+  // 값을 쓰고, 없으면(응답을 받은 적이 없는 실패 — BUDGET_EXCEEDED/client 생성 실패 등)
+  // 기존과 동일하게 "openai"로 fallback한다(이 파일의 production default provider가 여전히
+  // OpenAIReviewProvider뿐이므로 기존 동작은 그대로 보존된다).
+  const provider = result.model?.provider ?? "openai";
+  const pricing = resolvePricing(provider, result.model?.name);
   const cost = calculateEstimatedCost(
     {
       inputTokens: result.tokenUsage?.inputTokens,
@@ -887,7 +905,7 @@ export function buildGptReviewLedgerEntryInput(
     agentId: fields.agentId,
     environment: isProductionRuntime() ? "production" : "development",
     service: GPT_REVIEWER_LEDGER_SERVICE,
-    provider: "openai",
+    provider,
     model: result.model?.name,
     operation: GPT_REVIEWER_LEDGER_OPERATION,
     requestCount,

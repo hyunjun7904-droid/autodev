@@ -20,6 +20,7 @@
     "test:gpt-retry": "npm run build && node dist/gpt-retry-tests.js",
     "test:gpt-budget-guard": "npm run build && node dist/gpt-budget-guard-tests.js",
     "test:gpt-budget-guard-integration": "npm run build && node dist/gpt-budget-guard-integration-tests.js",
+    "test:review-provider": "npm run build && node dist/review-provider-tests.js",
     "test:provider-security-gate": "npm run build && node dist/provider-security-gate-tests.js",
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",
