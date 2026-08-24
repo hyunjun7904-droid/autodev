@@ -38,7 +38,12 @@ export type GptErrorCode =
   // SI-3.8A — GPT Reviewer API Budget Guard(gpt-budget-guard.ts)가 실제 OpenAI API 호출
   // 직전에 payload/추정 토큰 상한 초과를 감지해 호출 자체를 막았을 때만 쓰인다. 재시도로
   // 해결되지 않으므로 항상 transient=false다.
-  | "BUDGET_EXCEEDED";
+  | "BUDGET_EXCEEDED"
+  // SI-3.8D — Incremental GPT Reviewer의 Final Consistency Cross-check(review-baseline.ts)가
+  // "이번 round의 payload를 만든 시점"과 "OpenAI로부터 decision을 받은 시점" 사이에 working
+  // tree 내용이 실제로 달라졌음을 감지했을 때만 쓰인다. decision=PASS를 그대로 신뢰하지 않고
+  // HUMAN_REQUIRED로 강제 전환한다 — 재시도로 해결되지 않으므로 항상 transient=false다.
+  | "REVIEW_CONSISTENCY_CHECK_FAILED";
 
 // SI-3.8A — GPT Reviewer API Budget Guard가 OpenAI API 호출을 막았을 때 별도의
 // "WAITING_API_BUDGET" enum 값을 추가하는 대신 기존 WAITING_HUMAN을 그대로 재사용하기로

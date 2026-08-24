@@ -14,6 +14,10 @@ export interface WorkingTreeChange {
   /** POSIX 상대경로(프로젝트 루트 기준). */
   path: string;
   status: "modified" | "added" | "deleted" | "renamed" | "untracked";
+  /** status==="renamed"일 때만 채워진다 — rename 이전 경로(POSIX 상대경로). Incremental GPT
+   *  Reviewer(SI-3.8D)가 rename을 정확히 표현하는 데 쓴다. 기존 소비처(checkpoint.ts/
+   *  secret-scanner.ts/dependency-scanner.ts)는 이 필드를 읽지 않으므로 동작에 영향 없다. */
+  renamedFrom?: string;
 }
 
 export interface WorkingTreeChanges {
@@ -48,10 +52,14 @@ function parsePorcelainLine(line: string): WorkingTreeChange | null {
   const rest = line.slice(3);
   if (x === "?" && y === "?") return { path: rest, status: "untracked" };
   if (x === "R" || y === "R") {
-    // "R  old -> new" — 커밋 대상은 new만 취급한다.
+    // "R  old -> new" — 커밋 대상은 new만 취급하되, old 경로도 renamedFrom으로 보존한다
+    // (SI-3.8D Incremental GPT Reviewer가 rename을 modification/deletion과 구분해 정확히
+    // 표현하는 데 쓴다 — § 요구사항 7).
     const arrowIdx = rest.indexOf(" -> ");
-    const newPath = arrowIdx === -1 ? rest : rest.slice(arrowIdx + 4);
-    return { path: newPath, status: "renamed" };
+    if (arrowIdx === -1) return { path: rest, status: "renamed" };
+    const oldPath = rest.slice(0, arrowIdx);
+    const newPath = rest.slice(arrowIdx + 4);
+    return { path: newPath, status: "renamed", renamedFrom: oldPath };
   }
   if (x === "D" || y === "D") return { path: rest, status: "deleted" };
   if (x === "A" || y === "A") return { path: rest, status: "added" };
@@ -94,9 +102,25 @@ export function getWorkingTreeChanges(scopeDirs: string[], cwd: string = PROJECT
 }
 
 /** tracked 파일들의 diff 텍스트 — 기존 gpt-reviewer.ts의 고정 인자 방식을 그대로 유지한다
- *  (파일명을 셸 문자열에 이어붙이지 않음, injection 방지). */
+ *  (파일명을 셸 문자열에 이어붙이지 않음, injection 방지). pathspec에는 scopeDirs(디렉터리
+ *  prefix)뿐 아니라 개별 파일 경로 목록도 그대로 넘길 수 있다(git diff pathspec 문법이
+ *  동일) — SI-3.8D Incremental GPT Reviewer가 "변경된 파일만"의 diff를 얻는 데 이 함수를
+ *  그대로 재사용한다(중복 구현 없음). -M(rename detection)을 추가해 rename을 delete+add
+ *  두 hunk로 쪼개 보여주는 대신 "rename from X to Y" 형태로 정확히 표현한다(§ 요구사항 7) —
+ *  rename을 감지하려면 old/new 경로가 모두 같은 git diff 호출의 pathspec 범위 안에 있어야
+ *  하므로, 호출부(SI-3.8D)는 renamed 파일의 old path도 함께 pathspec에 포함해서 넘긴다.
+ *
+ *  HEAD를 명시적으로 기준으로 준다(기존에는 인자 없이 "git diff"만 써서 사실상 index 기준
+ *  — unstaged만 — 비교였다) — getWorkingTreeChanges()(git status --porcelain)는 staged(X
+ *  column)와 unstaged(Y column) 변경을 이미 모두 합쳐서 보고하는데, 예전 "git diff"(HEAD 생략)
+ *  는 staged 변경(예: rename이 git add로 index에 반영된 경우)의 실제 diff 내용을 전혀 보여주지
+ *  못했다(실제로 재현해 확인함 — staged rename 이후 "git diff"는 빈 문자열을 반환하지만
+ *  "git diff HEAD"는 정확한 rename diff를 반환한다). 이 저장소의 실제 운용 흐름은 review 시점
+ *  이전에 git add를 하지 않으므로(index === HEAD인 게 보통) 대다수 경우 결과가 동일하지만,
+ *  staged 상태가 섞여 있어도 항상 "HEAD 대비 실제 working tree 전체 차이"를 정확히 반영하도록
+ *  고쳤다. */
 export function getTrackedDiff(scopeDirs: string[], cwd: string = PROJECT_ROOT): string {
-  const res = spawnSync("git", ["diff", "--", ...scopeDirs], { cwd, shell: false, encoding: "utf-8" });
+  const res = spawnSync("git", ["diff", "-M", "HEAD", "--", ...scopeDirs], { cwd, shell: false, encoding: "utf-8" });
   if (res.status !== 0) return "";
   return res.stdout || "";
 }

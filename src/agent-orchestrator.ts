@@ -369,10 +369,16 @@ async function executeReviewerStepWithRevise(
   let developerData = developerStepResult.data as DeveloperResult;
   let latestDeveloperStep = developerStepResult;
   let cycle = 1;
+  // Phase SI-3.8D — 이 REVISE 루프 안에서만 이어지는 loop-local baseline이다(orchestrator.ts의
+  // reviewBaseline 변수와 동일한 패턴 — § review-baseline.ts 상단 주석, project-state에
+  // 영속화하지 않는다). 호출부가 명시적으로 초기 baseline을 지정했다면(드묾) 그 값에서
+  // 시작하고, 아니면 첫 round는 항상 undefined(FULL)다.
+  let baseline = input.reviewerOptions?.baseline;
 
   while (true) {
     const requiredTestsFailed = hasFailedRequiredTest(developerData.tests);
-    const reviewResult = await reviewerRunner(developerData as ClaudeResult, cycle, input.taskGoal, input.reviewerOptions ?? {});
+    const reviewResult = await reviewerRunner(developerData as ClaudeResult, cycle, input.taskGoal, { ...(input.reviewerOptions ?? {}), baseline });
+    baseline = reviewResult.reviewBaseline ?? baseline;
     // Phase SI-3.8B — orchestrator.ts(runOrchestrator)의 recordGptReviewUsage와 동일한
     // 매핑 함수(gpt-reviewer.ts buildGptReviewLedgerEntryInput)를 그대로 재사용한다 — 이
     // reviewer step이 몇 번 REVISE를 반복하든 실제 gpt-reviewer 호출 1건마다 정확히 한 번씩만

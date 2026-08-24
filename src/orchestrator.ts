@@ -4,6 +4,7 @@ import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
 import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
+import type { ReviewBaseline } from "./review-baseline";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
@@ -34,6 +35,15 @@ export interface GptReviewerReturn extends GptReviewResult {
    *  gpt-reviewer.ts GptReviewApiResult.requestAttempted, buildGptReviewLedgerEntryInput의
    *  requestCount 계산에 쓰인다). */
   requestAttempted?: boolean;
+  /** Phase SI-3.8D — 이번 round의 payload가 FULL/INCREMENTAL/SAFE_FULL_FALLBACK 중 어느
+   *  방식으로 만들어졌는지(§ gpt-reviewer.ts GptReviewApiResult.reviewMode). */
+  reviewMode?: "FULL" | "INCREMENTAL" | "SAFE_FULL_FALLBACK";
+  /** Phase SI-3.8D — 이번 round가 끝난 뒤의 새 baseline. while 루프가 다음 round의
+   *  gptReviewer() 호출에 그대로 넘긴다(§ gpt-reviewer.ts GptReviewApiResult.reviewBaseline). */
+  reviewBaseline?: ReviewBaseline;
+  /** Phase SI-3.8D — 실제로 OpenAI에 전달된 payload 글자수(§ gpt-reviewer.ts
+   *  GptReviewApiResult.payloadChars) — Ledger에 그대로 반영된다. */
+  payloadChars?: number;
 }
 
 export interface OrchestratorDeps {
@@ -47,7 +57,10 @@ export interface OrchestratorDeps {
     /** SI-3.8A — 이 loop의 gptCallCount/gptRawCallTotal(아래 while 루프의 로컬 카운터)을
      *  Budget Guard 관측값으로 그대로 전달한다(§ gpt-budget-guard.ts). */
     gptCallCount?: number,
-    gptRawCallTotal?: number
+    gptRawCallTotal?: number,
+    /** SI-3.8D — 직전 round가 반환한 GptReviewerReturn.reviewBaseline(아래 while 루프의
+     *  로컬 변수)을 그대로 전달한다. */
+    baseline?: ReviewBaseline
   ) => Promise<GptReviewerReturn>;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   claudeLimitWaitMs?: number;
@@ -123,11 +136,12 @@ function selectDefaultGptReviewer(executor?: SafeExecutorContext): (
   allowedPathPrefixes?: string[],
   projectContext?: ReviewProjectContext,
   gptCallCount?: number,
-  gptRawCallTotal?: number
+  gptRawCallTotal?: number,
+  baseline?: ReviewBaseline
 ) => Promise<GptReviewerReturn> {
   if (process.env.AUTOMATION_DRY_RUN !== "false") return fakeReviewClaudeResult;
-  return (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal) =>
-    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor, gptCallCount, gptRawCallTotal });
+  return (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline) =>
+    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor, gptCallCount, gptRawCallTotal, baseline });
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -217,6 +231,10 @@ export async function runOrchestrator(
 
   let gptCallCount = 0;
   let gptRawCallTotal = 0;
+  // Phase SI-3.8D — 이 run(while 루프) 안에서만 이어지는 loop-local 값이다(gptCallCount/
+  // gptRawCallTotal과 동일한 이유로 project-state.json에 저장하지 않는다 — § review-baseline.ts
+  // 상단 주석). 첫 round는 항상 undefined(FULL)로 시작한다.
+  let reviewBaseline: ReviewBaseline | undefined;
 
   while (true) {
     setStatus("CLAUDE_WORKING");
@@ -284,7 +302,20 @@ export async function runOrchestrator(
     emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
     // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
     // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
-    const gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal);
+    // SI-3.8D — reviewBaseline(직전 round의 결과, 첫 round는 undefined)도 그대로 전달한다.
+    const gptResult = await gptReviewer(
+      claudeResult,
+      state.reviewCycle,
+      task,
+      deps.allowedPathPrefixes,
+      deps.projectContext,
+      gptCallCount,
+      gptRawCallTotal,
+      reviewBaseline
+    );
+    // 이번 round가 만든 새 baseline을 다음 round를 위해 보존한다(BLOCK/HUMAN_REQUIRED로
+    // 루프가 끝나도 무해하다 — 더 이상 쓰이지 않을 뿐).
+    reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
 
     // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
     // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).

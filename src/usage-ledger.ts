@@ -62,6 +62,11 @@ export interface UsageLedgerEntryInput {
   totalTokens?: number;
   payloadChars?: number;
   durationMs?: number;
+  /** Phase SI-3.8D — "FULL" | "INCREMENTAL" | "SAFE_FULL_FALLBACK"(review-baseline.ts
+   *  ReviewPayloadMode). string으로 받는 이유는 gpt-budget-guard.ts의 status 필드와 동일한
+   *  근거 — 이 파일이 review-baseline.ts의 타입에 직접 의존하지 않게 해서(Ledger는 provider별
+   *  세부 개념을 몰라도 되는 범용 스키마로 유지) 순환 의존을 만들지 않는다. */
+  reviewMode?: string;
 
   // cost — estimatedCostUsd와 actualCostUsd를 절대 혼동하지 않는다(§ 요구사항 5).
   /** pricing-catalog.ts의 calculateEstimatedCost()로 계산된 값만 채운다 — 가격표가 없으면

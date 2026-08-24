@@ -42,6 +42,8 @@
     "test:agent-orchestrator": "npm run build && node dist/agent-orchestrator-tests.js",
     "test:agent-orchestrator-revise": "npm run build && node dist/agent-orchestrator-revise-tests.js",
     "test:git-changes": "npm run build && node dist/git-changes-tests.js",
+    "test:review-baseline": "npm run build && node dist/review-baseline-tests.js",
+    "test:incremental-reviewer": "npm run build && node dist/incremental-reviewer-tests.js",
     "test:project-context": "npm run build && node dist/project-context-tests.js",
     "test:project-manifest": "npm run build && node dist/project-manifest-tests.js",
     "test:project-policy": "npm run build && node dist/project-policy-tests.js",

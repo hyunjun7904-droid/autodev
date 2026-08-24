@@ -5,6 +5,7 @@ import OpenAI from "openai";
 import { AuthenticationError, RateLimitError, APIConnectionTimeoutError, APIConnectionError, APIError } from "openai";
 import type { ClaudeResult, GptReviewResult, GptErrorCode } from "./types";
 import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, isPathInScope } from "./git-changes";
+import type { WorkingTreeChanges } from "./git-changes";
 import { PROJECT_ROOT } from "./safe-executor";
 import { validateReadPath } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
@@ -13,6 +14,17 @@ import { resolveGptBudgetGuardConfig, evaluateGptBudgetGuard } from "./gpt-budge
 import { resolvePricing, calculateEstimatedCost } from "./pricing-catalog";
 import type { UsageLedgerEntryInput } from "./usage-ledger";
 import { isProductionRuntime } from "./runtime-origin";
+import {
+  buildTaskIdentity,
+  buildScopeKey,
+  buildAllowedPathPrefixesKey,
+  buildFileStateSnapshot,
+  buildReviewBaseline,
+  validateReviewBaseline,
+  diffAgainstBaseline,
+  snapshotsAreIdentical,
+} from "./review-baseline";
+import type { ReviewBaseline, ReviewPayloadMode, FileContentReader, ReviewFileState } from "./review-baseline";
 
 // 실제 OpenAI Responses API 기반 리뷰어. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
 // 이 모듈을 선택한다. OPENAI_API_KEY는 client 생성자가 process.env에서 자동으로 읽는다 —
@@ -94,6 +106,19 @@ export interface GptReviewApiResult extends GptReviewResult {
    *  확인한다. 지정하지 않으면(성공 응답, 또는 실제로 전송된 요청이 실패한 일반적인 경우)
    *  true로 간주한다. */
   requestAttempted?: boolean;
+  /** Phase SI-3.8D — 이번 round의 payload가 FULL/INCREMENTAL/SAFE_FULL_FALLBACK 중 어느
+   *  방식으로 만들어졌는지(§ review-baseline.ts ReviewPayloadMode). Budget Guard BLOCK처럼
+   *  실제 payload를 만든 뒤에만 채워진다. */
+  reviewMode?: ReviewPayloadMode;
+  /** Phase SI-3.8D — 이번 round가 끝난 뒤의 새 baseline. 호출부(orchestrator.ts/
+   *  agent-orchestrator.ts)가 loop-local 변수로 들고 있다가 다음 round의 reviewClaudeResult
+   *  호출에 그대로 넘기면 그 다음 round는 INCREMENTAL로 진행될 수 있다. project-state.json에
+   *  영속화하지 않는다(§ review-baseline.ts 상단 주석). */
+  reviewBaseline?: ReviewBaseline;
+  /** Phase SI-3.8D — 실제 OpenAI에 전달된 instructions+input의 글자수(gpt-budget-guard.ts가
+   *  이미 계산한 값을 그대로 옮긴 것) — Usage Ledger의 payloadChars에 그대로 반영되어
+   *  FULL/INCREMENTAL round 간 payload 절감을 증거로 보여준다. */
+  payloadChars?: number;
 }
 export interface GptReviewRetryResult extends GptReviewApiResult {
   /** 실제로 수행된 API 통신 재시도 횟수(최초 시도 제외) — reviewCycle과 별개로 집계. */
@@ -183,9 +208,9 @@ function getRulesSummary(rulesPath: string | undefined, access: ReviewFileAccess
 function buildChangeSection(
   allowedPathPrefixes: string[],
   scopeDirs: string[],
+  changes: WorkingTreeChanges,
   access: ReviewFileAccess
-): { text: string; scopeViolations: string[] } {
-  const changes = getWorkingTreeChanges(scopeDirs, access.projectRoot);
+): { text: string; scopeViolations: string[]; fullyIncludedPaths: string[] } {
   const allPaths = changes.all.map((c) => c.path);
   const scopeViolations = allPaths.filter((p) => !isPathInScope(p, allowedPathPrefixes));
   const scopeViolationSet = new Set(scopeViolations);
@@ -193,14 +218,23 @@ function buildChangeSection(
   const inScopeUntracked = changes.untracked.filter((c) => !scopeViolationSet.has(c.path));
 
   let trackedDiffText: string;
+  // Claude code-review 지적 — 예산 초과로 truncate된(또는 조회 자체가 실패한) tracked diff를
+  // "review됨"으로 취급해 baseline에 반영하면, 실제로 GPT가 본 적 없는 내용이 이후 round에서
+  // "이미 검토됨"으로 조용히 영구 제외될 수 있다. 그래서 이 블록은 실제로 전체 내용이 담겼는지
+  // (trackedFullyIncluded)를 별도로 추적해 fullyIncludedPaths 계산에 반영한다.
+  let trackedFullyIncluded = true;
   try {
     const raw = getTrackedDiff(scopeDirs, access.projectRoot);
-    trackedDiffText = !raw
-      ? "(tracked diff 없음)"
-      : raw.length <= MAX_DIFF_CHARS
-        ? raw
-        : raw.slice(0, MAX_DIFF_CHARS) + `\n...[diff truncated, ${raw.length - MAX_DIFF_CHARS}자 생략]`;
+    if (!raw) {
+      trackedDiffText = "(tracked diff 없음)";
+    } else if (raw.length <= MAX_DIFF_CHARS) {
+      trackedDiffText = raw;
+    } else {
+      trackedFullyIncluded = false;
+      trackedDiffText = raw.slice(0, MAX_DIFF_CHARS) + `\n...[diff truncated, ${raw.length - MAX_DIFF_CHARS}자 생략]`;
+    }
   } catch (e) {
+    trackedFullyIncluded = false;
     trackedDiffText = `(git diff 조회 실패: ${sanitizeForLog(String(e)).slice(0, 200)})`;
   }
 
@@ -215,6 +249,11 @@ function buildChangeSection(
         .join("\n\n")
     : "(신규 untracked 파일 없음)";
 
+  const fullyIncludedPaths = [
+    ...(trackedFullyIncluded ? changes.tracked.map((c) => c.path) : []),
+    ...untrackedFiles.filter((f) => !f.truncated).map((f) => f.path),
+  ];
+
   const text = [
     `## tracked 변경 diff (최대 ${MAX_DIFF_CHARS}자)\n${trackedDiffText}`,
     `## 신규(untracked) 파일 전체 내용\n${untrackedText}`,
@@ -223,25 +262,231 @@ function buildChangeSection(
     `## 이 task의 허용 경로(allowedPathPrefixes) 밖에서 발견된 변경 — 정책 위반, 반드시 BLOCK 또는 REVISE 판단에 반영\n${scopeViolations.length ? scopeViolations.join("\n") : "(없음)"}`,
   ].join("\n\n");
 
-  return { text, scopeViolations };
+  return { text, scopeViolations, fullyIncludedPaths };
+}
+
+// Phase SI-3.8D — Incremental GPT Reviewer. FULL(첫 review)/SAFE_FULL_FALLBACK(baseline을
+// 신뢰할 수 없을 때)는 access.projectRoot 기준으로 tracked file을 직접 읽는다(getTrackedDiff가
+// 이미 Safe Executor read-prefix 제한 없이 scopeDirs 전체 diff를 노출하는 것과 동일한 노출
+// 수준 — 새 정보 노출이 아니다). untracked file은 기존과 동일하게 access.validateReadPath로
+// 게이트한다(§ readUntrackedFiles와 동일한 보안 경계 유지).
+function makeFileStateReader(access: ReviewFileAccess): FileContentReader {
+  return {
+    read(path, status) {
+      if (status === "untracked") {
+        const v = access.validateReadPath(path);
+        if (!v.ok) return { ok: false };
+        try {
+          return { ok: true, content: readFileSync(v.abs, "utf-8") };
+        } catch {
+          return { ok: false };
+        }
+      }
+      try {
+        return { ok: true, content: readFileSync(join(access.projectRoot, ...path.split("/")), "utf-8") };
+      } catch {
+        return { ok: false };
+      }
+    },
+  };
+}
+
+// INCREMENTAL 전용 — changedPaths(이전 baseline 이후 실제로 달라진 파일)만의 diff/content를
+// 담는다. unchangedPaths는 경로만 명시하고 내용은 다시 보내지 않는다(§ 요구사항 5/6). rename은
+// getTrackedDiff의 -M과 old+new pathspec 조합으로 "rename from X to Y" 형태로 정확히
+// 표현되고, 별도 요약 섹션으로도 한번 더 명시한다(§ 요구사항 7).
+function buildIncrementalText(
+  changedPaths: string[],
+  unchangedPaths: string[],
+  removedPaths: string[],
+  changes: WorkingTreeChanges,
+  access: ReviewFileAccess,
+  scopeViolations: string[]
+): { text: string; fullyIncludedPaths: string[] } {
+  const changedSet = new Set(changedPaths);
+  const scopeViolationSet = new Set(scopeViolations);
+  const changedTracked = changes.tracked.filter((c) => changedSet.has(c.path));
+  // Claude code-review 지적 — FULL 모드(buildChangeSection)는 scope 밖 untracked 파일의
+  // 내용을 애초에 읽지 않는데, 이 함수는 그 필터를 빠뜨려서 scope 밖 파일이 "변경됨"으로
+  // 분류되는 순간(baseline 대비 hash가 달라지는 순간) 내용이 그대로 OpenAI payload에
+  // 포함될 수 있었다 — FULL과 동일하게 scope 밖 untracked는 내용을 읽지 않는다(경로는
+  // scopeViolations 섹션에 이미 명시된다).
+  const changedUntracked = changes.untracked.filter((c) => changedSet.has(c.path) && !scopeViolationSet.has(c.path));
+
+  const trackedPathspec: string[] = [];
+  for (const c of changedTracked) {
+    trackedPathspec.push(c.path);
+    if (c.renamedFrom) trackedPathspec.push(c.renamedFrom);
+  }
+
+  let trackedDiffText: string;
+  let trackedFullyIncluded = true;
+  try {
+    const raw = trackedPathspec.length > 0 ? getTrackedDiff(trackedPathspec, access.projectRoot) : "";
+    if (!raw) {
+      trackedDiffText = "(이전 review 이후 변경된 tracked 파일 없음)";
+    } else if (raw.length <= MAX_DIFF_CHARS) {
+      trackedDiffText = raw;
+    } else {
+      trackedFullyIncluded = false;
+      trackedDiffText = raw.slice(0, MAX_DIFF_CHARS) + `\n...[diff truncated, ${raw.length - MAX_DIFF_CHARS}자 생략]`;
+    }
+  } catch (e) {
+    trackedFullyIncluded = false;
+    trackedDiffText = `(git diff 조회 실패: ${sanitizeForLog(String(e)).slice(0, 200)})`;
+  }
+
+  const { files: untrackedFiles, skipped } = readUntrackedFiles(
+    changedUntracked,
+    { perFileMaxChars: 20_000, totalBudgetChars: MAX_DIFF_CHARS },
+    { validateReadPath: access.validateReadPath }
+  );
+  const untrackedText = untrackedFiles.length
+    ? untrackedFiles
+        .map((f) => `--- 신규 파일: ${f.path}${f.truncated ? " (내용 일부 truncated)" : ""} ---\n${f.content}`)
+        .join("\n\n")
+    : "(이전 review 이후 변경된 신규 untracked 파일 없음)";
+
+  const fullyIncludedPaths = [
+    ...(trackedFullyIncluded ? changedTracked.map((c) => c.path) : []),
+    ...untrackedFiles.filter((f) => !f.truncated).map((f) => f.path),
+  ];
+
+  const renamedNotes = changedTracked.filter((c) => c.status === "renamed").map((c) => `${c.renamedFrom} -> ${c.path}`);
+  const deletedNotes = changedTracked.filter((c) => c.status === "deleted").map((c) => c.path);
+
+  const text = [
+    `## Incremental review — 이전 review(last-reviewed state) 이후 실제로 변경된 파일만 포함합니다(전체 재전송 아님).`,
+    `## tracked 변경 diff — 이름 변경(rename)/삭제 포함(최대 ${MAX_DIFF_CHARS}자)\n${trackedDiffText}`,
+    `## 신규(untracked) 파일 전체 내용 — 이전 review 이후 변경분만\n${untrackedText}`,
+    `## 이름이 변경된 파일(old -> new)\n${renamedNotes.length ? renamedNotes.join("\n") : "(없음)"}`,
+    `## 삭제된 파일\n${deletedNotes.length ? deletedNotes.join("\n") : "(없음)"}`,
+    `## 예산 초과로 이번 payload에서 생략된 파일\n${skipped.length ? skipped.join("\n") : "(없음)"}`,
+    `## 이전 review 이후 내용이 전혀 변경되지 않아 이번 payload에서 생략된 파일(${unchangedPaths.length}개, 이미 이전 round에서 검토됨)\n${unchangedPaths.length ? unchangedPaths.join("\n") : "(없음)"}`,
+    `## 이전에 감지되었으나 이번 review에서는 더 이상 나타나지 않는 파일(예: untracked 신규 파일이 삭제됨 — git status가 더 이상 추적하지 않음)\n${removedPaths.length ? removedPaths.join("\n") : "(없음)"}`,
+    `## secret/빌드산출물/로그/temp 등으로 제외된 경로\n${changes.excluded.length ? changes.excluded.join("\n") : "(없음)"}`,
+    `## 이 task의 허용 경로(allowedPathPrefixes) 밖에서 발견된 변경 — 정책 위반, 반드시 BLOCK 또는 REVISE 판단에 반영\n${scopeViolations.length ? scopeViolations.join("\n") : "(없음)"}`,
+  ].join("\n\n");
+
+  return { text, fullyIncludedPaths };
+}
+
+export interface ReviewPayloadResult {
+  text: string;
+  scopeViolations: string[];
+  mode: ReviewPayloadMode;
+  newBaseline: ReviewBaseline;
+}
+
+/**
+ * Review payload/mode 결정의 단일 지점 — reviewClaudeResultOnce()가 이 함수 하나만 호출해서
+ * FULL/INCREMENTAL/SAFE_FULL_FALLBACK을 결정한다. baseline이 없으면(첫 review) 항상 FULL.
+ * baseline이 있어도 validateReviewBaseline()이 무효라고 판정하면(§ 요구사항 8 — missing/
+ * stale/tampered/incompatible) 조용히 INCREMENTAL을 계속하지 않고 명시적으로
+ * SAFE_FULL_FALLBACK으로 전환한다(silent fallback 금지 — log로 사유를 남긴다).
+ */
+function buildReviewPayload(
+  task: string,
+  reviewCycle: number,
+  allowedPathPrefixes: string[],
+  scopeDirs: string[],
+  access: ReviewFileAccess,
+  baseline: ReviewBaseline | undefined
+): ReviewPayloadResult {
+  // git status/diff 조회는 이 함수 안에서 한 번만 수행한다 — 이전에는 FULL/SAFE_FULL_FALLBACK
+  // 분기가 buildChangeSection() 내부에서 별도로 다시 getWorkingTreeChanges()를 호출해, 그
+  // 사이 working tree가 바뀌면 baseline과 실제 전송된 내용이 서로 다른 상태를 가리킬 수
+  // 있었다(§ Claude code-review 지적). 지금은 이 하나의 changes/currentSnapshot을 모든 분기가
+  // 공유한다.
+  const changes = getWorkingTreeChanges(scopeDirs, access.projectRoot);
+  const taskIdentity = buildTaskIdentity(task);
+  const scopeKey = buildScopeKey(scopeDirs);
+  const allowedPathPrefixesKey = buildAllowedPathPrefixesKey(allowedPathPrefixes);
+  const reader = makeFileStateReader(access);
+  const currentSnapshot = buildFileStateSnapshot(changes, reader);
+
+  // Claude code-review 지적 — "이번 round에 실제로 GPT에게 전달된 내용"만 다음 baseline에
+  // "review됨"으로 기록한다. changedThisRound가 "ALL"(FULL/SAFE_FULL_FALLBACK, baseline이 없거나
+  // 무효라 모든 파일이 사실상 처음 보여지는 것과 같음)이면, fullyIncludedPaths에 없는 파일은
+  // baseline에서 완전히 제외된다(다음 round에도 계속 "변경됨"으로 재시도됨). INCREMENTAL이면
+  // changedThisRound가 실제 changedPaths 집합이고, 그 집합 밖(=이전 round와 내용이 같아 이번
+  // round에 아예 재전송 대상이 아니었던 파일)은 예산 초과 여부와 무관하게 항상 그대로 이어간다
+  // (이미 어떤 과거 round에서 fully-included 되었을 때만 baseline에 존재할 수 있으므로).
+  function buildReviewedBaseline(fullyIncludedPaths: string[], changedThisRound: Set<string> | "ALL"): ReviewBaseline {
+    const fullyIncludedSet = new Set(fullyIncludedPaths);
+    const reviewedFileHashes: Record<string, ReviewFileState> = {};
+    for (const path of Object.keys(currentSnapshot)) {
+      const wasChangedThisRound = changedThisRound === "ALL" || changedThisRound.has(path);
+      if (!wasChangedThisRound || fullyIncludedSet.has(path)) {
+        reviewedFileHashes[path] = currentSnapshot[path];
+      }
+      // else: 이번 round에 변경됐지만 예산 초과 등으로 완전히 전달되지 못한 파일 — baseline에서
+      // 제외해 다음 round에도 계속 "변경됨"으로 재시도되게 한다(previous PASS를 신뢰하지 않는다).
+    }
+    return buildReviewBaseline({ taskIdentity, scopeKey, allowedPathPrefixesKey, reviewCycleOfBaseline: reviewCycle, fileHashes: reviewedFileHashes });
+  }
+
+  if (!baseline) {
+    const { text, scopeViolations, fullyIncludedPaths } = buildChangeSection(allowedPathPrefixes, scopeDirs, changes, access);
+    return { text, scopeViolations, mode: "FULL", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL") };
+  }
+
+  const validation = validateReviewBaseline(baseline, { taskIdentity, scopeKey, allowedPathPrefixesKey, reviewCycle });
+  if (!validation.ok) {
+    log(`GPT Reviewer baseline을 신뢰할 수 없음(${validation.reason}) — SAFE_FULL_FALLBACK으로 전환합니다.`, { reviewCycle });
+    const { text, scopeViolations, fullyIncludedPaths } = buildChangeSection(allowedPathPrefixes, scopeDirs, changes, access);
+    return { text, scopeViolations, mode: "SAFE_FULL_FALLBACK", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL") };
+  }
+
+  const scopeViolations = changes.all.map((c) => c.path).filter((p) => !isPathInScope(p, allowedPathPrefixes));
+  const { changedPaths, unchangedPaths, removedPaths } = diffAgainstBaseline(currentSnapshot, baseline);
+  const { text, fullyIncludedPaths } = buildIncrementalText(changedPaths, unchangedPaths, removedPaths, changes, access, scopeViolations);
+  return { text, scopeViolations, mode: "INCREMENTAL", newBaseline: buildReviewedBaseline(fullyIncludedPaths, new Set(changedPaths)) };
+}
+
+// Final Consistency Cross-check(§ 요구사항 9)의 핵심 판정 — reviewClaudeResultOnce()가
+// decision=PASS를 그대로 신뢰하기 직전에 호출한다. export하는 이유: 이 함수는 실제 OpenAI
+// round-trip 없이도(git-changes.ts/review-baseline.ts만으로) 결정적으로 재현/검증할 수 있어,
+// 이 Task의 테스트가 실제 API를 호출하지 않고도 "review payload를 만든 시점 이후 working
+// tree가 실제로 달라졌는가"를 직접 증명할 수 있게 한다(review-baseline-tests.ts).
+export function hasWorkingTreeDriftedSincePayload(
+  scopeDirs: string[],
+  payloadBaseline: ReviewBaseline,
+  executor?: SafeExecutorContext
+): boolean {
+  const access = resolveFileAccess(executor);
+  const currentChanges = getWorkingTreeChanges(scopeDirs, access.projectRoot);
+  const currentSnapshot = buildFileStateSnapshot(currentChanges, makeFileStateReader(access));
+  return !snapshotsAreIdentical(currentSnapshot, payloadBaseline.fileHashes);
 }
 
 // export: developer-reviewer-context-tests.ts가 실제 OpenAI API를 호출하지 않고도 review
 // input/system instructions에 프로젝트별 내용이 정확히 삽입되는지 직접 검증할 수 있게 한다.
+// baseline(Phase SI-3.8D)을 지정하지 않으면(기존 호출부 전부 포함) 항상 FULL review와 완전히
+// 동일하게 동작한다 — 기존 동작을 바꾸지 않는다.
 export function buildReviewInput(
   task: string,
   result: ClaudeResult,
   reviewCycle: number,
   allowedPathPrefixes: string[],
   projectContext: ReviewProjectContext,
-  executor?: SafeExecutorContext
-): { input: string; scopeViolations: string[] } {
+  executor?: SafeExecutorContext,
+  baseline?: ReviewBaseline
+): { input: string; scopeViolations: string[]; reviewMode: ReviewPayloadMode; newBaseline: ReviewBaseline } {
   const access = resolveFileAccess(executor);
   const testsSummary = result.tests.map((t) => `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`).join("\n") || "(없음)";
-  const { text: changeSection, scopeViolations } = buildChangeSection(allowedPathPrefixes, projectContext.scopeDirs, access);
+  const { text: changeSection, scopeViolations, mode, newBaseline } = buildReviewPayload(
+    task,
+    reviewCycle,
+    allowedPathPrefixes,
+    projectContext.scopeDirs,
+    access,
+    baseline
+  );
   const input = [
     `# Task\n${task}`,
     `# Review cycle\n${reviewCycle}`,
+    `# Review payload mode\n${mode}`,
     `# 프로젝트\n${projectContext.projectName}`,
     `# 프로젝트 규칙 요약\n${getRulesSummary(projectContext.rulesPath, access)}`,
     `# Claude 결과 요약\n${result.summary}`,
@@ -249,7 +494,7 @@ export function buildReviewInput(
     `# 테스트 결과(AutoDev가 실제로 실행해 확인한 exitCode 기준)\n${testsSummary}`,
     `# 실제 변경 내역(git status 기준, tracked+untracked 전부)\n${changeSection}`,
   ].join("\n\n");
-  return { input, scopeViolations };
+  return { input, scopeViolations, reviewMode: mode, newBaseline };
 }
 
 export function buildSystemInstructions(ctx: ReviewProjectContext): string {
@@ -296,17 +541,31 @@ export async function reviewClaudeResultOnce(
   /** orchestrator.ts가 자신의 loop-local 카운터를 그대로 넘긴다(§ GptBudgetGuardInput) —
    *  이 함수 자체는 이 값을 계산/추적하지 않는다(관측 목적 pass-through일 뿐). */
   gptCallCount?: number,
-  gptRawCallTotal?: number
+  gptRawCallTotal?: number,
+  /** Phase SI-3.8D — 직전 round가 반환한 GptReviewApiResult.reviewBaseline을 호출부가 그대로
+   *  넘긴다. 지정하지 않으면(첫 review, 또는 baseline 개념이 없는 기존 호출부) 항상 FULL로
+   *  동작한다 — 기존 동작을 바꾸지 않는다. */
+  baseline?: ReviewBaseline
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
-  const { input, scopeViolations } = buildReviewInput(task, result, reviewCycle, effectiveAllowedPathPrefixes, projectContext, executor);
+  const { input, scopeViolations, reviewMode, newBaseline } = buildReviewInput(
+    task,
+    result,
+    reviewCycle,
+    effectiveAllowedPathPrefixes,
+    projectContext,
+    executor,
+    baseline
+  );
   const instructions = buildSystemInstructions(projectContext);
 
   // GPT Reviewer API Budget Guard(SI-3.8A) — 실제 OpenAI API를 호출하기 직전의 마지막
   // deterministic 검문소다. 여기서 BLOCK이면 getClient()조차 호출하지 않는다(아래 try 블록
   // 진입 자체를 하지 않음) — API 호출 0회를 구조적으로 보장한다. 재시도로 해결되는 문제가
   // 아니므로 transient는 항상 false다(reviewClaudeResultWithRetry가 즉시 반환하고 재시도하지
-  // 않음).
+  // 않음). FULL/INCREMENTAL/SAFE_FULL_FALLBACK 어느 모드로 만들어진 payload든 완성된
+  // instructions+input 글자수/추정 토큰수만으로 판정하므로 이 Guard는 세 모드 모두에 동일하게
+  // 적용된다(§ 요구사항 10 — 모드별 예외 없음).
   const budgetGuardResult = evaluateGptBudgetGuard(
     { instructions, input, reviewCycle, gptCallCount, gptRawCallTotal },
     resolveGptBudgetGuardConfig()
@@ -314,6 +573,7 @@ export async function reviewClaudeResultOnce(
   if (budgetGuardResult.verdict === "BLOCK") {
     log(`GPT Budget Guard BLOCK(${budgetGuardResult.blockCode}) — OpenAI API 호출 생략`, {
       reviewCycle,
+      reviewMode,
       payloadChars: budgetGuardResult.payloadChars,
       estimatedInputTokens: budgetGuardResult.estimatedInputTokens,
       config: budgetGuardResult.config,
@@ -326,6 +586,9 @@ export async function reviewClaudeResultOnce(
       errorCode: "BUDGET_EXCEEDED",
       transient: false,
       scopeViolations,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
     };
   }
 
@@ -351,6 +614,9 @@ export async function reviewClaudeResultOnce(
       transient: false,
       scopeViolations,
       requestAttempted: false,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
     };
   }
 
@@ -398,11 +664,51 @@ export async function reviewClaudeResultOnce(
         scopeViolations,
         model,
         tokenUsage,
+        reviewMode,
+        reviewBaseline: newBaseline,
+        payloadChars: budgetGuardResult.payloadChars,
       };
     }
 
-    log("GPT 리뷰 완료", { reviewCycle, decision: parsed.decision, severity: parsed.severity });
-    return { ...parsed, scopeViolations, model, tokenUsage };
+    // Final Consistency Cross-check(§ 요구사항 9) — decision=PASS를 그대로 신뢰하기 직전에,
+    // "이번 round의 payload를 만든 시점"의 snapshot(newBaseline.fileHashes)과 "지금(OpenAI
+    // round-trip 이후) 다시 계산한 snapshot"이 완전히 같은지 로컬 hash 비교만으로 재확인한다
+    // (OpenAI를 다시 호출하지 않는다). working tree가 review 도중 실제로 달라졌다면 PASS를
+    // 그대로 반환하지 않고 HUMAN_REQUIRED로 강제 전환한다 — "previous PASS를 단순히 신뢰하지
+    // 않는다"는 원칙을 APPROVED 후보 시점에도 동일하게 적용한다.
+    if (parsed.decision === "PASS") {
+      if (hasWorkingTreeDriftedSincePayload(projectContext.scopeDirs, newBaseline, executor)) {
+        log("GPT 리뷰 Final Consistency Cross-check 실패 — working tree가 review 도중 변경됨, PASS를 신뢰하지 않음", {
+          reviewCycle,
+          reviewMode,
+        });
+        return {
+          decision: "HUMAN_REQUIRED",
+          severity: parsed.severity,
+          feedback: `Final Consistency Cross-check 실패: review payload를 만든 시점과 decision을 받은 시점 사이에 working tree가 변경되었습니다. 원래 GPT feedback: ${parsed.feedback}`,
+          nextTask: parsed.nextTask,
+          errorCode: "REVIEW_CONSISTENCY_CHECK_FAILED",
+          transient: false,
+          scopeViolations,
+          model,
+          tokenUsage,
+          reviewMode,
+          reviewBaseline: newBaseline,
+          payloadChars: budgetGuardResult.payloadChars,
+        };
+      }
+    }
+
+    log("GPT 리뷰 완료", { reviewCycle, decision: parsed.decision, severity: parsed.severity, reviewMode });
+    return {
+      ...parsed,
+      scopeViolations,
+      model,
+      tokenUsage,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
+    };
   } catch (e) {
     const { code: errorCode, transient } = classifyApiError(e);
     log(`GPT 리뷰 API 오류(${errorCode})`, { reviewCycle, transient });
@@ -414,6 +720,9 @@ export async function reviewClaudeResultOnce(
       errorCode,
       transient,
       scopeViolations,
+      reviewMode,
+      reviewBaseline: newBaseline,
+      payloadChars: budgetGuardResult.payloadChars,
     };
   }
 }
@@ -455,6 +764,12 @@ export interface ReviewRetryOptions {
    *  강제한다). */
   gptCallCount?: number;
   gptRawCallTotal?: number;
+  /** Phase SI-3.8D — 직전 round의 GptReviewRetryResult.reviewBaseline을 호출부(orchestrator.ts/
+   *  agent-orchestrator.ts)가 loop-local 변수로 그대로 넘긴다. 재시도 wrapper는 이 값을
+   *  attempt마다 그대로 재사용한다(같은 round 안의 재시도는 같은 payload/baseline을 다시
+   *  보낼 뿐, 새 round로 진행하지 않는다 — § 요구사항 21 "retry wrapper does not bypass
+   *  baseline/budget failure"). */
+  baseline?: ReviewBaseline;
 }
 
 export async function reviewClaudeResultWithRetry(
@@ -469,7 +784,17 @@ export async function reviewClaudeResultWithRetry(
   const allowedPathPrefixes = opts.allowedPathPrefixes ?? projectContext.scopeDirs;
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const r = await attempt(result, reviewCycle, task, allowedPathPrefixes, projectContext, opts.executor, opts.gptCallCount, opts.gptRawCallTotal);
+    const r = await attempt(
+      result,
+      reviewCycle,
+      task,
+      allowedPathPrefixes,
+      projectContext,
+      opts.executor,
+      opts.gptCallCount,
+      opts.gptRawCallTotal,
+      opts.baseline
+    );
     if (!r.transient) {
       return { ...r, gptTransportRetry: i };
     }
@@ -535,6 +860,9 @@ export function buildGptReviewLedgerEntryInput(
     tokenUsage?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalTokens?: number };
     gptTransportRetry?: number;
     requestAttempted?: boolean;
+    /** Phase SI-3.8D — GptReviewApiResult.reviewMode/payloadChars를 그대로 옮긴다(있으면). */
+    reviewMode?: string;
+    payloadChars?: number;
   },
   fields: GptReviewLedgerContextFields
 ): UsageLedgerEntryInput {
@@ -570,6 +898,8 @@ export function buildGptReviewLedgerEntryInput(
     estimatedCostUsd: cost.status === "CALCULATED" ? cost.estimatedCostUsd : undefined,
     currency: cost.status === "CALCULATED" ? cost.currency : undefined,
     operationCycle: fields.operationCycle,
+    payloadChars: result.payloadChars,
+    reviewMode: result.reviewMode,
     status,
   };
 }
