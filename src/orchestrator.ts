@@ -2,7 +2,7 @@ import { loadState, saveState, DEFAULT_STATE_PATH } from "./state";
 import { runClaudeTask as fakeRunClaudeTask } from "./fake-claude-runner";
 import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
-import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
+import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
@@ -10,6 +10,7 @@ import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTE
 import { buildTestSummary, isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import type { EventStore } from "./event-store";
+import type { UsageLedger } from "./usage-ledger";
 import { log } from "./logger";
 import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, CoreState } from "./types";
 
@@ -26,7 +27,13 @@ export interface GptReviewerReturn extends GptReviewResult {
   scopeViolations?: string[];
   /** Phase G Task G3.1 — 실제 OpenAI Responses API 응답이 제공한 경우만(§ gpt-reviewer.ts). */
   model?: { provider: string; name: string };
-  tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  /** Phase SI-3.8B — cachedInputTokens는 response.usage.input_tokens_details.cached_tokens를
+   *  그대로 옮긴 값이다(§ gpt-reviewer.ts GptReviewApiResult.tokenUsage). */
+  tokenUsage?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalTokens?: number };
+  /** Phase SI-3.8B — false면 실제 네트워크 요청이 전혀 나가지 않았다는 뜻이다(§
+   *  gpt-reviewer.ts GptReviewApiResult.requestAttempted, buildGptReviewLedgerEntryInput의
+   *  requestCount 계산에 쓰인다). */
+  requestAttempted?: boolean;
 }
 
 export interface OrchestratorDeps {
@@ -76,6 +83,14 @@ export interface OrchestratorDeps {
   runId?: string;
   taskId?: string;
   projectId?: string;
+  /**
+   * Phase SI-3.8B — 지정하면 실제 GPT reviewer 호출(정확히 1회, 위 gptReviewer 호출)마다
+   * requestCount/token/추정비용을 Usage Ledger에 append한다(§ gpt-reviewer.ts
+   * buildGptReviewLedgerEntryInput). 지정하지 않으면 이 파일의 동작은 이전과 완전히
+   * 동일하다(instrumentation이 전부 no-op) — events/runId와 동일한 "지정 안 하면 no-op"
+   * 원칙을 따른다.
+   */
+  ledger?: UsageLedger;
 }
 
 export interface OrchestratorRunResult {
@@ -159,6 +174,23 @@ export async function runOrchestrator(
       log("observability event 기록 실패(telemetry)", { eventType: input.eventType, error: result.error });
     }
   };
+  // Phase SI-3.8B — deps.ledger가 없으면 완전한 no-op이다(events/runId와 동일한 원칙). append
+  // 실패는 Ledger 자체가 이미 ok:false로 정직하게 반환하므로(§ usage-ledger.ts) 여기서는
+  // 경고만 남기고 state/실행 흐름에는 영향을 주지 않는다 — 비용 telemetry 기록 실패가 실제
+  // 자동개발 진행을 막아서는 안 된다(event의 audit-critical 정책과 의도적으로 다르다).
+  const recordGptReviewUsage = (result: GptReviewerReturn, reviewCycle: number): void => {
+    if (!deps.ledger) return;
+    const entry = buildGptReviewLedgerEntryInput(result, {
+      projectId: deps.projectId,
+      taskId: deps.taskId,
+      operationCycle: reviewCycle,
+    });
+    const appendResult = deps.ledger.append(entry);
+    if (!appendResult.ok) {
+      log("Usage Ledger 기록 실패(gpt-reviewer) — 비용 telemetry만 유실됨, 실행에는 영향 없음", { error: appendResult.error });
+    }
+  };
+
   const statusHistory: OrchestratorStatus[] = [];
   const setStatus = (s: OrchestratorStatus) => {
     state.status = s;
@@ -257,6 +289,13 @@ export async function runOrchestrator(
     // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
     // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
     gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
+
+    // Phase SI-3.8B — 이 reviewCycle의 gptReviewer() 호출 1건(Budget Guard BLOCK/실제 API
+    // 성공/실패 전부 포함, 결과 branch 분기보다 먼저)을 정확히 한 번만 Ledger에 기록한다 —
+    // 아래 어떤 branch(BUDGET_EXCEEDED/AUTH_ERROR/PASS/BLOCK/REVISE)로 진행하든 중복 기록되지
+    // 않는다.
+    recordGptReviewUsage(gptResult, state.reviewCycle);
+
     if (gptRawCallTotal > MAX_GPT_RAW_CALLS) {
       log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — WAITING_HUMAN`, { gptRawCallTotal });
       state.deferredHumanTasks.push(`GPT_RAW_CALL_LIMIT_EXCEEDED: 총 ${gptRawCallTotal}회`);

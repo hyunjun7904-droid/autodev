@@ -21,6 +21,8 @@ import type { AgentStepResult, ReadOnlyAgentRunner } from "./agent-orchestrator"
 import { classifyTaskRisk, requiresHumanApproval } from "./policy";
 import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
+import { selectDefaultUsageLedgerForProject } from "./usage-ledger";
+import type { UsageLedger } from "./usage-ledger";
 import { acquireProjectLock, releaseProjectLock } from "./project-lock";
 import type { ProjectLockHandle, ProjectLockOwnerKind } from "./project-lock";
 import { isAuditCriticalEvent } from "./observability-event";
@@ -177,6 +179,14 @@ export interface AutodevRunOptions {
    * event-store.ts의 append를 비활성화/약화시킬 수 없다(그런 파라미터 자체가 없다).
    */
   events?: EventStore;
+  /**
+   * Phase SI-3.8B — 지정하면 이 실행의 gpt-reviewer 호출(orchestrator.ts 경로)마다
+   * requestCount/token/추정비용을 기록한다. 지정하지 않으면(기본값)
+   * selectDefaultUsageLedgerForProject(manifest.projectId)가 production 여부에 따라
+   * file/in-memory를 자동 선택한다(§ usage-ledger.ts — event-store.ts의 selectDefaultEventStore
+   * 와 동일한 원칙).
+   */
+  ledger?: UsageLedger;
   /** 지정하지 않으면 이 실행마다 새 runId를 생성한다(node:crypto의 randomUUID). */
   runId?: string;
   /**
@@ -370,6 +380,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
   const runId = opts.runId ?? randomUUID();
   const events = opts.events ?? selectDefaultEventStore();
+  const ledger = opts.ledger ?? selectDefaultUsageLedgerForProject(manifest.projectId);
   const lockOwnerKind: ProjectLockOwnerKind = opts.lockOwnerKind ?? "autodev";
 
   // Phase G Task G7 — Project Lock & Concurrent Writer Safety. 실제 production write(state
@@ -612,6 +623,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // instrumentation은 orchestrator.ts 자신이 담당한다 — 이 파일은 events/runId/taskId/
     // projectId만 넘긴다.
     events,
+    // Phase SI-3.8B — Usage Ledger instrumentation은 orchestrator.ts 자신이 담당한다(§
+    // recordGptReviewUsage) — 이 파일은 ledger/runId/taskId/projectId만 넘긴다.
+    ledger,
     runId,
     taskId: taskDef.id,
     projectId: manifest.projectId,

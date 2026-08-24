@@ -54,6 +54,7 @@
     "test:event-store": "npm run build && node dist/event-store-tests.js",
     "test:metrics": "npm run build && node dist/metrics-tests.js",
     "test:usage-telemetry": "npm run build && node dist/usage-telemetry-tests.js",
+    "test:usage-ledger": "npm run build && node dist/usage-ledger-tests.js",
     "test:live-snapshot": "npm run build && node dist/live-snapshot-tests.js",
     "test:dashboard-snapshot-provider": "npm run build && node dist/dashboard-snapshot-provider-tests.js",
     "test:dashboard-server": "npm run build && node dist/dashboard-server-tests.js",

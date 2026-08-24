@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { reviewClaudeResultOnce, reviewClaudeResultWithRetry, reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
+import { reviewClaudeResultOnce, reviewClaudeResultWithRetry, reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { GptReviewApiResult, ReviewProjectContext } from "./gpt-reviewer";
 import { runOrchestrator } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
@@ -11,6 +11,7 @@ import { routeTask, CORE_AGENT_REGISTRY } from "./agent-registry";
 import type { RoutableTaskInput } from "./agent-registry";
 import type { ClaudeResult } from "./types";
 import type { DeveloperResult } from "./claude-developer";
+import { createInMemoryUsageLedger } from "./usage-ledger";
 
 // GPT Reviewer API Budget Guard(SI-3.8A) — 통합(wiring) 테스트.
 //
@@ -60,6 +61,14 @@ async function scenarioA_directGuardBlocksBeforeClient(): Promise<void> {
     allowed.errorCode === "API_ERROR"
   );
   check("A) 대조군 결과는 BUDGET_EXCEEDED가 아님(guard가 관여하지 않았음을 확인)", allowed.errorCode !== "BUDGET_EXCEEDED");
+
+  // Phase SI-3.8B(Claude code-review 지적 반영) — 이 API_ERROR는 클라이언트 생성 자체가
+  // 실패한 것(실제 네트워크 요청 0회)이지, 실제로 전송된 요청이 실패한 것이 아니다.
+  // requestAttempted=false로 명확히 구분되고, Usage Ledger 매핑도 이를 requestCount=0으로
+  // 반영해야 한다(전송되지 않은 요청을 "실제 API 사용량"으로 오기록하지 않는다).
+  check("A) 클라이언트 생성 실패는 requestAttempted=false로 표시됨(실제 요청 미전송)", allowed.requestAttempted === false);
+  const ledgerInputForPreflightFailure = buildGptReviewLedgerEntryInput(allowed, { projectId: "p", taskId: "t" });
+  check("A) 그 결과를 Ledger에 매핑하면 requestCount=0(API_ERROR라도 실제 사용량으로 기록되지 않음)", ledgerInputForPreflightFailure.requestCount === 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +152,10 @@ async function scenarioC_orchestratorEntersWaitingHumanWithBudgetReason(statePat
     return realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal });
   };
 
-  const { finalState } = await runOrchestrator(HUGE_TASK, { claudeRunner, gptReviewer, statePath });
+  // Phase SI-3.8B — Budget Guard가 BLOCK한 이 호출이 Usage Ledger에 "실제 API 사용량"으로
+  // 잘못 기록되지 않는지(§ 요구사항 15)도 같은 시나리오에서 함께 확인한다.
+  const ledger = createInMemoryUsageLedger();
+  const { finalState } = await runOrchestrator(HUGE_TASK, { claudeRunner, gptReviewer, statePath, ledger, taskId: "T-budget", projectId: "budget-guard-fixture" });
 
   check("C) 최종 상태 WAITING_HUMAN(별도 enum 값 없이 기존 상태 재사용)", finalState.status === "WAITING_HUMAN");
   check("C) deferredHumanTasks에 BUDGET_EXCEEDED 기록됨", finalState.deferredHumanTasks.some((t) => t.startsWith("BUDGET_EXCEEDED")));
@@ -151,6 +163,12 @@ async function scenarioC_orchestratorEntersWaitingHumanWithBudgetReason(statePat
   check("C) Claude worker는 1회만 호출됨(재시도로 낭비되지 않음)", claudeCalls === 1);
   check("C) orchestrator의 실제 gptCallCount(1)이 Guard 관측값으로 전달됨", capturedGptCallCount === 1);
   check("C) orchestrator의 실제 gptRawCallTotal(0, 이번 호출 이전 누적)이 전달됨", capturedGptRawCallTotal === 0);
+
+  const ledgerEntries = ledger.query({ projectId: "budget-guard-fixture" }).entries;
+  check("C) Budget Guard BLOCK도 Ledger에 entry 1건은 남지만(관측 목적)", ledgerEntries.length === 1);
+  check("C) 그 entry의 requestCount=0(실제 API 호출로 기록되지 않음)", ledgerEntries[0]?.requestCount === 0);
+  check("C) 그 entry에 token/비용이 전혀 없음(실제 사용량으로 오기록되지 않음)", ledgerEntries[0]?.inputTokens === undefined && ledgerEntries[0]?.estimatedCostUsd === undefined && ledgerEntries[0]?.actualCostUsd === undefined);
+  check("C) 그 entry의 status=BUDGET_EXCEEDED", ledgerEntries[0]?.status === "BUDGET_EXCEEDED");
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +192,8 @@ async function scenarioD_agentOrchestratorCannotBypassGuard(): Promise<void> {
     };
   };
 
-  const deps: AgentOrchestratorDeps = { developerRunner, reviewerRunner: realReviewClaudeResult };
+  const ledger = createInMemoryUsageLedger();
+  const deps: AgentOrchestratorDeps = { developerRunner, reviewerRunner: realReviewClaudeResult, ledger, projectId: "budget-guard-agent-orchestrator-fixture" };
   const plan = routeTask(req());
   const input: AgentExecutionInput = { taskId: "budget-guard-task", taskGoal: HUGE_TASK };
 
@@ -184,6 +203,9 @@ async function scenarioD_agentOrchestratorCannotBypassGuard(): Promise<void> {
   check("D) overallStatus=HUMAN_APPROVAL_REQUIRED(HUMAN_REQUIRED decision 매핑)", result.overallStatus === "HUMAN_APPROVAL_REQUIRED");
   const reviewerStep = result.stepResults.find((r) => r.role === "reviewer");
   check("D) reviewer step data.errorCode === BUDGET_EXCEEDED(동일 Guard가 그대로 적용됨)", (reviewerStep?.data as GptReviewApiResult | undefined)?.errorCode === "BUDGET_EXCEEDED");
+
+  const ledgerEntries = ledger.query({ projectId: "budget-guard-agent-orchestrator-fixture" }).entries;
+  check("D) agent-orchestrator 경로도 Budget Guard BLOCK을 requestCount=0으로 기록함(실제 사용량 아님)", ledgerEntries.length === 1 && ledgerEntries[0].requestCount === 0);
 }
 
 async function main(): Promise<void> {

@@ -4,8 +4,9 @@ import {
 import type { AgentDefinition, AgentRegistry, AgentRole, RoutingPlan, RoutingStep } from "./agent-registry";
 import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
 import type { DeveloperResult, DeveloperTaskOptions } from "./claude-developer";
-import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
+import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { GptReviewRetryResult, ReviewRetryOptions } from "./gpt-reviewer";
+import type { UsageLedger } from "./usage-ledger";
 import { runClaudeTask as realReadOnlyClaudeCall } from "./claude-runner";
 import { runClaudeTask as fakeClaudeTask } from "./fake-claude-runner";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
@@ -15,6 +16,7 @@ import type { CapabilityDiscoveryResult, DiscoverCapabilityOptions, SourceCatalo
 import type { CapabilityRequirement } from "./capability-resolver";
 import { MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
+import { log } from "./logger";
 
 // Agent Execution Orchestration — Phase F Task F2.
 //
@@ -187,6 +189,14 @@ export interface AgentOrchestratorDeps {
   developerRunner?: DeveloperAgentRunner;
   reviewerRunner?: ReviewerAgentRunner;
   readOnlyRunner?: ReadOnlyAgentRunner;
+  /** Phase SI-3.8B — 지정하면 reviewer step(§ executeReviewerStepWithRevise)의 각 실제
+   *  gpt-reviewer 호출마다 Usage Ledger에 기록한다. orchestrator.ts(runOrchestrator)의
+   *  deps.ledger와 동일한 UsageLedger 인터페이스를 그대로 재사용한다(중복 구현 없음) —
+   *  지정하지 않으면 완전한 no-op이다. */
+  ledger?: UsageLedger;
+  /** Ledger entry의 projectId — 이 파일은 project 개념을 자체적으로 갖지 않으므로, 호출부가
+   *  실제로 알고 있을 때만 명시적으로 전달한다(가짜 projectId를 만들어내지 않는다). */
+  projectId?: string;
 }
 
 export type AgentExecutionOverallStatus = "COMPLETED" | "BLOCKED" | "HUMAN_APPROVAL_REQUIRED" | "FAILED";
@@ -340,7 +350,8 @@ async function executeReviewerStepWithRevise(
   priorResults: AgentStepResult[],
   input: AgentExecutionInput,
   developerRunner: DeveloperAgentRunner,
-  reviewerRunner: ReviewerAgentRunner
+  reviewerRunner: ReviewerAgentRunner,
+  ledgerDeps: Pick<AgentOrchestratorDeps, "ledger" | "projectId">
 ): Promise<{ reviewerStep: AgentStepResult; updatedDeveloperStep?: AgentStepResult }> {
   const developerStepResult = priorResults.find((r) => r.role === "developer");
   if (!developerStepResult || developerStepResult.status !== "SUCCESS") {
@@ -362,6 +373,18 @@ async function executeReviewerStepWithRevise(
   while (true) {
     const requiredTestsFailed = hasFailedRequiredTest(developerData.tests);
     const reviewResult = await reviewerRunner(developerData as ClaudeResult, cycle, input.taskGoal, input.reviewerOptions ?? {});
+    // Phase SI-3.8B — orchestrator.ts(runOrchestrator)의 recordGptReviewUsage와 동일한
+    // 매핑 함수(gpt-reviewer.ts buildGptReviewLedgerEntryInput)를 그대로 재사용한다 — 이
+    // reviewer step이 몇 번 REVISE를 반복하든 실제 gpt-reviewer 호출 1건마다 정확히 한 번씩만
+    // 기록된다.
+    if (ledgerDeps.ledger) {
+      const appendResult = ledgerDeps.ledger.append(
+        buildGptReviewLedgerEntryInput(reviewResult, { projectId: ledgerDeps.projectId, taskId: input.taskId, agentId: agent.id, operationCycle: cycle })
+      );
+      if (!appendResult.ok) {
+        log("Usage Ledger 기록 실패(agent-orchestrator reviewer step) — 비용 telemetry만 유실됨, 실행에는 영향 없음", { error: appendResult.error });
+      }
+    }
     const decision = applyReviewDecisionPolicy(reviewResult, requiredTestsFailed);
     const reviseCycles = cycle - 1;
 
@@ -562,7 +585,10 @@ export async function executeRoutingPlan(
     if (step.role === "developer") {
       stepResult = await executeDeveloperStep(agent, input, developerRunner);
     } else if (step.role === "reviewer") {
-      const { reviewerStep, updatedDeveloperStep } = await executeReviewerStepWithRevise(agent, stepResults, input, developerRunner, reviewerRunner);
+      const { reviewerStep, updatedDeveloperStep } = await executeReviewerStepWithRevise(agent, stepResults, input, developerRunner, reviewerRunner, {
+        ledger: deps.ledger,
+        projectId: deps.projectId,
+      });
       if (updatedDeveloperStep) {
         const developerIdx = stepResults.findIndex((r) => r.role === "developer");
         if (developerIdx !== -1) stepResults[developerIdx] = updatedDeveloperStep;

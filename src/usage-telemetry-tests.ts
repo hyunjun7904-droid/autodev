@@ -6,7 +6,7 @@ import { parseClaudeJsonOutput } from "./claude-runner";
 import type { RealClaudeResult } from "./claude-runner";
 import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
 import { reviewClaudeResultWithRetry } from "./gpt-reviewer";
-import type { GptReviewApiResult } from "./gpt-reviewer";
+import type { GptReviewApiResult, GptReviewRetryResult } from "./gpt-reviewer";
 import { runOrchestrator } from "./orchestrator";
 import type { GptReviewerReturn } from "./orchestrator";
 import { runAutodevOnce } from "./autodev";
@@ -14,9 +14,14 @@ import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ClaudeResult, ProjectState } from "./types";
-import type { ReadOnlyAgentRunner } from "./agent-orchestrator";
+import type { ReadOnlyAgentRunner, AgentOrchestratorDeps, DeveloperAgentRunner, AgentExecutionInput } from "./agent-orchestrator";
+import { executeRoutingPlan } from "./agent-orchestrator";
+import { routeTask, CORE_AGENT_REGISTRY } from "./agent-registry";
+import type { RoutableTaskInput } from "./agent-registry";
+import type { DeveloperResult } from "./claude-developer";
 import { createInMemoryEventStore } from "./event-store";
 import { aggregateUsageMetrics, aggregateCostMetrics } from "./metrics";
+import { createInMemoryUsageLedger, aggregateUsageLedgerEntries } from "./usage-ledger";
 
 // Phase G Task G3.1 — Production Usage & Model Telemetry Wiring 테스트. 실제 Claude/GPT
 // 유료 API를 전혀 호출하지 않는다 — claude-runner의 parseClaudeJsonOutput은 순수 함수를
@@ -313,6 +318,115 @@ async function scenarioOrchestratorDoubleCountingAcrossReviseCycles(): Promise<v
 }
 
 // ===========================================================================
+// D.1) Phase SI-3.8B — orchestrator.ts가 gpt-reviewer 호출 1건당 정확히 1개의 Usage Ledger
+//      entry를 기록하는지(REVISE 반복에도 중복 없음), Budget Guard BLOCK과 정상 호출을
+//      requestCount로 구분하는지.
+// ===========================================================================
+
+async function scenarioOrchestratorRecordsUsageLedgerEntries(): Promise<void> {
+  const statePath = makeTempStatePath();
+  const events = createInMemoryEventStore();
+  const ledger = createInMemoryUsageLedger();
+  const runId = "run-ledger";
+
+  const claudeRunner = async (): Promise<ClaudeResult> => ({
+    success: true,
+    summary: "구현 완료",
+    changedFiles: [],
+    tests: [{ name: "check", pass: true }],
+    rawOutput: "",
+  });
+
+  const gptUsage = [
+    { inputTokens: 1000, cachedInputTokens: 100, outputTokens: 100, totalTokens: 1100 },
+    { inputTokens: 2000, outputTokens: 200, totalTokens: 2200 },
+  ];
+  let gptCall = 0;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => {
+    const usage = gptUsage[gptCall];
+    const isLast = gptCall === 1;
+    gptCall += 1;
+    return {
+      decision: isLast ? "PASS" : "REVISE",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: isLast ? "이제 문제 없음" : "REVISE 1",
+      nextTask: null,
+      model: { provider: "openai", name: "gpt-5.6-2026-02-01" },
+      tokenUsage: usage,
+    };
+  };
+
+  const { finalState } = await runOrchestrator("Ledger 통합 테스트 task", {
+    statePath,
+    claudeRunner,
+    gptReviewer,
+    events,
+    ledger,
+    runId,
+    taskId: "T-ledger",
+    projectId: "usage-ledger-fixture",
+  });
+
+  check("Ledger 통합: 최종 status=APPROVED", finalState.status === "APPROVED");
+  check("Ledger 통합: reviewer가 2회 호출됨(REVISE 1회 + PASS)", gptCall === 2);
+
+  const ledgerEntries = ledger.query({ projectId: "usage-ledger-fixture" }).entries;
+  check("Ledger 통합: gpt-reviewer 호출 1건당 정확히 1개의 entry(2건, 중복 없음)", ledgerEntries.length === 2);
+  check("Ledger 통합: entry의 taskId/service/provider/operation이 정확함", ledgerEntries.every((e) => e.taskId === "T-ledger" && e.service === "gpt-reviewer" && e.provider === "openai" && e.operation === "gpt_review"));
+  check("Ledger 통합: 각 entry의 requestCount=1(실제 성공 호출, 재시도 없음)", ledgerEntries.every((e) => e.requestCount === 1));
+  check("Ledger 통합: 첫 entry(REVISE)의 cachedInputTokens가 정확히 기록됨", ledgerEntries[0].cachedInputTokens === 100);
+  check("Ledger 통합: 두 번째 entry(PASS)의 inputTokens가 두 번째 호출 값과 일치", ledgerEntries[1].inputTokens === 2000);
+  check("Ledger 통합: status가 각각 REVISE/PASS 여부와 무관하게 SUCCESS(실제 API 성공)", ledgerEntries.every((e) => e.status === "SUCCESS"));
+  check("Ledger 통합: actualCostUsd는 어떤 entry에도 없음(임의 생성 금지)", ledgerEntries.every((e) => e.actualCostUsd === undefined));
+
+  const agg = aggregateUsageLedgerEntries(ledgerEntries);
+  check("Ledger 통합: 집계된 totalInputTokens=3000(1000+2000)", agg.totalInputTokens === 3000);
+  check("Ledger 통합: unknownCostEntryCount=2(pricing catalog가 비어있어 전부 unknown)", agg.unknownCostEntryCount === 2);
+}
+
+// ===========================================================================
+// D.2) Phase SI-3.8B — agent-orchestrator.ts의 reviewer step이 orchestrator.ts와 동일한
+//      Usage Ledger 인터페이스를 재사용하는지(중복 구현 없이).
+// ===========================================================================
+
+function req(overrides: Partial<RoutableTaskInput> = {}): RoutableTaskInput {
+  return { id: "ledger-agent-orchestrator-task", description: "새 기능을 구현해줘", hasFixedRequiredTests: true, ...overrides };
+}
+
+async function scenarioAgentOrchestratorReusesUsageLedger(): Promise<void> {
+  const ledger = createInMemoryUsageLedger();
+  const developerRunner: DeveloperAgentRunner = async (): Promise<DeveloperResult> => ({
+    success: true,
+    summary: "[FAKE] developer 완료",
+    changedFiles: ["file.ts"],
+    tests: [{ name: "unit-1", pass: true }],
+    rawOutput: "raw",
+  });
+  const reviewerRunner = async (): Promise<GptReviewRetryResult> =>
+    ({
+      decision: "PASS" as const,
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: "ok",
+      nextTask: null,
+      model: { provider: "openai", name: "gpt-5.6-2026-02-01" },
+      tokenUsage: { inputTokens: 55, outputTokens: 11, totalTokens: 66 },
+      gptTransportRetry: 0,
+    });
+
+  const deps: AgentOrchestratorDeps = { developerRunner, reviewerRunner, ledger, projectId: "agent-orchestrator-ledger-fixture" };
+  const plan = routeTask(req());
+  const input: AgentExecutionInput = { taskId: "ledger-agent-orchestrator-task", taskGoal: "기능 구현" };
+
+  const result = await executeRoutingPlan(plan, input, CORE_AGENT_REGISTRY, deps);
+
+  check("agent-orchestrator Ledger 재사용: overallStatus=COMPLETED", result.overallStatus === "COMPLETED");
+  const entries = ledger.query({ projectId: "agent-orchestrator-ledger-fixture" }).entries;
+  check("agent-orchestrator Ledger 재사용: reviewer 호출 1건이 동일 Ledger에 기록됨", entries.length === 1);
+  check("agent-orchestrator Ledger 재사용: taskId/agentId가 정확히 채워짐", entries[0]?.taskId === "ledger-agent-orchestrator-task" && entries[0]?.agentId === "core-reviewer");
+  check("agent-orchestrator Ledger 재사용: tokenUsage가 orchestrator.ts와 동일한 매핑 함수로 채워짐", entries[0]?.inputTokens === 55 && entries[0]?.outputTokens === 11);
+}
+
+// ===========================================================================
 // E) 서로 다른 runId 혼합 없음 — 같은 in-memory store에 두 run을 기록해도 Metrics가 섞이지 않는다.
 // ===========================================================================
 
@@ -477,6 +591,8 @@ async function main(): Promise<void> {
     await scenarioGptReviewUsageUndefinedWhenAbsent();
     await scenarioGptReviewTransientRetryDoesNotMergeUsage();
     await scenarioOrchestratorDoubleCountingAcrossReviseCycles();
+    await scenarioOrchestratorRecordsUsageLedgerEntries();
+    await scenarioAgentOrchestratorReusesUsageLedger();
     await scenarioDifferentRunIdsNotMixed();
     await scenarioAdvisoryAgentUsageRecordedExactlyOnce();
   } finally {

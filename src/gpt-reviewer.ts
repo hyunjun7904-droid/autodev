@@ -10,6 +10,9 @@ import { validateReadPath } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
 import { log, sanitizeForLog } from "./logger";
 import { resolveGptBudgetGuardConfig, evaluateGptBudgetGuard } from "./gpt-budget-guard";
+import { resolvePricing, calculateEstimatedCost } from "./pricing-catalog";
+import type { UsageLedgerEntryInput } from "./usage-ledger";
+import { isProductionRuntime } from "./runtime-origin";
 
 // 실제 OpenAI Responses API 기반 리뷰어. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
 // 이 모듈을 선택한다. OPENAI_API_KEY는 client 생성자가 process.env에서 자동으로 읽는다 —
@@ -78,8 +81,19 @@ export interface GptReviewApiResult extends GptReviewResult {
    *  undefined다. */
   model?: { provider: string; name: string };
   /** response.usage(input_tokens/output_tokens/total_tokens)를 그대로 옮긴 값 — 추정/가격
-   *  환산 없음. */
-  tokenUsage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+   *  환산 없음. cachedInputTokens는 response.usage.input_tokens_details.cached_tokens(OpenAI
+   *  SDK가 실제로 제공하는 필드)를 그대로 옮긴다 — Phase SI-3.8B, Usage Ledger의 cached-token
+   *  기록을 위해 추가됐다(추정하지 않음, 제공된 값만). */
+  tokenUsage?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalTokens?: number };
+  /** Phase SI-3.8B — errorCode가 있을 때만 의미가 있다: false면 실제 네트워크 요청이 전혀
+   *  나가지 않은 채(예: OPENAI_API_KEY 미설정으로 OpenAI SDK 클라이언트 생성자 자체가
+   *  동기적으로 throw) 실패했다는 뜻이다. classifyApiError()는 이런 로컬 생성 실패와 실제로
+   *  전송된 요청이 서버/네트워크에서 실패한 경우를 같은 errorCode(예: API_ERROR)로 분류할 수
+   *  있어(§ Claude code-review 지적) errorCode만으로는 구분할 수 없다 — 그래서
+   *  buildGptReviewLedgerEntryInput()의 requestCount 계산은 errorCode 대신 이 필드를 우선
+   *  확인한다. 지정하지 않으면(성공 응답, 또는 실제로 전송된 요청이 실패한 일반적인 경우)
+   *  true로 간주한다. */
+  requestAttempted?: boolean;
 }
 export interface GptReviewRetryResult extends GptReviewApiResult {
   /** 실제로 수행된 API 통신 재시도 횟수(최초 시도 제외) — reviewCycle과 별개로 집계. */
@@ -315,8 +329,33 @@ export async function reviewClaudeResultOnce(
     };
   }
 
+  // Claude code-review(SI-3.8B) 지적 — getClient()(OpenAI SDK 클라이언트 생성자, 예:
+  // OPENAI_API_KEY 미설정 시 동기적으로 throw)를 responses.create() 호출과 같은 try 블록에
+  // 두면, "실제 요청을 한 번도 보내지 못한 로컬 실패"와 "요청을 보냈지만 서버/네트워크에서
+  // 실패한 경우"가 아래 catch 하나로 합쳐져 classifyApiError()가 둘 다 API_ERROR로 분류할 수
+  // 있다 — Usage Ledger의 requestCount가 실제로 나가지 않은 요청까지 세게 된다(§ 요구사항
+  // 4 requestCount 정확성). 클라이언트 생성을 별도 try로 분리해 이 두 실패를
+  // requestAttempted로 구분한다.
+  let client: OpenAI;
   try {
-    const response = await getClient().responses.create({
+    client = getClient();
+  } catch (e) {
+    const { code: errorCode } = classifyApiError(e);
+    log(`GPT 리뷰 클라이언트 생성 실패(${errorCode}) — 실제 요청은 전송되지 않음`, { reviewCycle });
+    return {
+      decision: "HUMAN_REQUIRED",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: `GPT API 오류: ${errorCode}`,
+      nextTask: null,
+      errorCode,
+      transient: false,
+      scopeViolations,
+      requestAttempted: false,
+    };
+  }
+
+  try {
+    const response = await client.responses.create({
       model: MODEL,
       instructions,
       input,
@@ -337,7 +376,12 @@ export async function reviewClaudeResultOnce(
     // 응답 자체가 없는 경우)에는 이 값이 존재하지 않는다.
     const model = response.model ? { provider: "openai", name: response.model } : undefined;
     const tokenUsage = response.usage
-      ? { inputTokens: response.usage.input_tokens, outputTokens: response.usage.output_tokens, totalTokens: response.usage.total_tokens }
+      ? {
+          inputTokens: response.usage.input_tokens,
+          cachedInputTokens: response.usage.input_tokens_details?.cached_tokens,
+          outputTokens: response.usage.output_tokens,
+          totalTokens: response.usage.total_tokens,
+        }
       : undefined;
 
     let parsed: GptReviewResult;
@@ -446,3 +490,86 @@ export async function reviewClaudeResultWithRetry(
 
 // orchestrator.ts는 이 이름으로 import한다 — 재시도까지 포함된 버전을 실제 사용 경로로 삼는다.
 export const reviewClaudeResult = reviewClaudeResultWithRetry;
+
+// Phase SI-3.8B — Usage & Cost Ledger 연결. 이 파일(gpt-reviewer.ts) 자신은 Ledger를
+// 저장/조회하지 않는다(호출부인 orchestrator.ts/agent-orchestrator.ts가 이미 project/task/
+// agent identity를 알고 있고, Ledger append도 그쪽에서 수행한다) — 여기서는 그 두 호출부가
+// 공유하는 "GPT reviewer 호출 결과 → UsageLedgerEntryInput" 매핑 로직 하나만 제공해서 같은
+// 변환 로직이 두 파일에 복제되지 않게 한다.
+export interface GptReviewLedgerContextFields {
+  projectId?: string;
+  taskId?: string;
+  agentId?: string;
+  /** review cycle(orchestrator.ts의 state.reviewCycle 또는 agent-orchestrator.ts의 내부
+   *  REVISE cycle) — UsageLedgerEntryInput.operationCycle에 그대로 옮긴다. */
+  operationCycle?: number;
+}
+
+/** GPT reviewer 서비스 식별자 — Ledger entry의 service 필드에 그대로 쓰인다(단일 출처). */
+export const GPT_REVIEWER_LEDGER_SERVICE = "gpt-reviewer";
+export const GPT_REVIEWER_LEDGER_OPERATION = "gpt_review";
+
+/**
+ * 순수 함수 — 실제 API를 호출하거나 Ledger에 append하지 않는다. requestCount=0으로 고정되는
+ * 경우는 둘이다(§ 요구사항 8/Claude code-review) — (1) Budget Guard가 API 호출 자체를 막은
+ * 경우(errorCode==="BUDGET_EXCEEDED"), (2) result.requestAttempted===false(OpenAI SDK
+ * 클라이언트 생성 자체가 실패해 실제 네트워크 요청이 전혀 나가지 않은 경우 — §
+ * reviewClaudeResultOnce의 client 생성 분리). errorCode만으로는 이 둘을 구분할 수 없다 —
+ * classifyApiError()가 "요청을 아예 못 보낸 로컬 실패"와 "요청을 보냈지만 실패한 경우"를 같은
+ * errorCode(API_ERROR)로 분류할 수 있기 때문이다. 그 외에는 실제로 시도된 API 통신 횟수(최초
+ * 시도 + gptTransportRetry)를 requestCount로 담는다 — reviewCycle 자체(코드 재작업 횟수)와는
+ * 다른 값이다.
+ *
+ * estimatedCostUsd는 pricing-catalog.ts의 CORE_PRICING_CATALOG에 해당 provider/model 가격이
+ * 등록돼 있을 때만 채워진다 — 이번 Task 시점에는 그 catalog가 비어 있으므로(§
+ * pricing-catalog.ts 상단 주석) 항상 undefined다. actualCostUsd는 이 함수가 절대 채우지
+ * 않는다(실제 billing source를 연결하지 않았다 — § 요구사항 5).
+ */
+export function buildGptReviewLedgerEntryInput(
+  result: {
+    /** orchestrator.ts의 GptReviewerReturn.errorCode(string)와 gpt-reviewer.ts의
+     *  GptReviewApiResult.errorCode(GptErrorCode) 양쪽 호출부를 모두 그대로 받을 수 있게
+     *  일부러 GptErrorCode보다 넓은 string으로 받는다(둘 다 이 함수의 유일한 실제 호출부). */
+    errorCode?: string;
+    model?: { provider: string; name: string };
+    tokenUsage?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number; totalTokens?: number };
+    gptTransportRetry?: number;
+    requestAttempted?: boolean;
+  },
+  fields: GptReviewLedgerContextFields
+): UsageLedgerEntryInput {
+  const isBudgetBlocked = result.errorCode === "BUDGET_EXCEEDED";
+  const requestNeverSent = isBudgetBlocked || result.requestAttempted === false;
+  const requestCount = requestNeverSent ? 0 : 1 + (result.gptTransportRetry ?? 0);
+  const status = result.errorCode ?? "SUCCESS";
+
+  const pricing = resolvePricing("openai", result.model?.name);
+  const cost = calculateEstimatedCost(
+    {
+      inputTokens: result.tokenUsage?.inputTokens,
+      cachedInputTokens: result.tokenUsage?.cachedInputTokens,
+      outputTokens: result.tokenUsage?.outputTokens,
+    },
+    pricing
+  );
+
+  return {
+    projectId: fields.projectId,
+    taskId: fields.taskId,
+    agentId: fields.agentId,
+    environment: isProductionRuntime() ? "production" : "development",
+    service: GPT_REVIEWER_LEDGER_SERVICE,
+    provider: "openai",
+    model: result.model?.name,
+    operation: GPT_REVIEWER_LEDGER_OPERATION,
+    requestCount,
+    inputTokens: result.tokenUsage?.inputTokens,
+    cachedInputTokens: result.tokenUsage?.cachedInputTokens,
+    outputTokens: result.tokenUsage?.outputTokens,
+    totalTokens: result.tokenUsage?.totalTokens,
+    estimatedCostUsd: cost.status === "CALCULATED" ? cost.estimatedCostUsd : undefined,
+    currency: cost.status === "CALCULATED" ? cost.currency : undefined,
+    operationCycle: fields.operationCycle,
+    status,
+  };
+}
