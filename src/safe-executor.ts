@@ -136,13 +136,20 @@ export const SECRET_NAME_PATTERNS: RegExp[] = [/secret/i, /token/i, /credential/
 // tree/stash 목록을 바꾼다. 서브커맨드 문자열만 보고 "stash가 포함되면 차단"처럼 단순
 // 매칭하면 `git stash list`까지 잘못 차단된다 — branch/tag/remote/reflog처럼 읽기/쓰기 형태가
 // 섞인 서브커맨드도 마찬가지라 첫 세부 인자까지 확인한다.
-function isGitExecutable(command: string): boolean {
-  return /^git(\.exe)?$/i.test(command.trim());
-}
-
+// SI-3.3~3.5 4-chunk 최종 리뷰 2라운드 지적(HIGH) — "help"는 read-only(정보 조회)로
+// 보이지만 help.format=web/man.viewer/man.<viewer>.cmd 같은 config에 따라 외부
+// 브라우저/man viewer 프로그램을 실행할 수 있다(git 공식 문서) — 이는 diff.external과
+// 동일한 클래스의 config-driven 외부 실행 벡터이지만, "help"는 diff 옵션 체계를 공유하지
+// 않아 --no-ext-diff/--no-textconv 같은 단일 플래그로 무력화할 방법이 없다(help가 어떤
+// viewer를 쓸지는 config 자체가 결정하며, 이를 서브커맨드마다 안전하게 무력화하려면 help
+// 전용 로직이 또 필요해진다 — 요구사항 6/7: 새 parser/무한定 방어 로직을 계속 추가하지
+// 않는다). AutoDev의 실제 필요(.claude/CLAUDE.md 검증 절차, 이 저장소의 모든 git 사용
+// fixture) 어디에도 "git help"가 없으므로, 이 서브커맨드를 read-only allow-list에서
+// 아예 제외해 이 위험 표면 자체를 구조적으로 없앤다("있지도 않은 필요를 위해 위험한
+// 표면을 열어두지 않는다").
 const GIT_READ_ONLY_NO_SUBARG_CHECK: ReadonlySet<string> = new Set([
   "status", "diff", "log", "show", "blame", "rev-parse", "describe",
-  "ls-files", "ls-tree", "cat-file", "shortlog", "help", "version",
+  "ls-files", "ls-tree", "cat-file", "shortlog", "version",
 ]);
 
 // 서브커맨드별로 "이 세부 첫 인자까지는 read-only"로 허용하는 목록. 정의되지 않은 서브커맨드는
@@ -206,6 +213,14 @@ const GIT_READ_ONLY_FIRST_ARG: Readonly<Record<string, ReadonlySet<string>>> = {
 // 정의된 전체 옵션 집합을 알아야만 판정 가능한 문제라 여기서 다루지 않는다(요구사항: 전체
 // git 옵션 parser를 새로 만들지 않는다) — 이 게이트가 다루는 것은 "정식 옵션명의 등호형/
 // 분리형 두 표현"까지다.
+// SI-3.3~3.5 4-chunk 최종 리뷰 3라운드 지적(HIGH) — "help"를 read-only 허용 서브커맨드
+// 목록에서 제거해도, 이미 허용된 다른 모든 서브커맨드(status/diff/log/show 등)에
+// "--help"를 인자로 붙이면 동일한 git help viewer 경로(help.format/man.viewer/
+// man.<viewer>.cmd로 설정 가능한 외부 프로그램)로 진입한다 — "help" 서브커맨드 제거만으로는
+// 이 표면을 닫지 못했다. 이 패턴은 GIT_READ_ONLY_NO_SUBARG_CHECK/GIT_READ_ONLY_FIRST_ARG에
+// 있는 모든 서브커맨드에 공통 적용되므로(rest 전체를 검사) "help" 서브커맨드 자체를
+// 제거한 것과 별개로, "--help" 인자 자체를 여기(모든 read-only 호출 공통 위험 옵션
+// 목록)에 추가해 어떤 서브커맨드에 붙어도 차단한다.
 const GIT_DANGEROUS_OPTION_PATTERNS: RegExp[] = [
   /^--output(=.*)?$/,
   /^--ext-diff$/,
@@ -213,6 +228,7 @@ const GIT_DANGEROUS_OPTION_PATTERNS: RegExp[] = [
   /^--filters$/,
   /^--paginate$/,
   /^--contents(=.*)?$/,
+  /^--help$/,
 ];
 
 /**
@@ -248,21 +264,242 @@ function isReadOnlyGitInvocation(args: string[]): boolean {
   return true;
 }
 
+// SI-3.3~3.5 4-chunk 최종 리뷰 지적(HIGH) — read-only로 확인된 git 서브커맨드(diff/log/
+// show 등)도 "명령줄 플래그 없이" repo 자신의 config/.gitattributes만으로 외부 프로그램을
+// 실행시킬 수 있다: core.pager(대화형 pager), diff.external/diff.<driver>.command(경로별
+// diff 드라이버, .gitattributes의 "diff=<driver>" 속성으로 CLI 플래그 없이도 자동
+// 트리거됨), core.fsmonitor(status/기타 명령이 자동 조회하는 외부 훅). GIT_DANGEROUS_
+// OPTION_PATTERNS는 "명령줄에 그 플래그가 있는가"만 보므로, 이런 config-driven(플래그
+// 없이 저장소 자체 설정만으로 트리거되는) 실행 벡터는 놓친다.
+//
+// project-bootstrap.ts의 runHardenedGit()이 이미 정확히 같은 클래스의 문제(core.hooksPath/
+// core.fsmonitor/commit.gpgSign을 이용한 config 기반 임의 프로그램 실행, SI-2 REVISE
+// 6~8회차에서 GPT Independent Reviewer가 지적)를 "매 호출마다 안전한 값으로 강제 override"
+// 방식으로 막고 있다 — 이 파일의 git 실행에도 그 검증된 패턴을 재사용한다(새 방어 로직을
+// 발명하지 않는다). validateCommand()가 이미 통과시킨 read-only 서브커맨드에 대해서만,
+// 실제 spawnSync 호출 직전에 이 override를 추가한다(검증에 쓰인 args 자체는 건드리지
+// 않는다 — 이 override는 validateCommand의 뒤에서만 적용된다).
+const GIT_NEUTRALIZING_C_OVERRIDES: readonly string[] = [
+  "-c",
+  "core.pager=cat", // 대화형 pager(및 그 안에서 셸 이스케이프 가능성) 무력화.
+  "-c",
+  "core.fsmonitor=false", // status 등이 자동 실행하는 fsmonitor 훅 무력화.
+  "-c",
+  "diff.external=", // diff.external로 지정된 외부 diff 프로그램 무력화.
+  "-c",
+  "interactive.diffFilter=", // add -p 등에서 쓰이는 외부 필터 무력화.
+];
+// git-diff/log/show가 공유하는 diff 옵션 — "diff=<driver>" gitattributes 속성으로 지정된
+// 경로별 외부 diff 드라이버(diff.<driver>.command)를 명령줄 플래그 없이도 자동 실행하는
+// 것을 막는다(git 공식 문서 "--no-ext-diff": "Disallow external diff drivers."). 이
+// 옵션은 diff 관련 서브커맨드만 인식한다 — status/ls-files/rev-parse 등 무관한
+// 서브커맨드에 붙이면 "unknown option"으로 그 명령 자체가 실패하므로, 실제로 diff
+// 옵션을 공유하는 서브커맨드에만 골라 붙인다(GIT_EXT_DIFF_CAPABLE_SUBCOMMANDS).
+//
+// SI-3.3~3.5 4-chunk 최종 리뷰 2라운드 지적(HIGH) — external diff driver(diff.external/
+// diff.<driver>.command, --no-ext-diff가 막는 대상)와 textconv filter(diff.<driver>.
+// textconv, git-show(1)/git-log(1) 문서 기준 --textconv/--no-textconv로 제어)는 git이
+// 서로 다른 표면으로 취급한다 — --no-ext-diff 하나만으로는 textconv를 막지 못한다.
+// 동일하게 "diff=<driver>" gitattributes 속성 하나로 명령줄 플래그 없이 자동 트리거되므로
+// --no-ext-diff와 나란히 강제한다.
+const GIT_NO_EXT_DIFF_FLAG = "--no-ext-diff";
+const GIT_NO_TEXTCONV_FLAG = "--no-textconv";
+const GIT_EXT_DIFF_CAPABLE_SUBCOMMANDS: ReadonlySet<string> = new Set(["diff", "log", "show"]);
+// pager/external-diff는 config(-c, 위)보다도 이 환경변수가 우선한다는 것이 git 공식 문서에
+// 명시되어 있다("The order of preference is the $GIT_PAGER environment variable, then
+// core.pager configuration") — -c override만으로는 상속된 환경변수를 이길 수 없으므로
+// 반드시 함께 제거해야 한다.
+const GIT_EXTERNAL_HELPER_ENV_KEYS: readonly string[] = ["GIT_PAGER", "PAGER", "GIT_EXTERNAL_DIFF"];
+
+function hardenedGitSpawnEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const k of GIT_EXTERNAL_HELPER_ENV_KEYS) delete out[k];
+  return out;
+}
+
+/** read-only로 이미 검증된 git args에 위 안전 override를 적용한 실제 spawn용 argv를
+ *  만든다 — args[0](서브커맨드) 앞에 전역 -c 옵션들을, diff 관련 서브커맨드에만
+ *  --no-ext-diff/--no-textconv를 추가한다. 이 함수는 args가 이미
+ *  isReadOnlyGitInvocation()을 통과했다는 전제 위에서만 호출된다. */
+function buildHardenedGitArgs(args: string[]): string[] {
+  const [sub, ...rest] = args;
+  const extDiffGuard = GIT_EXT_DIFF_CAPABLE_SUBCOMMANDS.has(sub) ? [GIT_NO_EXT_DIFF_FLAG, GIT_NO_TEXTCONV_FLAG] : [];
+  return [...GIT_NEUTRALIZING_C_OVERRIDES, sub, ...extDiffGuard, ...rest];
+}
+
+// =========================================================
+// Core Recognized Executable Family Allow-list — SI-3.4(Command Execution Safety
+// Architecture Closure) — Core hard rule.
+// =========================================================
+// SI-3.3 REVISE는 "알려진 위험한 interpreter/wrapper 이름"을 계속 나열하는 방식
+// (POSIX_SHELL_INTERPRETERS/SCRIPT_EVAL_INTERPRETERS/WINDOWS_SHELL_INTERPRETERS/
+// EXECUTION_DELEGATION_WRAPPERS — bash/sh/zsh/python/powershell/env/nohup/setsid 등)으로
+// 버텼다. GPT Independent Reviewer는 매 회차 새로운 wrapper 조합을 찾아냈고(이번 SI-3.4
+// 지시서의 nice/timeout/stdbuf/busybox 포함), 그 목록은 원리상 완결될 수 없다 — "이 세상
+// 모든 shell/wrapper 실행 파일 이름"은 유한한 방식으로 나열할 수 있는 집합이 아니다.
+//
+// SI-3.4는 설계를 뒤집는다: "무엇이 위험한가"를 나열하는 대신 "AutoDev가 실제로 필요로
+// 하는 것이 무엇인가"만 나열한다. CORE_ALLOWED_EXECUTABLE_FAMILIES는 AutoDev 자신의
+// 빌드/테스트/개발 도구 표면(.claude/CLAUDE.md 검증 절차 — npx tsc --noEmit / npm run
+// build / npm run test:<module> — 그리고 claude-developer.ts가 실제 만들어내는
+// RUN_COMMAND의 실제 사용례 — node <script>.test.js / git 조회)과 정확히 일치하는 닫힌
+// (closed) 5개 executable family다. 이 목록에 없는 executable은 그것이 무엇이든(알려진
+// wrapper든 이전에 한 번도 본 적 없는 새 wrapper든) 무조건 거부된다 — bash/sh/zsh/dash/
+// ksh/ash/pwsh/powershell/cmd/python/ruby/perl/php/deno/bun은 물론 nice/timeout/stdbuf/
+// busybox/env/nohup/setsid 같은 실행 위임 wrapper, 그리고 이 목록에 없는 임의의 다른
+// 이름도 "이 목록에 없다"는 사실 하나만으로 차단된다 — 이 코드가 "이것이 wrapper라는
+// 것"을 알 필요가 전혀 없다(요구사항 7: 모든 wrapper를 알아내는 parser를 만들지 않는다 —
+// 알아낼 필요 자체가 없어졌다). "wrapper nesting"(예: `env timeout bash -c ...`)도 첫
+// executable(env)부터 이미 이 목록에 없으므로 중첩을 재귀 추적할 필요가 없다(요구사항 6:
+// shell parsing을 새로 구현하지 않는다 — 애초에 두 번째 이상의 argv를 해석할 필요가
+// 없다). "path-qualified"("/usr/bin/bash", "C:\\tools\\bash.exe")나 대소문자/확장자가
+// 다른 변형("BASH", "CMD.EXE")도 normalizeExecutableBase() 하나로 통일해 같은 판정을
+// 받는다.
+//
+// 이 allow-list는 policy.allowedCommands(project 소유)보다 항상 먼저, 그리고 그것과
+// 무관하게 적용된다(요구사항 3: 프로젝트가 arbitrary shell string으로 이 경계를 우회할 수
+// 없다) — 이 함수는 policy를 인자로 받지 않으므로 어떤 project도 이 5개 목록을 확장할
+// 방법이 없다.
+//
+// family 허용은 "이 실행 파일 자체를 실행할 자격이 있다"는 판정일 뿐, "어떤 인자로도
+// 실행해도 된다"는 뜻이 아니다 — family 허용 뒤에 각 family별 추가 검사가 적용된다: git은
+// read-only 서브커맨드 allow-list(GIT_READ_ONLY_*, 아래 그대로 유지), node는 코드/표현식을
+// 즉시 실행하거나 모듈을 preload하는 플래그 검사(NODE_EVAL_FLAG_PATTERNS), npm/npx는 첫
+// 인자 allow-list(NPM_ALLOWED_SUBCOMMANDS/NPX_ALLOWED_PACKAGE_NAMES — SI-3.4 bounded GPT
+// Independent Review 1차 CRITICAL 지적으로 추가: npm exec/npx는 인자로 지정한 임의
+// 코드·패키지를 그대로 실행하는 위임 executor라 node의 eval 플래그와 동일한 클래스의
+// 위험이다). tsc만 인자로 넘긴 내용을 코드로 즉시 실행하는 표준 플래그/서브커맨드가 없어
+// family 허용만으로 충분하다.
+const CORE_ALLOWED_EXECUTABLE_FAMILIES: ReadonlySet<string> = new Set([
+  "git",
+  "npm",
+  "npx",
+  "node",
+  "nodejs", // 일부 Linux 배포판(Debian/Ubuntu 계열)에서 쓰이는 node의 대체 실행 파일 이름.
+  "tsc",
+]);
+
+/** command에서 디렉터리/확장자를 제거한 실행 파일 이름(소문자)만 남긴다 — 이 파일 전체가
+ *  "실행 파일이 무엇인가"를 판정하는 단일 출처다(git 판정/family 판정/node eval 판정이
+ *  모두 이 함수 하나만 쓴다). 호스트 OS와 무관하게 "/"와 "\\" 둘 다 항상 구분자로
+ *  인식한다(POSIX 호스트에서도 Windows 경로 형태의 basename을 놓치지 않는다).
+ */
+function normalizeExecutableBase(command: string): string {
+  const withoutDir = command.trim().split(/[\\/]/).pop() ?? command.trim();
+  return withoutDir.toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
+}
+
+// node에만 적용되는 "코드/표현식을 즉시 실행하거나 모듈을 preload로 강제 로드하는" 플래그 —
+// SI-3.3에서 검증된 -c/-e/-p/--eval/--print 정규식에 더해, SI-3.4 bounded GPT Independent
+// Review(1차, HIGH)가 지적한 --require/-r(CJS preload)/--import(ESM preload)/--loader·
+// --experimental-loader(모듈 loader 등록)를 추가한다 — 이 넷 모두 entry script 실행 전에
+// 임의 로컬 모듈을 먼저 로드해 그 모듈의 top-level 코드를 즉시 실행시킨다는 점에서
+// -e/--eval과 같은 클래스의 위험이다(그 모듈 파일 내용은 이 gate가 검증할 방법이 없다).
+// family 범위가 5개로 줄어 python/ruby/perl/php/deno/bun/bash 등은 이제 위 allow-list
+// 단계에서 이미 차단되므로 그 언어들의 개별 eval 플래그 형태를 더는 나열할 필요가 없다.
+const NODE_EVAL_FLAG_PATTERNS: RegExp[] = [
+  /^(-c|-e|-r|-p|--eval|--print|--require|--import|--loader|--experimental-loader)$/i,
+  /^--(eval|print|require|import|loader|experimental-loader)=/i,
+  /^-[ecrp]./,
+];
+
+function hasNodeEvalFlag(args: string[]): boolean {
+  return args.some((a) => NODE_EVAL_FLAG_PATTERNS.some((p) => p.test(a)));
+}
+
+// npm/npx에만 적용되는 "인자로 지정한 대상을 그대로 실행" 제한 — SI-3.4 bounded GPT
+// Independent Review(1차, CRITICAL)가 지적: npm/npx는 family 허용만으로는 node의 eval
+// 플래그와 동일한 클래스의 우회를 허용한다 — npx는 사실상 "npm exec"의 별칭이고, 둘 다
+// 인자로 지정한 임의 패키지/커맨드를 즉시 다운로드·실행할 수 있다("npm exec -- <cmd>",
+// "npm x <pkg>", "npx --package=<pkg> <cmd>"). AutoDev의 실제 필요(.claude/CLAUDE.md
+// 검증 절차, REALISTIC_EXECUTION_POLICY fixture)는 "npm run <script>"/"npm test"/
+// "npx tsc"뿐이므로 그 형태만 허용하고 나머지는 전부 차단한다 — args[0]를 고정된
+// allow-set으로 제한하면 "--package="처럼 args[0] 자리에 오는 우회 플래그도 그 자체로
+// allow-set에 없어 함께 차단된다(별도 플래그 목록을 나열할 필요가 없다).
+const NPM_ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set(["run", "test"]);
+const NPX_ALLOWED_PACKAGE_NAMES: ReadonlySet<string> = new Set(["tsc"]);
+
 /**
  * RUN_COMMAND의 Core Command Safety Gate — validateCommand()가 policy.allowedCommands를
  * 확인하기 전에 항상 먼저 통과해야 한다.
- *   1) 대상이 git이면 read-only 서브커맨드가 아닌 한 무조건 거부(위 설명).
- *   2) 명령 인자 중 하나라도 ENV_FILE_PATTERNS/SECRET_NAME_PATTERNS(이 파일의 단일 출처,
+ *   1) 실행 파일(normalizeExecutableBase 기준)이 CORE_ALLOWED_EXECUTABLE_FAMILIES(git/npm/
+ *      npx/node/tsc) 밖이면 무조건 거부한다(위 설명 — SI-3.4, 이 다섯 개 밖은 그것이
+ *      wrapper인지 여부와 무관하게 전부 차단이라 bash/sh/env/nice/timeout/stdbuf/busybox 등
+ *      개별 이름을 알 필요가 없다).
+ *   2) 대상이 node/nodejs이고 인자에 코드/표현식을 즉시 실행하거나 모듈을 preload하는 플래그
+ *      (-c/-e/-r/-p/--eval/--print/--require/--import/--loader 등)가 있으면 무조건
+ *      거부한다(위 설명).
+ *   2-1) 대상이 npm이면 첫 인자가 NPM_ALLOWED_SUBCOMMANDS(run/test) 밖일 때, 대상이 npx면
+ *      첫 인자가 NPX_ALLOWED_PACKAGE_NAMES(tsc) 밖일 때 무조건 거부한다(위 설명 — npm
+ *      exec/x, npx의 임의 패키지 실행은 node의 eval 플래그와 같은 클래스의 위험이다).
+ *   3) 대상이 git이면 read-only 서브커맨드가 아닌 한 무조건 거부(위 설명).
+ *   0) command 문자열 자체에 경로 구분자("/"·"\\")나 드라이브 문자(":")가 있으면 무조건
+ *      거부한다(위 1)보다도 먼저 — SI-3.4 bounded GPT Independent Review 2차(CRITICAL)
+ *      지적: normalizeExecutableBase()가 경로를 벗겨내고 basename만으로 family를 판정하기
+ *      때문에, hand-authored(비-Planner) ProjectExecutionPolicy가 "/tmp/git" 같은
+ *      path-qualified 이름을 그대로 policy.allowedCommands에 등록하면(spec-planner.ts의
+ *      LLM 생성 policy 전용 경로-구분자 거부는 여기 적용되지 않는다) 공격자가 배치한 임의
+ *      경로의 파일이 "git"으로 정규화되어 family 허용까지 통과할 위험이 있었다. 이 검사는
+ *      그 등록 자체를 Core 레벨에서 authoritative하게 차단해, "policy가 어떤 절대/상대
+ *      경로를 command에 넣더라도" 통과할 수 없게 한다(bare 실행 파일 이름만 허용 — 실제
+ *      무엇이 실행될지는 표준 PATH 탐색에 맡긴다).
+ *   4) 명령 인자 중 하나라도 ENV_FILE_PATTERNS/SECRET_NAME_PATTERNS(이 파일의 단일 출처,
  *      secret-scanner.ts와 동일한 상수를 재사용 — 목록을 복제하지 않는다)에 매칭되면 거부한다
- *      — "cat web/.env", "powershell Get-Content web/.env.local" 같은 경로 기반 secret/env
- *      접근을 명령 인자 레벨에서 막는다. 이 목적은 secret-scanner.ts(Phase C Task C3, commit
- *      대상 파일 "내용"을 검사)와 겹치지 않는다 — 여기는 "명령 실행 인자"가 secret/env
- *      파일을 가리키는지만 본다(책임 분리).
+ *      — "cat web/.env" 같은 경로 기반 secret/env 접근을 명령 인자 레벨에서 막는다(이제
+ *      "cat"은 1)에서 이미 차단되지만, 이 검사는 CORE_ALLOWED_EXECUTABLE_FAMILIES 안의
+ *      명령(예: 향후 git 인자로 실수로 .env 경로가 전달되는 경우)에도 동일하게 적용되는
+ *      별도 방어선이다). 이 목적은 secret-scanner.ts(Phase C Task C3, commit 대상 파일
+ *      "내용"을 검사)와 겹치지 않는다 — 여기는 "명령 실행 인자"가 secret/env 파일을
+ *      가리키는지만 본다(책임 분리).
  * 어떤 ProjectExecutionPolicy도 이 함수의 동작을 바꿀 방법이 없다(인자로 policy를 받지
  * 않음).
  */
 export function coreCommandSafetyGate(command: string, args: string[]): { ok: boolean; reason?: string } {
-  if (isGitExecutable(command) && !isReadOnlyGitInvocation(args)) {
+  if (/[\\/]/.test(command) || command.includes(":")) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: 경로 구분자/드라이브 문자가 포함된 executable은 허용되지 않습니다 — " +
+        "bare 실행 파일 이름만 허용됩니다(예: \"git\", \"npm\") — 어떤 프로젝트 정책으로도 우회할 수 없습니다.",
+    };
+  }
+  const base = normalizeExecutableBase(command);
+
+  if (!CORE_ALLOWED_EXECUTABLE_FAMILIES.has(base)) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: 인식되지 않은 executable입니다 — Core가 허용하는 command family" +
+        "(git/npm/npx/node/tsc) 밖의 명령은 어떤 프로젝트 정책으로도 실행할 수 없습니다" +
+        "(shell/interpreter wrapper 포함, 알려진 wrapper 여부와 무관).",
+    };
+  }
+  if ((base === "node" || base === "nodejs") && hasNodeEvalFlag(args)) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: node에 코드·표현식을 즉시 실행하거나 모듈을 preload하는 플래그" +
+        "(-c/-e/-r/-p/--eval/--print/--require/--import/--loader 등)가 포함되어 있어 내용을 안전하게 " +
+        "검증할 수 없습니다 — 어떤 프로젝트 정책으로도 허용되지 않습니다.",
+    };
+  }
+  if (base === "npm" && (args.length === 0 || !NPM_ALLOWED_SUBCOMMANDS.has(args[0]))) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: npm은 run/test 서브커맨드만 허용됩니다 — exec/x 등 인자로 지정한 " +
+        "임의 코드·패키지를 즉시 실행하는 형태는 어떤 프로젝트 정책으로도 허용되지 않습니다.",
+    };
+  }
+  if (base === "npx" && (args.length === 0 || !NPX_ALLOWED_PACKAGE_NAMES.has(args[0]))) {
+    return {
+      ok: false,
+      reason:
+        "Core Command Safety Gate: npx는 Core가 인식하는 패키지(tsc)만 실행할 수 있습니다 — 그 외 임의 " +
+        "패키지 실행(--package= 우회 포함)은 어떤 프로젝트 정책으로도 허용되지 않습니다.",
+    };
+  }
+  if (base === "git" && !isReadOnlyGitInvocation(args)) {
     return {
       ok: false,
       reason:
@@ -534,12 +771,21 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
     if (!v.ok) return { ok: false, action: "RUN_COMMAND", denyReason: v.reason };
     const cwdResolved = cwdToPath(cwd);
     if (!cwdResolved.ok) return { ok: false, action: "RUN_COMMAND", denyReason: cwdResolved.reason };
-    const res = spawnSync(command, args, {
+    // SI-3.3~3.5 4-chunk 최종 리뷰 지적(HIGH) — git은 validateCommand()를 통과했다는
+    // 사실만으로는(명령줄 플래그 검사만 거쳤을 뿐) 여전히 repo 자신의 config/gitattributes를
+    // 통해 외부 프로그램을 실행할 수 있다(§ buildHardenedGitArgs 상단 주석). 실제 spawn
+    // 직전에만(위 validateCommand의 args 자체는 건드리지 않음) 안전 override를 추가한다 —
+    // git이 아닌 명령에는 전혀 영향 없다.
+    const isGit = normalizeExecutableBase(command) === "git";
+    const spawnArgs = isGit ? buildHardenedGitArgs(args) : args;
+    const spawnEnv = isGit ? hardenedGitSpawnEnv(process.env) : process.env;
+    const res = spawnSync(command, spawnArgs, {
       cwd: cwdResolved.path,
       shell: false,
       encoding: "utf-8",
       timeout: 300_000,
       maxBuffer: 5 * 1024 * 1024,
+      env: spawnEnv,
     });
     return {
       ok: res.status === 0,

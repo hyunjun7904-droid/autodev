@@ -1,6 +1,7 @@
 import {
   existsSync,
   statSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
@@ -9,11 +10,12 @@ import {
   realpathSync,
   openSync,
   fstatSync,
+  fsyncSync,
   closeSync,
   unlinkSync,
   rmSync,
 } from "node:fs";
-import { resolve, join, relative, isAbsolute, sep } from "node:path";
+import { resolve, join, relative, dirname, isAbsolute, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -184,6 +186,124 @@ export function isRealPathWithin(childReal: string, parentReal: string): boolean
 }
 
 /**
+ * SI-3.5(Trusted Filesystem / TOCTOU Security Boundary Closure — Option A, Portable Core
+ * Boundary, § `.claude/rules/filesystem-trust-model.md`) — `startAbsPath`부터
+ * `rootReal`(이미 realpath로 canonicalize된 신뢰 root)까지의 전체 조상 체인 중 어떤
+ * 구성요소도 symlink/junction이 아님을 확인한다. 여기서 "symlink/junction"은 정확히
+ * Node의 `lstatSync().isSymbolicLink()`가 참으로 보고하는 것(POSIX symlink, Windows
+ * symlink/junction — mount point 유형 reparse point)만을 뜻한다 — Windows의 다른 필터
+ * 드라이버 고유 reparse tag(예: cloud placeholder, dedup) 전부를 이 API가 포괄한다고
+ * 주장하지 않는다("portable Node.js로 완전한 kernel-level TOCTOU 제거"라고 근거 없이
+ * 주장하지 않는다는 이 Task의 원칙과 동일하게, 이 함수의 보장 범위도 정확히 명시한다).
+ *
+ * 기존 `isRealPathWithin()` containment 판정은 "resolve 결과가 root 내부에 있는가"만
+ * 본다 — root 내부의 다른 위치를 가리키는 symlink는(escape가 아니므로) 그 판정을
+ * 통과한다. 하지만 그런 symlink는 검증 이후 언제든 다시 다른 대상을 가리키도록
+ * 재설정될 수 있어, 검증 시점과 실제 I/O 시점 사이에 완전히 다른 대상으로 바뀔 수
+ * 있다(§ threat model 문서 "ancestor directory symlink swap"). 이 함수는 "root 밖을
+ * 가리키지 않는 symlink"조차 구조적으로 거부해 그 위험 자체를 원천적으로 없앤다.
+ *
+ * `rootReal`이 이미 존재를 전제로 하므로 각 조상 레벨의 stop 조건은 문자열 비교가 아니라
+ * "그 레벨 자신의 realpath가 rootReal과 같은가"로 판정한다 — 호출부가 매번 별도의
+ * "정규화 전(raw) root 문자열"을 함께 넘길 필요가 없어(정규화된 root 하나만 알면 충분),
+ * 여러 파일이 서로 다른 방식(join/resolve)으로 만든 경로에도 안전하게 동작한다. 아직
+ * 존재하지 않는 조상(정상적으로 아직 만들어지지 않은 경로 — 예: 새로 쓰려는 파일)은
+ * symlink일 수 없으므로 통과시키고 계속 위로 올라간다.
+ *
+ * SI-3.5 bounded GPT Independent Review 지적(HIGH) — 이전 구현은 1024회 안에
+ * `rootReal`에 도달하지 못하면(비정상적으로 깊은 경로, 또는 realpath 계산이 실제 root와
+ * 끝내 일치하지 않는 경우) 그대로 반복문을 빠져나가 지금까지 확인한 조상만으로 조용히
+ * `{ok:true}`를 반환했다 — root 근처(1025번째 이상)의 symlink를 놓치는 fail-open이었다.
+ * 이제 `reachedRoot`를 명시적으로 추적해, 상한 안에 root에 도달하지 못하면 무조건
+ * `{ok:false}`로 fail-closed한다(대상을 신뢰하지 못했다는 뜻 — "symlink가 없었다"고
+ * 잘못 보고하지 않는다).
+ *
+ * `testDeps.realpathSyncImpl`(SI-3.5 bounded GPT Independent Review 2차 MEDIUM 지적) —
+ * 위 1024-경계 fail-closed 동작 자체를 회귀 테스트하려면 실제로 1024단계 깊이의 디렉터리가
+ * 필요한데, 이 환경(Windows, 기본 MAX_PATH=260, long path opt-in 없음)에서는 그런 경로를
+ * 실제로 만드는 것 자체가 별개의 이유(경로 길이 제한)로 실패한다. `realpathSync`만
+ * 주입 가능하게 분리하면(실제 운용 코드는 이 매개변수를 전혀 쓰지 않고 항상 진짜
+ * `realpathSync`를 쓴다 — production 동작 변경 없음) 테스트가 순수 문자열 경로(디스크에
+ * 존재할 필요 없음)로 "1024번째에 정확히 root 도달 성공"과 "1024회 소진 후 fail-closed"
+ * 경계를 직접, 결정적으로 재현할 수 있다.
+ *
+ * `testDeps.lstatSyncImpl`(SI-3.3~3.5 4-chunk 최종 리뷰 지적, HIGH) — 아래 lstat 루프는
+ * ENOENT(정말로 아직 만들어지지 않은 조상)만 통과시키고 EACCES/EPERM/EIO 등 다른 오류는
+ * fail-closed로 거부한다. 이 분기를 실제 권한 거부 디렉터리를 만들지 않고 결정적으로
+ * 회귀 테스트하기 위해 `lstatSync`도 동일한 방식으로 주입 가능하게 분리한다(운용 코드는
+ * 이 매개변수를 쓰지 않는다).
+ */
+export function assertNoSymlinkInChain(
+  startAbsPath: string,
+  rootReal: string,
+  testDeps: { realpathSyncImpl?: (p: string) => string; lstatSyncImpl?: (p: string) => { isSymbolicLink(): boolean } } = {}
+): { ok: true } | { ok: false; detail: string } {
+  const realpathImpl = testDeps.realpathSyncImpl ?? realpathSync;
+  const lstatImpl = testDeps.lstatSyncImpl ?? lstatSync;
+  const resolvedStart = resolve(startAbsPath);
+  const resolvedRoot = resolve(rootReal);
+  const checked: string[] = [];
+  let current = resolvedStart;
+  let reachedRoot = false;
+  // 비정상적으로 깊은 경로/무한루프 방지를 위한 안전 상한 — 일반적인 파일시스템 깊이를
+  // 크게 웃도는 값이라 정상 사용에는 전혀 영향이 없다. 이 상한 안에 root에 도달하지
+  // 못하면(아래) fail-closed로 거부한다 — 상한 자체가 fail-open의 원인이 되지 않는다.
+  for (let i = 0; i < 1024; i++) {
+    checked.push(current);
+    let currentReal: string | undefined;
+    try {
+      currentReal = realpathImpl(current);
+    } catch {
+      currentReal = undefined;
+    }
+    if (currentReal !== undefined && currentReal === resolvedRoot) {
+      reachedRoot = true;
+      break;
+    }
+    const parent = dirname(current);
+    if (parent === current) {
+      return {
+        ok: false,
+        detail: `${resolvedStart}에서 신뢰 root(${resolvedRoot})까지 도달하지 못하고 파일시스템 최상위에 도달했습니다 — 대상이 신뢰 root 하위 경로가 아닙니다.`,
+      };
+    }
+    current = parent;
+  }
+  if (!reachedRoot) {
+    return {
+      ok: false,
+      detail: `${resolvedStart}에서 신뢰 root(${resolvedRoot})까지 1024단계 안에 도달하지 못했습니다 — 비정상적으로 깊은 경로이거나 root를 확인할 수 없어 fail-closed로 거부합니다.`,
+    };
+  }
+  for (const seg of checked) {
+    let st;
+    try {
+      st = lstatImpl(seg);
+    } catch (e) {
+      // SI-3.5 4-chunk final review 지적(HIGH) — 이전에는 모든 예외(ENOENT뿐 아니라
+      // EACCES/EPERM/EIO 등)를 "아직 존재하지 않는 조상"으로 간주해 조용히 건너뛰었다.
+      // 하지만 EACCES/EPERM/EIO는 그 경로가 존재하지 않는다는 뜻이 아니다 — 단지 그
+      // 경로가 symlink인지 확인하지 못했을 뿐이다. 확인하지 못한 조상을 "symlink가
+      // 아니다"로 조용히 취급하는 것은 fail-open이다. ENOENT(정말로 아직 만들어지지
+      // 않은 정상 상태)만 통과시키고, 그 외 모든 오류는 "이 조상을 신뢰할 수 있게
+      // 확인하지 못했다"는 뜻으로 fail-closed 거부한다.
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return {
+        ok: false,
+        detail: `${seg} 확인 실패(${(e as NodeJS.ErrnoException).code ?? "UNKNOWN"}) — symlink 여부를 신뢰할 수 있게 확인하지 못해 거부합니다: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+    if (st.isSymbolicLink()) {
+      return {
+        ok: false,
+        detail: `${seg}가 symlink/junction입니다 — 신뢰 root(${resolvedRoot})부터 대상까지 어떤 구성요소도 symlink일 수 없습니다.`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/**
  * bootstrapBaseDir가 AutoDev Core 저장소(AUTODEV_ROOT)와 어느 방향으로도 중첩되지 않는지
  * 확인한다 — "AutoDev Core repository 내부 중첩 생성 금지"(§ 요구사항 4/10/17)의 단일
  * 판정 지점이다. realpath 기준으로 비교해 symlink로 우회하는 것도 막는다. 이 함수가 만나는
@@ -313,6 +433,13 @@ function verifySpecContentRefFile(
       code: "SPEC_CONTENT_REF_ESCAPE",
       detail: "specContentRef가 symlink/junction/reparse point를 통해 source root 밖을 가리킵니다.",
     };
+  }
+  // SI-3.5 — containment(위)만으로는 "source root 내부의 다른 위치를 가리키는 symlink"를
+  // 잡지 못한다(§ assertNoSymlinkInChain 상단 주석). ref가 가리키는 경로 체인 중 어느
+  // 구성요소도 symlink/junction일 수 없다.
+  const chainCheck = assertNoSymlinkInChain(candidate, sourceRootReal);
+  if (!chainCheck.ok) {
+    return { ok: false, code: "SPEC_CONTENT_REF_ESCAPE", detail: chainCheck.detail };
   }
 
   // GPT Independent Reviewer 지적(SI-2 REVISE 2~4회차, HIGH, 최종 정리) — 순수 Node.js
@@ -514,15 +641,65 @@ function readBootstrapState(projectRoot: string): ReadBootstrapStateResult {
   return { kind: "valid", state: parsed };
 }
 
+// SI-3.5(§ `.claude/rules/filesystem-trust-model.md`) — spec-planner.ts의 writeJsonAtomic과
+// 동일한 hardening 패턴(fsync, 대상 symlink 재확인, pre-promotion revalidation,
+// post-promotion 검증)을 적용한다. projectRoot는 이 함수가 호출되는 시점(PROJECT_ROOT_
+// CREATED 직후 또는 evaluateExistingProjectRoot가 이미 검증한 resume 경로)에 이미 검증된
+// 값이다.
 function writeBootstrapStateAtomic(projectRoot: string, state: BootstrapStateFile): { ok: true } | { ok: false; detail: string } {
+  const dir = join(projectRoot, ".autodev");
+  let tmp: string | undefined;
   try {
-    mkdirSync(join(projectRoot, ".autodev"), { recursive: true });
+    mkdirSync(dir, { recursive: true });
+    const projectRootReal = realpathSync(projectRoot);
+    const dirReal = realpathSync(dir);
+    if (!isRealPathWithin(dirReal, projectRootReal)) {
+      return { ok: false, detail: "bootstrap state 저장 실패: .autodev가 project root 밖을 가리킵니다." };
+    }
+    const chainCheck = assertNoSymlinkInChain(dir, projectRootReal);
+    if (!chainCheck.ok) return { ok: false, detail: `bootstrap state 저장 실패: ${chainCheck.detail}` };
+
     const target = bootstrapStateFilePath(projectRoot);
-    const tmp = `${target}.${randomUUID()}.tmp`;
+    tmp = `${target}.${randomUUID()}.tmp`;
     writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+    const fd = openSync(tmp, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (existsSync(target) && lstatSync(target).isSymbolicLink()) {
+      const targetReal = realpathSync(target);
+      if (!isRealPathWithin(targetReal, projectRootReal)) {
+        throw new Error("대상 경로가 project root 밖을 가리키는 symlink로 바뀌었습니다.");
+      }
+    }
+    // pre-promotion revalidation.
+    const preRenameCheck = assertNoSymlinkInChain(dir, projectRootReal);
+    if (!preRenameCheck.ok) throw new Error(preRenameCheck.detail);
+
     renameSync(tmp, target);
+    tmp = undefined;
+
+    // post-promotion 검증(destination swap detection 가능한 범위) — prevention이 아니라
+    // detection이다.
+    const postLstat = lstatSync(target);
+    if (!postLstat.isFile()) {
+      return { ok: false, detail: "bootstrap state 저장 실패: write 이후 재확인에서 대상이 regular file이 아닙니다(가능한 race 탐지)." };
+    }
+    const postReal = realpathSync(target);
+    if (!isRealPathWithin(postReal, projectRootReal)) {
+      return { ok: false, detail: "bootstrap state 저장 실패: write 이후 재확인에서 대상이 project root 밖을 가리킵니다(가능한 race 탐지)." };
+    }
     return { ok: true };
   } catch (e) {
+    if (tmp !== undefined) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // 정리 실패는 원래 오류를 덮지 않는다.
+      }
+    }
     return { ok: false, detail: `bootstrap state 저장 실패: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
@@ -699,11 +876,54 @@ function preserveMasterSpec(
     bootstrapProvenance: { ...provenance, bootstrappedAt: new Date().toISOString() },
     storedContentDigest: { algorithm, hash: rehash },
   };
+  // SI-3.5(§ `.claude/rules/filesystem-trust-model.md`) — writeBootstrapStateAtomic/
+  // spec-planner.ts의 writeJsonAtomic과 동일한 hardening 패턴을 적용한다.
+  let tmp: string | undefined;
   try {
-    const tmp = `${manifestPath}.${randomUUID()}.tmp`;
+    const projectRootReal = realpathSync(projectRoot);
+    const dirReal = realpathSync(dir);
+    if (!isRealPathWithin(dirReal, projectRootReal)) {
+      return { ok: false, detail: "Master Spec manifest 쓰기 실패: master-spec 디렉터리가 project root 밖을 가리킵니다." };
+    }
+    const chainCheck = assertNoSymlinkInChain(dir, projectRootReal);
+    if (!chainCheck.ok) return { ok: false, detail: `Master Spec manifest 쓰기 실패: ${chainCheck.detail}` };
+
+    tmp = `${manifestPath}.${randomUUID()}.tmp`;
     writeFileSync(tmp, JSON.stringify(manifest, null, 2) + "\n", "utf-8");
+    const fd = openSync(tmp, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (existsSync(manifestPath) && lstatSync(manifestPath).isSymbolicLink()) {
+      const targetReal = realpathSync(manifestPath);
+      if (!isRealPathWithin(targetReal, projectRootReal)) {
+        throw new Error("대상 경로가 project root 밖을 가리키는 symlink로 바뀌었습니다.");
+      }
+    }
+    const preRenameCheck = assertNoSymlinkInChain(dir, projectRootReal);
+    if (!preRenameCheck.ok) throw new Error(preRenameCheck.detail);
+
     renameSync(tmp, manifestPath);
+    tmp = undefined;
+
+    const postLstat = lstatSync(manifestPath);
+    if (!postLstat.isFile()) {
+      return { ok: false, detail: "Master Spec manifest 쓰기 실패: write 이후 재확인에서 대상이 regular file이 아닙니다(가능한 race 탐지)." };
+    }
+    const postReal = realpathSync(manifestPath);
+    if (!isRealPathWithin(postReal, projectRootReal)) {
+      return { ok: false, detail: "Master Spec manifest 쓰기 실패: write 이후 재확인에서 대상이 project root 밖을 가리킵니다(가능한 race 탐지)." };
+    }
   } catch (e) {
+    if (tmp !== undefined) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // 정리 실패는 원래 오류를 덮지 않는다.
+      }
+    }
     return { ok: false, detail: `Master Spec manifest 쓰기 실패: ${e instanceof Error ? e.message : String(e)}` };
   }
   return { ok: true };
@@ -1053,6 +1273,11 @@ function assertExistingSubPathContained(parentAbs: string, parentReal: string, s
   if (!isRealPathWithin(real, parentReal)) {
     return { ok: false, detail: `${subPathRel}가 symlink/junction/reparse point를 통해 project root 밖을 가리킵니다.` };
   }
+  // SI-3.5 — containment(위)만으로는 "root 내부의 다른 위치를 가리키는 symlink"를 잡지
+  // 못한다(§ assertNoSymlinkInChain 상단 주석). subPathRel 자체가 symlink/junction이면
+  // 그 목적지가 root 안이든 밖이든 구조적으로 거부한다.
+  const chainCheck = assertNoSymlinkInChain(candidate, parentReal);
+  if (!chainCheck.ok) return { ok: false, detail: chainCheck.detail };
   return { ok: true };
 }
 
@@ -1090,6 +1315,16 @@ function evaluateExistingProjectRoot(
         code: "PROJECT_ROOT_ESCAPE",
         detail: "기존 project root가 symlink/junction/reparse point를 통해 bootstrapBaseDir 밖을 가리킵니다 — metadata를 신뢰하지 않고 즉시 중단합니다.",
       },
+    };
+  }
+  // SI-3.5 — containment(위)만으로는 "bootstrapBaseDir 내부의 다른(예: 다른 프로젝트)
+  // 위치를 가리키는 symlink"를 잡지 못한다(§ assertNoSymlinkInChain 상단 주석). project
+  // root 자체가 symlink/junction이면 그 목적지가 base 안이든 밖이든 구조적으로 거부한다 —
+  // "우연히 base 내부를 가리켜 통과"하는 identity 혼동을 막는다.
+  const projectRootChainCheck = assertNoSymlinkInChain(projectRoot, bootstrapBaseDirReal);
+  if (!projectRootChainCheck.ok) {
+    return {
+      outcome: { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: projectRootChainCheck.detail },
     };
   }
 

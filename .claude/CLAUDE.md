@@ -58,6 +58,21 @@ Claude Worker 세션 운영, GPT Reviewer 전달 범위, context 관리 원칙�
   없다(`PerformCheckpointOptions.dependencyVulnerabilityAuditSource`는 `cwd`와 동일한
   성격의 테스트 전용 seam일 뿐, 구조/source/integrity/install-script 검사는 이 값과 무관
   하게 항상 수행된다). 자세한 구조는 `src/dependency-scanner.ts` 상단 주석 참고.
+- **Filesystem Trust Model — Portable Core Boundary**(SI-3.5, Trusted Filesystem / TOCTOU
+  Security Boundary Closure) — `project-bootstrap.ts`/`spec-planner.ts`의 trusted file
+  read/atomic write가 실제로 방어하는 것과 방어하지 않는 것을 명시적으로 정의한
+  threat model이다. 자세한 내용, Option A(채택)/Option B(네이티브 primitive, 미채택)
+  비교와 비용 분석, 코드/테스트 매핑은
+  [`.claude/rules/filesystem-trust-model.md`](rules/filesystem-trust-model.md) 참고.
+  핵심 요약: 동일 OS 사용자 권한의 악의적 프로세스가 검증~실제 I/O 사이의 극히 짧은
+  창에서 ancestor directory를 rename/swap하는 정밀 timing 공격은 이 Core 보장의 범위
+  밖이다(그 정도 로컬 공격 능력을 가진 공격자는 이미 더 쉬운 다른 공격 경로를 갖고
+  있다) — 그 경계 안에서는 project root canonicalization/ancestor chain symlink·junction
+  금지(`assertNoSymlinkInChain`)/containment/regular-file 강제/trusted read/project
+  lock/identity·hash 재검증/same-directory temp+atomic rename/pre-promotion
+  재검증/post-promotion(destination swap) 탐지/generation hash binding을 전부
+  deterministic하게 강제한다. "portable Node.js로 완전한 kernel-level TOCTOU 제거"라고
+  주장하지 않는다.
 
 네 모듈의 책임은 명확히 분리된다: Safe Executor(경로 접근 범위 + 명령 실행 자체의 Core
 안전 게이트), Secret Scanner(commit 직전 내용 검사), Dependency / Supply-chain Scanner

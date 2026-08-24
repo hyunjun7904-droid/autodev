@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync, spawn } from "node:child_process";
-import { bootstrapProject, isRealPathWithin, debugComputeBootstrapLockFilePath } from "./project-bootstrap";
+import { bootstrapProject, isRealPathWithin, assertNoSymlinkInChain, debugComputeBootstrapLockFilePath } from "./project-bootstrap";
 import type { BootstrapTrustedConfig, BootstrapOutcome } from "./project-bootstrap";
 import { AUTODEV_ROOT } from "./project-context";
 
@@ -262,6 +262,53 @@ function scenarioContentRefJunctionEscapeBlocked(): void {
 }
 
 // ---------------------------------------------------------------------------
+// SI-3.5(Trusted Filesystem / TOCTOU Security Boundary Closure) — 시나리오 5/6은 escape
+// (junction이 source root "밖"을 가리키는 경우)만 다뤘다. containment 판정
+// (isRealPathWithin)만으로는 "source root 안의 다른 위치를 가리키는" junction을 잡지
+// 못한다 — 그 junction은 검증 이후 언제든 다시 다른 대상(root 밖 포함)을 가리키도록
+// 재설정될 수 있어 그 자체로 신뢰할 수 없다(§ .claude/rules/filesystem-trust-model.md).
+// assertNoSymlinkInChain()이 이 gap을 구조적으로 닫는다 — ref가 가리키는 경로의 조상
+// 체인 중 어떤 구성요소도 symlink/junction일 수 없다(목적지가 root 안이든 밖이든).
+// ---------------------------------------------------------------------------
+function scenarioContentRefAncestorSymlinkWithinRootBlocked(): void {
+  const sourceRoot = makeTempDir("si35-src-innerlink-");
+  const realContent = "REAL CONTENT — 정상적으로 source root 내부에 있는 파일";
+  mkdirSync(join(sourceRoot, "real-sub"), { recursive: true });
+  writeFileSync(join(sourceRoot, "real-sub", "spec.md"), realContent, "utf-8");
+
+  // "link-sub"는 source root 밖이 아니라 같은 source root 안의 "real-sub"를 가리키는
+  // junction이다 — 기존 containment 판정만으로는 이 경로도 그대로 통과했다.
+  const linkDir = join(sourceRoot, "link-sub");
+  let created = false;
+  try {
+    symlinkSync(join(sourceRoot, "real-sub"), linkDir, "junction");
+    created = true;
+  } catch {
+    // 이 Node/OS 조합에서 junction 생성이 지원되지 않을 수 있다.
+  }
+  if (!created) {
+    skip("SI-3.5) specContentRef ancestor가 source root 내부를 가리키는 junction(non-escape) — 이 Node/OS 환경에서 junction 생성이 지원되지 않아 건너뜀");
+    return;
+  }
+
+  const baseDir = makeTempDir("si35-base-innerlink-");
+  const projectId = nextId("si35-innerlink");
+  const envelope = makeRefEnvelope({
+    projectId,
+    specContentRef: "link-sub/spec.md",
+    specIntegrity: { algorithm: "sha256", hash: sha256Hex(realContent) },
+  });
+  const config: BootstrapTrustedConfig = { bootstrapBaseDir: baseDir, specContentRefSourceRoot: sourceRoot, commitIdentity: COMMIT_IDENTITY };
+
+  const outcome = run(envelope, config);
+  check(
+    "SI-3.5) source root 내부를 가리키는(non-escape) junction도 → BLOCKED(SPEC_CONTENT_REF_ESCAPE, ancestor symlink 자체가 금지)",
+    outcome.status === "BLOCKED" && outcome.code === "SPEC_CONTENT_REF_ESCAPE"
+  );
+  check("SI-3.5) project 폴더가 생성되지 않음", !existsSync(join(baseDir, projectId)));
+}
+
+// ---------------------------------------------------------------------------
 // 7) specContentRef target이 regular file이 아님 → BLOCK
 // ---------------------------------------------------------------------------
 function scenarioContentRefNotRegularFileBlocked(): void {
@@ -332,6 +379,145 @@ function scenarioCaseSensitiveContainmentFix(): void {
     isRealPathWithin("/tmp/root-other/secret.md", "/tmp/root") === false
   );
   check("REVISE) 상위 디렉터리로의 이탈은 containment로 인정되지 않음", isRealPathWithin("/tmp", "/tmp/root") === false);
+}
+
+// ---------------------------------------------------------------------------
+// SI-3.5(Trusted Filesystem / TOCTOU Security Boundary Closure) — assertNoSymlinkInChain()
+// 직접 단위 테스트. isRealPathWithin()과 달리 실제 파일시스템을 확인하는 함수이므로 순수
+// 문자열이 아니라 실제 임시 디렉터리 fixture를 쓴다.
+// ---------------------------------------------------------------------------
+function scenarioAssertNoSymlinkInChainUnitTests(): void {
+  // A) symlink가 전혀 없는 정상적인 깊은 경로 → ok:true.
+  {
+    const root = makeTempDir("si35-chain-plain-");
+    const target = join(root, "a", "b", "c.json");
+    mkdirSync(join(root, "a", "b"), { recursive: true });
+    writeFileSync(target, "{}", "utf-8");
+    const result = assertNoSymlinkInChain(target, root);
+    check("SI-3.5-chain-A) symlink 없는 정상 경로 → ok:true", result.ok === true);
+  }
+
+  // B) 아직 생성되지 않은 leaf(정상적으로 write 예정인 새 파일) → ok:true(조상만 확인).
+  {
+    const root = makeTempDir("si35-chain-notyet-");
+    mkdirSync(join(root, "a"), { recursive: true });
+    const target = join(root, "a", "not-yet-created.json");
+    const result = assertNoSymlinkInChain(target, root);
+    check("SI-3.5-chain-B) 아직 존재하지 않는 leaf(생성 예정 파일) → ok:true", result.ok === true);
+  }
+
+  // C) target 자체가 root와 정확히 같음(단일 레벨) → ok:true.
+  {
+    const root = makeTempDir("si35-chain-samelevel-");
+    const result = assertNoSymlinkInChain(root, root);
+    check("SI-3.5-chain-C) target === root(단일 레벨) → ok:true", result.ok === true);
+  }
+
+  // D) 조상 체인 중간에 symlink/junction이 있으면(목적지가 root 내부여도) → ok:false.
+  {
+    const root = makeTempDir("si35-chain-midlink-");
+    mkdirSync(join(root, "real-mid"), { recursive: true });
+    writeFileSync(join(root, "real-mid", "leaf.json"), "{}", "utf-8");
+    let created = false;
+    try {
+      symlinkSync(join(root, "real-mid"), join(root, "link-mid"), "junction");
+      created = true;
+    } catch {
+      // 이 Node/OS 조합에서 junction 생성이 지원되지 않을 수 있다.
+    }
+    if (!created) {
+      skip("SI-3.5-chain-D) 조상 체인 중간 symlink(non-escape) — 이 환경에서 junction 생성이 지원되지 않아 건너뜀");
+    } else {
+      const target = join(root, "link-mid", "leaf.json");
+      const result = assertNoSymlinkInChain(target, root);
+      check("SI-3.5-chain-D) 조상 체인 중간에 symlink(root 내부를 가리켜도) → ok:false", result.ok === false);
+    }
+  }
+
+  // E) target이 root와 전혀 무관한 경로(하위 경로가 아님) → ok:false(파일시스템 최상위 도달).
+  {
+    const root = makeTempDir("si35-chain-unrelated-root-");
+    const unrelated = makeTempDir("si35-chain-unrelated-target-");
+    const target = join(unrelated, "somefile.json");
+    writeFileSync(target, "{}", "utf-8");
+    const result = assertNoSymlinkInChain(target, root);
+    check("SI-3.5-chain-E) target이 root의 하위 경로가 아님 → ok:false", result.ok === false);
+  }
+
+  // F/G) SI-3.5 bounded GPT Independent Review 2차(MEDIUM) — 1024회 상한 경계 자체를
+  // 회귀 테스트한다. 실제 1024단계 디렉터리는 이 환경(Windows MAX_PATH=260)에서 만들 수
+  // 없으므로, realpathSyncImpl을 주입해(순수 문자열 경로만 쓰고 디스크에 실제로 존재할
+  // 필요가 없다) 정확한 경계에서의 성공/실패를 결정적으로 재현한다. dirname()은 순수
+  // 문자열 연산이라 주입하지 않고 실제 함수를 그대로 쓴다 — 파일시스템 접근이 필요한
+  // realpathSync만 대체하면 충분하다.
+  {
+    // depth개의 중간 세그먼트를 가진 순수 문자열 경로를 만든다 — join()이 자동으로
+    // 정규화하므로 이 자체가 실제 경로 규칙과 동일하게 동작한다(디스크 접근 없음).
+    function buildSyntheticChain(depth: number): { start: string; root: string } {
+      const root = "C:\\si35-synthetic-root";
+      let start = root;
+      for (let i = 0; i < depth; i++) start = join(start, `lvl${i}`);
+      return { start, root };
+    }
+    const identityRealpath = (p: string): string => p;
+
+    // F) root가 정확히 1024번째 확인(i=1023, 0-indexed 마지막 허용 반복)에서 발견되는
+    // 경계 — 성공해야 한다.
+    {
+      const { start, root } = buildSyntheticChain(1023);
+      const result = assertNoSymlinkInChain(start, root, { realpathSyncImpl: identityRealpath });
+      check("SI-3.5-chain-F) root가 정확히 1024번째 확인(경계)에서 발견됨 → ok:true", result.ok === true);
+    }
+
+    // G) root가 그보다 한 단계 더 깊이 있어(1025번째 확인이 필요) 1024회 상한 안에 확인되지
+    // 못하는 경계 — 이전(HIGH) 버그였다면 조용히 ok:true를 반환했을 상황이다. 이제는
+    // fail-closed로 거부해야 한다.
+    {
+      const { start, root } = buildSyntheticChain(1024);
+      const result = assertNoSymlinkInChain(start, root, { realpathSyncImpl: identityRealpath });
+      check(
+        "SI-3.5-chain-G) root가 1024회 상한 밖(1025번째)에 있음 → ok:false(fail-closed, 이전에는 fail-open 버그였음)",
+        result.ok === false
+      );
+    }
+  }
+
+  // H/I) SI-3.3~3.5 4-chunk 최종 리뷰(HIGH) — lstat 예외 처리가 ENOENT만 "아직 존재하지
+  // 않음"으로 통과시키고, 그 외(EACCES/EPERM/EIO 등)는 fail-closed로 거부하는지 검증한다.
+  // 실제 권한 거부 디렉터리를 만들지 않고 lstatSyncImpl을 주입해 결정적으로 재현한다.
+  {
+    const root = makeTempDir("si35-lstat-error-root-");
+    const target = join(root, "a", "leaf.json");
+    mkdirSync(join(root, "a"), { recursive: true });
+    writeFileSync(target, "{}", "utf-8");
+
+    // H) ENOENT는 여전히 "존재하지 않는 조상"으로 통과되어야 한다(회귀 유지) — 실제
+    // lstatSync 대신 항상 ENOENT를 던지는 구현을 주입해도 결과가 바뀌지 않아야 한다.
+    {
+      const alwaysEnoent = (_p: string): { isSymbolicLink(): boolean } => {
+        const err = new Error("ENOENT (fake)") as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      };
+      const result = assertNoSymlinkInChain(target, root, { lstatSyncImpl: alwaysEnoent });
+      check("SI-3.5-lstat-H) lstat이 ENOENT를 던지면 여전히 ok:true(회귀 유지)", result.ok === true);
+    }
+
+    // I) EACCES(또는 다른 비-ENOENT 오류)는 "확인하지 못함"으로 fail-closed 거부해야 한다 —
+    // 이전에는 이 경우도 조용히 건너뛰어 ok:true를 반환했다(fail-open 버그).
+    {
+      const alwaysEacces = (_p: string): { isSymbolicLink(): boolean } => {
+        const err = new Error("EACCES (fake)") as NodeJS.ErrnoException;
+        err.code = "EACCES";
+        throw err;
+      };
+      const result = assertNoSymlinkInChain(target, root, { lstatSyncImpl: alwaysEacces });
+      check(
+        "SI-3.5-lstat-I) lstat이 EACCES를 던지면 ok:false(fail-closed, 이전에는 fail-open 버그였음)",
+        result.ok === false
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +830,74 @@ function scenarioExistingSubPathJunctionEscapeBlocked(): void {
     );
     check("REVISE 5b) 외부 디렉터리 내용이 그대로 보존됨", existsSync(join(outsideDir, "planted.txt")));
   }
+}
+
+// ---------------------------------------------------------------------------
+// SI-3.5(Trusted Filesystem / TOCTOU Security Boundary Closure) — 시나리오 5a/5b는
+// escape(junction이 project root "밖"을 가리키는 경우)만 다뤘다. 이번 시나리오는 project
+// root 안의 다른(합법적인) 위치를 가리키는(=escape가 아닌) junction도 assertNoSymlinkInChain
+// 이 구조적으로 거부하는지 확인한다 — "root 내부를 가리켜서 통과"하는 것 자체가 이후 언제든
+// 재설정 가능한 신뢰할 수 없는 상태이기 때문이다(§ filesystem-trust-model.md).
+// ---------------------------------------------------------------------------
+function scenarioExistingSubPathInnerJunctionBlocked(): void {
+  const baseDir = makeTempDir("si35-base-inner-subpath-");
+  const projectId = nextId("si35-inner-subpath");
+  const projectRoot = join(baseDir, projectId);
+  // ".autodev"가 project root 밖이 아니라 project root 안의 다른 real 디렉터리("legit-storage")를
+  // 가리키는 junction이다.
+  mkdirSync(join(projectRoot, "legit-storage"), { recursive: true });
+
+  let created = false;
+  try {
+    symlinkSync(join(projectRoot, "legit-storage"), join(projectRoot, ".autodev"), "junction");
+    created = true;
+  } catch {
+    // 이 Node/OS 조합에서 junction 생성이 지원되지 않을 수 있다.
+  }
+  if (!created) {
+    skip("SI-3.5) .autodev가 project root 내부를 가리키는 junction(non-escape) — 이 환경에서 junction 생성이 지원되지 않아 건너뜀");
+    return;
+  }
+
+  const envelope = makeInlineEnvelope({ projectId });
+  const outcome = run(envelope, { bootstrapBaseDir: baseDir, commitIdentity: COMMIT_IDENTITY });
+  check(
+    "SI-3.5) project root 내부를 가리키는(non-escape) .autodev junction도 → BLOCKED(PROJECT_ROOT_ESCAPE, ancestor symlink 자체가 금지)",
+    outcome.status === "BLOCKED" && outcome.code === "PROJECT_ROOT_ESCAPE"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SI-3.5 — project root "자체"가 bootstrapBaseDir 안의 다른(합법적인) 디렉터리를 가리키는
+// junction인 경우(escape가 아님). 기존 isRealPathWithin(projectRootReal, bootstrapBaseDirReal)
+// 만으로는 이 경우가 그대로 통과했다 — 다른 프로젝트의 디렉터리를 자신의 project root처럼
+// identity 혼동을 일으킬 수 있는 위험이다. assertNoSymlinkInChain()이 project root 자체가
+// symlink/junction인 것 자체를 구조적으로 거부한다.
+// ---------------------------------------------------------------------------
+function scenarioProjectRootItselfInnerJunctionBlocked(): void {
+  const baseDir = makeTempDir("si35-base-root-innerlink-");
+  const realProjectId = nextId("si35-real-target");
+  const linkedProjectId = nextId("si35-linked-alias");
+  mkdirSync(join(baseDir, realProjectId), { recursive: true });
+
+  let created = false;
+  try {
+    symlinkSync(join(baseDir, realProjectId), join(baseDir, linkedProjectId), "junction");
+    created = true;
+  } catch {
+    // 이 Node/OS 조합에서 junction 생성이 지원되지 않을 수 있다.
+  }
+  if (!created) {
+    skip("SI-3.5) project root 자체가 bootstrapBaseDir 내부의 다른 디렉터리를 가리키는 junction(non-escape) — 이 환경에서 junction 생성이 지원되지 않아 건너뜀");
+    return;
+  }
+
+  const envelope = makeInlineEnvelope({ projectId: linkedProjectId });
+  const outcome = run(envelope, { bootstrapBaseDir: baseDir, commitIdentity: COMMIT_IDENTITY });
+  check(
+    "SI-3.5) project root 자체가 bootstrapBaseDir 내부의 다른 디렉터리를 가리키는(non-escape) junction → BLOCKED(PROJECT_ROOT_ESCAPE)",
+    outcome.status === "BLOCKED" && outcome.code === "PROJECT_ROOT_ESCAPE"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,9 +1254,11 @@ function main(): void {
     scenarioContentRefHashMismatchBlocked();
     scenarioContentRefSymlinkEscapeBlocked();
     scenarioContentRefJunctionEscapeBlocked();
+    scenarioContentRefAncestorSymlinkWithinRootBlocked();
     scenarioContentRefNotRegularFileBlocked();
     scenarioContentRefSecretDetectedBlocked();
     scenarioCaseSensitiveContainmentFix();
+    scenarioAssertNoSymlinkInChainUnitTests();
     scenarioCollisionWithUnrelatedFolder();
     scenarioIdempotentRepeatedHandoff();
     scenarioConflictSameHandoffDifferentHash();
@@ -1014,6 +1270,8 @@ function main(): void {
     scenarioCoreRepoNestedCreationBlocked();
     scenarioExistingProjectRootJunctionEscapeBlocked();
     scenarioExistingSubPathJunctionEscapeBlocked();
+    scenarioExistingSubPathInnerJunctionBlocked();
+    scenarioProjectRootItselfInnerJunctionBlocked();
     scenarioConcurrentAndStaleBootstrapLock();
     scenarioSameHandoffDifferentProjectIdConcurrencyBlocked();
     scenarioBaseLevelIndexAndLockDirJunctionEscapeBlocked();

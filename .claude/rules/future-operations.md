@@ -122,3 +122,19 @@ Microsoft 연결, 유료 외부 action 등)을 재알림 미확인을 이유로 
   안정적으로 파싱하는 기능(F2의 `requestedPermission` 자기보고 필드는 타입/enforcement
   로직만 구현했고, 실제 운용 read-only runner는 이 필드를 채우지 않는다 — fake runner를
   쓰는 테스트에서만 채워 enforcement 자체를 검증한다)
+- Command Execution Safety Gate(`coreCommandSafetyGate`, `src/safe-executor.ts`)의 실행
+  파일 identity/trust 검증. SI-3.4(Command Execution Safety Architecture Closure)는 "어떤
+  executable/wrapper 이름을 호출할 수 있는가"를 STRICT ALLOW-LIST(`CORE_ALLOWED_
+  EXECUTABLE_FAMILIES` = git/npm/npx/node/tsc, bare 이름만 허용 — 경로 구분자/드라이브
+  문자가 있으면 무조건 거부)로 닫았고, family 안에서도 git 서브커맨드/node eval·preload
+  플래그/npm·npx 위임 형태를 추가로 제한했다. 하지만 이 gate는 spawn 시점에 그 bare 이름이
+  실제로 PATH/cwd 탐색을 거쳐 어떤 파일을 가리키는지는 검증하지 않는다 — project-writable
+  디렉터리가 PATH보다 먼저 탐색되거나 cwd에 동일 이름의 가짜 실행 파일(`git`/`node`/
+  `git.cmd` 등)이 있으면 그 파일이 실제 git/node 대신 실행될 수 있다(PATH/cwd executable
+  shadowing). 이 gap은 SI-3.4가 새로 만든 것이 아니라 Phase B의 최초 `allowedCommands`
+  도입 이후 어떤 Task(C4/C4.1/C4.2/SI-3.3 포함)도 다루지 않았던 기존 특성이다 — SI-3.4
+  bounded GPT Independent Review 3라운드에서 지적됐고, 닫으려면 canonical 절대 경로 해석·
+  신뢰된 설치 경로 pinning 같은 별도의 "Verified Executable Trust Store" 성격의 새 Task가
+  필요하다고 판단해(새 shell/parser를 만들지 않는다는 SI-3.4의 제약과 근본적으로 상충)
+  SI-3.4 범위에서는 제외했다. 이 문서에 적혀 있다는 사실 자체가 착수 승인을 의미하지
+  않는다 — 이 항목도 명시적으로 지정된 별도 Task에서만 구현한다.

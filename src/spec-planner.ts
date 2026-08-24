@@ -1,7 +1,22 @@
-import { existsSync, statSync, lstatSync, mkdirSync, writeFileSync, readFileSync, renameSync, realpathSync } from "node:fs";
-import { resolve, join } from "node:path";
+import {
+  existsSync,
+  statSync,
+  lstatSync,
+  fstatSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  renameSync,
+  realpathSync,
+  openSync,
+  fsyncSync,
+  closeSync,
+  unlinkSync,
+  constants,
+} from "node:fs";
+import { resolve, join, dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { isRealPathWithin } from "./project-bootstrap";
+import { isRealPathWithin, assertNoSymlinkInChain } from "./project-bootstrap";
 import type { BootstrapRequestIdentity, BootstrapStage } from "./project-bootstrap";
 import { scanContentForSecrets } from "./secret-scanner";
 import { validateProjectManifest } from "./project-manifest";
@@ -13,47 +28,32 @@ import type { TaskDefinition, RequiredTestCommand } from "./task-registry";
 import { runClaudeTask } from "./claude-runner";
 import { acquireProjectLock, releaseProjectLock } from "./project-lock";
 
-// AutoDev Core 선행 업그레이드 — Planner → AutoDev Execution Data Synthesis + E2E (SI-3).
+// AutoDev Core 선행 업그레이드 — Incremental / Chunked Planner (SI-3.3).
 //
-// SI-1(spec-intake.ts)은 Handoff를 받아들일지 판정만 하고, SI-2(project-bootstrap.ts)는
-// 그 판정을 실제 project root 생성 + Master Spec 보존으로 실행한다. 이 모듈은 그 다음 단계다
-// — SI-2가 안전하게 보존한 APPROVED Master Spec(WHAT)을, AutoDev가 실제로 실행할 수 있는
-// Phase/Task/ExecutionPolicy(HOW)로 변환한다. Master Spec이 HOW를 정하지 않는다 — 이
-// Planner가 정한다. 이 모듈은 이번 Task에서 실제 JARVIS/MOVAN/BILLION 프로젝트를 전혀
-// 언급하지 않는다 — 항상 이미 존재하는(SI-2가 만든) projectRoot를 외부에서 주입받는다.
+// SI-3(spec-planner.ts 최초 버전)는 "대형 Master Spec → 단일 Claude 호출 → 전체
+// Architecture+Phase+Task+ExecutionPolicy JSON" 구조였다. 실제 JARVIS Master Spec으로
+// 검증한 결과 이 단일 호출이 300초(SI-3.2가 이미 늘린 Planner 전용 timeout) + transport
+// retry 1회 후에도 반복 TIMEOUT됐다(§ Task SI-3.3 prompt 진단 — claude CLI/인증/네트워크
+// 자체는 정상, 대형 단일 요청 구조 자체가 병목). 이 모듈은 그 단일 거대 요청을 제거하고
+// STAGE 1(ARCHITECTURE) → STAGE 2(PHASE PLAN) → STAGE 3(TASK PLAN, Phase별 개별 호출)
+// → STAGE 4(GLOBAL TRACEABILITY, deterministic) → STAGE 5(FINAL ASSEMBLY, deterministic)
+// 로 나눈 incremental pipeline으로 대체한다. 각 LLM stage는 검증된 좁은 범위의 JSON만
+// 요구하므로 프롬프트/응답이 작고, Phase별 Task 생성은 독립적인 correction/transport retry
+// 예산과 독립적인 checkpoint를 가져 부분 실패가 이미 완료된 이전 단계/이전 Phase를
+// 재호출시키지 않는다(§ evaluateTrustedPlannerInput/runPlannerLocked 아래).
 //
-// 신뢰 경계 — runPlanner()는 원본 HandoffEnvelope JSON을 다시 받지 않는다. SI-2가 이미
-// projectRoot/.autodev/bootstrap-state.json + projectRoot/.autodev/master-spec/
-// {spec.md,manifest.json}에 검증된 결과를 영구 보존했으므로, Planner의 신뢰 입력은
-// "파일시스템(SI-2의 출력)"이다 — 이 함수는 그 파일들을 직접 다시 읽고, spec.md의 실제
-// digest를 재계산해 manifest.json의 storedContentDigest와 대조하며, specStatus/
-// userApproval/reviewerGate/unresolvedCriticalCount/contradictionCount 게이트를 전부
-// 다시 확인한다(§ evaluateTrustedPlannerInput). 호출부가 넘기는 expectedIdentity와
-// 실제로 읽은 identity가 하나라도 다르면 즉시 BLOCK한다 — 어떤 값도 추측하지 않는다.
-//
-// Master Spec 정규화(normalizeMasterSpec)는 LLM을 쓰지 않는 순수 deterministic 파서다 —
-// "## <Section Name>" 헤더 + "- " 목록 항목이라는 최소 관례를 따르는 Master Spec 본문에서
-// REQ-*/AC-*/FC-*/DEF-*/OOS-* 안정 id를 자동 채번한다(WHAT 추출은 항상 재현 가능해야
-// 하므로 LLM에 맡기지 않는다). "HOW"(architecture/phase/task/execution policy)만 LLM(또는
-// 테스트의 deterministic fixture)이 만든 rawOutputSource로 생성하고, 그 결과는 반드시
-// validatePlannerRawOutput()(순수 함수, 첫 실패에서 멈추지 않고 위반 사항을 전부 모음)을
-// 통과해야 한다 — LLM의 추측을 자동 승인하지 않는다(§ 요구사항 16). LLM 호출 자체는 새
-// provider system을 만들지 않고 claude-runner.ts의 runClaudeTask를 그대로 감싼다
-// (createClaudeCliRawOutputSource) — agent-orchestrator.ts의 realReadOnlyAgentRunner와
-// 동일한 재사용 원칙.
-//
-// Phase/Task id는 이미 이 저장소가 쓰는 관례("{phase}.{taskNumber}", task-registry.ts 상단
-// 주석)를 그대로 따른다 — phaseId는 "1","2",... 형태의 양의 정수 문자열, taskId는
-// "{phaseId}.{taskNumber}" 형태다. 새 id 스킴을 만들지 않는다.
-//
-// 이 모듈은 project-manifest.ts/task-registry.ts/project-policy.ts의 타입과 검증 함수를
-// 그대로 재사용한다 — 병렬 Manifest/Registry 시스템을 만들지 않는다. 생성된 실행 데이터는
-// projectRoot/.autodev/ 아래(project-manifest.json/task-registry.json/execution-policy.json/
-// planner-state.json)에 저장된다 — AutoDev Core 저장소(automation/)에는 어떤 파일도 만들지
-// 않는다.
+// SI-1(spec-intake.ts)/SI-2(project-bootstrap.ts)와의 관계, 신뢰 경계(§
+// evaluateTrustedPlannerInput), Master Spec 정규화(normalizeMasterSpec, 순수/LLM 없음),
+// projectRoot 외부 주입 원칙은 SI-3와 동일하다 — 이 주석은 SI-3.3에서 바뀐 부분(단일 호출
+// → incremental pipeline)에 집중한다. 이 모듈은 여전히 project-manifest.ts/task-registry.ts/
+// project-policy.ts의 타입/검증 함수를 그대로 재사용한다(병렬 시스템 없음) — 특히 STAGE
+// 5(Final Assembly)는 검증된 단계별 산출물(Architecture/Phase Plan/Phase별 Task Plan)을
+// synthesizeLegacyRawOutput()으로 SI-3가 이미 쓰던 PlannerRawOutput 모양으로 순수
+// deterministic 조립한 뒤, SI-3의 buildGeneratedExecutionData/assembleProjectManifest를
+// 그대로 재사용한다 — LLM이 최종 실행 데이터를 다시 통째로 생성하지 않는다.
 
 // ---------------------------------------------------------------------------
-// Master Spec 정규화 — 순수 deterministic 파서(LLM 없음).
+// Master Spec 정규화 — 순수 deterministic 파서(LLM 없음). SI-3과 동일, 변경 없음.
 // ---------------------------------------------------------------------------
 
 export type RequirementCategory =
@@ -107,12 +107,8 @@ export interface NormalizedMasterSpec {
   deferredItems: DeferredItemEntry[];
   outOfScope: OutOfScopeItemEntry[];
   unresolvedItems: string[];
-  /** GPT Independent Reviewer 지적(SI-3 REVISE 1회차, HIGH) — "## <Section Name>" 관례를
-   *  따르지 않는(또는 오타가 있는) 헤더 아래의 내용은 이전에는 조용히 버려졌다 — Fixed
-   *  Decisions/Must-have Requirements가 실수로 다른 이름의 헤더 아래 적혔다면 WHAT 자체가
-   *  Planner 모르게 누락될 수 있었다. 알려진 18개 섹션 이름과 일치하지 않는 "## ..." 헤더가
-   *  하나라도 있으면 여기 기록되고, runPlanner()가 이를 즉시 BLOCK한다(침묵하는 손실 대신
-   *  fail closed) — 정상 Master Spec은 이 배열이 항상 비어있어야 한다. */
+  /** 알려진 섹션 이름과 일치하지 않는 "## ..." 헤더 시도가 있으면 여기 기록되고,
+   *  runPlanner()가 이를 즉시 BLOCK한다(침묵하는 손실 대신 fail closed). */
   unrecognizedHeaders: string[];
 }
 
@@ -133,9 +129,6 @@ interface SectionSpec {
   mustHave?: boolean;
 }
 
-// Master Spec 본문의 "## <Section Name>" 관례 — 이 표만이 인식되는 section이다(알려지지
-// 않은 헤더의 본문은 조용히 무시된다, 요구사항을 몰래 지어내지 않기 위해 무엇이든 "그 외"로
-// 뭉뚱그려 REQ로 만들지 않는다).
 const SECTION_SPECS: Record<string, SectionSpec> = {
   "Project Goal": { kind: "goal" },
   "Product Scope": { kind: "scope" },
@@ -157,36 +150,9 @@ const SECTION_SPECS: Record<string, SectionSpec> = {
   "Out-of-scope": { kind: "outofscope" },
 };
 
-// GPT Independent Reviewer 지적(SI-3 REVISE 2~3회차, HIGH) — "^##\s+"만 헤더로 인식하면
-// "### Fixed Decisions"/"# Fixed Decisions"처럼 hash 개수나 공백이 살짝 다른 오타는 헤더로
-// 아예 인식되지 않아, current가 바뀌지 않은 채 그 아래 "- ..." 항목들이 직전(엉뚱한) 섹션의
-// 항목으로 잘못 흡수될 수 있었다(silent-drop보다 더 나쁜 silent-misattribution — fail-closed가
-// 아니었다). 1~6개의 '#'로 시작하는 모든 줄을 "헤더를 시도한 줄"로 넓게 인식하고, 정확히
-// "## <알려진 섹션 이름>" 형태가 아니면 unrecognizedHeaders에 기록함과 동시에 current를
-// 즉시 null로 되돌린다 — 이후 내용이 엉뚱한 이전 섹션에 계속 쌓이는 것을 막는다(그 다음 줄부터
-// 다음 진짜 헤더가 나올 때까지는 완전히 버려질 뿐 다른 섹션으로 흡수되지 않는다).
-//
-// 3회차 지적 — 이 정규식이 줄의 맨 앞(`^`)에서만 '#'를 찾으므로 "   ### Fixed Decisions"처럼
-// 앞에 공백이 있는(Markdown 표준상 유효한 최대 3칸 들여쓰기 헤더 포함) 헤더 시도는 여전히
-// 놓쳤다 — current가 이전 섹션에 머문 채 같은 misattribution이 재현될 수 있었다. 정규식
-// 자체를 복잡하게 만드는 대신, 호출부에서 매 줄을 먼저 trimStart()한 뒤 이 정규식을 적용한다
-// (Markdown의 "0~3칸까지만 허용"보다 더 엄격하게 "앞에 공백이 몇 칸이든" 모두 정규화한다 —
-// 관대한 예외를 만들지 않는다). 이 저장소는 이 Master Spec 관례를 스스로 정의하므로("## "
-// 헤더가 항상 줄의 실제 시작이어야 한다), 자유 형식 문서 제목(예: 첫 줄의 "# JARVIS")도
-// 예외 없이 동일하게 미인식 헤더로 취급해 BLOCK한다 — 모든 내용은 정의된 "## <Section>"
-// 안에 있어야 한다는 요구사항을 예외 없이 강제한다(정당한 회귀가 아니라 의도된 제약이며,
-// 테스트로 명시적으로 고정한다).
 const HEADER_LOOKALIKE_RE = /^(#{1,6})[ \t]*(.*?)\s*$/;
 const LIST_ITEM_RE = /^-\s+(.+)$/;
 
-/**
- * "## <Section Name>" + "- <내용>" 관례를 따르는 Master Spec 본문을 파싱해 안정적인
- * REQ-, AC-, FC-, DEF-, OOS- id를 자동 채번한다. 순수 함수 — 파일시스템/네트워크/LLM을
- * 전혀 쓰지 않으며 동일 입력에는 항상 동일 결과를 반환한다. 이 관례를 벗어난 헤더 시도(§
- * HEADER_LOOKALIKE_RE 주석)는 unrecognizedHeaders에 기록되고 그 아래 내용은 어떤 섹션에도
- * 흡수되지 않는다(runPlanner()가 이를 즉시 BLOCK한다) — Unresolved Items만 자유 텍스트
- * 목록으로 정보성으로 보존된다(§ 요구사항 2: Unresolved Items).
- */
 export function normalizeMasterSpec(content: string): NormalizedMasterSpec {
   const result: NormalizedMasterSpec = {
     projectGoal: "",
@@ -218,7 +184,7 @@ export function normalizeMasterSpec(content: string): NormalizedMasterSpec {
       const name = headerMatch[2];
       const spec = hashes === "##" ? SECTION_SPECS[name] : undefined;
       if (!spec) result.unrecognizedHeaders.push(rawLine.trim().slice(0, 200));
-      current = spec ?? null; // 인식 실패 시 이전 섹션으로 오귀속되지 않도록 즉시 초기화됨
+      current = spec ?? null;
       continue;
     }
     if (!current) continue;
@@ -286,8 +252,7 @@ export function normalizeMasterSpec(content: string): NormalizedMasterSpec {
 }
 
 // ---------------------------------------------------------------------------
-// Planner Raw Output — LLM(또는 fixture)이 만드는 HOW. 반드시 validatePlannerRawOutput()을
-// 통과해야만 신뢰된다.
+// 공유 raw-output 조각 타입 — 여러 stage/최종 조립에서 재사용된다.
 // ---------------------------------------------------------------------------
 
 export interface PlannerRawTechnologyChoice {
@@ -334,6 +299,8 @@ export interface PlannerRawExecutionPolicy {
   allowedCommands: AllowedCommandSpec[];
 }
 
+/** STAGE 5(Final Assembly)가 조립하는 legacy 모양 — LLM이 직접 만들지 않는다(§ 파일 상단
+ *  주석). synthesizeLegacyRawOutput()만 이 타입의 값을 만든다. */
 export interface PlannerRawOutput {
   projectId: string;
   specVersion: string;
@@ -351,7 +318,7 @@ export interface PlannerRawOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic Planner Output Validator — LLM 출력을 절대 그대로 신뢰하지 않는다.
+// 검증 공용 유틸 — 여러 stage validator가 공유한다.
 // ---------------------------------------------------------------------------
 
 export type PlannerValidationIssueCode =
@@ -359,9 +326,9 @@ export type PlannerValidationIssueCode =
   | "INVALID_STRUCTURE"
   | "PROJECT_ID_MISMATCH"
   | "SPEC_VERSION_MISMATCH"
+  | "TASK_STAGE_PHASE_MISMATCH"
   | "DUPLICATE_PHASE_ID"
   | "DUPLICATE_TASK_ID"
-  | "UNKNOWN_PHASE_REFERENCE"
   | "MISSING_DEPENDENCY"
   | "DEPENDENCY_CYCLE"
   | "MISSING_MUST_HAVE_COVERAGE"
@@ -373,7 +340,14 @@ export type PlannerValidationIssueCode =
   | "UNSAFE_EXECUTION_POLICY"
   | "DESTRUCTIVE_COMMAND_REQUESTED"
   | "PRODUCTION_DEPLOY_REQUESTED"
-  | "SECRET_SHAPED_OUTPUT";
+  | "SECRET_SHAPED_OUTPUT"
+  | "NO_RUNNABLE_TASK_FOUND"
+  | "PHASE_DEPENDENCY_ORDER_VIOLATION"
+  | "TASK_DEPENDENCY_PHASE_ORDER_VIOLATION"
+  | "REQUIREMENT_OUTSIDE_PHASE_SCOPE"
+  | "ACCEPTANCE_CRITERIA_OUTSIDE_PHASE_SCOPE"
+  | "TOO_MANY_PHASES"
+  | "TOO_MANY_TASKS_IN_PHASE";
 
 export interface PlannerValidationIssue {
   code: PlannerValidationIssueCode;
@@ -382,32 +356,102 @@ export interface PlannerValidationIssue {
 
 const PHASE_ID_RE = /^[1-9]\d*$/;
 const TASK_ID_RE = /^([1-9]\d*)\.([1-9]\d*)$/;
-// normalizeMasterSpec()이 채번하는 REQ-/AC-/FC-/DEF-/OOS- id 계열 전체를 넓게 포괄하는 형태
-// — safeEchoValue()가 "이 필드는 이런 id 계열이어야 한다"는 것만 알고 있을 때 쓴다. GPT
-// Independent Reviewer 지적(SI-3 REVISE 2회차, HIGH) — 구조 검증에 실제로 쓰이는
-// PHASE_ID_RE/TASK_ID_RE는 자릿수 상한이 없어(예: 32자리 숫자) echo 허용 판단에 그대로
-// 쓰면 긴 숫자 토큰까지 "id처럼 보인다"는 이유로 원문 그대로 노출될 수 있었다. echo 판단
-// 전용으로 자릿수 상한을 더한 별도 shape를 둔다(실제 phase/task id 구조 검증 로직
-// PHASE_ID_RE/TASK_ID_RE 자체는 바꾸지 않는다 — echo 여부 판단과 구조 검증은 다른 문제다).
 const ID_FAMILY_SHAPE = /^[A-Z]{2,4}-\d{1,6}$/;
 const PHASE_ID_ECHO_SHAPE = /^[1-9]\d{0,5}$/;
 const TASK_ID_ECHO_SHAPE = /^[1-9]\d{0,5}\.[1-9]\d{0,5}$/;
 const COMMAND_NAME_SHAPE = /^[a-z][a-z0-9_-]{0,14}$/;
-// "./"(프로젝트 전체)도 형식상으로는 안전한 상대경로이므로 여기서는 통과시킨다 — 최소 권한
-// 위반(전체 접근) 판정은 이 뒤에서 allPrefixes.includes("./")로 별도로 명시적 검사한다.
-const RELATIVE_DIR_PREFIX_RE = /^[^/][^:]*\/$/;
 
-function isSafeScopePrefix(value: unknown): value is string {
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — Phase Plan의 phase 개수와
+// Phase별 task 개수에 상한이 없었다 — phase 하나마다 STAGE 3 LLM 호출이 하나씩 발생하므로
+// (§ validatePhasePlanRawOutput/validatePhaseTaskRawOutput 사용 지점 주석), 신뢰할 수 없는
+// LLM 응답이 과도한 개수를 반환하면 호출 횟수/비용/실행 시간이 무제한 증폭될 수 있다. 이
+// 값은 Core가 소유하며 project policy로 확대할 수 없다(검증 함수가 policy를 인자로 받지
+// 않음). 실제 프로젝트 규모를 고려해 넉넉하되 무제한은 아닌 값을 고른다.
+export const PLANNER_MAX_PHASES = 50;
+export const PLANNER_MAX_TASKS_PER_PHASE = 50;
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전 isSafeScopePrefix()는
+// "/"만 구분자로 취급했다(split("/").includes(".."), 정규식도 "/" 기준). Windows에서는
+// "\"도 유효한 경로 구분자라 "a\\..\\b/" 같은 값이 "/" 기준 분해로는 ".." 세그먼트가 전혀
+// 보이지 않아 그대로 통과했고, "\\\\server\\share/"(UNC)도 "/"로 시작하지 않고 드라이브
+// 문자도 없어 통과했다("//server/share/"류 POSIX-style UNC는 이미 startsWith("/")로
+// 막혀 있었다 — 비대칭 방어였다). 문자열 치환/정규식 조합으로 매 우회 사례를 개별
+// 패치하는 대신, 이 프로젝트의 scope prefix 표기 관례(항상 "/" 구분자, 항상 project-relative)
+// 자체를 강제하는 단일 canonical validator로 교체한다 — "\"가 하나라도 있으면 그 자체로
+// 거부(Windows 구분자/UNC(\\server\share)/mixed-separator 우회를 파생 규칙 없이 한 번에
+// 차단), 그 다음 "/"만 구분자로 신뢰하고 세그먼트 단위로 "."/".."을 판정한다("." 세그먼트도
+// 거부해 "./"·"./sub/" 같은 현재-디렉터리 기반 broad prefix까지 막는다). allowedReadPrefixes/
+// allowedWritePrefixes(trailing "/" 필수)와 commandCwdAliases 값(trailing "/" 불필요, cwd
+// alias는 디렉터리 자체를 가리키므로 trailing slash 관례가 다르다)이 이 함수 하나를
+// requireTrailingSlash 옵션만 다르게 재사용한다 — 로직 복제 없음.
+//
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 위 1차 수정도 세그먼트를
+// 원문 그대로 "."/".."와 비교할 뿐이었다. Windows는 파일/디렉터리 이름 끝의 "."와 " "을
+// 조용히 제거한다("foo. "와 "foo. ."는 실제로 "foo"를 가리킨다) — 그래서 "..  "(마침표+공백)
+// 처럼 원문은 ".."와 다르지만 Windows API가 실제로는 ".."로 취급하는 값이 그대로 통과할 수
+// 있었다. 각 세그먼트에서 후행 "."/" "을 제거한 뒤에도 다시 "."/".."/빈 문자열이 되면
+// 거부한다. 같은 이유로 "foo//bar"(중간 빈 세그먼트)와 CON/NUL/COM1/LPT1류 Windows 예약
+// 장치 이름(확장자가 붙어도 장치 자체를 가리킴)도 이 시점에 함께 차단한다 — 파생 규칙을
+// 여러 곳에 늘리지 않고 이 하나의 canonical validator에 전부 모은다.
+//
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 2차 재검증, HIGH) — 콜론을 "드라이브
+// 문자 뒤"(문자열 시작 위치)에서만 거부해 "NUL:stream/"·"foo/bar:stream/"·"C:relative"
+// (경로 중간)류 Windows NTFS Alternate Data Stream/device 참조가 통과했다(예전
+// RELATIVE_DIR_PREFIX_RE([^:]*)는 위치와 무관하게 콜론 자체를 거부했었다 — 이 부분에서는
+// 보안 회귀였다). project-relative 경로 표기에 콜론이 필요한 정상 사례가 없으므로 위치와
+// 무관하게 값 전체에서 콜론을 금지한다(드라이브 문자 검사를 대체 — 중복 규칙 없음).
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 3차 재검증, HIGH) — ASCII COM1-9/LPT1-9
+// 외에 Win32가 동일하게 예약 장치로 인식하는 위첨자 숫자 변형(COM¹/COM²/COM³/LPT¹/LPT²/LPT³,
+// U+00B9/U+00B2/U+00B3)과 콘솔 별칭 CONIN$/CONOUT$도 함께 차단한다.
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 5차 재검증, MEDIUM) — 역사적으로 예약된
+// 시스템 시계 장치 이름 CLOCK$도 함께 차단한다.
+const WINDOWS_RESERVED_DEVICE_NAME_RE = /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|COM[1-9¹²³]|LPT[1-9¹²³])(\.[^/]*)?$/i;
+const CONTROL_CHAR_RE = /[\x00-\x1f]/;
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 4차 재검증, MEDIUM) — traversal 우회는
+// 아니지만 "<>\"|?*"는 Win32에서 파일/디렉터리 이름에 아예 쓸 수 없는 문자다(CreateFile 계열이
+// 즉시 실패한다) — 검증은 통과했지만 실제로는 Windows에서 절대 만들 수 없는 cwd/prefix가
+// 되어 이후 실행 시점에 예측 못한 실패를 유발할 수 있다. project-relative 표기에 이런 문자가
+// 필요한 정상 사례가 없으므로 함께 거부한다.
+const WINDOWS_FORBIDDEN_CHAR_RE = /[<>"|?*]/;
+
+function isSafeProjectRelativePath(value: unknown, opts: { requireTrailingSlash: boolean }): value is string {
   if (typeof value !== "string" || value.length === 0) return false;
-  if (!value.endsWith("/")) return false;
-  if (value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value)) return false;
-  if (value.split("/").includes("..")) return false;
-  return RELATIVE_DIR_PREFIX_RE.test(value);
+  if (value.includes("\\")) return false;
+  if (value.startsWith("/")) return false; // 절대경로 + POSIX-style UNC("//server/share")
+  if (value.includes(":")) return false; // 드라이브 문자 경로 + Windows ADS/device 참조("NUL:stream" 등), 위치 무관 전부 차단
+  if (WINDOWS_FORBIDDEN_CHAR_RE.test(value)) return false;
+  if (opts.requireTrailingSlash && !value.endsWith("/")) return false;
+  if (CONTROL_CHAR_RE.test(value)) return false;
+
+  const rawSegments = value.split("/");
+  const hasTrailingSlash = value.endsWith("/");
+  const contentSegments = hasTrailingSlash ? rawSegments.slice(0, -1) : rawSegments;
+  if (contentSegments.length === 0) return false; // 빈 값/"/"류 root-like 값
+  for (const seg of contentSegments) {
+    if (seg.length === 0) return false; // 내부 빈 세그먼트("foo//bar") — 연속 "/" 거부
+    if (seg === "." || seg === "..") return false;
+    const trimmedTrailingDotsSpaces = seg.replace(/[ .]+$/, "");
+    if (
+      trimmedTrailingDotsSpaces !== seg ||
+      trimmedTrailingDotsSpaces.length === 0 ||
+      trimmedTrailingDotsSpaces === "." ||
+      trimmedTrailingDotsSpaces === ".."
+    ) {
+      return false;
+    }
+    if (WINDOWS_RESERVED_DEVICE_NAME_RE.test(seg)) return false;
+  }
+  return true;
 }
 
-// Core는 git commit/checkpoint를 전담한다(checkpoint.ts) — task 레벨 allowedCommands에
-// git이 들어오면 그 자체로 위험 신호이므로(예: git reset/push --force/rebase 등 어떤
-// 서브커맨드든), 서브커맨드를 파싱하지 않고 command==="git" 자체를 항상 거부한다.
+function isSafeScopePrefix(value: unknown): value is string {
+  return isSafeProjectRelativePath(value, { requireTrailingSlash: true });
+}
+
+function isSafeCommandCwdAliasValue(value: unknown): value is string {
+  return isSafeProjectRelativePath(value, { requireTrailingSlash: false });
+}
+
 const DANGEROUS_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "git",
   "rm",
@@ -443,17 +487,18 @@ function isNonEmptyString(v: unknown): v is string {
 function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((x) => typeof x === "string");
 }
+// SI-3.3~3.5 4-chunk 최종 리뷰 지적(MEDIUM) — Number.isInteger()는 JSON의 unsafe integer
+// (2^53-1을 넘는 값)도 통과시킨다 — 그런 값은 JSON.parse 시점에 이미 정밀도가 손실되어
+// 있을 수 있어(JS Number가 배정밀도 부동소수점이라 안전하게 표현 가능한 정수 범위 밖),
+// 이후 정렬/중복 판정이 오판될 수 있다. sequence 번호가 그 정도로 클 정당한 이유가 없으므로
+// Number.isSafeInteger()로 교체한다 — 기존의 모든 정상 사용(1..수십 단위)에는 영향이 없다.
+function isPositiveInteger(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 1;
+}
+function isPositiveIntegerArray(v: unknown): v is number[] {
+  return Array.isArray(v) && v.every(isPositiveInteger);
+}
 
-// GPT Independent Reviewer 지적(SI-3 REVISE 1~2회차, HIGH) — LLM이 제공한 값(reqId/acId/
-// dependsOn 항목/명령 인자 등)이 알려진 id 형식과 일치하지 않을 때 REJECTED issue의 detail에
-// 그대로 echo됐다. 1회차 수정(길이 제한 + 허용 문자만 남김)은 짧고(≤60자) 허용 문자로만
-// 구성된 secret-shaped 값(예: 32자 hex API key)을 여전히 그대로 통과시켰다 — "잘라내고
-// 문자를 치환"하는 것은 원문 노출을 줄일 뿐 막지는 못한다. 이제는 원문을 절대 echo하지
-// 않는다 — 그 필드에서 기대되는 정확한 형식(REQ-001/1.1/1 등, expectedShape)과 정확히
-// 일치할 때만 원문을 그대로 보여주고(디버깅 편의), 그렇지 않으면(형식 미지정 포함) 원문
-// 대신 비가역 SHA-256 digest 앞 12자만 남긴다 — 같은 잘못된 값이 반복되는지 구분할 수는
-// 있지만 원문을 복원할 수는 없다(scanContentForSecrets가 이미 알려진 패턴을 잡는 것과
-// 별개로, 이 함수는 "알려지지 않은 형태의 짧은 secret"까지 구조적으로 차단한다).
 function safeEchoValue(value: unknown, expectedShape?: RegExp): string {
   const raw = typeof value === "string" ? value : JSON.stringify(value ?? null);
   if (expectedShape && raw.length <= 64 && expectedShape.test(raw)) {
@@ -468,11 +513,11 @@ function hasCycle(nodeIds: string[], edges: Map<string, string[]>): boolean {
   const state = new Map<string, 0 | 1 | 2>();
   const visit = (id: string): boolean => {
     const s = state.get(id) ?? 0;
-    if (s === 1) return true; // 방문중인 노드를 다시 만남 — 사이클
+    if (s === 1) return true;
     if (s === 2) return false;
     state.set(id, 1);
     for (const next of edges.get(id) ?? []) {
-      if (!edges.has(next)) continue; // 존재하지 않는 참조는 별도 검사(MISSING_DEPENDENCY)가 담당
+      if (!edges.has(next)) continue;
       if (visit(next)) return true;
     }
     state.set(id, 2);
@@ -489,14 +534,7 @@ function structuralGuard(v: unknown): v is Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
-// A. Transport Normalization — LLM이 "JSON만 출력하라"는 지시를 어기고 설명문을 앞뒤에
-// 붙이거나 markdown ```json fence로 감싸는 경우를 다룬다. 원본 raw JSON은 항상 그대로
-// 허용하고, 정확히 하나의 markdown 코드 펜스만 존재하며 그 언어 태그가 비어있거나 "json"일
-// 때만 그 안의 내용을 후보로 추출한다 — 코드 펜스가 0개/2개 이상이거나(여러 JSON 후보/
-// 애매함) 언어 태그가 다른 경우(예: ```yaml)는 추출을 포기하고 원문 그대로 strict
-// JSON.parse에 맡겨 실패시킨다(느슨하게 만들지 않는다 — 애매하면 거부). 이 함수는 key/값을
-// 전혀 들여다보지 않는다(schema validation과 완전히 분리) — 순수하게 "어디까지가 JSON
-// 텍스트인가"만 판정하는 순수 함수다.
+// A. Transport Normalization — SI-3.1과 동일, 변경 없음. 모든 stage validator가 공유한다.
 // ---------------------------------------------------------------------------
 const MARKDOWN_FENCE_RE = /```([A-Za-z0-9_-]*)[ \t]*\r?\n([\s\S]*?)```/g;
 
@@ -527,25 +565,25 @@ function extractJsonPayload(rawText: string): { ok: true; jsonText: string } | {
   return { ok: true, jsonText: body.trim() };
 }
 
+/** secret 패턴은 구조 파싱보다 먼저 원문 그대로 검사한다 — JSON 파싱 실패로 조기 반환해도
+ *  secret-shaped 텍스트가 rawText 안에 있었다는 사실 자체는 놓치지 않는다. 세 stage
+ *  validator가 모두 동일한 순서로 이 검사를 먼저 실행한다(로직 복제 없음). */
+function scanRawTextForSecrets(rawText: string, label: string): PlannerValidationIssue[] {
+  const findings = scanContentForSecrets(rawText, label);
+  if (findings.length === 0) return [];
+  return [
+    {
+      code: "SECRET_SHAPED_OUTPUT",
+      detail: `Planner 출력에서 secret으로 의심되는 패턴이 발견됐습니다(${findings.length}건). 원문은 기록하지 않습니다.`,
+    },
+  ];
+}
+
 // ---------------------------------------------------------------------------
-// B. 엄격한 key/type 스키마 — 허용된 key만 통과시킨다. 추가/오타/깨진(garbled) key나 누락된
-// 필수 key, 잘못된 타입을 자동으로 보정하지 않고 그대로 거부한다(§ issues.push만 하고 계속
-// 진행 — validatePlannerRawOutput() 전체 원칙과 동일하게 첫 위반에서 멈추지 않는다).
+// B. 엄격한 key/type 스키마 헬퍼 — 모든 stage validator가 공유한다.
 // ---------------------------------------------------------------------------
-const TOP_LEVEL_KEYS = [
-  "projectId", "specVersion", "architectureSummary", "technologyChoices",
-  "fixedConstraintAcknowledgement", "modulesOrComponents", "integrations",
-  "securityRequirementsSummary", "testingRequirementsSummary", "deliveryConstraintsSummary",
-  "phases", "tasks", "executionPolicy",
-] as const;
 const TECH_CHOICE_KEYS = ["area", "decision", "reason", "source", "status"] as const;
 const ACK_KEYS = ["id", "value"] as const;
-const PHASE_KEYS = ["phaseId", "name", "objective", "dependsOn", "completionCriteria"] as const;
-const TASK_KEYS = [
-  "taskId", "phaseId", "title", "objective", "scope", "constraints", "dependsOn",
-  "expectedModules", "requiredTests", "acceptanceCriteria", "reqIds",
-  "securityConsiderations", "completionGate",
-] as const;
 const REQUIRED_TEST_KEYS = ["name", "command", "args", "cwd"] as const;
 const EXECUTION_POLICY_KEYS = ["allowedReadPrefixes", "allowedWritePrefixes", "commandCwdAliases", "allowedCommands"] as const;
 const ALLOWED_COMMAND_KEYS = ["cwd", "command", "args"] as const;
@@ -570,250 +608,142 @@ function checkRequiredStringArray(container: string, obj: Record<string, unknown
   }
 }
 
-/**
- * rawText(LLM/fixture가 반환한 JSON 문자열)를 normalized(WHAT)와 trusted identity 기준으로
- * 검증한다 — 첫 실패에서 멈추지 않고 발견한 위반을 전부 모아 반환한다(spec-intake.ts와 동일
- * 원칙). 통과해야만 { ok: true, value, normalizedJsonText }를 반환한다. 이 함수는
- * 파일시스템/네트워크에 전혀 접근하지 않는 순수 함수다.
- *
- * normalizedJsonText는 extractJsonPayload()가 rawText(설명문/markdown fence가 섞여 있을 수
- * 있는 원문)에서 뽑아낸 "순수 JSON 텍스트"다 — 호출부(runPlanner)는 원본 rawText가 아니라
- * 반드시 이 값을 다음 단계(rawPlannerOutput 저장/JSON.parse)에 써야 한다. 원본 rawText를
- * 그대로 저장하면, transport normalization이 이 함수 안에서만 일어나고 저장은 fence가 섞인
- * 원문으로 되어 나중에(EXECUTION_DATA_GENERATED 생성 시점) 다시 strict JSON.parse가 실패하는
- * 모순이 생긴다.
- */
-export function validatePlannerRawOutput(
-  rawText: string,
-  normalized: NormalizedMasterSpec,
-  trusted: { projectId: string; specVersion: string }
-): { ok: true; value: PlannerRawOutput; normalizedJsonText: string } | { ok: false; issues: PlannerValidationIssue[] } {
-  const issues: PlannerValidationIssue[] = [];
+function validateRequiredTestsArray(container: string, value: unknown, issues: PlannerValidationIssue[]): void {
+  if (!Array.isArray(value)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: `${container}가 배열이 아닙니다.` });
+    return;
+  }
+  value.forEach((rt, idx) => {
+    if (!structuralGuard(rt)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `${container}[${idx}]가 객체가 아닙니다.` });
+      return;
+    }
+    checkExactKeys(`${container}[${idx}]`, rt, REQUIRED_TEST_KEYS, issues);
+    checkRequiredString(`${container}[${idx}]`, rt, "name", issues);
+    checkRequiredString(`${container}[${idx}]`, rt, "command", issues);
+    checkRequiredString(`${container}[${idx}]`, rt, "cwd", issues);
+    checkRequiredStringArray(`${container}[${idx}]`, rt, "args", issues);
+  });
+}
 
-  // secret 패턴은 구조 파싱보다 먼저 원문 그대로 검사한다 — JSON 파싱 실패로 조기 반환해도
-  // secret-shaped 텍스트가 rawText 안에 있었다는 사실 자체는 놓치지 않는다.
-  const secretFindings = scanContentForSecrets(rawText, "<planner-raw-output>");
-  if (secretFindings.length > 0) {
-    issues.push({
-      code: "SECRET_SHAPED_OUTPUT",
-      detail: `Planner 출력에서 secret으로 의심되는 패턴이 발견됐습니다(${secretFindings.length}건). 원문은 기록하지 않습니다.`,
-    });
-  }
-
-  const extraction = extractJsonPayload(rawText);
-  if (!extraction.ok) {
-    issues.push({
-      code: "MALFORMED_JSON",
-      detail: `Planner 출력에서 신뢰할 수 있는 단일 JSON을 찾지 못했습니다: ${extraction.reason}`,
-    });
-    return { ok: false, issues };
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(extraction.jsonText);
-  } catch {
-    issues.push({ code: "MALFORMED_JSON", detail: "추출된 JSON 후보가 올바른 JSON이 아닙니다." });
-    return { ok: false, issues };
-  }
-  if (!structuralGuard(parsed)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "Planner 출력이 객체가 아닙니다." });
-    return { ok: false, issues };
-  }
-  const raw = parsed as Record<string, unknown>;
-
-  checkExactKeys("Planner 출력", raw, TOP_LEVEL_KEYS, issues);
-  checkRequiredStringArray("Planner 출력", raw, "modulesOrComponents", issues);
-  checkRequiredStringArray("Planner 출력", raw, "integrations", issues);
-  checkRequiredStringArray("Planner 출력", raw, "securityRequirementsSummary", issues);
-  checkRequiredStringArray("Planner 출력", raw, "testingRequirementsSummary", issues);
-  checkRequiredStringArray("Planner 출력", raw, "deliveryConstraintsSummary", issues);
-
-  if (!Array.isArray(raw.technologyChoices)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "technologyChoices가 배열이 아닙니다." });
-  } else {
-    raw.technologyChoices.forEach((tc, idx) => {
-      if (!structuralGuard(tc)) {
-        issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}]가 객체가 아닙니다.` });
-        return;
-      }
-      checkExactKeys(`technologyChoices[${idx}]`, tc, TECH_CHOICE_KEYS, issues);
-      checkRequiredString(`technologyChoices[${idx}]`, tc, "area", issues);
-      checkRequiredString(`technologyChoices[${idx}]`, tc, "decision", issues);
-      checkRequiredString(`technologyChoices[${idx}]`, tc, "reason", issues);
-      checkRequiredString(`technologyChoices[${idx}]`, tc, "source", issues);
-      if (tc.status !== "proposed" && tc.status !== "confirmed") {
-        issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}].status가 "proposed"/"confirmed"가 아닙니다.` });
-      }
-    });
-  }
-
-  if (raw.projectId !== trusted.projectId) {
-    issues.push({ code: "PROJECT_ID_MISMATCH", detail: "Planner 출력의 projectId가 신뢰된 identity와 일치하지 않습니다." });
-  }
-  if (raw.specVersion !== trusted.specVersion) {
-    issues.push({ code: "SPEC_VERSION_MISMATCH", detail: "Planner 출력의 specVersion이 신뢰된 identity와 일치하지 않습니다." });
-  }
-  if (!isNonEmptyString(raw.architectureSummary)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "architectureSummary가 비어있습니다." });
-  }
-  if (!Array.isArray(raw.phases)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "phases가 배열이 아닙니다." });
-  }
-  if (!Array.isArray(raw.tasks)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "tasks가 배열이 아닙니다." });
-  }
+function validateExecutionPolicyBlock(raw: Record<string, unknown>, issues: PlannerValidationIssue[]): void {
   if (!structuralGuard(raw.executionPolicy)) {
     issues.push({ code: "INVALID_STRUCTURE", detail: "executionPolicy가 객체가 아닙니다." });
+    return;
   }
-  if (!Array.isArray(raw.fixedConstraintAcknowledgement)) {
-    issues.push({ code: "INVALID_STRUCTURE", detail: "fixedConstraintAcknowledgement가 배열이 아닙니다." });
-  }
-
-  // 아래부터는 최소 구조가 확보된 필드만 더 깊이 검사한다(구조 자체가 깨졌으면 그 필드에
-  // 대한 세부 검사는 의미가 없으므로 건너뛴다 — 이미 위에서 INVALID_STRUCTURE를 기록했다).
-  const phases: PlannerRawPhase[] = Array.isArray(raw.phases) ? (raw.phases as PlannerRawPhase[]) : [];
-  const tasks: PlannerRawTask[] = Array.isArray(raw.tasks) ? (raw.tasks as PlannerRawTask[]) : [];
-
-  const phaseIds = new Set<string>();
-  const phaseEdges = new Map<string, string[]>();
-  for (const p of phases) {
-    if (!structuralGuard(p as unknown as Record<string, unknown>) || !PHASE_ID_RE.test(String(p.phaseId))) {
-      issues.push({ code: "INVALID_STRUCTURE", detail: `phase id 형식이 올바르지 않습니다: ${safeEchoValue(p?.phaseId)}` });
-      continue;
-    }
-    const pObj = p as unknown as Record<string, unknown>;
-    checkExactKeys(`phase "${p.phaseId}"`, pObj, PHASE_KEYS, issues);
-    checkRequiredString(`phase "${p.phaseId}"`, pObj, "name", issues);
-    checkRequiredString(`phase "${p.phaseId}"`, pObj, "objective", issues);
-    checkRequiredStringArray(`phase "${p.phaseId}"`, pObj, "dependsOn", issues);
-    checkRequiredStringArray(`phase "${p.phaseId}"`, pObj, "completionCriteria", issues);
-
-    if (phaseIds.has(p.phaseId)) {
-      issues.push({ code: "DUPLICATE_PHASE_ID", detail: `phaseId가 중복됩니다: ${p.phaseId}` });
-    }
-    phaseIds.add(p.phaseId);
-    phaseEdges.set(p.phaseId, isStringArray(p.dependsOn) ? p.dependsOn : []);
-  }
-  for (const p of phases) {
-    if (!phaseIds.has(p.phaseId)) continue;
-    for (const dep of isStringArray(p.dependsOn) ? p.dependsOn : []) {
-      if (!phaseIds.has(dep)) {
-        issues.push({ code: "MISSING_DEPENDENCY", detail: `phase "${p.phaseId}"가 존재하지 않는 phase에 의존합니다: ${safeEchoValue(dep, PHASE_ID_ECHO_SHAPE)}` });
-      }
-    }
-  }
-  if (hasCycle([...phaseIds], phaseEdges)) {
-    issues.push({ code: "DEPENDENCY_CYCLE", detail: "phase 의존성 그래프에 사이클이 있습니다." });
-  }
-
-  const taskIds = new Set<string>();
-  const taskEdges = new Map<string, string[]>();
-  const requirementIds = new Set(normalized.requirements.map((r) => r.id));
-  const acIds = new Set(normalized.acceptanceCriteria.map((a) => a.id));
-  const deferredIds = new Set(normalized.deferredItems.map((d) => d.id));
-  const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
-  const reqCoverage = new Set<string>();
-  const acCoverage = new Set<string>();
-
-  for (const t of tasks) {
-    if (!structuralGuard(t as unknown as Record<string, unknown>) || !TASK_ID_RE.test(String(t.taskId))) {
-      issues.push({ code: "INVALID_STRUCTURE", detail: `task id 형식이 올바르지 않습니다: ${safeEchoValue(t?.taskId)}` });
-      continue;
-    }
-    if (taskIds.has(t.taskId)) {
-      issues.push({ code: "DUPLICATE_TASK_ID", detail: `taskId가 중복됩니다: ${t.taskId}` });
-    }
-    taskIds.add(t.taskId);
-    taskEdges.set(t.taskId, isStringArray(t.dependsOn) ? t.dependsOn : []);
-
-    const phasePrefix = TASK_ID_RE.exec(t.taskId)?.[1];
-    if (t.phaseId !== phasePrefix || !phaseIds.has(String(t.phaseId))) {
-      issues.push({ code: "UNKNOWN_PHASE_REFERENCE", detail: `task "${t.taskId}"가 알 수 없는 phase를 참조합니다: ${safeEchoValue(t.phaseId, PHASE_ID_ECHO_SHAPE)}` });
-    }
-
-    const tObj = t as unknown as Record<string, unknown>;
-    checkExactKeys(`task "${t.taskId}"`, tObj, TASK_KEYS, issues);
-    checkRequiredString(`task "${t.taskId}"`, tObj, "title", issues);
-    checkRequiredString(`task "${t.taskId}"`, tObj, "objective", issues);
-    checkRequiredString(`task "${t.taskId}"`, tObj, "completionGate", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "scope", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "constraints", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "dependsOn", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "expectedModules", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "acceptanceCriteria", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "reqIds", issues);
-    checkRequiredStringArray(`task "${t.taskId}"`, tObj, "securityConsiderations", issues);
-    if (!Array.isArray(t.requiredTests)) {
-      issues.push({ code: "INVALID_STRUCTURE", detail: `task "${t.taskId}".requiredTests가 배열이 아닙니다.` });
+  const epObj = raw.executionPolicy as Record<string, unknown>;
+  checkExactKeys("executionPolicy", epObj, EXECUTION_POLICY_KEYS, issues);
+  if (epObj.commandCwdAliases !== undefined) {
+    const aliases = epObj.commandCwdAliases;
+    if (!structuralGuard(aliases) || Array.isArray(aliases)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: "executionPolicy.commandCwdAliases가 문자열 값을 가진 객체가 아닙니다." });
     } else {
-      t.requiredTests.forEach((rt, idx) => {
-        if (!structuralGuard(rt)) {
-          issues.push({ code: "INVALID_STRUCTURE", detail: `task "${t.taskId}".requiredTests[${idx}]가 객체가 아닙니다.` });
-          return;
+      // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 alias 값이
+      // "문자열이기만 하면" 통과했다(경로 안전성 검사 전무). isSafeCommandCwdAliasValue()로
+      // allowedReadPrefixes/allowedWritePrefixes와 동일한 canonical validator를 재사용해
+      // absolute/drive/UNC/traversal 값을 여기서도 거부한다.
+      for (const [alias, aliasValue] of Object.entries(aliases)) {
+        if (typeof aliasValue !== "string") {
+          issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.commandCwdAliases["${safeEchoValue(alias)}"]가 문자열이 아닙니다.` });
+        } else if (!isSafeCommandCwdAliasValue(aliasValue)) {
+          issues.push({
+            code: "UNSAFE_EXECUTION_POLICY",
+            detail: `executionPolicy.commandCwdAliases["${safeEchoValue(alias)}"]가 안전한 project-relative 상대경로 형식이 아닙니다: ${safeEchoValue(aliasValue)}`,
+          });
         }
-        checkExactKeys(`task "${t.taskId}".requiredTests[${idx}]`, rt, REQUIRED_TEST_KEYS, issues);
-        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "name", issues);
-        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "command", issues);
-        checkRequiredString(`task "${t.taskId}".requiredTests[${idx}]`, rt, "cwd", issues);
-        checkRequiredStringArray(`task "${t.taskId}".requiredTests[${idx}]`, rt, "args", issues);
+      }
+    }
+  }
+
+  const ep = raw.executionPolicy as unknown as PlannerRawExecutionPolicy;
+  const allPrefixes = [...(Array.isArray(ep.allowedReadPrefixes) ? ep.allowedReadPrefixes : []), ...(Array.isArray(ep.allowedWritePrefixes) ? ep.allowedWritePrefixes : [])];
+  if (!Array.isArray(ep.allowedReadPrefixes) || ep.allowedReadPrefixes.length === 0 || !ep.allowedReadPrefixes.every(isSafeScopePrefix)) {
+    issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedReadPrefixes가 비어있거나 안전한 상대경로 형식이 아닙니다." });
+  }
+  if (!Array.isArray(ep.allowedWritePrefixes) || ep.allowedWritePrefixes.length === 0 || !ep.allowedWritePrefixes.every(isSafeScopePrefix)) {
+    issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedWritePrefixes가 비어있거나 안전한 상대경로 형식이 아닙니다." });
+  }
+  if (allPrefixes.includes("./")) {
+    issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy가 프로젝트 전체(\"./\")에 대한 접근을 요청합니다 — 최소 권한 원칙 위반." });
+  }
+  if (!Array.isArray(ep.allowedCommands)) {
+    issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedCommands가 배열이 아닙니다." });
+    return;
+  }
+  ep.allowedCommands.forEach((c, idx) => {
+    if (!structuralGuard(c as unknown as Record<string, unknown>)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}]가 객체가 아닙니다.` });
+      return;
+    }
+    const cObj = c as unknown as Record<string, unknown>;
+    checkExactKeys(`executionPolicy.allowedCommands[${idx}]`, cObj, ALLOWED_COMMAND_KEYS, issues);
+    checkRequiredString(`executionPolicy.allowedCommands[${idx}]`, cObj, "cwd", issues);
+    checkRequiredStringArray(`executionPolicy.allowedCommands[${idx}]`, cObj, "args", issues);
+    if (typeof c.command !== "string" || c.command.length === 0) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}].command가 비어있거나 문자열이 아닙니다.` });
+      return;
+    }
+    // command가 경로 구분자/드라이브 문자를 포함하면(=bare 실행 파일명이 아니면) 최소 권한
+    // 위반으로 거부한다. 실제 실행 시점의 최종 강제는 safe-executor.ts의 Core Command
+    // Safety Gate(coreCommandSafetyGate)다 — 이 검사가 유일한 방어선은 아니다.
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 콜론(드라이브/ADS)과
+    // Windows 후행 점/공백 정규화 우회를 command에도 동일하게 적용한다("git.exe." 같은 이름은
+    // Win32에서 "git.exe"로 취급된다) — isSafeProjectRelativePath와 같은 원칙을 재사용한다.
+    if (/[\\/]/.test(c.command) || c.command.includes(":") || WINDOWS_FORBIDDEN_CHAR_RE.test(c.command)) {
+      issues.push({
+        code: "UNSAFE_EXECUTION_POLICY",
+        detail: `executionPolicy.allowedCommands의 command는 경로가 아닌 실행 파일 이름이어야 합니다: ${safeEchoValue(c.command)}`,
       });
+      return;
     }
+    const trimmedTrailingDotsSpaces = c.command.replace(/[ .]+$/, "");
+    if (trimmedTrailingDotsSpaces.length === 0 || trimmedTrailingDotsSpaces !== c.command) {
+      issues.push({
+        code: "UNSAFE_EXECUTION_POLICY",
+        detail: `executionPolicy.allowedCommands의 command에 Windows에서 조용히 제거되는 후행 점/공백이 있습니다: ${safeEchoValue(c.command)}`,
+      });
+      return;
+    }
+    const cmd = c.command.trim().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
+    if (DANGEROUS_COMMAND_NAMES.has(cmd)) {
+      issues.push({ code: "DESTRUCTIVE_COMMAND_REQUESTED", detail: `executionPolicy.allowedCommands가 위험하거나 Core 전담 명령을 요청합니다: ${safeEchoValue(cmd, COMMAND_NAME_SHAPE)}` });
+    }
+    const args = isStringArray(c.args) ? c.args.map((a) => a.toLowerCase()) : [];
+    if (DEPLOY_COMMAND_NAMES.has(cmd) || (cmd === "npm" && (args.includes("publish") || args.includes("deploy")))) {
+      issues.push({ code: "PRODUCTION_DEPLOY_REQUESTED", detail: `executionPolicy.allowedCommands가 배포 관련 명령을 요청합니다: ${safeEchoValue(cmd, COMMAND_NAME_SHAPE)} ${safeEchoValue(args.join(" "))}` });
+    }
+  });
+}
 
-    for (const reqId of isStringArray(t.reqIds) ? t.reqIds : []) {
-      if (deferredIds.has(reqId) || outOfScopeIds.has(reqId)) {
-        issues.push({
-          code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED",
-          detail: `task "${t.taskId}"가 deferred/out-of-scope 항목(${safeEchoValue(reqId, ID_FAMILY_SHAPE)})을 요구사항으로 참조합니다.`,
-        });
-      } else if (!requirementIds.has(reqId)) {
-        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task "${t.taskId}"가 존재하지 않는 requirement(${safeEchoValue(reqId, ID_FAMILY_SHAPE)})를 참조합니다.` });
-      } else {
-        reqCoverage.add(reqId);
-      }
-    }
-    for (const acId of isStringArray(t.acceptanceCriteria) ? t.acceptanceCriteria : []) {
-      if (deferredIds.has(acId) || outOfScopeIds.has(acId)) {
-        issues.push({
-          code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED",
-          detail: `task "${t.taskId}"가 deferred/out-of-scope 항목(${safeEchoValue(acId, ID_FAMILY_SHAPE)})을 Acceptance Criteria로 참조합니다.`,
-        });
-      } else if (!acIds.has(acId)) {
-        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task "${t.taskId}"가 존재하지 않는 Acceptance Criteria(${safeEchoValue(acId, ID_FAMILY_SHAPE)})를 참조합니다.` });
-      } else {
-        acCoverage.add(acId);
-      }
-    }
+function validateTechnologyChoicesArray(raw: Record<string, unknown>, issues: PlannerValidationIssue[]): void {
+  if (!Array.isArray(raw.technologyChoices)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "technologyChoices가 배열이 아닙니다." });
+    return;
   }
-  for (const t of tasks) {
-    if (!taskIds.has(t.taskId)) continue;
-    for (const dep of isStringArray(t.dependsOn) ? t.dependsOn : []) {
-      if (!taskIds.has(dep)) {
-        issues.push({ code: "MISSING_DEPENDENCY", detail: `task "${t.taskId}"가 존재하지 않는 task에 의존합니다: ${safeEchoValue(dep, TASK_ID_ECHO_SHAPE)}` });
-      }
+  raw.technologyChoices.forEach((tc, idx) => {
+    if (!structuralGuard(tc)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}]가 객체가 아닙니다.` });
+      return;
     }
-  }
-  if (hasCycle([...taskIds], taskEdges)) {
-    issues.push({ code: "DEPENDENCY_CYCLE", detail: "task 의존성 그래프에 사이클이 있습니다." });
-  }
+    checkExactKeys(`technologyChoices[${idx}]`, tc, TECH_CHOICE_KEYS, issues);
+    checkRequiredString(`technologyChoices[${idx}]`, tc, "area", issues);
+    checkRequiredString(`technologyChoices[${idx}]`, tc, "decision", issues);
+    checkRequiredString(`technologyChoices[${idx}]`, tc, "reason", issues);
+    checkRequiredString(`technologyChoices[${idx}]`, tc, "source", issues);
+    if (tc.status !== "proposed" && tc.status !== "confirmed") {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `technologyChoices[${idx}].status가 "proposed"/"confirmed"가 아닙니다.` });
+    }
+  });
+}
 
-  for (const req of normalized.requirements) {
-    if (req.mustHave && !reqCoverage.has(req.id)) {
-      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `Must-have requirement(${req.id})가 어떤 task에도 매핑되지 않았습니다.` });
-    }
-  }
-  for (const ac of normalized.acceptanceCriteria) {
-    if (!acCoverage.has(ac.id)) {
-      issues.push({ code: "MISSING_ACCEPTANCE_CRITERIA_COVERAGE", detail: `Acceptance Criteria(${ac.id})가 어떤 task에도 매핑되지 않았습니다.` });
-    }
-  }
-
-  // Fixed constraint — Planner(LLM)가 이해한 내용이 Master Spec의 실제 내용과 정확히
-  // 일치해야만 통과한다(§ 요구사항 3/17: AutoDev가 임의로 변경 금지). 최종 ProjectManifest의
-  // fixedConstraints는 이 ack가 아니라 항상 normalized.fixedConstraints(코드가 직접 채움)로
-  // 채워지므로, LLM이 실제로 manifest 내용을 바꿀 방법은 없다 — 이 검사는 LLM이 "다른 값으로
-  // 잘못 이해한 채" 그 위에 phase/task를 설계하지 않았는지 확인하는 안전장치다.
+function validateFixedConstraintAcknowledgement(
+  raw: Record<string, unknown>,
+  normalized: NormalizedMasterSpec,
+  issues: PlannerValidationIssue[]
+): void {
   const ackRaw = Array.isArray(raw.fixedConstraintAcknowledgement) ? (raw.fixedConstraintAcknowledgement as unknown[]) : [];
   const ackById = new Map<string, string>();
+  const knownFixedConstraintIds = new Set(normalized.fixedConstraints.map((fc) => fc.id));
   ackRaw.forEach((a, idx) => {
     if (!structuralGuard(a)) {
       issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement[${idx}]가 객체가 아닙니다.` });
@@ -822,6 +752,17 @@ export function validatePlannerRawOutput(
     checkExactKeys(`fixedConstraintAcknowledgement[${idx}]`, a, ACK_KEYS, issues);
     if (!isNonEmptyString(a.id) || typeof a.value !== "string") {
       issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement[${idx}]의 id/value 형식이 올바르지 않습니다.` });
+      return;
+    }
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 2회차, 부가) — 중복 id나 Master Spec에 없는
+    // id의 ack 항목을 조용히 허용/무시하지 않는다("strict, no silent coercion" 원칙을 이
+    // 배열에도 동일하게 적용).
+    if (ackById.has(a.id)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement에 id가 중복됩니다: ${safeEchoValue(a.id, ID_FAMILY_SHAPE)}` });
+      return;
+    }
+    if (!knownFixedConstraintIds.has(a.id)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `fixedConstraintAcknowledgement가 존재하지 않는 fixed constraint id를 참조합니다: ${safeEchoValue(a.id, ID_FAMILY_SHAPE)}` });
       return;
     }
     ackById.set(a.id, a.value);
@@ -833,212 +774,168 @@ export function validatePlannerRawOutput(
       issues.push({ code: "FIXED_CONSTRAINT_VIOLATION", detail: `Fixed constraint(${fc.id})의 내용을 Planner가 다르게 이해했습니다 — 원본과 일치해야 합니다.` });
     }
   }
+}
 
-  // 안전하지 않은 Execution Policy — 최소 권한 위반(전체 파일시스템 허용) + Core가 전담하는
-  // 명령(git)/파괴적 명령/배포 명령 요구를 거부한다.
-  if (structuralGuard(raw.executionPolicy)) {
-    const epObj = raw.executionPolicy as Record<string, unknown>;
-    checkExactKeys("executionPolicy", epObj, EXECUTION_POLICY_KEYS, issues);
-    if (epObj.commandCwdAliases !== undefined) {
-      const aliases = epObj.commandCwdAliases;
-      if (!structuralGuard(aliases) || Array.isArray(aliases) || !Object.values(aliases).every((v) => typeof v === "string")) {
-        issues.push({ code: "INVALID_STRUCTURE", detail: "executionPolicy.commandCwdAliases가 문자열 값을 가진 객체가 아닙니다." });
-      }
-    }
+// ---------------------------------------------------------------------------
+// STAGE 1 — ARCHITECTURE. Master Spec(WHAT) → 프로젝트 요약/기술 선택/모듈/통합/경계/
+// executionPolicy만 생성한다. Phase/Task는 여기서 만들지 않는다.
+// ---------------------------------------------------------------------------
 
-    const ep = raw.executionPolicy as unknown as PlannerRawExecutionPolicy;
-    const allPrefixes = [...(Array.isArray(ep.allowedReadPrefixes) ? ep.allowedReadPrefixes : []), ...(Array.isArray(ep.allowedWritePrefixes) ? ep.allowedWritePrefixes : [])];
-    if (!Array.isArray(ep.allowedReadPrefixes) || ep.allowedReadPrefixes.length === 0 || !ep.allowedReadPrefixes.every(isSafeScopePrefix)) {
-      issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedReadPrefixes가 비어있거나 안전한 상대경로 형식이 아닙니다." });
-    }
-    if (!Array.isArray(ep.allowedWritePrefixes) || ep.allowedWritePrefixes.length === 0 || !ep.allowedWritePrefixes.every(isSafeScopePrefix)) {
-      issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedWritePrefixes가 비어있거나 안전한 상대경로 형식이 아닙니다." });
-    }
-    if (allPrefixes.includes("./")) {
-      issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy가 프로젝트 전체(\"./\")에 대한 접근을 요청합니다 — 최소 권한 원칙 위반." });
-    }
-    if (!Array.isArray(ep.allowedCommands)) {
-      issues.push({ code: "UNSAFE_EXECUTION_POLICY", detail: "executionPolicy.allowedCommands가 배열이 아닙니다." });
-    } else {
-      ep.allowedCommands.forEach((c, idx) => {
-        if (!structuralGuard(c as unknown as Record<string, unknown>)) {
-          issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}]가 객체가 아닙니다.` });
-          return;
-        }
-        const cObj = c as unknown as Record<string, unknown>;
-        checkExactKeys(`executionPolicy.allowedCommands[${idx}]`, cObj, ALLOWED_COMMAND_KEYS, issues);
-        checkRequiredString(`executionPolicy.allowedCommands[${idx}]`, cObj, "cwd", issues);
-        checkRequiredStringArray(`executionPolicy.allowedCommands[${idx}]`, cObj, "args", issues);
-        if (typeof c.command !== "string" || c.command.length === 0) {
-          issues.push({ code: "INVALID_STRUCTURE", detail: `executionPolicy.allowedCommands[${idx}].command가 비어있거나 문자열이 아닙니다.` });
-          return;
-        }
-        // GPT Independent Reviewer 지적(SI-3 REVISE 1회차, HIGH) — 이름 목록만 소문자
-        // 비교하면 "git.exe"/절대경로("C:\...\git.exe")/별칭 같은 사소한 변형으로 이 검사
-        // 단계를 우회할 수 있었다. 다만 이 검사가 유일한 방어선은 아니다 — 실제 실행 시점의
-        // 최종 강제는 이 Task가 손대지 않는, 어떤 project policy로도 약화 불가능한
-        // safe-executor.ts의 Core Command Safety Gate(coreCommandSafetyGate)다. 여기서는
-        // (1) command가 경로 구분자/드라이브 문자를 포함하면(=bare 실행 파일명이 아니면)
-        // 그 자체로 최소 권한 위반으로 거부하고, (2) 확장자(.exe/.cmd/.bat/.com)를 제거한
-        // basename으로 denylist를 비교해 흔한 변형을 추가로 잡는다.
-        if (/[\\/]/.test(c.command) || /^[a-zA-Z]:/.test(c.command)) {
-          issues.push({
-            code: "UNSAFE_EXECUTION_POLICY",
-            detail: `executionPolicy.allowedCommands의 command는 경로가 아닌 실행 파일 이름이어야 합니다: ${safeEchoValue(c.command)}`,
-          });
-          return;
-        }
-        const cmd = c.command.trim().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
-        if (DANGEROUS_COMMAND_NAMES.has(cmd)) {
-          issues.push({ code: "DESTRUCTIVE_COMMAND_REQUESTED", detail: `executionPolicy.allowedCommands가 위험하거나 Core 전담 명령을 요청합니다: ${safeEchoValue(cmd, COMMAND_NAME_SHAPE)}` });
-        }
-        const args = isStringArray(c.args) ? c.args.map((a) => a.toLowerCase()) : [];
-        if (DEPLOY_COMMAND_NAMES.has(cmd) || (cmd === "npm" && (args.includes("publish") || args.includes("deploy")))) {
-          issues.push({ code: "PRODUCTION_DEPLOY_REQUESTED", detail: `executionPolicy.allowedCommands가 배포 관련 명령을 요청합니다: ${safeEchoValue(cmd, COMMAND_NAME_SHAPE)} ${safeEchoValue(args.join(" "))}` });
-        }
-      });
-    }
+export interface ArchitectureRawOutput {
+  projectId: string;
+  specVersion: string;
+  architectureSummary: string;
+  technologyChoices: PlannerRawTechnologyChoice[];
+  modulesOrComponents: string[];
+  integrations: string[];
+  architecturalBoundaries: string[];
+  dependencyRelationships: string[];
+  majorConstraints: string[];
+  securityRequirementsSummary: string[];
+  testingRequirementsSummary: string[];
+  deliveryConstraintsSummary: string[];
+  fixedConstraintAcknowledgement: PlannerRawFixedConstraintAck[];
+  executionPolicy: PlannerRawExecutionPolicy;
+}
+
+const ARCHITECTURE_TOP_LEVEL_KEYS = [
+  "projectId",
+  "specVersion",
+  "architectureSummary",
+  "technologyChoices",
+  "modulesOrComponents",
+  "integrations",
+  "architecturalBoundaries",
+  "dependencyRelationships",
+  "majorConstraints",
+  "securityRequirementsSummary",
+  "testingRequirementsSummary",
+  "deliveryConstraintsSummary",
+  "fixedConstraintAcknowledgement",
+  "executionPolicy",
+] as const;
+
+export function validateArchitectureRawOutput(
+  rawText: string,
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string }
+): { ok: true; value: ArchitectureRawOutput } | { ok: false; issues: PlannerValidationIssue[] } {
+  const issues: PlannerValidationIssue[] = scanRawTextForSecrets(rawText, "<planner-architecture-output>");
+
+  const extraction = extractJsonPayload(rawText);
+  if (!extraction.ok) {
+    issues.push({ code: "MALFORMED_JSON", detail: `Architecture 출력에서 신뢰할 수 있는 단일 JSON을 찾지 못했습니다: ${extraction.reason}` });
+    return { ok: false, issues };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extraction.jsonText);
+  } catch {
+    issues.push({ code: "MALFORMED_JSON", detail: "추출된 JSON 후보가 올바른 JSON이 아닙니다." });
+    return { ok: false, issues };
+  }
+  if (!structuralGuard(parsed)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "Architecture 출력이 객체가 아닙니다." });
+    return { ok: false, issues };
+  }
+  const raw = parsed as Record<string, unknown>;
+
+  checkExactKeys("Architecture 출력", raw, ARCHITECTURE_TOP_LEVEL_KEYS, issues);
+  checkRequiredStringArray("Architecture 출력", raw, "modulesOrComponents", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "integrations", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "architecturalBoundaries", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "dependencyRelationships", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "majorConstraints", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "securityRequirementsSummary", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "testingRequirementsSummary", issues);
+  checkRequiredStringArray("Architecture 출력", raw, "deliveryConstraintsSummary", issues);
+
+  if (raw.projectId !== trusted.projectId) issues.push({ code: "PROJECT_ID_MISMATCH", detail: "Architecture 출력의 projectId가 신뢰된 identity와 일치하지 않습니다." });
+  if (raw.specVersion !== trusted.specVersion) issues.push({ code: "SPEC_VERSION_MISMATCH", detail: "Architecture 출력의 specVersion이 신뢰된 identity와 일치하지 않습니다." });
+  if (!isNonEmptyString(raw.architectureSummary)) issues.push({ code: "INVALID_STRUCTURE", detail: "architectureSummary가 비어있습니다." });
+
+  validateTechnologyChoicesArray(raw, issues);
+
+  if (!Array.isArray(raw.fixedConstraintAcknowledgement)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "fixedConstraintAcknowledgement가 배열이 아닙니다." });
+  }
+  validateFixedConstraintAcknowledgement(raw, normalized, issues);
+  validateExecutionPolicyBlock(raw, issues);
 
   if (issues.length > 0) return { ok: false, issues };
-  return { ok: true, value: raw as unknown as PlannerRawOutput, normalizedJsonText: extraction.jsonText };
+  return { ok: true, value: raw as unknown as ArchitectureRawOutput };
 }
 
-// ---------------------------------------------------------------------------
-// Raw Output Source — LLM 호출 seam(dependency-scanner.ts의 VulnerabilityAuditSource와
-// 동일한 설계). 새 provider system을 만들지 않는다 — claude-runner.ts의 runClaudeTask를
-// 그대로 감싼다(agent-orchestrator.ts의 realReadOnlyAgentRunner와 동일한 재사용 원칙).
-// ---------------------------------------------------------------------------
-
-export type PlannerRawOutputOutcome =
-  | { ok: true; rawOutput: string }
-  // retryable — SI-3.2. TIMEOUT처럼 일시적일 가능성이 있는 transport failure에서만 true로
-  // 설정된다(§ createClaudeCliRawOutputSource). 지정하지 않으면(테스트 fixture 등) 항상
-  // 재시도하지 않는 것으로(fail-closed 기본값) 취급한다 — § invokeRawOutputSourceWithTransportRetry.
-  | { ok: false; reason: string; retryable?: boolean };
-export type PlannerRawOutputSource = (prompt: string) => Promise<PlannerRawOutputOutcome>;
-
-export interface ClaudeCliRawOutputSourceOptions {
-  command?: string;
-  timeoutMs?: number;
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 1회차, HIGH) — checkpoint(planner-state.json)에
+// 저장된 architecture는 validateArchitectureRawOutput()을 통과한 시점에만 저장되지만, 그
+// 이후에는(다음 실행에서 resume할 때) 오직 shape만 재확인될 뿐(§ isValidArchitectureShape)
+// 내용까지 다시 검증되지 않았다 — planner-state.json은 로컬 파일이라 프로세스 사이에 직접
+// 변조/손상될 수 있고, shape을 그대로 유지한 채로도 fixedConstraintAcknowledgement를
+// 다르게 바꾸거나 secret-shaped 값을 넣거나 executionPolicy를 위험하게 바꿀 수 있다. 매번
+// architecture를 실제로 소비하기 직전(§ runPlannerLocked의 ARCHITECTURE_PLANNED/
+// TRACEABILITY_VALIDATED 두 지점)에 이 함수로 다시 검증한다 — validateArchitectureRawOutput()이
+// 이미 쓰는 헬퍼(validateFixedConstraintAcknowledgement/validateExecutionPolicyBlock/
+// scanRawTextForSecrets)를 그대로 재사용해 로직을 복제하지 않는다. exact-key/타입 재검증은
+// 하지 않는다(§ isValidArchitectureShape가 이미 타입 레벨로 shape를 강제하고, 저장된 값의
+// 알려진 필드만 실제로 읽어 쓰므로 추가 unknown key가 있어도 동작에 영향이 없다) — 여기서는
+// "내용이 안전/일치하는가"라는, shape 검사로는 잡을 수 없는 부분만 담당한다.
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 이전에는 trusted identity를
+// 인자로 받지 않아 checkpoint의 architecture.projectId/specVersion 자체가 변조돼도(exact-key/
+// shape/content 검사는 이 두 필드의 "존재/타입"만 볼 뿐 "신뢰된 값과 일치하는가"는 보지
+// 않았다) 잡히지 않았다 — validateArchitectureRawOutput()(라이브 경로)은 이미 이 비교를
+// 하므로 동일한 필드를 여기서도 재확인한다(로직 복제 없음, 단순 동등 비교).
+function validateResumedArchitecture(
+  architecture: ArchitectureRawOutput,
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string }
+): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = scanRawTextForSecrets(JSON.stringify(architecture), "<planner-architecture-checkpoint>");
+  const raw = architecture as unknown as Record<string, unknown>;
+  checkExactKeys("architecture(checkpoint)", raw, ARCHITECTURE_TOP_LEVEL_KEYS, issues);
+  if (raw.projectId !== trusted.projectId) issues.push({ code: "PROJECT_ID_MISMATCH", detail: "architecture checkpoint의 projectId가 신뢰된 identity와 일치하지 않습니다." });
+  if (raw.specVersion !== trusted.specVersion) issues.push({ code: "SPEC_VERSION_MISMATCH", detail: "architecture checkpoint의 specVersion이 신뢰된 identity와 일치하지 않습니다." });
+  validateTechnologyChoicesArray(raw, issues);
+  validateFixedConstraintAcknowledgement(raw, normalized, issues);
+  validateExecutionPolicyBlock(raw, issues);
+  return issues;
 }
 
-// SI-3.2 — 실제 JARVIS Master Spec Planner 실행에서 claude CLI 응답 생성이 2분(claude-runner.ts의
-// DEFAULT_TIMEOUT_MS=120000)을 넘겨 수분까지 걸리는 사례가 반복 관찰됐다. DEFAULT_TIMEOUT_MS
-// 자체는 건드리지 않는다 — agent-orchestrator.ts의 realReadOnlyAgentRunner 등 다른(짧은)
-// read-only 호출이 그 값을 그대로 공유하기 때문이다(§ .claude/CLAUDE.md). 이 값은 오직
-// Planner raw-output 호출(createClaudeCliRawOutputSource의 기본 timeoutMs)에만 적용된다 —
-// "응답을 기다리는 시간"만 늘릴 뿐, timeout이 늘었다고 fail-closed 검증
-// (validatePlannerRawOutput의 transport normalization → strict schema → semantic validation)을
-// 우회하지 않는다.
-export const PLANNER_RAW_OUTPUT_TIMEOUT_MS = 300_000;
-
-// SI-3.2 — TIMEOUT처럼 일시적일 가능성이 있는 transport failure(§ PlannerRawOutputOutcome.
-// retryable)에 한해서만 제한된 재시도를 허용한다. "추가로 허용하는 재시도 횟수"이므로 1이면
-// 최초 시도 + 재시도 1회 = 최대 2회 실제 호출이다 — 무한 retry를 금지하기 위해 항상 상수로
-// 상한을 둔다(§ invokeRawOutputSourceWithTransportRetry). CLI_NOT_FOUND/AUTH_REQUIRED/
-// USAGE_LIMIT 등 명백히 비복구이거나 즉시 재시도가 오히려 해로운(USAGE_LIMIT) 실패는
-// retryable이 설정되지 않으므로 이 재시도 대상이 아니다.
-export const PLANNER_MAX_TRANSPORT_RETRIES = 1;
-
-/** 실제 운용 기본 구현 — claude-runner.ts의 runClaudeTask(항상 --tools "")를 그대로
- *  감싼다. command override는 테스트 전용(claude-runner-tests.ts와 동일한 관례)이며
- *  실제 운용 코드는 지정하지 않는다. timeoutMs를 지정하지 않으면 claude-runner.ts 자신의
- *  DEFAULT_TIMEOUT_MS(120000, 다른 호출부용)가 아니라 PLANNER_RAW_OUTPUT_TIMEOUT_MS를 쓴다. */
-export function createClaudeCliRawOutputSource(opts: ClaudeCliRawOutputSourceOptions = {}): PlannerRawOutputSource {
-  return async (prompt: string) => {
-    const timeoutMs = opts.timeoutMs ?? PLANNER_RAW_OUTPUT_TIMEOUT_MS;
-    const result = await runClaudeTask(prompt, 1, { command: opts.command, timeoutMs });
-    if (!result.success) {
-      return {
-        ok: false,
-        reason: `claude 호출 실패: ${result.errorCode ?? "UNKNOWN"} — ${result.summary}`,
-        // TIMEOUT만 일시적일 가능성이 있는 transport failure로 취급한다(§ 위 상수 주석) —
-        // CLI_NOT_FOUND/AUTH_REQUIRED/USAGE_LIMIT/NON_ZERO_EXIT/INVALID_OUTPUT은 재시도해도
-        // 회복 가능성이 낮거나(비복구) 재시도 자체가 해로울 수 있어(예: USAGE_LIMIT 즉시
-        // 재요청) retryable로 표시하지 않는다.
-        retryable: result.errorCode === "TIMEOUT",
-      };
-    }
-    return { ok: true, rawOutput: result.summary };
-  };
-}
-
-// SI-3.2 — transport-level bounded retry. correction retry(PLANNER_MAX_RAW_OUTPUT_ATTEMPTS —
-// LLM이 스스로 schema 위반을 고칠 기회를 주는 재시도)와는 완전히 다른 문제를 다룬다: 여기서는
-// "응답을 아예 받지 못했다"(예: TIMEOUT)는 transport 실패만 다루고, retryable이 아닌 실패는
-// 재시도 없이 즉시 그대로 반환한다. 매 시도는 rawOutputSource(실제 운용에서는 runClaudeTask →
-// 매번 새 subprocess)를 통해 독립적으로 자신만의 timeout을 가진다 — 이전 시도의 timeout이
-// 다음 시도에 누적되지 않는다.
-async function invokeRawOutputSourceWithTransportRetry(
-  rawOutputSource: PlannerRawOutputSource,
-  prompt: string
-): Promise<PlannerRawOutputOutcome> {
-  let outcome: PlannerRawOutputOutcome = { ok: false, reason: "rawOutputSource가 한 번도 호출되지 않았습니다." };
-  for (let transportAttempt = 0; transportAttempt <= PLANNER_MAX_TRANSPORT_RETRIES; transportAttempt += 1) {
-    outcome = await rawOutputSource(prompt);
-    if (outcome.ok || !outcome.retryable) return outcome;
-  }
-  return outcome;
-}
-
-/** LLM에 전달하는 프롬프트 — Master Spec(WHAT, 정규화됨) + Fixed Constraints + Output
- *  Schema + Security Constraints + REQ/AC Traceability 요구를 포함한다(§ 요구사항 16). */
-export function buildPlannerPrompt(normalized: NormalizedMasterSpec, trusted: { projectId: string; specVersion: string }): string {
+export function buildArchitecturePrompt(normalized: NormalizedMasterSpec, trusted: { projectId: string; specVersion: string }): string {
   const reqLines = normalized.requirements.map((r) => `- ${r.id} [${r.category}${r.mustHave ? ", must-have" : ""}]: ${r.text}`).join("\n") || "(없음)";
-  const acLines = normalized.acceptanceCriteria.map((a) => `- ${a.id}: ${a.text}`).join("\n") || "(없음)";
   const fcLines = normalized.fixedConstraints.map((f) => `- ${f.id} [${f.kind}]: ${f.text}`).join("\n") || "(없음)";
   const deferredLines = normalized.deferredItems.map((d) => `- ${d.id}: ${d.text}`).join("\n") || "(없음)";
   const oosLines = normalized.outOfScope.map((o) => `- ${o.id}: ${o.text}`).join("\n") || "(없음)";
 
   return [
-    `당신은 AutoDev Planner입니다 — Master Spec(WHAT)을 실제 실행 계획(HOW: Phase/Task/Execution Policy)으로 변환합니다.`,
+    `당신은 AutoDev Planner입니다 — 이번 호출은 STAGE 1(ARCHITECTURE)만 담당합니다. Phase/Task는 만들지 마세요(다음 단계에서 별도로 생성됩니다).`,
     `projectId=${trusted.projectId}, specVersion=${trusted.specVersion}`,
     `# Project Goal\n${normalized.projectGoal || "(명시되지 않음)"}`,
     `# Product Scope\n${normalized.productScope || "(명시되지 않음)"}`,
-    `# Requirements\n${reqLines}`,
-    `# Acceptance Criteria\n${acLines}`,
+    `# Requirements(참고용 — 이 단계에서 task로 분해하지 않습니다)\n${reqLines}`,
     `# Fixed Constraints(절대 변경 불가 — 반드시 원문 그대로 fixedConstraintAcknowledgement로 확인)\n${fcLines}`,
-    `# Deferred Items(Task로 만들지 말 것)\n${deferredLines}`,
-    `# Out-of-scope(Task로 만들지 말 것)\n${oosLines}`,
+    `# Deferred Items(구현 대상 아님)\n${deferredLines}`,
+    `# Out-of-scope(구현 대상 아님)\n${oosLines}`,
     [
       "# Output — 반드시 아래 JSON 구조만 반환(다른 텍스트 금지):",
       '{ "projectId": string, "specVersion": string, "architectureSummary": string,',
       '  "technologyChoices": [{"area":string,"decision":string,"reason":string,"source":string,"status":"proposed"|"confirmed"}],',
+      '  "modulesOrComponents": string[], "integrations": string[],',
+      '  "architecturalBoundaries": string[], "dependencyRelationships": string[], "majorConstraints": string[],',
+      '  "securityRequirementsSummary": string[], "testingRequirementsSummary": string[], "deliveryConstraintsSummary": string[],',
       '  "fixedConstraintAcknowledgement": [{"id":string,"value":string}] (모든 Fixed Constraint id를 원문 그대로 echo),',
-      '  "modulesOrComponents": string[], "integrations": string[], "securityRequirementsSummary": string[],',
-      '  "testingRequirementsSummary": string[], "deliveryConstraintsSummary": string[],',
-      '  "phases": [{"phaseId":"1","name":string,"objective":string,"dependsOn":string[],"completionCriteria":string[]}],',
-      '  "tasks": [{"taskId":"1.1","phaseId":"1","title":string,"objective":string,"scope":["dir/"],"constraints":string[],',
-      '    "dependsOn":string[],"expectedModules":string[],"requiredTests":[{"name":string,"command":string,"args":string[],"cwd":"root"}],',
-      '    "acceptanceCriteria":["AC-001"],"reqIds":["REQ-001"],"securityConsiderations":string[],"completionGate":string}],',
-      '  "executionPolicy": {"allowedReadPrefixes":["dir/"],"allowedWritePrefixes":["dir/"],"allowedCommands":[{"cwd":"root","command":string,"args":string[]}]} }',
+      '  "executionPolicy": {"allowedReadPrefixes":["dir/"],"allowedWritePrefixes":["dir/"],"allowedCommands":[{"cwd":"root","command":string,"args":string[]}],',
+      '    "commandCwdAliases": {"alias-name": "project-relative-dir"} (선택 — cwd로 "root"가 아닌 하위 디렉터리가 필요할 때만 추가, 불필요하면 이 key 자체를 생략)} }',
     ].join("\n"),
     [
       "# Security Constraints",
-      "- 모든 Must-have requirement와 Acceptance Criteria는 최소 하나의 task(reqIds/acceptanceCriteria)에 매핑돼야 합니다.",
-      "- Deferred/Out-of-scope 항목을 task의 reqIds/acceptanceCriteria로 참조하지 마세요.",
       '- executionPolicy에 "./"(프로젝트 전체) 접근이나 git/rm 등 위험한 명령, 배포 명령을 포함하지 마세요.',
       "- secret/API key/token/password로 보이는 어떤 값도 출력에 포함하지 마세요.",
+      "- phases/tasks key를 만들지 마세요 — 이 단계의 스키마에는 없는 key입니다.",
     ].join("\n"),
   ].join("\n\n");
 }
 
-// GPT Independent Reviewer 지적(SI-3 REVISE 4회차 — 실제 JARVIS 실행 관찰) — 실제 claude CLI가
-// "JSON only" 지시를 어기고 설명문을 앞뒤에 붙이거나 markdown ```json fence로 감싸는 경우,
-// 또는 허용되지 않는/깨진 key를 만드는 경우가 관찰됐다. buildPlannerPrompt()의 최초 프롬프트는
-// 이미 통과된 spec/schema를 그대로 두되(느슨하게 만들지 않음), validatePlannerRawOutput()가
-// 실제로 발견한 위반(§ PlannerValidationIssue)을 그대로 되돌려주며 Planner에게 같은 요청을
-// 다시 한다 — 값을 이쪽에서 임의로 보정하지 않고, "무엇이 왜 거부됐는지"만 정확히 알려서
-// Planner 스스로 고치게 한다(§ 요구사항: correction retry). issues[].detail은 이미
-// safeEchoValue()로 원문 secret/긴 임의 문자열을 노출하지 않도록 정제돼 있으므로 그대로
-// 프롬프트에 포함해도 안전하다.
-export function buildPlannerCorrectionPrompt(
-  normalized: NormalizedMasterSpec,
-  trusted: { projectId: string; specVersion: string },
-  issues: PlannerValidationIssue[]
-): string {
-  const base = buildPlannerPrompt(normalized, trusted);
+function appendCorrectionSuffix(base: string, issues: PlannerValidationIssue[]): string {
   const issueLines = issues.length > 0 ? issues.map((i) => `- [${i.code}] ${i.detail}`).join("\n") : "(기록된 위반 없음)";
   return [
     base,
@@ -1055,18 +952,1081 @@ export function buildPlannerCorrectionPrompt(
   ].join("\n\n");
 }
 
+export function buildArchitectureCorrectionPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  issues: PlannerValidationIssue[]
+): string {
+  return appendCorrectionSuffix(buildArchitecturePrompt(normalized, trusted), issues);
+}
+
 // ---------------------------------------------------------------------------
-// Execution Data 생성 — 검증된 raw output + normalized(WHAT)를 기존 Core 타입
-// (ProjectManifest/TaskDefinition/ProjectExecutionPolicy)으로 변환한다. fixedConstraints는
-// 항상 normalized(코드)에서만 채워진다 — LLM 출력에서 직접 채우지 않는다(§ 위 주석).
+// STAGE 2 — PHASE PLAN. Master Spec + 검증된 Architecture → Phase 목록만 생성한다(세부
+// Task는 STAGE 3에서 Phase별로 생성한다). Phase id는 LLM이 만들지 않는다 — LLM은 이 응답
+// 안에서만 고유한 sequence(1..)로 순서/의존성을 표현하고, Core가 sequence 오름차순으로
+// "1","2",...를 deterministic 부여한다(§ 요구사항 6 "Phase ID는 가능하면 Core에서
+// deterministic하게 부여한다").
 // ---------------------------------------------------------------------------
 
+/** 최종 확정된(Core가 phaseId를 부여한) Phase — STAGE 3 프롬프트 구성을 위해 reqIds/acIds도
+ *  함께 보존한다(원본 PlannerPhase에는 없던 필드 — 조립 결과물에는 필요 없어 최종
+ *  legacy raw 변환 시 drop된다). */
 export interface PlannerPhase {
   phaseId: string;
   name: string;
   objective: string;
   dependencies: string[];
   completionCriteria: string[];
+}
+export interface ValidatedPlannerPhase extends PlannerPhase {
+  reqIds: string[];
+  acIds: string[];
+}
+
+const PHASE_PLAN_TOP_LEVEL_KEYS = ["projectId", "specVersion", "phases"] as const;
+const PHASE_PLAN_ITEM_KEYS = ["sequence", "name", "objective", "dependsOnSequence", "reqIds", "acIds", "completionCriteria"] as const;
+// 검증을 통과해 Core가 phaseId를 부여한 뒤(§ ValidatedPlannerPhase)의 key 집합 — LLM이 만드는
+// wire 형식(PHASE_PLAN_ITEM_KEYS, sequence/dependsOnSequence 기반)과는 다르다. 오직
+// validateResumedPhasePlanAndKnownTasks()가 checkpoint 재검증(§ 요구사항 MEDIUM1)에만 쓴다.
+const VALIDATED_PHASE_KEYS = ["phaseId", "name", "objective", "dependencies", "completionCriteria", "reqIds", "acIds"] as const;
+
+export function validatePhasePlanRawOutput(
+  rawText: string,
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string }
+): { ok: true; value: ValidatedPlannerPhase[] } | { ok: false; issues: PlannerValidationIssue[] } {
+  const issues: PlannerValidationIssue[] = scanRawTextForSecrets(rawText, "<planner-phase-plan-output>");
+
+  const extraction = extractJsonPayload(rawText);
+  if (!extraction.ok) {
+    issues.push({ code: "MALFORMED_JSON", detail: `Phase Plan 출력에서 신뢰할 수 있는 단일 JSON을 찾지 못했습니다: ${extraction.reason}` });
+    return { ok: false, issues };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extraction.jsonText);
+  } catch {
+    issues.push({ code: "MALFORMED_JSON", detail: "추출된 JSON 후보가 올바른 JSON이 아닙니다." });
+    return { ok: false, issues };
+  }
+  if (!structuralGuard(parsed)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "Phase Plan 출력이 객체가 아닙니다." });
+    return { ok: false, issues };
+  }
+  const raw = parsed as Record<string, unknown>;
+  checkExactKeys("Phase Plan 출력", raw, PHASE_PLAN_TOP_LEVEL_KEYS, issues);
+  if (raw.projectId !== trusted.projectId) issues.push({ code: "PROJECT_ID_MISMATCH", detail: "Phase Plan 출력의 projectId가 신뢰된 identity와 일치하지 않습니다." });
+  if (raw.specVersion !== trusted.specVersion) issues.push({ code: "SPEC_VERSION_MISMATCH", detail: "Phase Plan 출력의 specVersion이 신뢰된 identity와 일치하지 않습니다." });
+
+  if (!Array.isArray(raw.phases) || raw.phases.length === 0) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "phases가 배열이 아니거나 비어있습니다." });
+    return { ok: false, issues };
+  }
+  // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — phase 개수에 상한이
+  // 없었다. Phase Plan의 phase 하나마다 STAGE 3에서 독립적인 LLM 호출(최대
+  // PLANNER_MAX_RAW_OUTPUT_ATTEMPTS번 correction retry, 각 최대 PLANNER_RAW_OUTPUT_TIMEOUT_MS)이
+  // 발생하므로, 신뢰할 수 없거나 오작동한 LLM이 수백~수천 개 phase를 반환하면 호출 횟수/
+  // 비용/실행 시간이 무제한으로 증폭된다. Core가 소유하는 명시적 상한을 두고 초과 시
+  // fail-closed한다(project policy로 확대할 수 없음 — 이 검증은 policy를 인자로 받지 않는다).
+  if (raw.phases.length > PLANNER_MAX_PHASES) {
+    issues.push({
+      code: "TOO_MANY_PHASES",
+      detail: `phases 개수(${raw.phases.length})가 상한(${PLANNER_MAX_PHASES})을 초과합니다 — phase마다 별도 LLM 호출이 발생해 비용/시간이 무제한 증폭될 수 있습니다.`,
+    });
+    return { ok: false, issues };
+  }
+
+  interface Item {
+    sequence: number;
+    name: string;
+    objective: string;
+    dependsOnSequence: number[];
+    reqIds: string[];
+    acIds: string[];
+    completionCriteria: string[];
+  }
+  const validItems: Item[] = [];
+  const seenSequences = new Set<number>();
+
+  (raw.phases as unknown[]).forEach((pRaw, idx) => {
+    if (!structuralGuard(pRaw)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `phases[${idx}]가 객체가 아닙니다.` });
+      return;
+    }
+    const pObj = pRaw as Record<string, unknown>;
+    checkExactKeys(`phases[${idx}]`, pObj, PHASE_PLAN_ITEM_KEYS, issues);
+    checkRequiredString(`phases[${idx}]`, pObj, "name", issues);
+    checkRequiredString(`phases[${idx}]`, pObj, "objective", issues);
+    checkRequiredStringArray(`phases[${idx}]`, pObj, "reqIds", issues);
+    checkRequiredStringArray(`phases[${idx}]`, pObj, "acIds", issues);
+    checkRequiredStringArray(`phases[${idx}]`, pObj, "completionCriteria", issues);
+    if (!isPositiveIntegerArray(pObj.dependsOnSequence)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `phases[${idx}].dependsOnSequence가 양의 정수 배열이 아닙니다.` });
+    }
+    if (!isPositiveInteger(pObj.sequence)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `phases[${idx}].sequence가 양의 정수가 아닙니다.` });
+      return;
+    }
+    const sequence = pObj.sequence as number;
+    if (seenSequences.has(sequence)) {
+      issues.push({ code: "DUPLICATE_PHASE_ID", detail: `phases 안에서 sequence가 중복됩니다: ${sequence}` });
+      return;
+    }
+    seenSequences.add(sequence);
+    validItems.push({
+      sequence,
+      name: isNonEmptyString(pObj.name) ? pObj.name : "",
+      objective: isNonEmptyString(pObj.objective) ? pObj.objective : "",
+      dependsOnSequence: isPositiveIntegerArray(pObj.dependsOnSequence) ? pObj.dependsOnSequence : [],
+      reqIds: isStringArray(pObj.reqIds) ? pObj.reqIds : [],
+      acIds: isStringArray(pObj.acIds) ? pObj.acIds : [],
+      completionCriteria: isStringArray(pObj.completionCriteria) ? pObj.completionCriteria : [],
+    });
+  });
+
+  const seqSet = seenSequences;
+  const seqEdges = new Map<number, number[]>();
+  for (const item of validItems) seqEdges.set(item.sequence, item.dependsOnSequence);
+  for (const item of validItems) {
+    for (const dep of item.dependsOnSequence) {
+      if (!seqSet.has(dep)) {
+        issues.push({ code: "MISSING_DEPENDENCY", detail: `phase(sequence=${item.sequence})가 존재하지 않는 sequence(${dep})에 의존합니다.` });
+      } else if (dep >= item.sequence) {
+        // GPT Independent Reviewer 지적(SI-3.3 REVISE 1회차, MEDIUM) — Core는 phaseId를
+        // sequence 오름차순으로 부여하고, STAGE 3(TASK PLAN)도 그 phaseId 오름차순으로만
+        // 처리한다(§ runPlannerLocked PHASE_PLANNED 블록). dependsOnSequence가 자기보다 크거나
+        // 같은(=아직 처리되지 않을) sequence를 가리키면 hasCycle() 통과 여부와 무관하게 STAGE
+        // 3에서 그 "선행" phase의 task id를 실제로는 알 수 없다 — phase 순서와 실행 순서가
+        // 어긋나는 것을 여기서 즉시 거부한다(LLM에게는 "dependsOnSequence는 항상 더 작은
+        // sequence만 참조" 규칙을 프롬프트로 안내한다).
+        issues.push({
+          code: "PHASE_DEPENDENCY_ORDER_VIOLATION",
+          detail: `phase(sequence=${item.sequence})가 자신보다 늦거나 같은 sequence(${dep})에 의존합니다 — dependsOnSequence는 항상 더 작은 sequence만 참조해야 합니다.`,
+        });
+      }
+    }
+  }
+  if (hasCycle([...seqSet].map(String), new Map([...seqEdges].map(([k, v]) => [String(k), v.map(String)])))) {
+    issues.push({ code: "DEPENDENCY_CYCLE", detail: "phase 의존성 그래프에 사이클이 있습니다." });
+  }
+
+  const deferredIds = new Set(normalized.deferredItems.map((d) => d.id));
+  const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
+  const requirementIds = new Set(normalized.requirements.map((r) => r.id));
+  const acIdSet = new Set(normalized.acceptanceCriteria.map((a) => a.id));
+  const reqUnion = new Set<string>();
+  const acUnion = new Set<string>();
+  for (const item of validItems) {
+    for (const r of item.reqIds) {
+      if (deferredIds.has(r) || outOfScopeIds.has(r)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `phase(sequence=${item.sequence})가 deferred/out-of-scope 항목(${safeEchoValue(r, ID_FAMILY_SHAPE)})을 참조합니다.` });
+      } else if (!requirementIds.has(r)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `phase(sequence=${item.sequence})가 존재하지 않는 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else {
+        reqUnion.add(r);
+      }
+    }
+    for (const a of item.acIds) {
+      if (deferredIds.has(a) || outOfScopeIds.has(a)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `phase(sequence=${item.sequence})가 deferred/out-of-scope 항목(${safeEchoValue(a, ID_FAMILY_SHAPE)})을 Acceptance Criteria로 참조합니다.` });
+      } else if (!acIdSet.has(a)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `phase(sequence=${item.sequence})가 존재하지 않는 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else {
+        acUnion.add(a);
+      }
+    }
+  }
+  // 조기 fail-fast — 어떤 phase에도 배정되지 않은 must-have REQ/AC는 STAGE 3(Phase별
+  // Task 생성) 프롬프트 어디에도 등장하지 못해 영원히 누락되므로, 여기서 즉시 잡는다
+  // (STAGE 4 Global Traceability는 "phase는 배정됐지만 실제 task가 안 만든" 누락을 잡는
+  // 두 번째 방어선이다 — 서로 다른 실패 시점을 담당한다).
+  for (const req of normalized.requirements) {
+    if (req.mustHave && !reqUnion.has(req.id)) {
+      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `Must-have requirement(${req.id})가 어떤 phase에도 배정되지 않았습니다.` });
+    }
+  }
+  for (const ac of normalized.acceptanceCriteria) {
+    if (!acUnion.has(ac.id)) {
+      issues.push({ code: "MISSING_ACCEPTANCE_CRITERIA_COVERAGE", detail: `Acceptance Criteria(${ac.id})가 어떤 phase에도 배정되지 않았습니다.` });
+    }
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  const sorted = [...validItems].sort((a, b) => a.sequence - b.sequence);
+  const seqToPhaseId = new Map<number, string>();
+  sorted.forEach((item, i) => seqToPhaseId.set(item.sequence, String(i + 1)));
+  const value: ValidatedPlannerPhase[] = sorted.map((item) => ({
+    phaseId: seqToPhaseId.get(item.sequence)!,
+    name: item.name,
+    objective: item.objective,
+    dependencies: item.dependsOnSequence.map((s) => seqToPhaseId.get(s)!),
+    completionCriteria: item.completionCriteria,
+    reqIds: item.reqIds,
+    acIds: item.acIds,
+  }));
+  return { ok: true, value };
+}
+
+export function buildPhasePlanPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  architecture: ArchitectureRawOutput
+): string {
+  const reqLines = normalized.requirements.map((r) => `- ${r.id} [${r.category}${r.mustHave ? ", must-have" : ""}]: ${r.text}`).join("\n") || "(없음)";
+  const acLines = normalized.acceptanceCriteria.map((a) => `- ${a.id}: ${a.text}`).join("\n") || "(없음)";
+  const fcLines = normalized.fixedConstraints.map((f) => `- ${f.id} [${f.kind}]: ${f.text}`).join("\n") || "(없음)";
+
+  return [
+    `당신은 AutoDev Planner입니다 — 이번 호출은 STAGE 2(PHASE PLAN)만 담당합니다. 세부 Task는 만들지 마세요(다음 단계에서 Phase별로 별도 생성됩니다).`,
+    `projectId=${trusted.projectId}, specVersion=${trusted.specVersion}`,
+    `# Architecture Summary(이미 확정됨 — 참고만 할 것, 다시 만들지 마세요)\n${architecture.architectureSummary}`,
+    `# Modules/Components\n${architecture.modulesOrComponents.join(", ") || "(없음)"}`,
+    `# Requirements\n${reqLines}`,
+    `# Acceptance Criteria\n${acLines}`,
+    `# Fixed Constraints(참고 — 이미 STAGE 1에서 확인됨)\n${fcLines}`,
+    [
+      "# Output — 반드시 아래 JSON 구조만 반환(다른 텍스트 금지):",
+      '{ "projectId": string, "specVersion": string,',
+      '  "phases": [{"sequence": number(1부터 시작 — 이 응답 안에서만 고유하면 됨. 실제 phaseId는 Core가 부여합니다),',
+      '    "name": string, "objective": string, "dependsOnSequence": number[](이 응답 안에서 자신보다 작은 sequence만 참조 — 나중 단계는 만들어지기 전이라 참조 불가),',
+      '    "reqIds": string[], "acIds": string[], "completionCriteria": string[]}] }',
+    ].join("\n"),
+    [
+      "# Rules",
+      "- Phase 개수를 미리 정하지 마세요 — 실제로 필요한 만큼만 만드세요.",
+      "- phases 배열을 의존성 순서(먼저 실행돼야 하는 phase가 먼저)로 나열하고, sequence도 그 순서대로(먼저 나오는 phase일수록 작은 sequence) 매기세요.",
+      "- dependsOnSequence에는 반드시 자신보다 작은 sequence만 넣으세요 — 자신과 같거나 더 큰 sequence(아직 정의되지 않은 이후 phase)는 절대 참조할 수 없습니다.",
+      "- 모든 Must-have requirement와 모든 Acceptance Criteria는 최소 하나의 phase(reqIds/acIds)에 포함돼야 합니다.",
+      "- Deferred/Out-of-scope 항목을 참조하지 마세요.",
+      "- phaseId를 직접 만들지 마세요 — sequence만 지정하면 Core가 phaseId를 부여합니다.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
+export function buildPhasePlanCorrectionPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  architecture: ArchitectureRawOutput,
+  issues: PlannerValidationIssue[]
+): string {
+  return appendCorrectionSuffix(buildPhasePlanPrompt(normalized, trusted, architecture), issues);
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 3 — TASK PLAN(Phase별 개별 호출). 한 번에 하나의 Phase만 대상으로 한다 — 입력을
+// 그 Phase에 배정된 REQ/AC + Fixed Constraints + Architecture 요약 + 이전 Phase 요약 +
+// 이미 확정된 이전 Phase의 taskId 목록으로 최소화한다(전체 이전 raw output을 다시 넣지
+// 않는다). taskId도 Core가 부여한다 — LLM은 이 응답 안에서만 고유한 sequence로 표현하고,
+// 다른(이미 확정된) Phase의 task를 가리킬 때만 실제 taskId 문자열을 쓴다.
+// ---------------------------------------------------------------------------
+
+const PHASE_TASK_TOP_LEVEL_KEYS = ["projectId", "specVersion", "phaseId", "tasks"] as const;
+const PHASE_TASK_ITEM_KEYS = [
+  "sequence",
+  "title",
+  "objective",
+  "scope",
+  "constraints",
+  "dependsOn",
+  "dependsOnSequenceInPhase",
+  "expectedModules",
+  "requiredTests",
+  "acceptanceCriteria",
+  "reqIds",
+  "securityConsiderations",
+  "completionGate",
+] as const;
+// 검증을 통과해 Core가 taskId를 부여한 뒤(§ PlannerRawTask)의 key 집합 — LLM이 만드는 wire
+// 형식(PHASE_TASK_ITEM_KEYS, sequence/dependsOnSequenceInPhase 기반)과는 다르다. 오직
+// validateResumedPhasePlanAndKnownTasks()가 checkpoint 재검증에만 쓴다.
+const PLANNER_RAW_TASK_KEYS = [
+  "taskId",
+  "phaseId",
+  "title",
+  "objective",
+  "scope",
+  "constraints",
+  "dependsOn",
+  "expectedModules",
+  "requiredTests",
+  "acceptanceCriteria",
+  "reqIds",
+  "securityConsiderations",
+  "completionGate",
+] as const;
+
+export function validatePhaseTaskRawOutput(
+  rawText: string,
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  phase: ValidatedPlannerPhase,
+  knownTaskIds: ReadonlySet<string>
+): { ok: true; value: PlannerRawTask[] } | { ok: false; issues: PlannerValidationIssue[] } {
+  const issues: PlannerValidationIssue[] = scanRawTextForSecrets(rawText, "<planner-task-plan-output>");
+
+  const extraction = extractJsonPayload(rawText);
+  if (!extraction.ok) {
+    issues.push({ code: "MALFORMED_JSON", detail: `Task Plan 출력(phase ${phase.phaseId})에서 신뢰할 수 있는 단일 JSON을 찾지 못했습니다: ${extraction.reason}` });
+    return { ok: false, issues };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(extraction.jsonText);
+  } catch {
+    issues.push({ code: "MALFORMED_JSON", detail: "추출된 JSON 후보가 올바른 JSON이 아닙니다." });
+    return { ok: false, issues };
+  }
+  if (!structuralGuard(parsed)) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "Task Plan 출력이 객체가 아닙니다." });
+    return { ok: false, issues };
+  }
+  const raw = parsed as Record<string, unknown>;
+  checkExactKeys("Task Plan 출력", raw, PHASE_TASK_TOP_LEVEL_KEYS, issues);
+  if (raw.projectId !== trusted.projectId) issues.push({ code: "PROJECT_ID_MISMATCH", detail: "Task Plan 출력의 projectId가 신뢰된 identity와 일치하지 않습니다." });
+  if (raw.specVersion !== trusted.specVersion) issues.push({ code: "SPEC_VERSION_MISMATCH", detail: "Task Plan 출력의 specVersion이 신뢰된 identity와 일치하지 않습니다." });
+  if (raw.phaseId !== phase.phaseId) {
+    issues.push({ code: "TASK_STAGE_PHASE_MISMATCH", detail: `Task Plan 출력의 phaseId가 요청된 phase(${phase.phaseId})와 일치하지 않습니다: ${safeEchoValue(raw.phaseId, PHASE_ID_ECHO_SHAPE)}` });
+  }
+
+  if (!Array.isArray(raw.tasks) || raw.tasks.length === 0) {
+    issues.push({ code: "INVALID_STRUCTURE", detail: "tasks가 배열이 아니거나 비어있습니다." });
+    return { ok: false, issues };
+  }
+  // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — phase당 task 개수에도
+  // 동일한 이유(§ 위 phases 상한 주석)로 상한이 필요하다 — task 개수 자체가 LLM 호출을
+  // 늘리지는 않지만, 다음 correction retry 프롬프트에 이 phase의 이미 확정된 task 목록이
+  // 그대로 다시 포함되므로(§ buildPhaseTaskPrompt) 무한정 커지면 프롬프트 크기/비용이
+  // 함께 증폭된다.
+  if (raw.tasks.length > PLANNER_MAX_TASKS_PER_PHASE) {
+    issues.push({
+      code: "TOO_MANY_TASKS_IN_PHASE",
+      detail: `phase ${phase.phaseId}의 tasks 개수(${raw.tasks.length})가 상한(${PLANNER_MAX_TASKS_PER_PHASE})을 초과합니다.`,
+    });
+    return { ok: false, issues };
+  }
+
+  interface Item {
+    sequence: number;
+    title: string;
+    objective: string;
+    scope: string[];
+    constraints: string[];
+    dependsOn: string[];
+    dependsOnSequenceInPhase: number[];
+    expectedModules: string[];
+    requiredTests: RequiredTestCommand[];
+    acceptanceCriteria: string[];
+    reqIds: string[];
+    securityConsiderations: string[];
+    completionGate: string;
+  }
+  const validItems: Item[] = [];
+  const seenSequences = new Set<number>();
+
+  (raw.tasks as unknown[]).forEach((tRaw, idx) => {
+    if (!structuralGuard(tRaw)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `tasks[${idx}]가 객체가 아닙니다.` });
+      return;
+    }
+    const tObj = tRaw as Record<string, unknown>;
+    checkExactKeys(`tasks[${idx}]`, tObj, PHASE_TASK_ITEM_KEYS, issues);
+    checkRequiredString(`tasks[${idx}]`, tObj, "title", issues);
+    checkRequiredString(`tasks[${idx}]`, tObj, "objective", issues);
+    checkRequiredString(`tasks[${idx}]`, tObj, "completionGate", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "scope", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "constraints", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "dependsOn", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "expectedModules", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "acceptanceCriteria", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "reqIds", issues);
+    checkRequiredStringArray(`tasks[${idx}]`, tObj, "securityConsiderations", issues);
+    if (!isPositiveIntegerArray(tObj.dependsOnSequenceInPhase)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `tasks[${idx}].dependsOnSequenceInPhase가 양의 정수 배열이 아닙니다.` });
+    }
+    validateRequiredTestsArray(`tasks[${idx}].requiredTests`, tObj.requiredTests, issues);
+    if (!isPositiveInteger(tObj.sequence)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `tasks[${idx}].sequence가 양의 정수가 아닙니다.` });
+      return;
+    }
+    const sequence = tObj.sequence as number;
+    if (seenSequences.has(sequence)) {
+      issues.push({ code: "DUPLICATE_TASK_ID", detail: `tasks 안에서 sequence가 중복됩니다: ${sequence}` });
+      return;
+    }
+    seenSequences.add(sequence);
+    validItems.push({
+      sequence,
+      title: isNonEmptyString(tObj.title) ? tObj.title : "",
+      objective: isNonEmptyString(tObj.objective) ? tObj.objective : "",
+      scope: isStringArray(tObj.scope) ? tObj.scope : [],
+      constraints: isStringArray(tObj.constraints) ? tObj.constraints : [],
+      dependsOn: isStringArray(tObj.dependsOn) ? tObj.dependsOn : [],
+      dependsOnSequenceInPhase: isPositiveIntegerArray(tObj.dependsOnSequenceInPhase) ? tObj.dependsOnSequenceInPhase : [],
+      expectedModules: isStringArray(tObj.expectedModules) ? tObj.expectedModules : [],
+      requiredTests: Array.isArray(tObj.requiredTests) ? (tObj.requiredTests as RequiredTestCommand[]) : [],
+      acceptanceCriteria: isStringArray(tObj.acceptanceCriteria) ? tObj.acceptanceCriteria : [],
+      reqIds: isStringArray(tObj.reqIds) ? tObj.reqIds : [],
+      securityConsiderations: isStringArray(tObj.securityConsiderations) ? tObj.securityConsiderations : [],
+      completionGate: isNonEmptyString(tObj.completionGate) ? tObj.completionGate : "",
+    });
+  });
+
+  const seqSet = seenSequences;
+  const seqEdges = new Map<number, number[]>();
+  for (const item of validItems) seqEdges.set(item.sequence, item.dependsOnSequenceInPhase);
+  for (const item of validItems) {
+    for (const dep of item.dependsOnSequenceInPhase) {
+      if (!seqSet.has(dep)) {
+        issues.push({ code: "MISSING_DEPENDENCY", detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 같은 phase 내 존재하지 않는 sequence(${dep})에 의존합니다.` });
+      }
+    }
+  }
+  if (hasCycle([...seqSet].map(String), new Map([...seqEdges].map(([k, v]) => [String(k), v.map(String)])))) {
+    issues.push({ code: "DEPENDENCY_CYCLE", detail: `phase ${phase.phaseId} 내 task 의존성 그래프에 사이클이 있습니다.` });
+  }
+
+  for (const item of validItems) {
+    for (const dep of item.dependsOn) {
+      if (!TASK_ID_RE.test(dep) || !knownTaskIds.has(dep)) {
+        issues.push({
+          code: "MISSING_DEPENDENCY",
+          detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 존재하지 않거나 아직 확정되지 않은 task(${safeEchoValue(dep, TASK_ID_ECHO_SHAPE)})에 의존합니다.`,
+        });
+      }
+    }
+  }
+
+  const deferredIds = new Set(normalized.deferredItems.map((d) => d.id));
+  const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
+  const requirementIds = new Set(normalized.requirements.map((r) => r.id));
+  const acIdSet = new Set(normalized.acceptanceCriteria.map((a) => a.id));
+  // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 "Master Spec 전체
+  // 기준으로 존재하는 REQ/AC인가"만 확인했다. Phase Plan이 이미 각 Phase에 reqIds/acIds를
+  // 배정했는데도(§ STAGE 2) 이 검증은 그 배정 범위를 전혀 쓰지 않아, 이 Phase의 Task가 다른
+  // Phase에 배정된 REQ/AC를 claim해도(global union만 맞으면) 통과했다 — "Phase가 담당하지
+  // 않는 REQ/AC를 Task가 claim하면 REJECT" 요구를 위반한다. 여기서 phase.reqIds/phase.acIds
+  // 부분집합 여부를 추가로 확인한다(기존 전역 존재성 검사는 그대로 유지 — 두 검사는 서로
+  // 다른 실패를 잡는다).
+  const phaseReqIdSet = new Set(phase.reqIds);
+  const phaseAcIdSet = new Set(phase.acIds);
+  const reqCoverageInThisPhase = new Set<string>();
+  const acCoverageInThisPhase = new Set<string>();
+  for (const item of validItems) {
+    for (const r of item.reqIds) {
+      if (deferredIds.has(r) || outOfScopeIds.has(r)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 deferred/out-of-scope 항목(${safeEchoValue(r, ID_FAMILY_SHAPE)})을 요구사항으로 참조합니다.` });
+      } else if (!requirementIds.has(r)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 존재하지 않는 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (!phaseReqIdSet.has(r)) {
+        issues.push({
+          code: "REQUIREMENT_OUTSIDE_PHASE_SCOPE",
+          detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 이 phase에 배정되지 않은 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다 — 다른 phase의 REQ는 claim할 수 없습니다.`,
+        });
+      } else {
+        reqCoverageInThisPhase.add(r);
+      }
+    }
+    for (const a of item.acceptanceCriteria) {
+      if (deferredIds.has(a) || outOfScopeIds.has(a)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 deferred/out-of-scope 항목(${safeEchoValue(a, ID_FAMILY_SHAPE)})을 Acceptance Criteria로 참조합니다.` });
+      } else if (!acIdSet.has(a)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 존재하지 않는 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (!phaseAcIdSet.has(a)) {
+        issues.push({
+          code: "ACCEPTANCE_CRITERIA_OUTSIDE_PHASE_SCOPE",
+          detail: `task(phase ${phase.phaseId}, sequence=${item.sequence})가 이 phase에 배정되지 않은 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다 — 다른 phase의 AC는 claim할 수 없습니다.`,
+        });
+      } else {
+        acCoverageInThisPhase.add(a);
+      }
+    }
+  }
+  // "해당 Phase에 배정된 Must-have REQ/AC는 그 Phase의 Task들에 실제로 coverage되어야 한다" —
+  // AC는 must-have 구분이 없으므로(§ validateCoverageCompleteness와 동일 기준) phase에
+  // 배정된 acIds 전부, REQ는 그중 must-have만 이 phase 안에서 커버돼야 한다.
+  const mustHaveReqIds = new Set(normalized.requirements.filter((r) => r.mustHave).map((r) => r.id));
+  for (const reqId of phase.reqIds) {
+    if (mustHaveReqIds.has(reqId) && !reqCoverageInThisPhase.has(reqId)) {
+      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 must-have requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+    }
+  }
+  for (const acId of phase.acIds) {
+    if (!acCoverageInThisPhase.has(acId)) {
+      issues.push({ code: "MISSING_ACCEPTANCE_CRITERIA_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 Acceptance Criteria(${acId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+    }
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  const sorted = [...validItems].sort((a, b) => a.sequence - b.sequence);
+  const seqToTaskId = new Map<number, string>();
+  sorted.forEach((item, i) => seqToTaskId.set(item.sequence, `${phase.phaseId}.${i + 1}`));
+  const value: PlannerRawTask[] = sorted.map((item) => ({
+    taskId: seqToTaskId.get(item.sequence)!,
+    phaseId: phase.phaseId,
+    title: item.title,
+    objective: item.objective,
+    scope: item.scope,
+    constraints: item.constraints,
+    dependsOn: [...item.dependsOn, ...item.dependsOnSequenceInPhase.map((s) => seqToTaskId.get(s)!)],
+    expectedModules: item.expectedModules,
+    requiredTests: item.requiredTests,
+    acceptanceCriteria: item.acceptanceCriteria,
+    reqIds: item.reqIds,
+    securityConsiderations: item.securityConsiderations,
+    completionGate: item.completionGate,
+  }));
+  return { ok: true, value };
+}
+
+export function buildPhaseTaskPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  architecture: ArchitectureRawOutput,
+  phase: ValidatedPlannerPhase,
+  priorPhases: ValidatedPlannerPhase[],
+  knownTasks: { taskId: string; title: string }[]
+): string {
+  const reqIdSet = new Set(phase.reqIds);
+  const acIdSet = new Set(phase.acIds);
+  const relevantReqs = normalized.requirements.filter((r) => reqIdSet.has(r.id));
+  const relevantAcs = normalized.acceptanceCriteria.filter((a) => acIdSet.has(a.id));
+  const reqLines = relevantReqs.map((r) => `- ${r.id} [${r.category}${r.mustHave ? ", must-have" : ""}]: ${r.text}`).join("\n") || "(이 phase에 명시적으로 배정된 requirement 없음)";
+  const acLines = relevantAcs.map((a) => `- ${a.id}: ${a.text}`).join("\n") || "(이 phase에 명시적으로 배정된 Acceptance Criteria 없음)";
+  const fcLines = normalized.fixedConstraints.map((f) => `- ${f.id} [${f.kind}]: ${f.text}`).join("\n") || "(없음)";
+  const priorPhaseLines = priorPhases.map((p) => `- Phase ${p.phaseId} "${p.name}": ${p.objective}`).join("\n") || "(이전 phase 없음)";
+  const knownTaskLines = knownTasks.map((t) => `- ${t.taskId}: ${t.title}`).join("\n") || "(이전에 확정된 task 없음)";
+
+  return [
+    `당신은 AutoDev Planner입니다 — 이번 호출은 STAGE 3(TASK PLAN) — phaseId=${phase.phaseId}만 담당하며, 오직 Phase ${phase.phaseId}("${phase.name}")의 task만 만듭니다. 다른 phase의 task는 만들지 마세요.`,
+    `projectId=${trusted.projectId}, specVersion=${trusted.specVersion}`,
+    `# Architecture Summary\n${architecture.architectureSummary}`,
+    `# 이 Phase\nphaseId=${phase.phaseId}\nname=${phase.name}\nobjective=${phase.objective}\ncompletionCriteria=${phase.completionCriteria.join("; ") || "(없음)"}`,
+    `# 이 Phase에 배정된 Requirements\n${reqLines}`,
+    `# 이 Phase에 배정된 Acceptance Criteria\n${acLines}`,
+    `# Fixed Constraints(절대 변경 불가)\n${fcLines}`,
+    `# 이전 Phase 요약(참고용)\n${priorPhaseLines}`,
+    `# 이미 확정된 이전 Phase의 task id(cross-phase dependsOn에 참조 가능)\n${knownTaskLines}`,
+    [
+      "# Output — 반드시 아래 JSON 구조만 반환(다른 텍스트 금지):",
+      `{ "projectId": string, "specVersion": string, "phaseId": "${phase.phaseId}",`,
+      '  "tasks": [{"sequence": number(1부터 시작 — 이 응답 안에서만 고유하면 됨. 실제 taskId는 Core가 부여합니다),',
+      '    "title": string, "objective": string, "scope": ["dir/"], "constraints": string[],',
+      '    "dependsOn": string[](다른 phase의 이미 확정된 taskId만, 위 목록에서 선택), "dependsOnSequenceInPhase": number[](같은 응답 안의 다른 task의 sequence만),',
+      '    "expectedModules": string[], "requiredTests": [{"name":string,"command":string,"args":string[],"cwd":"root"}],',
+      '    "acceptanceCriteria": string[], "reqIds": string[], "securityConsiderations": string[], "completionGate": string}] }',
+    ].join("\n"),
+    [
+      "# Rules",
+      "- 이 phase의 목표를 달성하는 데 필요한 task만 만드세요.",
+      "- taskId를 직접 만들지 마세요 — sequence만 지정하면 Core가 taskId를 부여합니다.",
+      "- Deferred/Out-of-scope 항목을 참조하지 마세요.",
+      "- executionPolicy는 이미 STAGE 1에서 확정됐습니다 — 여기서 다시 만들지 마세요.",
+    ].join("\n"),
+  ].join("\n\n");
+}
+
+export function buildPhaseTaskCorrectionPrompt(
+  normalized: NormalizedMasterSpec,
+  trusted: { projectId: string; specVersion: string },
+  architecture: ArchitectureRawOutput,
+  phase: ValidatedPlannerPhase,
+  priorPhases: ValidatedPlannerPhase[],
+  knownTasks: { taskId: string; title: string }[],
+  issues: PlannerValidationIssue[]
+): string {
+  return appendCorrectionSuffix(buildPhaseTaskPrompt(normalized, trusted, architecture, phase, priorPhases, knownTasks), issues);
+}
+
+// ---------------------------------------------------------------------------
+// Raw Output Source — LLM 호출 seam. SI-3.1/SI-3.2와 동일, 변경 없음(claude-runner.ts의
+// runClaudeTask를 그대로 감싼다, Planner 전용 timeout/transport retry 상수도 동일).
+// ---------------------------------------------------------------------------
+
+export type PlannerRawOutputOutcome =
+  | { ok: true; rawOutput: string }
+  | { ok: false; reason: string; retryable?: boolean };
+export type PlannerRawOutputSource = (prompt: string) => Promise<PlannerRawOutputOutcome>;
+
+export interface ClaudeCliRawOutputSourceOptions {
+  command?: string;
+  timeoutMs?: number;
+}
+
+export const PLANNER_RAW_OUTPUT_TIMEOUT_MS = 300_000;
+export const PLANNER_MAX_TRANSPORT_RETRIES = 1;
+
+export function createClaudeCliRawOutputSource(opts: ClaudeCliRawOutputSourceOptions = {}): PlannerRawOutputSource {
+  return async (prompt: string) => {
+    const timeoutMs = opts.timeoutMs ?? PLANNER_RAW_OUTPUT_TIMEOUT_MS;
+    const result = await runClaudeTask(prompt, 1, { command: opts.command, timeoutMs });
+    if (!result.success) {
+      return {
+        ok: false,
+        reason: `claude 호출 실패: ${result.errorCode ?? "UNKNOWN"} — ${result.summary}`,
+        retryable: result.errorCode === "TIMEOUT",
+      };
+    }
+    return { ok: true, rawOutput: result.summary };
+  };
+}
+
+async function invokeRawOutputSourceWithTransportRetry(
+  rawOutputSource: PlannerRawOutputSource,
+  prompt: string
+): Promise<PlannerRawOutputOutcome> {
+  let outcome: PlannerRawOutputOutcome = { ok: false, reason: "rawOutputSource가 한 번도 호출되지 않았습니다." };
+  for (let transportAttempt = 0; transportAttempt <= PLANNER_MAX_TRANSPORT_RETRIES; transportAttempt += 1) {
+    outcome = await rawOutputSource(prompt);
+    if (outcome.ok || !outcome.retryable) return outcome;
+  }
+  return outcome;
+}
+
+// SI-3와 동일 — LLM이 스스로 schema 위반을 고칠 기회를 주는 correction retry 상한. Phase별
+// TASK PLAN 호출을 포함해 모든 LLM stage 호출이 이 상한을 독립적으로 각자 소비한다(§
+// runLlmStage 아래 — "Phase별 Planner 호출은 retry budget이 독립적이어야 한다").
+export const PLANNER_MAX_RAW_OUTPUT_ATTEMPTS = 3;
+
+export interface PlannerDiagnosticEvent {
+  stage: "ARCHITECTURE" | "PHASE_PLAN" | "TASK_PLAN";
+  phaseId?: string;
+  attempt: number;
+  promptLength: number;
+  elapsedMs: number;
+  transportResult: "ok" | "failed";
+  validationResult: "ok" | "rejected" | "not_attempted";
+}
+
+type LlmStageOutcome<T> =
+  | { kind: "ok"; value: T }
+  | { kind: "transport_failed"; detail: string }
+  | { kind: "rejected"; issues: PlannerValidationIssue[] };
+
+/** 하나의 LLM stage(ARCHITECTURE/PHASE_PLAN/한 Phase의 TASK_PLAN) 호출 전체를 담당하는
+ *  공용 루프 — transport bounded retry(§ invokeRawOutputSourceWithTransportRetry) +
+ *  correction bounded retry(§ PLANNER_MAX_RAW_OUTPUT_ATTEMPTS)를 재사용한다. 매 호출마다
+ *  독립적인 attempt 카운터를 새로 시작하므로, Phase별 TASK_PLAN 호출은 서로 retry 예산을
+ *  공유하지 않는다(§ 요구사항 8) — 한 Phase의 실패가 다른 Phase의 남은 예산을 갉아먹지
+ *  않는다. */
+async function runLlmStage<T>(
+  rawOutputSource: PlannerRawOutputSource,
+  stage: PlannerDiagnosticEvent["stage"],
+  phaseId: string | undefined,
+  buildInitialPrompt: () => string,
+  buildCorrectionPrompt: (issues: PlannerValidationIssue[]) => string,
+  validate: (rawText: string) => { ok: true; value: T } | { ok: false; issues: PlannerValidationIssue[] },
+  onDiagnostic?: (event: PlannerDiagnosticEvent) => void
+): Promise<LlmStageOutcome<T>> {
+  let lastIssues: PlannerValidationIssue[] = [];
+  for (let attempt = 1; attempt <= PLANNER_MAX_RAW_OUTPUT_ATTEMPTS; attempt += 1) {
+    const prompt = attempt === 1 ? buildInitialPrompt() : buildCorrectionPrompt(lastIssues);
+    const startedAt = Date.now();
+    const sourceResult = await invokeRawOutputSourceWithTransportRetry(rawOutputSource, prompt);
+    const elapsedMs = Date.now() - startedAt;
+    if (!sourceResult.ok) {
+      onDiagnostic?.({ stage, phaseId, attempt, promptLength: prompt.length, elapsedMs, transportResult: "failed", validationResult: "not_attempted" });
+      return { kind: "transport_failed", detail: sourceResult.reason };
+    }
+    const validation = validate(sourceResult.rawOutput);
+    onDiagnostic?.({ stage, phaseId, attempt, promptLength: prompt.length, elapsedMs, transportResult: "ok", validationResult: validation.ok ? "ok" : "rejected" });
+    if (validation.ok) return { kind: "ok", value: validation.value };
+    lastIssues = validation.issues;
+  }
+  return { kind: "rejected", issues: lastIssues };
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 4 — GLOBAL TRACEABILITY. LLM이 아니라 Core가 deterministic하게 전체를 재검증한다.
+// 각 stage validator가 이미 개별적으로 검사했지만, 여기서는 "모든 Phase의 모든 Task가 모인
+// 뒤"에만 드러나는 전역 불변식(예: phase는 REQ를 배정했지만 그 phase의 어떤 task도 실제로
+// 그 REQ를 claim하지 않은 경우)과, resume된 checkpoint 데이터의 변조/손상에 대한 방어를
+// 담당한다.
+// ---------------------------------------------------------------------------
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 2회차, HIGH) — 원래 하나의 함수였던 것을 세
+// 조각으로 나눈다. 이유: coverage 완전성(모든 must-have REQ/AC가 매핑됐는가)은 "모든 Phase의
+// 모든 Task가 이미 확정된 뒤"에만 유효하게 물을 수 있는 질문이다 — STAGE 3(TASK PLAN) 루프가
+// 아직 일부 Phase만 처리한 resume 도중(§ runPlannerLocked PHASE_PLANNED 블록, 아래
+// validateResumedKnownTasks)에 이 셋을 그대로 재사용하면, 아직 만들어지지 않은 뒤 Phase의
+// REQ/AC가 "커버되지 않음"으로 항상 오탐(false positive)된다. reference 무결성(존재하지
+// 않는/금지된 REQ·AC 참조, taskId 중복, phaseId 불일치, dangling dependency, cycle)은
+// 부분집합에 대해서도 항상 안전하게(단조적으로) 재확인할 수 있으므로 별도 함수로 분리해
+// 두 곳(부분 resume 방어 + 최종 완전성 검증)에서 재사용한다.
+function validatePhaseGraphIntegrity(phasePlan: readonly ValidatedPlannerPhase[]): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = [];
+  const phaseIds = new Set<string>();
+  for (const p of phasePlan) {
+    if (phaseIds.has(p.phaseId)) issues.push({ code: "DUPLICATE_PHASE_ID", detail: `phaseId가 중복됩니다: ${p.phaseId}` });
+    phaseIds.add(p.phaseId);
+  }
+  const phaseEdges = new Map(phasePlan.map((p) => [p.phaseId, p.dependencies]));
+  for (const p of phasePlan) {
+    for (const dep of p.dependencies) {
+      if (!phaseIds.has(dep)) {
+        issues.push({ code: "MISSING_DEPENDENCY", detail: `phase "${p.phaseId}"가 존재하지 않는 phase에 의존합니다: ${safeEchoValue(dep, PHASE_ID_ECHO_SHAPE)}` });
+      } else if (Number(dep) >= Number(p.phaseId)) {
+        issues.push({
+          code: "PHASE_DEPENDENCY_ORDER_VIOLATION",
+          detail: `phase "${p.phaseId}"가 자신보다 늦거나 같은 phaseId(${dep})에 의존합니다.`,
+        });
+      }
+    }
+  }
+  if (hasCycle([...phaseIds], phaseEdges)) issues.push({ code: "DEPENDENCY_CYCLE", detail: "phase 의존성 그래프에 사이클이 있습니다(global)." });
+  return issues;
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — validatePhasePlanRawOutput()
+// (STAGE 2 라이브 validator)는 각 phase의 reqIds/acIds를 deferred/out-of-scope/실제 존재
+// 여부까지 검증하지만, 그 결과가 checkpoint된 뒤(resume/최종 검증 시점)에는 이 필드 자체가
+// 다시 검증되지 않았다 — validatePhaseGraphIntegrity(의존성만 확인)와
+// validateTaskReferenceIntegrity(task가 실제로 참조한 값만 확인)는 phasePlan[].reqIds/acIds에
+// 존재하지 않거나 deferred/out-of-scope인 값이 직접 주입돼도 잡지 못한다. 이 값은 STAGE 3
+// 프롬프트(buildPhaseTaskPrompt)의 "이 Phase에 배정된 Requirements/AC" 섹션 구성에 그대로
+// 쓰이므로, 신뢰 경계(LLM 프롬프트) 진입 전에 다시 검증한다 — validateResumedPhasePlanAndKnownTasks
+// (PHASE_PLANNED resume)와 validateGlobalTraceability(최종 검증) 양쪽에서 재사용한다.
+function validatePhaseRequirementAssignmentIntegrity(
+  normalized: NormalizedMasterSpec,
+  phasePlan: readonly ValidatedPlannerPhase[]
+): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = [];
+  const deferredIds = new Set(normalized.deferredItems.map((d) => d.id));
+  const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
+  const requirementIds = new Set(normalized.requirements.map((r) => r.id));
+  const acIdSet = new Set(normalized.acceptanceCriteria.map((a) => a.id));
+  for (const phase of phasePlan) {
+    for (const r of phase.reqIds) {
+      if (deferredIds.has(r) || outOfScopeIds.has(r)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `phase "${phase.phaseId}"가 deferred/out-of-scope 항목(${safeEchoValue(r, ID_FAMILY_SHAPE)})을 참조합니다.` });
+      } else if (!requirementIds.has(r)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `phase "${phase.phaseId}"가 존재하지 않는 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      }
+    }
+    for (const a of phase.acIds) {
+      if (deferredIds.has(a) || outOfScopeIds.has(a)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `phase "${phase.phaseId}"가 deferred/out-of-scope 항목(${safeEchoValue(a, ID_FAMILY_SHAPE)})을 Acceptance Criteria로 참조합니다.` });
+      } else if (!acIdSet.has(a)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `phase "${phase.phaseId}"가 존재하지 않는 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      }
+    }
+  }
+  return issues;
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 phaseIds(단순 존재
+// 집합)만 받아 "존재하는 phase를 가리키는가"만 확인했다. "Task reqIds/acceptanceCriteria가
+// 자신의 phase가 배정받은 REQ/AC 범위 안인가"는 STAGE 3 단일 호출(§ validatePhaseTaskRawOutput)
+// 에서만 검사됐는데, 그 검사는 resume checkpoint가 직접 변조된 경우(STAGE 3를 다시 거치지
+// 않고 phaseTaskPlans만 바뀐 경우) 우회된다 — 여기서 phasePlan 전체를 받아 phase별
+// reqIds/acIds도 함께 재확인하고, phase 단위 coverage(§ validatePhaseTaskRawOutput과 동일
+// 기준)까지 다시 검증해 "Task-stage validator 우회"를 막는다.
+function validateTaskReferenceIntegrity(
+  normalized: NormalizedMasterSpec,
+  phasePlan: readonly ValidatedPlannerPhase[],
+  allTasks: readonly PlannerRawTask[]
+): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = [];
+  const phaseById = new Map(phasePlan.map((p) => [p.phaseId, p]));
+  const taskIds = new Set<string>();
+  const taskEdges = new Map<string, string[]>();
+  const taskPhaseById = new Map<string, string>();
+  const deferredIds = new Set(normalized.deferredItems.map((d) => d.id));
+  const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
+  const requirementIds = new Set(normalized.requirements.map((r) => r.id));
+  const acIdSet = new Set(normalized.acceptanceCriteria.map((a) => a.id));
+  const mustHaveReqIds = new Set(normalized.requirements.filter((r) => r.mustHave).map((r) => r.id));
+  const reqCoverageByPhase = new Map<string, Set<string>>();
+  const acCoverageByPhase = new Map<string, Set<string>>();
+  for (const t of allTasks) {
+    if (taskIds.has(t.taskId)) issues.push({ code: "DUPLICATE_TASK_ID", detail: `taskId가 중복됩니다: ${t.taskId}` });
+    taskIds.add(t.taskId);
+    taskEdges.set(t.taskId, t.dependsOn);
+    taskPhaseById.set(t.taskId, t.phaseId);
+    const phase = phaseById.get(t.phaseId);
+    if (!phase || !t.taskId.startsWith(`${t.phaseId}.`)) {
+      issues.push({ code: "INVALID_STRUCTURE", detail: `task "${safeEchoValue(t.taskId, TASK_ID_ECHO_SHAPE)}"의 phaseId(${safeEchoValue(t.phaseId, PHASE_ID_ECHO_SHAPE)})가 존재하지 않거나 taskId와 일치하지 않습니다.` });
+    }
+    const phaseReqIdSet = phase ? new Set(phase.reqIds) : undefined;
+    const phaseAcIdSet = phase ? new Set(phase.acIds) : undefined;
+    for (const r of t.reqIds) {
+      if (deferredIds.has(r) || outOfScopeIds.has(r)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `task "${t.taskId}"가 deferred/out-of-scope 항목(${safeEchoValue(r, ID_FAMILY_SHAPE)})을 요구사항으로 참조합니다.` });
+      } else if (!requirementIds.has(r)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task "${t.taskId}"가 존재하지 않는 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (phaseReqIdSet && !phaseReqIdSet.has(r)) {
+        issues.push({ code: "REQUIREMENT_OUTSIDE_PHASE_SCOPE", detail: `task "${t.taskId}"가 자신의 phase(${t.phaseId})에 배정되지 않은 requirement(${safeEchoValue(r, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (phaseReqIdSet) {
+        if (!reqCoverageByPhase.has(t.phaseId)) reqCoverageByPhase.set(t.phaseId, new Set());
+        reqCoverageByPhase.get(t.phaseId)!.add(r);
+      }
+    }
+    for (const a of t.acceptanceCriteria) {
+      if (deferredIds.has(a) || outOfScopeIds.has(a)) {
+        issues.push({ code: "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED", detail: `task "${t.taskId}"가 deferred/out-of-scope 항목(${safeEchoValue(a, ID_FAMILY_SHAPE)})을 Acceptance Criteria로 참조합니다.` });
+      } else if (!acIdSet.has(a)) {
+        issues.push({ code: "UNKNOWN_REQUIREMENT_REFERENCE", detail: `task "${t.taskId}"가 존재하지 않는 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (phaseAcIdSet && !phaseAcIdSet.has(a)) {
+        issues.push({ code: "ACCEPTANCE_CRITERIA_OUTSIDE_PHASE_SCOPE", detail: `task "${t.taskId}"가 자신의 phase(${t.phaseId})에 배정되지 않은 Acceptance Criteria(${safeEchoValue(a, ID_FAMILY_SHAPE)})를 참조합니다.` });
+      } else if (phaseAcIdSet) {
+        if (!acCoverageByPhase.has(t.phaseId)) acCoverageByPhase.set(t.phaseId, new Set());
+        acCoverageByPhase.get(t.phaseId)!.add(a);
+      }
+    }
+  }
+  // SI-3.3~3.5 4-chunk 최종 리뷰 지적(HIGH) — 지금까지 task dependency는 "존재하는 task를
+  // 가리키는가"(MISSING_DEPENDENCY)와 "전체 그래프에 사이클이 없는가"(DEPENDENCY_CYCLE)만
+  // 확인했다. 정상 fresh 생성에서는(STAGE 3가 phase를 순서대로 하나씩 처리하므로) 이보다
+  // 이른 phase의 task가 "아직 생성되지 않은" 늦은 phase의 task를 가리킬 수 없어 이 문제가
+  // 드러나지 않았다. 하지만 resume checkpoint가 변조되어 늦은 phase가 이른 phase보다 먼저
+  // 완료된 상태로 저장되면(§ validateResumedPhasePlanAndKnownTasks가 이미 이 phase 순서를
+  // 강제하지 않는다는 점을 이 리뷰가 지적), 그 시점의 knownTasksFlat에 늦은 phase의 task가
+  // 포함되어 이른 phase의 task가 그 task에 의존하는 것을 이 함수가 지금까지 허용했다 — 실행
+  // 순서를 역전시키는 task dependency다. phase 자체의 의존성은 이미 같은 원칙(자신보다
+  // 늦거나 같은 phaseId에 의존 금지, § validatePhaseGraphIntegrity의
+  // PHASE_DEPENDENCY_ORDER_VIOLATION)으로 강제되므로, task dependency에도 동일한 원칙을
+  // 적용한다 — 서로 다른 phase를 가리키는 task dependency는 반드시 자신보다 이른 phaseId를
+  // 가리켜야 한다.
+  for (const t of allTasks) {
+    for (const dep of t.dependsOn) {
+      if (!taskIds.has(dep)) {
+        issues.push({ code: "MISSING_DEPENDENCY", detail: `task "${t.taskId}"가 존재하지 않는 task에 의존합니다: ${safeEchoValue(dep, TASK_ID_ECHO_SHAPE)}` });
+        continue;
+      }
+      const depPhaseId = taskPhaseById.get(dep);
+      if (depPhaseId !== undefined && depPhaseId !== t.phaseId && Number(depPhaseId) >= Number(t.phaseId)) {
+        issues.push({
+          code: "TASK_DEPENDENCY_PHASE_ORDER_VIOLATION",
+          detail: `task "${t.taskId}"(phase ${t.phaseId})가 자신보다 늦거나 같은 phase(${depPhaseId})의 task(${safeEchoValue(dep, TASK_ID_ECHO_SHAPE)})에 의존합니다 — 실행 순서를 역전시킵니다.`,
+        });
+      }
+    }
+  }
+  if (hasCycle([...taskIds], taskEdges)) issues.push({ code: "DEPENDENCY_CYCLE", detail: "task 의존성 그래프에 사이클이 있습니다(global)." });
+
+  // phase 단위 coverage 재확인 — "이 데이터셋에 해당 phase의 task가 하나라도 존재하면"
+  // (STAGE 3는 한 phase의 task 전체를 원자적으로 한 번에 checkpoint하므로, 정상 부분 resume
+  // 에서는 어떤 phase든 task가 "전부 있거나 전혀 없다") 그 phase가 배정받은 must-have
+  // REQ/전체 AC가 실제로 커버됐는지 재확인한다. 아직 생성되지 않은 뒤 phase는 건너뛴다
+  // (§ validateResumedPhasePlanAndKnownTasks 상단 주석 — 정상적인 부분 resume을 오탐하지 않음).
+  const phasesWithTasks = new Set(allTasks.map((t) => t.phaseId));
+  for (const phase of phasePlan) {
+    if (!phasesWithTasks.has(phase.phaseId)) continue;
+    const reqCov = reqCoverageByPhase.get(phase.phaseId) ?? new Set<string>();
+    const acCov = acCoverageByPhase.get(phase.phaseId) ?? new Set<string>();
+    for (const reqId of phase.reqIds) {
+      if (mustHaveReqIds.has(reqId) && !reqCov.has(reqId)) {
+        issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 must-have requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+      }
+    }
+    for (const acId of phase.acIds) {
+      if (!acCov.has(acId)) {
+        issues.push({ code: "MISSING_ACCEPTANCE_CRITERIA_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 Acceptance Criteria(${acId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+      }
+    }
+  }
+  return issues;
+}
+
+function validateCoverageCompleteness(normalized: NormalizedMasterSpec, allTasks: readonly PlannerRawTask[]): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = [];
+  const reqCoverage = new Set<string>();
+  const acCoverage = new Set<string>();
+  for (const t of allTasks) {
+    for (const r of t.reqIds) reqCoverage.add(r);
+    for (const a of t.acceptanceCriteria) acCoverage.add(a);
+  }
+  for (const req of normalized.requirements) {
+    if (req.mustHave && !reqCoverage.has(req.id)) {
+      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `Must-have requirement(${req.id})가 어떤 task에도 매핑되지 않았습니다.` });
+    }
+  }
+  for (const ac of normalized.acceptanceCriteria) {
+    if (!acCoverage.has(ac.id)) {
+      issues.push({ code: "MISSING_ACCEPTANCE_CRITERIA_COVERAGE", detail: `Acceptance Criteria(${ac.id})가 어떤 task에도 매핑되지 않았습니다.` });
+    }
+  }
+  return issues;
+}
+
+// MEDIUM1(§ GPT Independent Reviewer 지적 SI-3.3 REVISE 2회차) — checkpoint shape 검사(§
+// isValidValidatedPhaseArray/isValidPhaseTaskPlansShape)는 타입만 확인할 뿐 unknown key를
+// 거부하지 않는다. "완전한(coverage 포함) 검증"이 아니라 "부분집합에도 항상 안전한 구조
+// 검증"이므로 validateTaskReferenceIntegrity와 동일하게 완전/부분 데이터 양쪽에서 재사용한다.
+function validateCheckpointShapeStrictness(phasePlan: readonly ValidatedPlannerPhase[], tasks: readonly PlannerRawTask[]): PlannerValidationIssue[] {
+  const issues: PlannerValidationIssue[] = [];
+  for (const p of phasePlan) {
+    checkExactKeys(`phase "${p.phaseId}"(checkpoint)`, p as unknown as Record<string, unknown>, VALIDATED_PHASE_KEYS, issues);
+  }
+  for (const t of tasks) {
+    const tObj = t as unknown as Record<string, unknown>;
+    checkExactKeys(`task "${t.taskId}"(checkpoint)`, tObj, PLANNER_RAW_TASK_KEYS, issues);
+    validateRequiredTestsArray(`task "${t.taskId}"(checkpoint).requiredTests`, tObj.requiredTests, issues);
+  }
+  return issues;
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 이 함수는 TASKS_PLANNED
+// resume 진입 시(STAGE 4)와 TRACEABILITY_VALIDATED resume 진입 직전(STAGE 5) 양쪽에서
+// checkpoint 전체를 재검증하는 마지막 방어선인데, validateResumedPhasePlanAndKnownTasks
+// (PHASE_PLANNED resume 방어선)와 달리 secret-shaped 값 스캔이 빠져 있었다 — checkpoint를
+// 직접 변조해 STAGE 3 라이브 validator(매 호출마다 scanRawTextForSecrets를 거침)를 우회하고
+// secret-shaped 문자열을 phasePlan/task 필드에 주입하면, 이 함수만으로는 잡히지 않고 최종
+// project-manifest.json/task-registry.json까지 그대로 전달될 수 있었다. 같은 헬퍼
+// (scanRawTextForSecrets)를 재사용해 로직 복제 없이 동일 방어를 적용한다.
+export function validateGlobalTraceability(
+  normalized: NormalizedMasterSpec,
+  phasePlan: readonly ValidatedPlannerPhase[],
+  allTasks: readonly PlannerRawTask[]
+): PlannerValidationIssue[] {
+  const countLimitIssues = validatePhaseTaskCountLimits(phasePlan, allTasks);
+  if (countLimitIssues.length > 0) return countLimitIssues;
+
+  const issues: PlannerValidationIssue[] = [
+    ...scanRawTextForSecrets(JSON.stringify(phasePlan), "<planner-phase-plan-checkpoint>"),
+    ...scanRawTextForSecrets(JSON.stringify(allTasks), "<planner-known-tasks-checkpoint>"),
+    ...validateCheckpointShapeStrictness(phasePlan, allTasks),
+    ...validatePhaseGraphIntegrity(phasePlan),
+    ...validatePhaseRequirementAssignmentIntegrity(normalized, phasePlan),
+    ...validateTaskReferenceIntegrity(normalized, phasePlan, allTasks),
+    ...validateCoverageCompleteness(normalized, allTasks),
+  ];
+
+  if (issues.length === 0 && allTasks.length > 0 && !allTasks.some((t) => t.dependsOn.length === 0)) {
+    issues.push({ code: "NO_RUNNABLE_TASK_FOUND", detail: "실행 가능한(의존성이 없는) 첫 task가 없습니다." });
+  }
+
+  return issues;
+}
+
+/**
+ * PHASE_PLANNED resume 진입 시(§ runPlannerLocked) STAGE 3 루프가 architecture/phasePlan을
+ * 실제로 Task Plan LLM 프롬프트에 쓰기 전에, 그리고 이미 확정된 phaseTaskPlans(있다면)를
+ * "이미 확정된 task id" 컨텍스트로 다음 프롬프트에 노출하기 전에 호출한다(§ GPT Independent
+ * Reviewer 지적 SI-3.3 REVISE 2회차, HIGH — "PHASE_PLANNED resume에서 architecture와
+ * phasePlan이 LLM prompt에 사용되기 전에 semantic 재검증되지 않는다"). must-have coverage는
+ * 아직 일부 Phase의 task만 존재할 수 있어(정상) 여기서 확인하지 않는다(§ 위
+ * validateCoverageCompleteness 분리 주석) — reference 무결성 + phase graph integrity +
+ * secret-shaped 값만 확인한다.
+ */
+// SI-3.3~3.5 4-chunk 최종 리뷰 지적(HIGH) — PLANNER_MAX_PHASES/PLANNER_MAX_TASKS_PER_PHASE는
+// 지금까지 fresh LLM raw output을 검증하는 시점(Phase Plan/Task Plan stage validator)에만
+// 강제됐다. resume 경로(이 함수)는 planner-state.json에서 읽은 phasePlan/phaseTaskPlans를
+// 그대로 신뢰해 이 상한을 다시 확인하지 않았다 — planner-state.json 자체가 변조되어(§
+// "mid-run-tamper-*" 시나리오가 이미 이 파일에 대한 변조 탐지를 검증하지만, 그 시나리오들은
+// "다른 신뢰 입력과 self-consistent하지 않은 변조"만 다뤘다) shape는 유효하지만 phase/task
+// 개수가 상한을 넘는 경우, resume이 phase마다 별도 LLM 호출을 계속 발생시켜 비용/시간
+// 제한을 우회할 수 있었다. fresh 경로와 동일한 Core 상한을 여기서도 강제한다(로직 복제가
+// 아니라 동일한 상수를 재사용 — 값의 단일 출처는 그대로 PLANNER_MAX_PHASES/
+// PLANNER_MAX_TASKS_PER_PHASE 하나다).
+// SI-3.3~3.5 4-chunk 최종 리뷰 2라운드 지적(HIGH) — 위 상한 재검증을
+// validateResumedPhasePlanAndKnownTasks(PHASE_PLANNED resume 전용)에만 넣었더니
+// TASKS_PLANNED/TRACEABILITY_VALIDATED resume과 fresh final assembly가 공유하는
+// validateGlobalTraceability()는 이 상한을 여전히 재확인하지 않았다 — checkpoint의
+// stage를 그 이후 단계로 만들고 모든 phaseTaskPlans key를 채우면 이 상한을 우회해
+// PHASE_PLANNED 방어선을 건너뛸 수 있었다. 두 함수 모두 이 하나의 헬퍼를 공유해(로직
+// 복제 없음) 상한이 "resume이 어느 stage에서 재개되든" 동일하게 적용되게 한다.
+function validatePhaseTaskCountLimits(phasePlan: readonly ValidatedPlannerPhase[], allTasks: readonly PlannerRawTask[]): PlannerValidationIssue[] {
+  if (phasePlan.length > PLANNER_MAX_PHASES) {
+    return [
+      {
+        code: "TOO_MANY_PHASES",
+        detail: `checkpoint의 phase 개수(${phasePlan.length})가 상한(${PLANNER_MAX_PHASES})을 초과합니다 — 변조/손상이 의심되어 거부합니다.`,
+      },
+    ];
+  }
+  const countByPhase = new Map<string, number>();
+  for (const t of allTasks) countByPhase.set(t.phaseId, (countByPhase.get(t.phaseId) ?? 0) + 1);
+  const issues: PlannerValidationIssue[] = [];
+  for (const [phaseId, count] of countByPhase) {
+    if (count > PLANNER_MAX_TASKS_PER_PHASE) {
+      issues.push({
+        code: "TOO_MANY_TASKS_IN_PHASE",
+        detail: `checkpoint의 phase ${phaseId} task 개수(${count})가 상한(${PLANNER_MAX_TASKS_PER_PHASE})을 초과합니다 — 변조/손상이 의심되어 거부합니다.`,
+      });
+    }
+  }
+  return issues;
+}
+
+function validateResumedPhasePlanAndKnownTasks(
+  phasePlan: readonly ValidatedPlannerPhase[],
+  phaseTaskPlans: Readonly<Record<string, PlannerRawTask[]>>,
+  normalized: NormalizedMasterSpec
+): PlannerValidationIssue[] {
+  const knownTasks = Object.values(phaseTaskPlans).flat();
+  const issues: PlannerValidationIssue[] = [
+    ...scanRawTextForSecrets(JSON.stringify(phasePlan), "<planner-phase-plan-checkpoint>"),
+    ...scanRawTextForSecrets(JSON.stringify(knownTasks), "<planner-known-tasks-checkpoint>"),
+    ...validatePhaseTaskCountLimits(phasePlan, knownTasks),
+  ];
+  if (issues.length > 0) return issues;
+  issues.push(
+    ...validateCheckpointShapeStrictness(phasePlan, knownTasks),
+    ...validatePhaseGraphIntegrity(phasePlan),
+    ...validatePhaseRequirementAssignmentIntegrity(normalized, phasePlan),
+    ...validateTaskReferenceIntegrity(normalized, phasePlan, knownTasks)
+  );
+  return issues;
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 5 — FINAL ASSEMBLY. 검증된 Architecture/Phase Plan/Phase별 Task Plan을 SI-3가
+// 쓰던 PlannerRawOutput 모양으로 순수 deterministic 조립한 뒤, buildGeneratedExecutionData
+// 이하는 SI-3와 완전히 동일한 경로를 재사용한다(project-manifest.ts/task-registry.ts/
+// project-policy.ts 재검증 포함) — LLM이 최종 실행 데이터를 다시 통째로 생성하지 않는다.
+// ---------------------------------------------------------------------------
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 `phaseTaskPlans[phase.phaseId] ?? []`로
+// 누락된 phase key를 조용히 "그 phase에는 task가 없음"으로 취급했다. 이 함수는 STAGE 4 이후
+// (모든 phase의 Task Plan이 이미 확정됐다고 stage가 보장하는 시점)에만 호출되므로, 이 시점에
+// phasePlan의 phaseId 중 하나라도 phaseTaskPlans에 대응 entry가 없으면 "누락"이 아니라
+// "checkpoint 손상/변조"다 — throw로 fail-closed하고, 호출부가 BLOCKED(PLANNER_STATE_CORRUPT)로
+// 변환한다(§ runPlannerLocked).
+export function flattenPhaseTaskPlans(
+  phasePlan: readonly ValidatedPlannerPhase[],
+  phaseTaskPlans: Readonly<Record<string, PlannerRawTask[]>>
+): PlannerRawTask[] {
+  const out: PlannerRawTask[] = [];
+  for (const phase of [...phasePlan].sort((a, b) => Number(a.phaseId) - Number(b.phaseId))) {
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, MEDIUM) — 이전에는
+    // `phaseTaskPlans[phase.phaseId]`의 truthiness만 확인했다. own-property 존재 여부를
+    // hasOwnProperty로 명시적으로 먼저 확인하고, 값이 실제로 비어있지 않은 배열인지도 여기서
+    // 다시 한번 방어적으로 확인한다(§ isValidPhaseTaskPlansShape가 이미 파일을 읽는 시점에
+    // 이 불변식을 강제하지만, 이 함수는 export되어 다른 호출부에서도 재사용될 수 있으므로
+    // 자체적으로도 fail-closed여야 한다).
+    const hasEntry = Object.prototype.hasOwnProperty.call(phaseTaskPlans, phase.phaseId);
+    const tasksForPhase = hasEntry ? phaseTaskPlans[phase.phaseId] : undefined;
+    if (!hasEntry || !Array.isArray(tasksForPhase) || tasksForPhase.length === 0) {
+      throw new Error(`flattenPhaseTaskPlans: phase "${phase.phaseId}"에 대응하는 유효한(비어있지 않은) phaseTaskPlans entry가 없습니다 — 누락되거나 빈 phase를 조용히 취급하지 않습니다.`);
+    }
+    out.push(...tasksForPhase);
+  }
+  return out;
+}
+
+export function synthesizeLegacyRawOutput(
+  identity: BootstrapRequestIdentity,
+  architecture: ArchitectureRawOutput,
+  phasePlan: readonly ValidatedPlannerPhase[],
+  allTasks: readonly PlannerRawTask[]
+): PlannerRawOutput {
+  return {
+    projectId: identity.projectId,
+    specVersion: identity.specVersion,
+    architectureSummary: architecture.architectureSummary,
+    technologyChoices: architecture.technologyChoices,
+    fixedConstraintAcknowledgement: architecture.fixedConstraintAcknowledgement,
+    modulesOrComponents: architecture.modulesOrComponents,
+    integrations: architecture.integrations,
+    securityRequirementsSummary: architecture.securityRequirementsSummary,
+    testingRequirementsSummary: architecture.testingRequirementsSummary,
+    deliveryConstraintsSummary: architecture.deliveryConstraintsSummary,
+    phases: phasePlan.map((p) => ({ phaseId: p.phaseId, name: p.name, objective: p.objective, dependsOn: p.dependencies, completionCriteria: p.completionCriteria })),
+    tasks: [...allTasks],
+    executionPolicy: architecture.executionPolicy,
+  };
 }
 
 export interface ReqTraceabilityEntry {
@@ -1154,16 +2114,10 @@ export interface PersistedProjectManifestFile {
   sourceSpecIntegrity: { algorithm: "sha256" | "sha512"; hash: string };
   reqTraceability: ReqTraceability;
   generatedAt: string;
-  /** GPT Independent Reviewer 지적(SI-3 REVISE 2회차, HIGH) — validatePlannerRawOutput()의
-   *  fixedConstraintAcknowledgement 검사는 Planner(LLM)가 fixed constraint의 "문구"를 정확히
-   *  echo했는지만 deterministic하게 확인한다 — phases/tasks/technologyChoices/executionPolicy
-   *  같은 실제 HOW가 그 constraint를 진짜로 지키는지는(자유 텍스트 의미 해석이 필요하므로)
-   *  결정적으로 검증하지 않는다(할 수 없다). 그 사실을 조용히 감추는 대신 항상 명시적으로
-   *  드러낸다 — fixedConstraints가 하나라도 있으면 이 필드가 항상 채워지고, READY_FOR_AUTODEV
-   *  outcome에도 동일한 내용이 그대로 노출된다(capability-resolver.ts가 자동으로 검증할 수
-   *  없는 위험을 조용히 통과시키지 않고 HUMAN_APPROVAL_REQUIRED로 명시적으로 분류하는 것과
-   *  동일한 원칙) — 실제 개발 시작 전 사람이 반드시 phases/tasks/technologyChoices/
-   *  executionPolicy를 Fixed Constraints와 직접 대조해야 한다. */
+  /** fixedConstraints가 하나라도 있으면 HOW(phases/tasks/technologyChoices/executionPolicy)가
+   *  그 constraint를 실제로 지키는지는 자유 텍스트 의미 해석이 필요해 이 Validator가 기계적으로
+   *  검증할 수 없다는 사실을 항상 명시적으로 드러낸다(READY_FOR_AUTODEV outcome에도 동일 내용
+   *  노출) — 사람이 반드시 phases/tasks/technologyChoices/executionPolicy를 직접 대조해야 한다. */
   fixedConstraintComplianceNote: string | null;
 }
 
@@ -1247,23 +2201,21 @@ function assembleProjectManifest(data: GeneratedExecutionData): ProjectManifest 
 }
 
 // ---------------------------------------------------------------------------
-// Planner State — 원자적 write, resume-safe, idempotent(SI-2의 bootstrap-state.json과
-// 동일한 tmp+rename + 3분류(absent/corrupt/valid) 패턴을 그대로 따른다).
+// Planner State — 원자적 write, resume-safe, idempotent. SI-3.3부터 schemaVersion=2로
+// stage별 구조화된 산출물(architecture/phasePlan/phaseTaskPlans)을 직접 저장한다(SI-3의
+// 단일 rawPlannerOutput 문자열 저장 방식을 대체) — resume은 이 구조화된 값을 그대로
+// 재사용하고, 이미 완료된 Phase의 Task Plan은 다시 호출하지 않는다.
 // ---------------------------------------------------------------------------
 
-export const PLANNER_STATE_SCHEMA_VERSION = 1 as const;
-
-// GPT Independent Reviewer 지적(SI-3 REVISE 4회차 — 실제 JARVIS 실행 관찰) — 실제 claude
-// CLI가 MALFORMED_JSON/schema 위반을 반복 생성한 관찰에 대한 방어. rawOutputSource가 매번
-// 같은(또는 더 나쁜) 출력을 반복해도 무한 재시도하지 않도록 상한을 둔다 — buildGoodRawOutput류
-// fixture가 아닌 실제 LLM은 correction prompt(§ buildPlannerCorrectionPrompt)를 받으면 보통
-// 1~2회 안에 수정하므로, 3회(최초 1회 + correction 2회)면 충분하다.
-export const PLANNER_MAX_RAW_OUTPUT_ATTEMPTS = 3;
+export const PLANNER_STATE_SCHEMA_VERSION = 2 as const;
 
 export type PlannerStage =
   | "SPEC_VERIFIED"
   | "REQUIREMENTS_NORMALIZED"
   | "ARCHITECTURE_PLANNED"
+  | "PHASE_PLANNED"
+  | "TASKS_PLANNED"
+  | "TRACEABILITY_VALIDATED"
   | "EXECUTION_DATA_GENERATED"
   | "EXECUTION_DATA_VALIDATED"
   | "COMPLETED";
@@ -1272,6 +2224,9 @@ const PLANNER_STAGE_ORDER: readonly PlannerStage[] = [
   "SPEC_VERIFIED",
   "REQUIREMENTS_NORMALIZED",
   "ARCHITECTURE_PLANNED",
+  "PHASE_PLANNED",
+  "TASKS_PLANNED",
+  "TRACEABILITY_VALIDATED",
   "EXECUTION_DATA_GENERATED",
   "EXECUTION_DATA_VALIDATED",
   "COMPLETED",
@@ -1283,11 +2238,17 @@ export interface PlannerStateFile {
   stage: PlannerStage;
   createdAt: string;
   updatedAt: string;
-  /** ARCHITECTURE_PLANNED 이상에서만 채워진다(검증을 통과한 raw output만 여기 저장된다). */
-  rawPlannerOutput?: string;
-  /** REJECTED로 끝난 마지막 시도의 진단 정보 — "partial output 보존"(감사/재시도 참고용).
+  /** ARCHITECTURE_PLANNED 이상에서만 채워진다(검증을 통과한 결과만 저장된다). */
+  architecture?: ArchitectureRawOutput;
+  /** PHASE_PLANNED 이상에서만 채워진다. */
+  phasePlan?: ValidatedPlannerPhase[];
+  /** phaseId를 key로 하는 부분 진행 상태 — PHASE_PLANNED 단계 진행 중에도 완료된 Phase마다
+   *  즉시(체크포인트로) 채워진다. TASKS_PLANNED 도달 시 phasePlan의 모든 phaseId를 포함한다. */
+  phaseTaskPlans?: Record<string, PlannerRawTask[]>;
+  /** REJECTED로 끝난 마지막 시도의 진단 정보 — "부분 산출물 보존"(감사/재시도 참고용).
    *  stage를 진행시키지 않는다. */
   lastValidationIssues?: PlannerValidationIssue[];
+  lastValidationContext?: { stage: string; phaseId?: string };
 }
 
 function plannerStateFilePath(projectRoot: string): string {
@@ -1301,6 +2262,43 @@ function generatedTaskRegistryPath(projectRoot: string): string {
 }
 function generatedExecutionPolicyPath(projectRoot: string): string {
   return join(projectRoot, ".autodev", "execution-policy.json");
+}
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH/MEDIUM) — project-manifest.json/
+// task-registry.json/execution-policy.json은 각각 독립적인 writeJsonAtomic() 호출로
+// 저장된다(개별 파일은 원자적이지만, 3개 파일 전체를 하나의 트랜잭션으로 묶는 파일시스템
+// 원시 기능은 없다) — 그중 하나만 실패하면(디스크 공간 부족 등) 서로 다른 generation의
+// 파일이 섞일 수 있다. 새 트랜잭션 framework 대신, 3개 파일을 모두 성공적으로 쓴 "직후"
+// 그 파일들의 실제 내용을 다시 읽어 해시를 계산하고, 그 해시를 담은 이 4번째 파일을 가장
+// 마지막에 쓴다 — 이 파일이 존재하고 기록된 해시가 실제 3개 파일과 일치해야만 "이 3개가
+// 같은 generation에서 함께 완성됐다"고 신뢰한다(§ reloadAndValidateGeneratedData). 부분
+// 실패(3개 중 일부만 갱신됨/이 파일 자체가 없음/해시 불일치)는 다음 resume에서 즉시
+// GENERATED_DATA_INVALID로 탐지된다 — 기존 generated-data integrity 검증에 통합될 뿐,
+// 별도 read/write 경로를 추가하지 않는다.
+function generationManifestPath(projectRoot: string): string {
+  return join(projectRoot, ".autodev", "generation.json");
+}
+interface GenerationManifest {
+  generationId: string;
+  manifestSha256: string;
+  taskRegistrySha256: string;
+  executionPolicySha256: string;
+}
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+function isValidGenerationManifestShape(v: unknown): v is GenerationManifest {
+  if (!structuralGuard(v)) return false;
+  return (
+    typeof v.generationId === "string" &&
+    v.generationId.length > 0 &&
+    typeof v.manifestSha256 === "string" &&
+    SHA256_HEX_RE.test(v.manifestSha256) &&
+    typeof v.taskRegistrySha256 === "string" &&
+    SHA256_HEX_RE.test(v.taskRegistrySha256) &&
+    typeof v.executionPolicySha256 === "string" &&
+    SHA256_HEX_RE.test(v.executionPolicySha256)
+  );
+}
+function sha256Hex(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 function isValidIdentityShape(v: unknown): v is BootstrapRequestIdentity {
@@ -1319,46 +2317,337 @@ function isValidIdentityShape(v: unknown): v is BootstrapRequestIdentity {
   );
 }
 
-function isValidPlannerStateFile(v: unknown): v is PlannerStateFile {
+function isValidArchitectureShape(v: unknown): v is ArchitectureRawOutput {
   if (!v || typeof v !== "object") return false;
   const o = v as Record<string, unknown>;
-  if (o.schemaVersion !== PLANNER_STATE_SCHEMA_VERSION) return false;
-  if (typeof o.stage !== "string" || !PLANNER_STAGE_ORDER.includes(o.stage as PlannerStage)) return false;
-  if (typeof o.createdAt !== "string" || typeof o.updatedAt !== "string") return false;
-  if (!isValidIdentityShape(o.identity)) return false;
-  if (o.rawPlannerOutput !== undefined && typeof o.rawPlannerOutput !== "string") return false;
+  return (
+    typeof o.projectId === "string" &&
+    typeof o.specVersion === "string" &&
+    typeof o.architectureSummary === "string" &&
+    Array.isArray(o.technologyChoices) &&
+    isStringArray(o.modulesOrComponents) &&
+    isStringArray(o.integrations) &&
+    isStringArray(o.architecturalBoundaries) &&
+    isStringArray(o.dependencyRelationships) &&
+    isStringArray(o.majorConstraints) &&
+    isStringArray(o.securityRequirementsSummary) &&
+    isStringArray(o.testingRequirementsSummary) &&
+    isStringArray(o.deliveryConstraintsSummary) &&
+    Array.isArray(o.fixedConstraintAcknowledgement) &&
+    structuralGuard(o.executionPolicy)
+  );
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 빈 배열은 Array.every()가
+// vacuously true를 반환해 "shape-valid"로 통과했다. 라이브 validator(validatePhasePlanRawOutput)는
+// `raw.phases.length === 0`을 절대 성공으로 반환하지 않으므로, 정상 파이프라인에서 저장된
+// phasePlan이 빈 배열일 수 없다 — checkpoint에 phasePlan=[]을 직접 주입하는 변조를 여기서
+// fail-closed로 거부한다.
+function isValidValidatedPhaseArray(v: unknown): v is ValidatedPlannerPhase[] {
+  if (!Array.isArray(v) || v.length === 0) return false;
+  return v.every((p) => {
+    if (!structuralGuard(p)) return false;
+    return (
+      typeof p.phaseId === "string" &&
+      PHASE_ID_RE.test(p.phaseId) &&
+      typeof p.name === "string" &&
+      typeof p.objective === "string" &&
+      isStringArray(p.dependencies) &&
+      isStringArray(p.completionCriteria) &&
+      isStringArray(p.reqIds) &&
+      isStringArray(p.acIds)
+    );
+  });
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 이전에는 phaseTaskPlans의
+// 각 phase entry가 "배열이기만 하면"(길이 0 포함) shape-valid로 인정됐다. 그런데 실제 STAGE 3
+// 라이브 validator(validatePhaseTaskRawOutput)는 tasks.length===0인 응답을 절대 성공으로
+// 반환하지 않는다(가장 먼저 INVALID_STRUCTURE로 거부) — 즉 "완료된 phase의 task 배열이
+// 비어있음"은 정상 파이프라인에서 나올 수 없는 상태다. 그런데 validateTaskReferenceIntegrity의
+// phase-local coverage 검사는 "이 phase에 속한 task가 실제로 있는가"로 "이 phase의 STAGE 3가
+// 완료됐는가"를 추론했다 — checkpoint에 `phaseTaskPlans[phaseId] = []`를 직접 주입하면(shape은
+// 여전히 유효) 그 phase는 task가 0개이므로 phase-local coverage 검사 대상에서 조용히
+// 제외되면서도, stage-artifact invariant(모든 phaseId가 key로 존재하기만 하면 통과)는
+// 그대로 통과해 우회가 가능했다. "정상적으로 완료된 phase는 절대 빈 배열일 수 없다"는
+// 불변식을 shape 검증 자체에 넣어 가장 이른 지점(파일을 읽는 즉시)에서 차단한다 — 이 결과
+// isValidPlannerStateFileV2/validateCheckpointShapeStrictness(둘 다 이 함수를 재사용) 양쪽
+// 모두에서 즉시 막힌다(로직 복제 없음).
+function isValidPhaseTaskPlansShape(v: unknown): v is Record<string, PlannerRawTask[]> {
+  if (!structuralGuard(v)) return false;
+  return Object.entries(v).every(([phaseId, tasks]) => {
+    if (!PHASE_ID_RE.test(phaseId)) return false;
+    if (!Array.isArray(tasks) || tasks.length === 0) return false;
+    return tasks.every((t) => {
+      if (!structuralGuard(t)) return false;
+      return (
+        typeof t.taskId === "string" &&
+        TASK_ID_RE.test(t.taskId) &&
+        t.phaseId === phaseId &&
+        typeof t.title === "string" &&
+        typeof t.objective === "string" &&
+        isStringArray(t.scope) &&
+        isStringArray(t.constraints) &&
+        isStringArray(t.dependsOn) &&
+        isStringArray(t.expectedModules) &&
+        Array.isArray(t.requiredTests) &&
+        isStringArray(t.acceptanceCriteria) &&
+        isStringArray(t.reqIds) &&
+        isStringArray(t.securityConsiderations) &&
+        typeof t.completionGate === "string"
+      );
+    });
+  });
+}
+
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 "각 필드의 shape만
+// 맞으면"(architecture/phasePlan/phaseTaskPlans가 optional이라 undefined든 valid value든
+// 전부 통과) 유효한 v2 planner-state로 인정했다. stage는 "이 시점까지 어떤 산출물이 이미
+// 확정됐어야 하는가"를 스스로 선언하는 값인데, 그 선언과 실제 저장된 필드가 어긋나도(예:
+// stage=SPEC_VERIFIED인데 architecture가 이미 채워짐, stage=TASKS_PLANNED인데
+// phaseTaskPlans가 일부 phase만 있음) shape 검사만으로는 잡히지 않았다 — runPlannerLocked의
+// 각 stage 블록은 "cur.architecture/phasePlan/phaseTaskPlans가 있다"를 그대로 신뢰해
+// 사용하므로, 이 불일치를 여기서 막지 않으면 이후 로직이 잘못된 가정 위에서 진행된다.
+// 실제 runPlannerLocked의 stage 전이 순서를 그대로 반영한다 — PHASE_PLANNED는 STAGE 3
+// 루프가 진행 중일 수 있어 phaseTaskPlans가 없거나 phasePlan의 일부 phaseId만 있을 수
+// 있고(정상), 그 이후(TASKS_PLANNED~COMPLETED)는 STAGE 3 루프가 전체 phase에 대해
+// 완료됐다고 stage 자체가 보장하므로 phaseTaskPlans가 phasePlan의 모든 phaseId를 정확히
+// 포함해야 한다.
+function isPlannerStageArtifactInvariantSatisfied(
+  stage: PlannerStage,
+  architecture: ArchitectureRawOutput | undefined,
+  phasePlan: ValidatedPlannerPhase[] | undefined,
+  phaseTaskPlans: Record<string, PlannerRawTask[]> | undefined
+): boolean {
+  const hasArchitecture = architecture !== undefined;
+  const hasPhasePlan = phasePlan !== undefined;
+
+  switch (stage) {
+    case "SPEC_VERIFIED":
+    case "REQUIREMENTS_NORMALIZED":
+      return !hasArchitecture && !hasPhasePlan && phaseTaskPlans === undefined;
+    case "ARCHITECTURE_PLANNED":
+      return hasArchitecture && !hasPhasePlan && phaseTaskPlans === undefined;
+    case "PHASE_PLANNED": {
+      if (!hasArchitecture || !hasPhasePlan) return false;
+      if (phaseTaskPlans === undefined) return true;
+      const validPhaseIds = new Set(phasePlan!.map((p) => p.phaseId));
+      return Object.keys(phaseTaskPlans).every((k) => validPhaseIds.has(k));
+    }
+    case "TASKS_PLANNED":
+    case "TRACEABILITY_VALIDATED":
+    case "EXECUTION_DATA_GENERATED":
+    case "EXECUTION_DATA_VALIDATED":
+    case "COMPLETED": {
+      if (!hasArchitecture || !hasPhasePlan || phaseTaskPlans === undefined) return false;
+      const planPhaseIds = phasePlan!.map((p) => p.phaseId);
+      const planPhaseIdSet = new Set(planPhaseIds);
+      const phaseTaskPlanKeys = Object.keys(phaseTaskPlans);
+      if (phaseTaskPlanKeys.length !== planPhaseIds.length) return false;
+      return phaseTaskPlanKeys.every((k) => planPhaseIdSet.has(k));
+    }
+    default:
+      return false;
+  }
+}
+
+function isValidPlannerStateFileV2(v: unknown): v is PlannerStateFile {
+  if (!structuralGuard(v)) return false;
+  if (v.schemaVersion !== PLANNER_STATE_SCHEMA_VERSION) return false;
+  if (typeof v.stage !== "string" || !PLANNER_STAGE_ORDER.includes(v.stage as PlannerStage)) return false;
+  if (typeof v.createdAt !== "string" || typeof v.updatedAt !== "string") return false;
+  if (!isValidIdentityShape(v.identity)) return false;
+  if (v.architecture !== undefined && !isValidArchitectureShape(v.architecture)) return false;
+  if (v.phasePlan !== undefined && !isValidValidatedPhaseArray(v.phasePlan)) return false;
+  if (v.phaseTaskPlans !== undefined && !isValidPhaseTaskPlansShape(v.phaseTaskPlans)) return false;
+  return isPlannerStageArtifactInvariantSatisfied(
+    v.stage as PlannerStage,
+    v.architecture as ArchitectureRawOutput | undefined,
+    v.phasePlan as ValidatedPlannerPhase[] | undefined,
+    v.phaseTaskPlans as Record<string, PlannerRawTask[]> | undefined
+  );
+}
+
+// --- 레거시(schemaVersion=1, SI-3/SI-3.1/SI-3.2) planner-state.json 마이그레이션 ---
+//
+// v1은 "단일 거대 rawPlannerOutput 문자열"을 저장했다 — SPEC_VERIFIED/REQUIREMENTS_NORMALIZED
+// 두 stage(아직 어떤 LLM 호출도 하지 않은 상태)는 v2와 의미가 완전히 동일해 안전하게
+// 마이그레이션할 수 있다. 그 이후 stage(ARCHITECTURE_PLANNED 이상)는 v1의 "완성된 단일
+// PlannerRawOutput"과 v2의 "stage별로 나뉜 구조화된 산출물"이 근본적으로 다른 모양이라
+// 안전하게 재해석할 수 없다 — 조용히 이어서 진행하지 않고 구조화된 BLOCKED로 중단한다(§
+// 요구사항 10).
+const LEGACY_V1_STAGE_ORDER = ["SPEC_VERIFIED", "REQUIREMENTS_NORMALIZED", "ARCHITECTURE_PLANNED", "EXECUTION_DATA_GENERATED", "EXECUTION_DATA_VALIDATED", "COMPLETED"] as const;
+type LegacyV1Stage = (typeof LEGACY_V1_STAGE_ORDER)[number];
+interface LegacyPlannerStateFileV1 {
+  schemaVersion: 1;
+  identity: BootstrapRequestIdentity;
+  stage: LegacyV1Stage;
+  createdAt: string;
+  updatedAt: string;
+  rawPlannerOutput?: string;
+}
+const LEGACY_V1_SAFELY_MIGRATABLE_STAGES: readonly LegacyV1Stage[] = ["SPEC_VERIFIED", "REQUIREMENTS_NORMALIZED"];
+
+function isValidLegacyPlannerStateFileV1(v: unknown): v is LegacyPlannerStateFileV1 {
+  if (!structuralGuard(v)) return false;
+  if (v.schemaVersion !== 1) return false;
+  if (typeof v.stage !== "string" || !LEGACY_V1_STAGE_ORDER.includes(v.stage as LegacyV1Stage)) return false;
+  if (typeof v.createdAt !== "string" || typeof v.updatedAt !== "string") return false;
+  if (!isValidIdentityShape(v.identity)) return false;
+  if (v.rawPlannerOutput !== undefined && typeof v.rawPlannerOutput !== "string") return false;
   return true;
 }
 
-type ReadPlannerStateResult = { kind: "absent" } | { kind: "corrupt"; detail: string } | { kind: "valid"; state: PlannerStateFile };
+function migrateLegacyV1(legacy: LegacyPlannerStateFileV1): PlannerStateFile {
+  return {
+    schemaVersion: PLANNER_STATE_SCHEMA_VERSION,
+    identity: legacy.identity,
+    stage: legacy.stage as PlannerStage,
+    createdAt: legacy.createdAt,
+    updatedAt: legacy.updatedAt,
+  };
+}
 
-function readPlannerState(projectRoot: string): ReadPlannerStateResult {
+type ReadPlannerStateResult =
+  | { kind: "absent" }
+  | { kind: "corrupt"; detail: string }
+  | { kind: "unsupported_migration"; detail: string }
+  | { kind: "valid"; state: PlannerStateFile };
+
+function readPlannerState(projectRoot: string, projectRootReal: string): ReadPlannerStateResult {
   const p = plannerStateFilePath(projectRoot);
   if (!existsSync(p)) return { kind: "absent" };
-  let raw: string;
-  try {
-    raw = readFileSync(p, "utf-8");
-  } catch {
-    return { kind: "absent" };
+  // GPT Independent Reviewer 지적(SI-3.3 REVISE 1회차, HIGH) — 이전에는 파일이 실제로
+  // 존재하는데 readFileSync가 실패하면(권한 오류/디렉터리로 대체됨/I-O 오류 등) "absent"로
+  // 취급해 SPEC_VERIFIED부터 새로 시작했다 — 이는 "checkpoint 변조/손상 시 BLOCKED, silent
+  // repair 금지" 요구를 정면으로 위반한다(기존 진행 상태를 조용히 버리고 처음부터 다시
+  // 시작하는 것도 일종의 silent repair다). 또한 planner-state.json 자체에는 생성 파일
+  // (project-manifest.json 등)에 이미 적용된 symlink/realpath containment 방어가 없었다.
+  // readTrustedGeneratedFile()을 그대로 재사용해(로직 복제 없음) 두 문제를 함께 해결한다 —
+  // 존재하지만 신뢰할 수 있게 읽을 수 없는 파일은 이제 항상 "corrupt"로 분류된다.
+  const fileRead = readTrustedGeneratedFile(p, projectRootReal);
+  if (!fileRead.ok) {
+    return { kind: "corrupt", detail: `planner-state.json을 신뢰할 수 있게 읽지 못했습니다: ${fileRead.detail}` };
   }
+  const raw = fileRead.content;
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return { kind: "corrupt", detail: "planner-state.json이 올바른 JSON이 아닙니다." };
   }
-  if (!isValidPlannerStateFile(parsed)) return { kind: "corrupt", detail: "planner-state.json이 예상된 schema와 일치하지 않습니다." };
-  return { kind: "valid", state: parsed };
+  if (!structuralGuard(parsed)) return { kind: "corrupt", detail: "planner-state.json이 객체가 아닙니다." };
+  const schemaVersion = parsed.schemaVersion;
+
+  if (schemaVersion === PLANNER_STATE_SCHEMA_VERSION) {
+    if (!isValidPlannerStateFileV2(parsed)) return { kind: "corrupt", detail: "planner-state.json이 예상된 schema(v2)와 일치하지 않습니다." };
+    return { kind: "valid", state: parsed };
+  }
+  if (schemaVersion === 1) {
+    if (!isValidLegacyPlannerStateFileV1(parsed)) return { kind: "corrupt", detail: "planner-state.json이 예상된 schema(legacy v1)와 일치하지 않습니다." };
+    if (LEGACY_V1_SAFELY_MIGRATABLE_STAGES.includes(parsed.stage)) {
+      return { kind: "valid", state: migrateLegacyV1(parsed) };
+    }
+    return {
+      kind: "unsupported_migration",
+      detail:
+        `planner-state.json이 SI-3.3 이전 schema(schemaVersion=1, stage=${parsed.stage})입니다 — 이 stage는 ` +
+        "SI-3.3의 incremental 구조로 안전하게 재해석할 수 없어 자동 진행을 중단합니다. 이 project root의 " +
+        "Planner 상태를 사람이 직접 확인해야 합니다(예: .autodev/planner-state.json을 백업 후 제거하고 STAGE 1부터 다시 시작).",
+    };
+  }
+  return { kind: "corrupt", detail: `planner-state.json의 schemaVersion(${String(schemaVersion)})을 인식할 수 없습니다.` };
 }
 
-function writeJsonAtomic(targetPath: string, data: unknown): { ok: true } | { ok: false; detail: string } {
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — 이전에는 mkdir 이후 대상/부모
+// 경로가 symlink로 바뀌는 TOCTOU를 전혀 방어하지 않았다(부모 디렉터리 realpath containment
+// 재확인 없음, rename 직전 재검증 없음, 실패 시 temp 정리 없음, fsync 없음). projectRootReal이
+// 주어지면(§ 호출부가 이미 알고 있는 값 — 새 subsystem 없이 그대로 전달) 부모 디렉터리의
+// realpath가 project root 안인지 write 직전에 재확인하고, temp 파일도 그 검증된 부모
+// 디렉터리 안에서만 만든다(기존과 동일한 위치). rename 직전에도 대상 경로가 project root
+// 밖을 가리키는 symlink로 바뀌지 않았는지 다시 확인한다 — 검증과 rename 사이의 아주 짧은
+// 창(window)까지 완전히 없앨 수는 없지만(cross-platform Node fs API에는 O_NOFOLLOW류 원자적
+// open+rename이 없다), 검증 시점을 write 직전까지 최대한 좁힌다. 실패 시 남은 temp 파일은
+// 항상 정리하고, writeFileSync 직후 fsync로 durability를 확보한 뒤에만 rename한다.
+// SI-3.5(Trusted Filesystem / TOCTOU Security Boundary Closure — Option A, § `.claude/
+// rules/filesystem-trust-model.md`) — 이전에는 parentDir의 containment를 함수 맨 앞에서
+// 딱 한 번만 확인했다. 그 확인과 실제 write(writeFileSync)/promote(renameSync) 사이에는
+// 여전히 창이 있다 — portable Node.js fs만으로 이 창을 완전히 없앨 수는 없지만(§ threat
+// model 문서), rename 직전에 한번 더 재확인하면(pre-promotion revalidation) 그 창을 최대한
+// 좁힐 수 있다. rename 직후에는 최종 대상을 다시 확인해(post-promotion 검증) race가 실제로
+// 일어났다면 "성공"으로 조용히 보고하지 않는다 — 이미 일어난 rename을 되돌릴 수는
+// 없으므로 이것은 prevention이 아니라 detection이다.
+function writeJsonAtomic(targetPath: string, data: unknown, projectRootReal?: string): { ok: true } | { ok: false; detail: string } {
+  const parentDir = dirname(targetPath);
+  let tmp: string | undefined;
   try {
-    mkdirSync(join(targetPath, ".."), { recursive: true });
-    const tmp = `${targetPath}.${randomUUID()}.tmp`;
+    mkdirSync(parentDir, { recursive: true });
+    if (projectRootReal !== undefined) {
+      const parentReal = realpathSync(parentDir);
+      if (!isRealPathWithin(parentReal, projectRootReal)) {
+        return { ok: false, detail: `파일 저장 실패(${targetPath}): 부모 디렉터리가 project root 밖을 가리킵니다.` };
+      }
+      // containment(위)만으로는 "root 내부의 다른 위치를 가리키는 symlink"를 잡지 못한다
+      // (§ assertNoSymlinkInChain 상단 주석) — parentDir 자체가 symlink/junction이면
+      // 목적지와 무관하게 구조적으로 거부한다.
+      const chainCheck = assertNoSymlinkInChain(parentDir, projectRootReal);
+      if (!chainCheck.ok) return { ok: false, detail: `파일 저장 실패(${targetPath}): ${chainCheck.detail}` };
+    }
+    tmp = `${targetPath}.${randomUUID()}.tmp`;
     writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    // Windows에서는 읽기 전용("r")으로 연 핸들의 fsync가 EPERM으로 실패하는 경우가 있다
+    // (실제로 이 환경에서 재현 확인) — "r+"(읽기/쓰기, 파일이 이미 존재해야 함)로 열어
+    // POSIX/Windows 양쪽에서 안전하게 동작하게 한다. 방금 writeFileSync로 만든 파일이라
+    // 항상 존재한다.
+    const fd = openSync(tmp, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (projectRootReal !== undefined && existsSync(targetPath)) {
+      const targetLstat = lstatSync(targetPath);
+      if (targetLstat.isSymbolicLink()) {
+        const targetReal = realpathSync(targetPath);
+        if (!isRealPathWithin(targetReal, projectRootReal)) {
+          throw new Error(`대상 경로(${targetPath})가 project root 밖을 가리키는 symlink로 바뀌었습니다.`);
+        }
+      }
+    }
+    // pre-promotion revalidation — write(위)와 promote(아래 renameSync) 사이에 parentDir가
+    // symlink로 교체됐을 가능성을 rename 직전에 한 번 더 좁혀서 재확인한다.
+    if (projectRootReal !== undefined) {
+      const parentRealBeforeRename = realpathSync(parentDir);
+      if (!isRealPathWithin(parentRealBeforeRename, projectRootReal)) {
+        throw new Error(`부모 디렉터리(${parentDir})가 write 도중 project root 밖을 가리키도록 바뀌었습니다.`);
+      }
+      const preRenameChainCheck = assertNoSymlinkInChain(parentDir, projectRootReal);
+      if (!preRenameChainCheck.ok) throw new Error(preRenameChainCheck.detail);
+    }
     renameSync(tmp, targetPath);
+    tmp = undefined;
+    // post-promotion 검증(destination swap detection 가능한 범위) — prevention이 아니라
+    // detection이다. rename 자체는 이미 일어났으므로 되돌릴 수 없지만, 최종 대상이 예상과
+    // 다르면(regular file이 아니거나 root 밖) 이 write를 "성공"으로 조용히 보고하지 않는다.
+    if (projectRootReal !== undefined) {
+      const postLstat = lstatSync(targetPath);
+      if (!postLstat.isFile()) {
+        return { ok: false, detail: `파일 저장 실패(${targetPath}): write 이후 재확인에서 대상이 regular file이 아닙니다(가능한 race 탐지).` };
+      }
+      const postReal = realpathSync(targetPath);
+      if (!isRealPathWithin(postReal, projectRootReal)) {
+        return { ok: false, detail: `파일 저장 실패(${targetPath}): write 이후 재확인에서 대상이 project root 밖을 가리킵니다(가능한 race 탐지).` };
+      }
+    }
     return { ok: true };
   } catch (e) {
+    if (tmp !== undefined) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // 정리 실패는 원래 오류를 덮지 않는다 — 아래에서 원래 오류만 보고한다.
+      }
+    }
     return { ok: false, detail: `파일 저장 실패(${targetPath}): ${e instanceof Error ? e.message : String(e)}` };
   }
 }
@@ -1374,7 +2663,7 @@ function identitiesMatch(a: BootstrapRequestIdentity, b: BootstrapRequestIdentit
 }
 
 // ---------------------------------------------------------------------------
-// 신뢰된 입력 확인(§ 요구사항 1) — SI-2가 남긴 파일시스템 결과만 신뢰 입력으로 쓴다.
+// 신뢰된 입력 확인 — SI-2가 남긴 파일시스템 결과만 신뢰 입력으로 쓴다. SI-3와 동일, 변경 없음.
 // ---------------------------------------------------------------------------
 
 export type PlannerBlockedCode =
@@ -1391,6 +2680,7 @@ export type PlannerBlockedCode =
   | "EXPECTED_IDENTITY_MISMATCH"
   | "PROJECT_ROOT_ESCAPE"
   | "PLANNER_STATE_CORRUPT"
+  | "PLANNER_STATE_SCHEMA_MIGRATION_UNSUPPORTED"
   | "UNRECOGNIZED_MASTER_SPEC_SECTION"
   | "RAW_OUTPUT_SOURCE_FAILED"
   | "GENERATED_DATA_INVALID"
@@ -1445,20 +2735,21 @@ function isValidBootstrapStateShape(v: unknown): v is BootstrapStateShape {
   return typeof (v as Record<string, unknown>).stage === "string";
 }
 
-/**
- * SI-2가 만든 projectRoot/.autodev/{bootstrap-state.json,master-spec/*}만 신뢰 입력으로
- * 다시 읽고 재검증한다(§ 요구사항 1 — Fail Closed, 하나라도 확인 불가면 Planner 실행 금지).
- * expectedIdentity가 실제로 읽은 identity와 다르면(호출부가 잘못된 project를 가리키는 경우)
- * EXPECTED_IDENTITY_MISMATCH로 즉시 BLOCK한다.
- */
-function evaluateTrustedPlannerInput(projectRoot: string, expectedIdentity: BootstrapRequestIdentity): TrustedInputResult {
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — bootstrap-state.json/
+// master-spec/manifest.json/spec.md는 SI-2(project-bootstrap.ts)가 남긴 산출물이라
+// "신뢰 입력"으로 취급되지만, 이 함수는 그동안 existsSync+readFileSync만 썼다(symlink/
+// project root 밖 escape 방어 없음) — planner-state.json/생성된 3개 실행 데이터 파일에는
+// 이미 적용된 readTrustedGeneratedFile()(symlink 거부 + realpath containment)을 여기서도
+// 재사용해 동일한 신뢰 경계를 적용한다(로직 복제 없음).
+function evaluateTrustedPlannerInput(projectRoot: string, projectRootReal: string, expectedIdentity: BootstrapRequestIdentity): TrustedInputResult {
   const bootstrapStatePath = join(projectRoot, ".autodev", "bootstrap-state.json");
-  if (!existsSync(bootstrapStatePath)) {
-    return { ok: false, code: "BOOTSTRAP_STATE_MISSING_OR_CORRUPT", detail: "bootstrap-state.json이 존재하지 않습니다 — SI-2 Bootstrap이 완료되지 않았습니다." };
+  const bootstrapStateRead = readTrustedGeneratedFile(bootstrapStatePath, projectRootReal);
+  if (!bootstrapStateRead.ok) {
+    return { ok: false, code: "BOOTSTRAP_STATE_MISSING_OR_CORRUPT", detail: `bootstrap-state.json을 신뢰할 수 있게 읽지 못했습니다: ${bootstrapStateRead.detail}` };
   }
   let bootstrapState: unknown;
   try {
-    bootstrapState = JSON.parse(readFileSync(bootstrapStatePath, "utf-8"));
+    bootstrapState = JSON.parse(bootstrapStateRead.content);
   } catch {
     return { ok: false, code: "BOOTSTRAP_STATE_MISSING_OR_CORRUPT", detail: "bootstrap-state.json을 읽거나 파싱할 수 없습니다." };
   }
@@ -1472,12 +2763,13 @@ function evaluateTrustedPlannerInput(projectRoot: string, expectedIdentity: Boot
   const masterSpecDir = join(projectRoot, ".autodev", "master-spec");
   const manifestPath = join(masterSpecDir, "manifest.json");
   const specPath = join(masterSpecDir, "spec.md");
-  if (!existsSync(manifestPath)) {
-    return { ok: false, code: "MASTER_SPEC_MANIFEST_MISSING_OR_CORRUPT", detail: "master-spec/manifest.json이 존재하지 않습니다." };
+  const manifestRead = readTrustedGeneratedFile(manifestPath, projectRootReal);
+  if (!manifestRead.ok) {
+    return { ok: false, code: "MASTER_SPEC_MANIFEST_MISSING_OR_CORRUPT", detail: `master-spec/manifest.json을 신뢰할 수 있게 읽지 못했습니다: ${manifestRead.detail}` };
   }
   let manifest: unknown;
   try {
-    manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    manifest = JSON.parse(manifestRead.content);
   } catch {
     return { ok: false, code: "MASTER_SPEC_MANIFEST_MISSING_OR_CORRUPT", detail: "master-spec/manifest.json을 읽거나 파싱할 수 없습니다." };
   }
@@ -1486,12 +2778,11 @@ function evaluateTrustedPlannerInput(projectRoot: string, expectedIdentity: Boot
   }
   const m = manifest as MasterSpecManifestShape;
 
-  let specContent: string;
-  try {
-    specContent = readFileSync(specPath, "utf-8");
-  } catch (e) {
-    return { ok: false, code: "MASTER_SPEC_CONTENT_UNREADABLE", detail: `master-spec/spec.md를 읽을 수 없습니다: ${e instanceof Error ? e.message : String(e)}` };
+  const specRead = readTrustedGeneratedFile(specPath, projectRootReal);
+  if (!specRead.ok) {
+    return { ok: false, code: "MASTER_SPEC_CONTENT_UNREADABLE", detail: `master-spec/spec.md를 신뢰할 수 있게 읽지 못했습니다: ${specRead.detail}` };
   }
+  const specContent = specRead.content;
   const actualHash = createHash(m.storedContentDigest.algorithm).update(specContent, "utf8").digest("hex");
   if (actualHash !== m.storedContentDigest.hash || m.specIntegrity.hash.toLowerCase() !== m.storedContentDigest.hash) {
     return {
@@ -1500,14 +2791,6 @@ function evaluateTrustedPlannerInput(projectRoot: string, expectedIdentity: Boot
       detail: "master-spec/spec.md의 실제 digest가 보존된 storedContentDigest와 일치하지 않습니다 — 변조가 의심되어 중단합니다.",
     };
   }
-  // GPT Independent Reviewer 지적(SI-3 REVISE 1회차, HIGH) — 위 두 비교는 manifest.json
-  // 내부 필드끼리(storedContentDigest ↔ specIntegrity)의 self-consistency와 spec.md ↔
-  // manifest의 일치만 본다. manifest.json 전체가 spec.md와 함께 "일관되게" 조작되면(세 값
-  // 모두 같은 새 내용을 가리키도록 함께 바뀌면) 위 체크만으로는 최종적으로 actualIdentity가
-  // expectedIdentity와 달라지는 것에 의존해서만 걸러진다 — 그 의존성을 명시적으로 만들기
-  // 위해, spec.md의 실제 바이트를 호출부가 아는 expectedIdentity.specIntegrityAlgorithm/Hash로
-  // 직접 재해시해 한 번 더 독립적으로 대조한다(manifest.json의 어떤 필드도 거치지 않는
-  // 별도 경로 — manifest 전체가 조작돼도 우회할 수 없다).
   const directHash = createHash(expectedIdentity.specIntegrityAlgorithm).update(specContent, "utf8").digest("hex");
   if (directHash !== expectedIdentity.specIntegrityHash) {
     return {
@@ -1565,6 +2848,11 @@ export interface PlannerTrustedConfig {
    *  항상 deterministic fixture를 명시적으로 주입한다. */
   rawOutputSource?: PlannerRawOutputSource;
   now?: () => Date;
+  /** 최소 Observability(§ 요구사항 14) — stage/phaseId/attempt/promptLength/elapsedMs/
+   *  transportResult/validationResult만 담는다. secret/raw sensitive 값은 전달되지
+   *  않는다. 지정하지 않으면 아무 것도 기록하지 않는다(과도한 신규 subsystem을 만들지
+   *  않는다). */
+  onDiagnostic?: (event: PlannerDiagnosticEvent) => void;
 }
 
 export type PlannerOutcome =
@@ -1572,14 +2860,11 @@ export type PlannerOutcome =
   | { status: "CONFLICT"; detail: string; existingIdentity: BootstrapRequestIdentity; requestedIdentity: BootstrapRequestIdentity }
   | { status: "REJECTED"; issues: PlannerValidationIssue[] }
   | {
-      // GPT Independent Reviewer 지적(SI-3 REVISE 2회차, HIGH) — fixedConstraintComplianceNote
-      // 필드만으로는 호출자가 note를 무시하고 그대로 실행을 진행할 수 있었다("알림"일 뿐
-      // 실제 상태 전이를 막지 못함). Fixed Constraint가 하나라도 있으면(HOW가 그 constraint를
-      // 실제로 지키는지는 이 Validator가 기계적으로 검증할 수 없으므로) status 자체가 절대
-      // "READY_FOR_AUTODEV"/"ALREADY_READY"가 아니라 "HUMAN_REVIEW_REQUIRED"가 된다 —
-      // capability-resolver.ts가 자동으로 검증할 수 없는 위험을 HUMAN_APPROVAL_REQUIRED로
-      // 분류하고 자동 선택을 구조적으로 막는 것과 동일한 원칙. fixedConstraints가 없는(드문)
-      // 경우에만 기존과 동일하게 READY_FOR_AUTODEV(최초 완료)/ALREADY_READY(재실행)를 쓴다.
+      // Fixed Constraint가 하나라도 있으면(HOW가 그 constraint를 실제로 지키는지는 이
+      // Validator가 기계적으로 검증할 수 없으므로) status 자체가 절대 "READY_FOR_AUTODEV"/
+      // "ALREADY_READY"가 아니라 "HUMAN_REVIEW_REQUIRED"가 된다. fixedConstraints가 없는
+      // (드문) 경우에만 기존과 동일하게 READY_FOR_AUTODEV(최초 완료)/ALREADY_READY(재실행)를
+      // 쓴다.
       status: "READY_FOR_AUTODEV" | "ALREADY_READY" | "HUMAN_REVIEW_REQUIRED";
       projectRoot: string;
       plannerStatePath: string;
@@ -1587,20 +2872,25 @@ export type PlannerOutcome =
       taskRegistryPath: string;
       executionPolicyPath: string;
       firstRunnableTask: TaskDefinition | null;
-      /** § PersistedProjectManifestFile.fixedConstraintComplianceNote — 파일을 열어보지
-       *  않아도 호출자가 바로 볼 수 있도록 outcome에도 그대로 노출한다. null이 아니면 항상
-       *  status==="HUMAN_REVIEW_REQUIRED"다. */
       fixedConstraintComplianceNote: string | null;
     };
 
-/**
- * GPT Independent Reviewer 지적(SI-3 REVISE 3회차, HIGH) — .autodev 디렉터리 자체의
- * containment만 확인해서는 그 "안"에 있는 개별 파일(project-manifest.json/task-registry.json/
- * execution-policy.json) 각각이 symlink로 project root 밖의 다른 파일을 가리키는 경우를
- * 막지 못한다(호출 시작 전부터 이미 존재하는 안정적인 symlink 포함 — "확인 직후 swap"되는
- * race와는 다른, 더 단순하고 항상 재현 가능한 문제). 읽기 전에 lstat로 symlink 자체를
- * 무조건 거부하고(따라가지 않음), realpath가 검증된 project root 내부인지 재확인한다.
- */
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 이전에는
+// lstatSync(path) → realpathSync(path) → readFileSync(path) 세 번 모두 각자 경로를 다시
+// 해석했다 — 각 호출 사이의 아주 짧은 창에서 경로가 symlink로 교체되면, 앞선 두 검사가
+// 통과한 "안전한 대상"과 실제로 읽는 대상이 달라질 수 있다(전형적인 다단계 TOCTOU). 실제
+// 읽기(readFileSync)는 이제 open()이 반환한 파일 디스크립터에서 수행한다 — fd는 open() 호출
+// 그 순간 커널이 확정한 대상에 고정되므로, 그 이후 경로가 무엇으로 바뀌든 이 fd를 통한 읽기
+// 결과 자체는 바뀌지 않는다(open~read 사이의 경로 교체를 무력화). 또한 지원되는 플랫폼
+// (대부분의 POSIX)에서는 O_NOFOLLOW로 열어 대상이 symlink이면 open() 자체가 fail-closed로
+// 실패하게 한다 — Windows는 이 플래그를 신뢰할 수 있게 강제하지 못하는 것으로 알려져 있어
+// (Node/libuv가 Windows에서 O_NOFOLLOW를 이식성 있게 보장하지 않음), 그 경우에도 fd 확보
+// 이후의 read는 여전히 open 시점에 고정된 대상만 반환한다는 방어는 유지된다. lstat 기반
+// symlink 거부와 realpath 기반 containment 확인은 그대로 유지하되(정책적으로 symlink 자체를
+// 거부하고 project root 밖 대상을 거부하는 목적), 이 두 검사와 실제 파일 open 사이에 남는
+// "open 자체가 무엇을 가리킬지"의 창은 표준 Node.js fs API만으로는(네이티브 addon 없이는)
+// 완전히 없앨 수 없다는 사실을 그대로 남긴다 — 이 함수는 그 잔여 창을 최소화하는 최선의
+// portable 구현이다(요구사항: 새로운 네이티브 의존성 추가 없이 해결).
 function readTrustedGeneratedFile(filePath: string, projectRootReal: string): { ok: true; content: string } | { ok: false; detail: string } {
   let st;
   try {
@@ -1623,23 +2913,59 @@ function readTrustedGeneratedFile(filePath: string, projectRootReal: string): { 
   if (!isRealPathWithin(real, projectRootReal)) {
     return { ok: false, detail: `${filePath}가 project root 밖을 가리킵니다.` };
   }
+  // SI-3.5 — containment(위)만으로는 "root 내부의 다른 위치를 가리키는 symlink"를 잡지
+  // 못한다(§ assertNoSymlinkInChain 상단 주석). filePath 자체는 이미 위에서 symlink가
+  // 아님을 확인했지만(lstat), 그 조상 디렉터리들은 아직 확인하지 않았다 — 여기서 함께
+  // 확인한다.
+  const chainCheck = assertNoSymlinkInChain(filePath, projectRootReal);
+  if (!chainCheck.ok) return { ok: false, detail: chainCheck.detail };
+  let fd: number;
   try {
-    return { ok: true, content: readFileSync(filePath, "utf-8") };
+    // Windows에서는 O_NOFOLLOW가 이식성 있게 강제되지 않는 것으로 알려져 있어(§ 위 주석)
+    // POSIX에서만 사용한다 — Windows에서도 아래 fd 기반 read 자체는 여전히 open 시점에
+    // 고정된 대상만 반환하므로 이중 방어 중 하나가 빠질 뿐, read의 정확성은 유지된다.
+    const openFlags = process.platform === "win32" ? constants.O_RDONLY : constants.O_RDONLY | constants.O_NOFOLLOW;
+    fd = openSync(filePath, openFlags);
+  } catch (e) {
+    return { ok: false, detail: `파일 열기 실패(${filePath}): ${e instanceof Error ? e.message : String(e)}` };
+  }
+  try {
+    const fdStat = fstatSync(fd);
+    if (!fdStat.isFile()) {
+      return { ok: false, detail: `${filePath}(open 이후 재확인)가 일반 파일이 아닙니다.` };
+    }
+    return { ok: true, content: readFileSync(fd, "utf-8") };
   } catch (e) {
     return { ok: false, detail: `파일 읽기 실패(${filePath}): ${e instanceof Error ? e.message : String(e)}` };
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // close 실패는 이미 확보한 결과에 영향 없음 — 무시한다.
+    }
   }
 }
 
-/**
- * projectRoot/.autodev/ 아래 저장된 3개 생성 파일을 다시 읽어 처음 생성했을 때와 동일한
- * Core 검증(validateProjectManifest/validateProjectExecutionPolicy/task id 중복 없음)을
- * 다시 통과하는지 확인한다. GPT Independent Reviewer 지적(SI-3 REVISE 2회차, HIGH) — 이전에는
- * EXECUTION_DATA_GENERATED→EXECUTION_DATA_VALIDATED 전환 시점에만 이 재확인을 했고,
- * stage===COMPLETED 이후(ALREADY_READY 재실행 경로)에는 파일을 다시 검증하지 않고 그대로
- * "준비됨"으로 보고했다 — COMPLETED 이후 누군가 파일을 직접 변조/손상시켜도 감지하지
- * 못했다. 이제 EXECUTION_DATA_GENERATED 전환과 매 ALREADY_READY/최종 완료 보고 양쪽 모두
- * 이 동일한 함수로 재검증한다(로직 복제 없음).
- */
+// GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 부분 실패/신뢰 입력 변경
+// 감지 시 정리(cleanup)를 위한 unlinkSync(path) 호출은 경로를 그대로 다시 해석한다 — write
+// 시점 이후 `.autodev`가 project root 밖을 가리키는 symlink/junction으로 교체되면, 이
+// cleanup 코드가 writeJsonAtomic()이 write 시점에 이미 강제한 containment 보호를 우회해
+// project root 밖의 파일을 삭제할 수 있다. 삭제 직전에도 동일한 containment를 재확인하고,
+// 그 사이 대상이 project root 밖으로 바뀐 것으로 보이면 삭제를 포기한다(파일을 남기는 쪽이
+// project root 밖 파일을 실수로 지우는 것보다 안전하다 — generation.json이 쓰이지 않으므로
+// 다음 실행이 어차피 GENERATED_DATA_INVALID로 이 상태를 다시 잡는다).
+function safeUnlinkWithinRoot(filePath: string, projectRootReal: string): void {
+  try {
+    const st = lstatSync(filePath);
+    if (st.isSymbolicLink()) return; // symlink 자체는 삭제 대상으로 신뢰하지 않는다.
+    const real = realpathSync(filePath);
+    if (!isRealPathWithin(real, projectRootReal)) return;
+    unlinkSync(filePath);
+  } catch {
+    // 대상이 이미 없거나 확인할 수 없으면 아무것도 하지 않는다 — 원래 실패만 보고된다.
+  }
+}
+
 function reloadAndValidateGeneratedData(
   projectRoot: string,
   projectId: string
@@ -1653,9 +2979,68 @@ function reloadAndValidateGeneratedData(
     const manifestFileRaw = readTrustedGeneratedFile(generatedManifestPath(projectRoot), projectRootReal);
     if (!manifestFileRaw.ok) return manifestFileRaw;
 
+    // § 위 generationManifestPath 주석 — 3개 파일이 서로 다른 generation에서 부분적으로만
+    // 갱신된 채 섞이지 않았는지 재확인한다. 이 파일이 없거나 해시가 실제 내용과 다르면 부분
+    // 실패로 간주해 즉시 실패 처리한다(어떤 필드도 조용히 신뢰하지 않는다).
+    const generationFile = readTrustedGeneratedFile(generationManifestPath(projectRoot), projectRootReal);
+    if (!generationFile.ok) return { ok: false, detail: `generation.json을 신뢰할 수 있게 읽지 못했습니다(3개 실행 데이터 파일의 generation 일관성을 확인할 수 없습니다): ${generationFile.detail}` };
+    let generationManifest: unknown;
+    try {
+      generationManifest = JSON.parse(generationFile.content);
+    } catch {
+      return { ok: false, detail: "generation.json이 올바른 JSON이 아닙니다." };
+    }
+    if (!isValidGenerationManifestShape(generationManifest)) {
+      return { ok: false, detail: "generation.json 형식이 올바르지 않습니다." };
+    }
+    if (
+      sha256Hex(manifestFileRaw.content) !== generationManifest.manifestSha256 ||
+      sha256Hex(taskRegistryFile.content) !== generationManifest.taskRegistrySha256 ||
+      sha256Hex(executionPolicyFile.content) !== generationManifest.executionPolicySha256
+    ) {
+      return {
+        ok: false,
+        detail: "project-manifest.json/task-registry.json/execution-policy.json 중 일부가 generation.json이 기록한 해시와 일치하지 않습니다 — 서로 다른 generation이 섞였을 수 있어(부분 write 실패 의심) 신뢰하지 않습니다.",
+      };
+    }
+
     const taskRegistry = JSON.parse(taskRegistryFile.content) as TaskDefinition[];
     const executionPolicy = JSON.parse(executionPolicyFile.content) as ProjectExecutionPolicy;
     const manifestFile = JSON.parse(manifestFileRaw.content) as PersistedProjectManifestFile;
+
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — write 직전/직후
+    // 재검증만으로는 "그 사이의 아주 짧은 창" 논쟁이 근본적으로 끝나지 않는다(여러 독립 파일에
+    // 걸친 진짜 원자적 트랜잭션은 표준 파일시스템 API로 만들 수 없다 — 요구사항: 과도한 새
+    // transaction framework 금지). 대신 "매번 다시 읽을 때(reload) 원본 신뢰 소스와 대조"하는
+    // 방식으로 전환한다 — 이 함수는 EXECUTION_DATA_GENERATED→VALIDATED 전이 시점뿐 아니라
+    // COMPLETED 이후 모든 재실행(readyOutcome, § 요구사항 "idempotent 재확인")에서도 항상
+    // 호출되므로, "실행 도중 마지막 순간에 바뀜"과 "COMPLETED 이후 나중에 바뀜"(더 실질적인
+    // 위험 — spec.md가 완료 후 다시 수정됐는데 오래된 생성물을 계속 신뢰하는 경우) 둘 다
+    // 이 지점에서 매번 다시 잡는다. manifestFile.sourceSpecIntegrity(생성 시점에 검증한
+    // digest)를 신뢰하지 않고, 지금 이 순간의 master-spec/spec.md를 다시 읽어(동일한
+    // readTrustedGeneratedFile containment) 직접 재계산한 digest와 대조한다.
+    if (!structuralGuard(manifestFile.sourceSpecIntegrity)) {
+      return { ok: false, detail: "manifestFile.sourceSpecIntegrity 형식이 올바르지 않습니다." };
+    }
+    const sourceSpecIntegrity = manifestFile.sourceSpecIntegrity as unknown as Record<string, unknown>;
+    const algorithm = sourceSpecIntegrity.algorithm;
+    const expectedHash = sourceSpecIntegrity.hash;
+    if ((algorithm !== "sha256" && algorithm !== "sha512") || typeof expectedHash !== "string" || expectedHash.length === 0) {
+      return { ok: false, detail: "manifestFile.sourceSpecIntegrity의 algorithm/hash 형식이 올바르지 않습니다." };
+    }
+    const specPath = join(projectRoot, ".autodev", "master-spec", "spec.md");
+    const specFile = readTrustedGeneratedFile(specPath, projectRootReal);
+    if (!specFile.ok) {
+      return { ok: false, detail: `master-spec/spec.md를 신뢰할 수 있게 다시 읽지 못했습니다(생성물이 여전히 유효한 spec을 반영하는지 확인할 수 없습니다): ${specFile.detail}` };
+    }
+    const liveSpecHash = createHash(algorithm).update(specFile.content, "utf8").digest("hex");
+    if (liveSpecHash !== expectedHash.toLowerCase()) {
+      return {
+        ok: false,
+        detail: "master-spec/spec.md의 현재 내용이 이 생성물이 생성될 때 검증한 digest와 더 이상 일치하지 않습니다 — spec이 그 사이(또는 완료 이후) 바뀐 것으로 보여 이 생성물을 신뢰하지 않습니다.",
+      };
+    }
+
     const manifest = assembleProjectManifest({ manifestFile, taskRegistry, executionPolicy });
     validateProjectManifest(manifest);
     validateProjectExecutionPolicy(executionPolicy, projectId);
@@ -1670,18 +3055,6 @@ function reloadAndValidateGeneratedData(
   }
 }
 
-/**
- * GPT Independent Reviewer 지적(SI-3 REVISE 3회차, HIGH) — 이전에는 status(READY_FOR_AUTODEV
- * vs HUMAN_REVIEW_REQUIRED) 판정을 persisted manifestFile.fixedConstraintComplianceNote
- * 필드의 null 여부에서 가져왔다 — 이 필드는 project-manifest.json 안의 평범한 데이터라,
- * fixedConstraints는 그대로 둔 채 note만 지우거나 둘을 함께 지우는 변조/손상이 있으면
- * validateProjectManifest()가 그 불일치를 알지 못해 그대로 통과시킬 수 있었다(즉 gate
- * 자체를 우회 가능). 이제 hasFixedConstraints는 이 호출 직전에 이미 재검증된 원본 spec.md
- * (evaluateTrustedPlannerInput의 digest 대조를 통과한 신뢰 입력)를 다시 정규화해서 얻은
- * 값만 쓴다 — persisted 파일의 어떤 필드도 이 판정에 관여하지 않는다. 추가로, persisted
- * note가 이 신뢰된 판정과 불일치하면(변조/손상의 증거이므로) 조용히 무시하지 않고
- * GENERATED_DATA_INVALID로 BLOCK한다.
- */
 function readyOutcome(
   freshness: "FRESH" | "IDEMPOTENT",
   projectRoot: string,
@@ -1716,25 +3089,16 @@ function readyOutcome(
 }
 
 /**
- * SI-2가 완료한 projectRoot를 대상으로 Planner를 실행한다 — projectRoot/.autodev/ 아래의
- * Bootstrap 산출물만 신뢰 입력으로 재검증하고(§ evaluateTrustedPlannerInput), 통과하면
- * Master Spec을 정규화(WHAT)한 뒤 config.rawOutputSource(HOW, LLM 또는 fixture)를 호출해
- * validatePlannerRawOutput()으로 검증하고, 통과한 결과만 Core 타입(ProjectManifest/
- * TaskDefinition/ProjectExecutionPolicy)으로 변환해 projectRoot/.autodev/ 아래 저장한다.
- * 동일 identity로 재호출하면 idempotent(이미 COMPLETED면 재생성 없이 동일 결과 반환)하고,
- * 같은 project root에 다른 identity가 이미 기록돼 있으면 CONFLICT를 반환한다. 중간 실패 후
- * 재호출하면 마지막으로 성공한 stage부터 이어서 진행한다(resume-safe) — 이미 검증을 통과한
- * rawPlannerOutput이 저장돼 있으면 rawOutputSource를 다시 호출하지 않는다.
+ * SI-2가 완료한 projectRoot를 대상으로 Incremental Planner를 실행한다 — projectRoot/.autodev/
+ * 아래의 Bootstrap 산출물만 신뢰 입력으로 재검증하고(§ evaluateTrustedPlannerInput), 통과하면
+ * Master Spec을 정규화(WHAT)한 뒤 STAGE 1(ARCHITECTURE) → STAGE 2(PHASE PLAN) →
+ * STAGE 3(TASK PLAN, Phase별) → STAGE 4(GLOBAL TRACEABILITY) → STAGE 5(FINAL ASSEMBLY)
+ * 순서로 진행한다. 각 stage는 독립적인 checkpoint를 가지며, 중간 실패 후 재호출하면 마지막으로
+ * 성공한 stage/Phase부터 이어서 진행한다(resume-safe) — 이미 검증을 통과한 stage는
+ * rawOutputSource를 다시 호출하지 않는다.
  *
  * 실제 작업은 runPlannerLocked()가 담당하고, 이 함수는 그 앞뒤로 projectId 단위 Project
- * Lock(project-lock.ts, 이미 존재하는 Core 동시성 방어 서비스 — Phase G Task G7)만 얹는다.
- * GPT Independent Reviewer 지적(SI-3 REVISE 1회차, HIGH) — 이 lock이 없으면 같은 project
- * root를 대상으로 한 두 runPlanner() 동시 호출이 서로 다른 시점의 상태를 읽고 각자 LLM을
- * 호출해 planner-state.json/생성 파일을 교차 덮어쓸 수 있었다. project-lock.ts는 이미 이
- * 저장소의 "동시 writer 방지"에 대한 단일 설계 원칙(check-then-create 금지, PID liveness로만
- * stale 복구)을 갖고 있으므로 그대로 재사용한다(복제 금지) — ownerKind는 기존 "autodev"를
- * 그대로 쓴다(이 project는 아직 실제 task 실행을 시작하지 않았으므로 실제 concurrent
- * task-execution lock과 충돌할 여지가 없다).
+ * Lock(project-lock.ts)만 얹는다(SI-3와 동일).
  */
 export async function runPlanner(
   projectRoot: string,
@@ -1744,6 +3108,12 @@ export async function runPlanner(
   const resolvedRoot = resolve(projectRoot);
   if (!existsSync(resolvedRoot) || !statSync(resolvedRoot).isDirectory()) {
     return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot가 존재하지 않거나 디렉터리가 아닙니다: ${resolvedRoot}` };
+  }
+  // SI-3.5 — statSync(위)는 symlink를 따라가므로 resolvedRoot 자체가 디렉터리를 가리키는
+  // symlink/junction이어도 통과한다. project root 자체는(§ threat model 문서) 어떤 방향을
+  // 가리키든 symlink일 수 없다.
+  if (lstatSync(resolvedRoot).isSymbolicLink()) {
+    return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot 자체가 symlink/junction/reparse point입니다: ${resolvedRoot}` };
   }
 
   const lockAcquire = acquireProjectLock({ projectId: expectedIdentity.projectId, targetProjectRoot: resolvedRoot, ownerKind: "autodev" });
@@ -1755,9 +3125,6 @@ export async function runPlanner(
     };
   }
   try {
-    // finally가 lock을 놓기 전에 실제 작업이 전부 끝나도록 반드시 await한다 — await 없이
-    // Promise를 그대로 return하면 finally가 즉시(작업이 끝나기 전에) 실행돼 lock이 조기
-    // release되는 race가 생긴다.
     return await runPlannerLocked(resolvedRoot, expectedIdentity, config);
   } finally {
     releaseProjectLock(lockAcquire.lock);
@@ -1770,22 +3137,27 @@ async function runPlannerLocked(
   config: PlannerTrustedConfig
 ): Promise<PlannerOutcome> {
   let projectRootReal: string;
+  let projectRootIdentity: { dev: number; ino: number };
   try {
     projectRootReal = realpathSync(resolvedRoot);
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — realpath 문자열
+    // 비교만으로는 "같은 경로에 원래 디렉터리를 rename으로 치우고 identical해 보이는 새
+    // 디렉터리를 그 자리에 설치"하는 공격을 잡지 못한다(symlink가 전혀 없으면 realpath는
+    // 경로 문자열을 그대로 반환할 뿐 그 밑의 실제 파일시스템 객체(inode)가 바뀌었는지는
+    // 보지 않는다). dev+ino(파일시스템 고유 식별자)를 함께 캡처해, write 직전 재확인
+    // 시점에 실제로 같은 디렉터리 객체인지(경로 문자열이 아니라) 대조한다.
+    const rootStat = statSync(projectRootReal);
+    projectRootIdentity = { dev: rootStat.dev, ino: rootStat.ino };
   } catch (e) {
     return { status: "BLOCKED", code: "INVALID_PROJECT_ROOT", detail: `projectRoot realpath 확인 실패: ${e instanceof Error ? e.message : String(e)}` };
   }
 
-  const trustedInputResult = evaluateTrustedPlannerInput(resolvedRoot, expectedIdentity);
+  const trustedInputResult = evaluateTrustedPlannerInput(resolvedRoot, projectRootReal, expectedIdentity);
   if (!trustedInputResult.ok) {
     return { status: "BLOCKED", code: trustedInputResult.code, detail: trustedInputResult.detail };
   }
   const { identity, projectName, specContent } = trustedInputResult.input;
 
-  // normalizeMasterSpec()은 순수/저비용 함수이므로 stage 분기보다 먼저(신뢰된 specContent를
-  // 얻은 직후) 계산해둔다 — IDEMPOTENT(COMPLETED) 조기 반환 경로도 hasFixedConstraints를
-  // persisted 파일이 아니라 이 신뢰된 재계산 값에서만 얻어야 하기 때문이다(§ readyOutcome
-  // 상단 주석, GPT Independent Reviewer 지적 SI-3 REVISE 3회차 HIGH).
   const normalized = normalizeMasterSpec(specContent);
   if (normalized.unrecognizedHeaders.length > 0) {
     return {
@@ -1796,10 +3168,6 @@ async function runPlannerLocked(
   }
   const hasFixedConstraints = normalized.fixedConstraints.length > 0;
 
-  // .autodev 하위가 symlink/junction으로 project root 밖을 가리키면(SI-2가 이미 만든
-  // 디렉터리이지만, 이후 외부에서 교체됐을 가능성에 대비) 실제 write 직전에 다시 확인한다
-  // (project-bootstrap.ts의 assertExistingSubPathContained와 동일한 방어 원칙, 재사용은
-  // 불가능해(비공개 함수) 최소한의 동일 판정만 여기서 반복한다).
   const autodevDir = join(resolvedRoot, ".autodev");
   if (existsSync(autodevDir)) {
     let autodevReal: string;
@@ -1813,15 +3181,18 @@ async function runPlannerLocked(
     }
   }
 
-  const stateRead = readPlannerState(resolvedRoot);
+  const stateRead = readPlannerState(resolvedRoot, projectRootReal);
   if (stateRead.kind === "corrupt") {
     return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: stateRead.detail };
+  }
+  if (stateRead.kind === "unsupported_migration") {
+    return { status: "BLOCKED", code: "PLANNER_STATE_SCHEMA_MIGRATION_UNSUPPORTED", detail: stateRead.detail };
   }
 
   let cur: PlannerStateFile;
   if (stateRead.kind === "absent") {
     cur = { schemaVersion: PLANNER_STATE_SCHEMA_VERSION, identity, stage: "SPEC_VERIFIED", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur, projectRootReal);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   } else {
     if (!identitiesMatch(stateRead.state.identity, identity)) {
@@ -1835,63 +3206,214 @@ async function runPlannerLocked(
 
   const now = config.now ? config.now() : new Date();
   const rawOutputSource = config.rawOutputSource ?? createClaudeCliRawOutputSource();
+  const nowIso = () => new Date().toISOString();
+  const persist = (next: PlannerStateFile): { ok: true } | { ok: false; detail: string } => writeJsonAtomic(plannerStateFilePath(resolvedRoot), next, projectRootReal);
 
   if (cur.stage === "SPEC_VERIFIED") {
-    cur = { ...cur, stage: "REQUIREMENTS_NORMALIZED", updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    cur = { ...cur, stage: "REQUIREMENTS_NORMALIZED", updatedAt: nowIso() };
+    const w = persist(cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
 
+  // STAGE 1 — ARCHITECTURE.
   if (cur.stage === "REQUIREMENTS_NORMALIZED") {
-    // Correction retry(§ 요구사항 C) — MALFORMED_JSON/schema 위반이면 validatePlannerRawOutput()이
-    // 찾은 실제 issues를 그대로 buildPlannerCorrectionPrompt()에 실어 같은 rawOutputSource를
-    // 다시 부른다(§ 새 provider/우회 경로 없음). 값을 임의로 보정하지 않는다 — 매 시도는 여전히
-    // validatePlannerRawOutput() 전체를 다시 통과해야 한다. PLANNER_MAX_RAW_OUTPUT_ATTEMPTS로
-    // 상한을 둬 무한 재시도를 금지한다 — 모든 시도가 실패하면 마지막 시도의 issues로 REJECTED한다.
-    let lastIssues: PlannerValidationIssue[] = [];
-    let acceptedRawOutput: string | null = null;
-    for (let attempt = 1; attempt <= PLANNER_MAX_RAW_OUTPUT_ATTEMPTS; attempt += 1) {
-      const prompt =
-        attempt === 1 ? buildPlannerPrompt(normalized, identity) : buildPlannerCorrectionPrompt(normalized, identity, lastIssues);
-      const sourceResult = await invokeRawOutputSourceWithTransportRetry(rawOutputSource, prompt);
-      if (!sourceResult.ok) {
-        return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: sourceResult.reason };
-      }
-      const validation = validatePlannerRawOutput(sourceResult.rawOutput, normalized, identity);
-      if (validation.ok) {
-        // § validatePlannerRawOutput 상단 주석 — 반드시 normalizedJsonText(순수 JSON)를
-        // 저장한다. 원본 sourceResult.rawOutput을 저장하면 설명문/markdown fence가 섞인
-        // 원문이 rawPlannerOutput에 남아, 다음 stage(EXECUTION_DATA_GENERATED)에서 다시
-        // JSON.parse(cur.rawPlannerOutput)가 실패한다.
-        acceptedRawOutput = validation.normalizedJsonText;
-        break;
-      }
-      lastIssues = validation.issues;
+    const outcome = await runLlmStage(
+      rawOutputSource,
+      "ARCHITECTURE",
+      undefined,
+      () => buildArchitecturePrompt(normalized, identity),
+      (issues) => buildArchitectureCorrectionPrompt(normalized, identity, issues),
+      (rawText) => validateArchitectureRawOutput(rawText, normalized, identity),
+      config.onDiagnostic
+    );
+    if (outcome.kind === "transport_failed") {
+      return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: outcome.detail };
     }
-    if (acceptedRawOutput === null) {
-      const withDiagnostics: PlannerStateFile = { ...cur, lastValidationIssues: lastIssues, updatedAt: new Date().toISOString() };
-      writeJsonAtomic(plannerStateFilePath(resolvedRoot), withDiagnostics); // best-effort — 실패해도 REJECTED 반환 자체는 막지 않는다.
-      return { status: "REJECTED", issues: lastIssues };
+    if (outcome.kind === "rejected") {
+      const rejectWrite = persist({ ...cur, lastValidationIssues: outcome.issues, lastValidationContext: { stage: "ARCHITECTURE" }, updatedAt: nowIso() });
+      if (!rejectWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: rejectWrite.detail };
+      return { status: "REJECTED", issues: outcome.issues };
     }
-    cur = { ...cur, stage: "ARCHITECTURE_PLANNED", rawPlannerOutput: acceptedRawOutput, lastValidationIssues: undefined, updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    cur = { ...cur, architecture: outcome.value, stage: "ARCHITECTURE_PLANNED", lastValidationIssues: undefined, updatedAt: nowIso() };
+    const w = persist(cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
 
+  // STAGE 2 — PHASE PLAN.
   if (cur.stage === "ARCHITECTURE_PLANNED") {
-    if (!cur.rawPlannerOutput) {
-      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=ARCHITECTURE_PLANNED인데 rawPlannerOutput이 저장돼 있지 않습니다." };
+    if (!cur.architecture) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=ARCHITECTURE_PLANNED인데 architecture가 저장돼 있지 않습니다." };
     }
-    // GPT Independent Reviewer 지적(SI-3 REVISE 2회차, MEDIUM) — planner-state.json이 구조
-    // 검증(isValidPlannerStateFile — rawPlannerOutput이 string인지)은 통과했지만 그 문자열
-    // 내용 자체는 손상된 경우(예: 저장 도중 중단), JSON.parse가 여기서 그대로 throw해
-    // 구조화된 BLOCKED 대신 처리되지 않은 예외로 전파될 수 있었다. buildGeneratedExecutionData
-    // 자체도 raw의 세부 필드 접근에서 예상치 못한 값(resume 경로로만 도달 가능한 손상)에
-    // 던질 수 있어 같은 try 안에서 함께 방어한다.
+    const resumedArchIssues = validateResumedArchitecture(cur.architecture, normalized, identity);
+    if (resumedArchIssues.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "PLANNER_STATE_CORRUPT",
+        detail: `저장된 architecture checkpoint가 신뢰할 수 없는 내용을 담고 있습니다: ${resumedArchIssues.map((i) => i.code).join(", ")}`,
+      };
+    }
+    const architecture = cur.architecture;
+    const outcome = await runLlmStage(
+      rawOutputSource,
+      "PHASE_PLAN",
+      undefined,
+      () => buildPhasePlanPrompt(normalized, identity, architecture),
+      (issues) => buildPhasePlanCorrectionPrompt(normalized, identity, architecture, issues),
+      (rawText) => validatePhasePlanRawOutput(rawText, normalized, identity),
+      config.onDiagnostic
+    );
+    if (outcome.kind === "transport_failed") {
+      return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: outcome.detail };
+    }
+    if (outcome.kind === "rejected") {
+      const rejectWrite = persist({ ...cur, lastValidationIssues: outcome.issues, lastValidationContext: { stage: "PHASE_PLAN" }, updatedAt: nowIso() });
+      if (!rejectWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: rejectWrite.detail };
+      return { status: "REJECTED", issues: outcome.issues };
+    }
+    cur = { ...cur, phasePlan: outcome.value, stage: "PHASE_PLANNED", lastValidationIssues: undefined, updatedAt: nowIso() };
+    const w = persist(cur);
+    if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
+  }
+
+  // STAGE 3 — TASK PLAN(Phase별). 이미 완료된 Phase는 건너뛰고(resume), 각 Phase마다
+  // 완료 즉시 checkpoint한다 — 뒤 Phase의 transport 실패/REJECTED가 앞선 Phase를 재호출시키지
+  // 않는다.
+  if (cur.stage === "PHASE_PLANNED") {
+    if (!cur.architecture || !cur.phasePlan) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=PHASE_PLANNED인데 architecture/phasePlan이 저장돼 있지 않습니다." };
+    }
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 2회차, HIGH) — 이 블록은 architecture를
+    // Task Plan LLM 프롬프트에 그대로 담아 외부로 보낸다(§ buildPhaseTaskPrompt). resume이
+    // ARCHITECTURE_PLANNED 블록을 거치지 않고 이 stage로 곧장 들어올 수 있어(예: 이전 실행이
+    // PHASE_PLANNED까지 이미 진행한 뒤 중단됨), 여기서 실제로 프롬프트를 만들기 전에 반드시
+    // architecture와 phasePlan(+이미 확정된 phaseTaskPlans, 다음 프롬프트의 "이미 확정된 task"
+    // 컨텍스트로 쓰인다)을 재검증한다 — secret-shaped 값이 검증 전에 외부로 유출되는 것을
+    // 막는다(§ validateResumedArchitecture/validateResumedPhasePlanAndKnownTasks 상단 주석).
+    const resumedArchIssuesAtPhasePlanned = validateResumedArchitecture(cur.architecture, normalized, identity);
+    if (resumedArchIssuesAtPhasePlanned.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "PLANNER_STATE_CORRUPT",
+        detail: `저장된 architecture checkpoint가 신뢰할 수 없는 내용을 담고 있습니다: ${resumedArchIssuesAtPhasePlanned.map((i) => i.code).join(", ")}`,
+      };
+    }
+    const resumedPhaseIssues = validateResumedPhasePlanAndKnownTasks(cur.phasePlan, cur.phaseTaskPlans ?? {}, normalized);
+    if (resumedPhaseIssues.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "PLANNER_STATE_CORRUPT",
+        detail: `저장된 phasePlan/phaseTaskPlans checkpoint가 신뢰할 수 없는 내용을 담고 있습니다: ${resumedPhaseIssues.map((i) => i.code).join(", ")}`,
+      };
+    }
+    const architecture = cur.architecture;
+    const orderedPhases = [...cur.phasePlan].sort((a, b) => Number(a.phaseId) - Number(b.phaseId));
+    let phaseTaskPlans: Record<string, PlannerRawTask[]> = { ...(cur.phaseTaskPlans ?? {}) };
+
+    for (const phase of orderedPhases) {
+      if (phaseTaskPlans[phase.phaseId]) continue;
+
+      const knownTasksFlat = Object.values(phaseTaskPlans).flat();
+      const knownTaskIds = new Set(knownTasksFlat.map((t) => t.taskId));
+      const knownTasks = knownTasksFlat.map((t) => ({ taskId: t.taskId, title: t.title }));
+      const priorPhases = orderedPhases.filter((p) => Number(p.phaseId) < Number(phase.phaseId));
+
+      const outcome = await runLlmStage(
+        rawOutputSource,
+        "TASK_PLAN",
+        phase.phaseId,
+        () => buildPhaseTaskPrompt(normalized, identity, architecture, phase, priorPhases, knownTasks),
+        (issues) => buildPhaseTaskCorrectionPrompt(normalized, identity, architecture, phase, priorPhases, knownTasks, issues),
+        (rawText) => validatePhaseTaskRawOutput(rawText, normalized, identity, phase, knownTaskIds),
+        config.onDiagnostic
+      );
+      if (outcome.kind === "transport_failed") {
+        return { status: "BLOCKED", code: "RAW_OUTPUT_SOURCE_FAILED", detail: outcome.detail };
+      }
+      if (outcome.kind === "rejected") {
+        cur = { ...cur, phaseTaskPlans, lastValidationIssues: outcome.issues, lastValidationContext: { stage: "TASK_PLAN", phaseId: phase.phaseId }, updatedAt: nowIso() };
+        const rejectWrite = persist(cur);
+        if (!rejectWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: rejectWrite.detail };
+        return { status: "REJECTED", issues: outcome.issues };
+      }
+      phaseTaskPlans = { ...phaseTaskPlans, [phase.phaseId]: outcome.value };
+      cur = { ...cur, phaseTaskPlans, lastValidationIssues: undefined, updatedAt: nowIso() };
+      const w = persist(cur);
+      if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
+    }
+
+    cur = { ...cur, stage: "TASKS_PLANNED", updatedAt: nowIso() };
+    const w = persist(cur);
+    if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
+  }
+
+  // STAGE 4 — GLOBAL TRACEABILITY(deterministic, LLM 없음).
+  if (cur.stage === "TASKS_PLANNED") {
+    if (!cur.phasePlan || !cur.phaseTaskPlans) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=TASKS_PLANNED인데 phasePlan/phaseTaskPlans가 저장돼 있지 않습니다." };
+    }
+    let allTasks: PlannerRawTask[];
+    try {
+      allTasks = flattenPhaseTaskPlans(cur.phasePlan, cur.phaseTaskPlans);
+    } catch (e) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: e instanceof Error ? e.message : String(e) };
+    }
+    const issues = validateGlobalTraceability(normalized, cur.phasePlan, allTasks);
+    if (issues.length > 0) {
+      const rejectWrite = persist({ ...cur, lastValidationIssues: issues, lastValidationContext: { stage: "TRACEABILITY" }, updatedAt: nowIso() });
+      if (!rejectWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: rejectWrite.detail };
+      return { status: "REJECTED", issues };
+    }
+    cur = { ...cur, stage: "TRACEABILITY_VALIDATED", lastValidationIssues: undefined, updatedAt: nowIso() };
+    const w = persist(cur);
+    if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
+  }
+
+  // STAGE 5 — FINAL ASSEMBLY(deterministic, LLM 없음) — SI-3의 나머지 파이프라인(Core
+  // 재검증 + write-직전 재확인 + 3개 파일 원자적 저장)을 그대로 재사용한다.
+  if (cur.stage === "TRACEABILITY_VALIDATED") {
+    if (!cur.architecture || !cur.phasePlan || !cur.phaseTaskPlans) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: "stage=TRACEABILITY_VALIDATED인데 architecture/phasePlan/phaseTaskPlans가 저장돼 있지 않습니다." };
+    }
+    // resume이 ARCHITECTURE_PLANNED 블록을 거치지 않고 이 stage로 곧장 들어올 수 있으므로
+    // (예: 이전 실행이 TASKS_PLANNED/TRACEABILITY_VALIDATED까지 이미 진행한 뒤 중단됨) 여기서도
+    // 독립적으로 재검증한다(§ validateResumedArchitecture 상단 주석).
+    const resumedArchIssuesAtAssembly = validateResumedArchitecture(cur.architecture, normalized, identity);
+    if (resumedArchIssuesAtAssembly.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "PLANNER_STATE_CORRUPT",
+        detail: `저장된 architecture checkpoint가 신뢰할 수 없는 내용을 담고 있습니다: ${resumedArchIssuesAtAssembly.map((i) => i.code).join(", ")}`,
+      };
+    }
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 2회차, HIGH) — resume이 TASKS_PLANNED
+    // 블록(STAGE 4)을 거치지 않고 이 stage로 곧장 들어올 수 있다(예: stage가 이미
+    // TRACEABILITY_VALIDATED로 저장된 뒤 phasePlan/phaseTaskPlans만 직접 변조됨). architecture만
+    // 재검증하고 넘어가면 unknown/dangling REQ·AC, deferred/out-of-scope 승격, taskId/phaseId
+    // 불일치, coverage 누락, task 사이클 등이 최종 조립까지 그대로 통과한다 —
+    // buildTaskRegistry()가 reqIds/acceptanceCriteria/dependsOn 상당수를 그대로 옮기지 않아
+    // downstream(Core project-manifest/execution-policy validator)도 이를 복구해 잡지 못한다.
+    // final assembly 직전에 STAGE 4 전체를 다시 실행해, 위반이 있으면 REJECTED(재시도 유도)가
+    // 아니라 BLOCKED(PLANNER_STATE_CORRUPT)로 처리한다 — 이 시점의 위반은 새 LLM 응답을 받아서
+    // 고칠 문제가 아니라 checkpoint 자체의 신뢰 문제이기 때문이다.
+    let allTasksAtAssembly: PlannerRawTask[];
+    try {
+      allTasksAtAssembly = flattenPhaseTaskPlans(cur.phasePlan, cur.phaseTaskPlans);
+    } catch (e) {
+      return { status: "BLOCKED", code: "PLANNER_STATE_CORRUPT", detail: e instanceof Error ? e.message : String(e) };
+    }
+    const traceabilityIssuesAtAssembly = validateGlobalTraceability(normalized, cur.phasePlan, allTasksAtAssembly);
+    if (traceabilityIssuesAtAssembly.length > 0) {
+      return {
+        status: "BLOCKED",
+        code: "PLANNER_STATE_CORRUPT",
+        detail: `저장된 phasePlan/phaseTaskPlans checkpoint가 Global Traceability 재검증을 통과하지 못했습니다: ${traceabilityIssuesAtAssembly.map((i) => i.code).join(", ")}`,
+      };
+    }
     let manifest: ProjectManifest;
     let generated: ReturnType<typeof buildGeneratedExecutionData>;
     try {
-      const raw = JSON.parse(cur.rawPlannerOutput) as PlannerRawOutput;
+      const allTasks = flattenPhaseTaskPlans(cur.phasePlan, cur.phaseTaskPlans);
+      const raw = synthesizeLegacyRawOutput(identity, cur.architecture, cur.phasePlan, allTasks);
       generated = buildGeneratedExecutionData(raw, normalized, identity, projectName, resolvedRoot, now);
       manifest = assembleProjectManifest(generated);
       validateProjectManifest(manifest);
@@ -1900,15 +3422,9 @@ async function runPlannerLocked(
       return { status: "BLOCKED", code: "GENERATED_DATA_INVALID", detail: `생성된 실행 데이터가 Core 검증을 통과하지 못했습니다: ${e instanceof Error ? e.message : String(e)}` };
     }
 
-    // GPT Independent Reviewer 지적(SI-3 REVISE 2회차, HIGH) — 이 시점 이전에 유일하게 긴
-    // 비동기 대기(rawOutputSource 호출, 실제 LLM이면 수십~수백 초)가 있었다. 그 사이
-    // project root/.autodev가 symlink로 교체됐을 가능성에 대비해 실제 write 직전에
-    // containment를 다시 확인한다(project-bootstrap.ts의 advanceBootstrap()과 동일한 "write
-    // 직전 재확인" 원칙). 완전한 TOCTOU 방지는 아니다 — project-bootstrap.ts의
-    // verifySpecContentRefFile() 상단 주석이 이미 문서화했듯, 순수 Node.js 동기 API만으로는
-    // realpath 확인과 실제 open/write를 원자적으로 묶을 방법이 없다(네이티브 addon 없이는
-    // 해결 불가한 플랫폼/런타임 한계) — 이 함수는 그 문서화된 잔여 위험과 동일한 성격의
-    // best-effort 재확인을 추가할 뿐이다.
+    // 이 시점 이전에 여러 번의 긴 비동기 대기(각 stage의 rawOutputSource 호출, 실제 LLM이면
+    // 수십~수백 초씩 여러 번)가 있었다. 그 사이 project root/.autodev가 symlink로 교체됐을
+    // 가능성에 대비해 실제 write 직전에 containment를 다시 확인한다.
     let projectRootRealNow: string;
     try {
       projectRootRealNow = realpathSync(resolvedRoot);
@@ -1917,6 +3433,23 @@ async function runPlannerLocked(
     }
     if (projectRootRealNow !== projectRootReal) {
       return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: "project root의 실제 대상이 처리 도중 바뀐 것으로 보여 안전하게 중단했습니다." };
+    }
+    // § 위 projectRootIdentity 캡처 주석 — 경로 문자열이 같아도 그 사이 원래 디렉터리가
+    // rename되고 같은 경로에 다른 디렉터리가 새로 설치됐을 수 있다(symlink 없이도 가능).
+    // dev+ino로 실제 같은 파일시스템 객체인지 재확인한다.
+    let projectRootIdentityNow: { dev: number; ino: number };
+    try {
+      const rootStatNow = statSync(projectRootRealNow);
+      projectRootIdentityNow = { dev: rootStatNow.dev, ino: rootStatNow.ino };
+    } catch (e) {
+      return { status: "BLOCKED", code: "PROJECT_ROOT_ESCAPE", detail: `write 직전 project root 객체 재확인 실패: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (projectRootIdentityNow.dev !== projectRootIdentity.dev || projectRootIdentityNow.ino !== projectRootIdentity.ino) {
+      return {
+        status: "BLOCKED",
+        code: "PROJECT_ROOT_ESCAPE",
+        detail: "project root 경로 문자열은 같지만 실제 파일시스템 객체(inode)가 실행 도중 바뀐 것으로 보여 안전하게 중단했습니다.",
+      };
     }
     const autodevDirNow = join(resolvedRoot, ".autodev");
     if (existsSync(autodevDirNow)) {
@@ -1931,36 +3464,152 @@ async function runPlannerLocked(
       }
     }
 
-    const writes = [
-      writeJsonAtomic(generatedManifestPath(resolvedRoot), generated.manifestFile),
-      writeJsonAtomic(generatedTaskRegistryPath(resolvedRoot), generated.taskRegistry),
-      writeJsonAtomic(generatedExecutionPolicyPath(resolvedRoot), generated.executionPolicy),
-    ];
-    const failed = writes.find((w) => !w.ok) as { ok: false; detail: string } | undefined;
-    if (failed) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: failed.detail };
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차, HIGH) — project lock(acquireProjectLock)이
+    // 실제로 막는 race와, 그것으로 막을 수 없는 위험을 구분해서 검토했다:
+    // (a) "동시에 실행되는 다른 runPlanner() 호출"이 같은 project root의 checkpoint/생성
+    //     파일을 동시에 쓰는 race — runPlanner()가 lock을 잡은 채로 runPlannerLocked
+    //     전체(모든 LLM stage await 포함)를 감싸므로 완전히 제거된다(같은/다른 프로세스의
+    //     두 번째 runPlanner() 호출은 CONCURRENT_PLANNER_RUN_IN_PROGRESS로 즉시 거부).
+    // (b) runPlannerLocked 자신이 planner-state.json을 externally tamper당하는 race —
+    //     이 파일은 stage가 바뀔 때마다 항상 cur 전체를 다시 write하는 "완전 덮어쓰기"
+    //     모델이라(부분 merge 없음), 매 LLM stage 호출 직후에는 어차피 그 결과로 다시
+    //     전체를 write한다 — 외부에서 그 사이에 무엇을 쓰더라도 다음 정상 write가 그대로
+    //     덮어쓴다. 그리고 stage가 이미 TRACEABILITY_VALIDATED 이상으로 resume되는
+    //     경로(§ 위 STAGE 5 블록)는 이 지점까지 오는 동안 추가 LLM await 자체가 없어(모든
+    //     재검증이 동기적으로 이어짐) 그 사이에 끼어들 틈이 구조적으로 없다 — 별도
+    //     방어를 추가해도 실제로 도달 불가능한 코드가 되므로 만들지 않는다.
+    // (c) lock이 막지 "못하는" 것은 runPlanner() 경로를 거치지 않는 bootstrap-state.json/
+    //     master-spec/spec.md에 대한 외부 변경이다 — 이 파일들은 evaluateTrustedPlannerInput()
+    //     이 실행 시작 시 한 번만 읽고 이후 다시 읽지 않으므로, 이 프로세스가 LLM 응답을
+    //     기다리는 수십~수백 초 동안 사람/다른 도구가 이 파일들을 직접 편집해도 원래는
+    //     끝까지 감지되지 않았다. 되돌릴 수 없는 최종 write 직전인 이 지점에서
+    //     evaluateTrustedPlannerInput()을 처음부터 다시 실행해(로직 복제 없음) 그 사이
+    //     bootstrap-state/manifest/spec.md가 여전히 이 실행이 시작할 때와 동일한 identity를
+    //     신뢰할 수 있는 상태인지 확인한다 — 어긋나면 결과를 덮어쓰지 않고 BLOCKED한다.
+    const revalidatedTrustedInput = evaluateTrustedPlannerInput(resolvedRoot, projectRootRealNow, expectedIdentity);
+    if (!revalidatedTrustedInput.ok) {
+      return {
+        status: "BLOCKED",
+        code: revalidatedTrustedInput.code,
+        detail: `write 직전 재검증 실패(실행 도중 신뢰 입력이 바뀐 것으로 의심됨): ${revalidatedTrustedInput.detail}`,
+      };
+    }
+    if (!identitiesMatch(revalidatedTrustedInput.input.identity, identity)) {
+      return {
+        status: "BLOCKED",
+        code: "EXPECTED_IDENTITY_MISMATCH",
+        detail: "write 직전 재검증한 identity가 이 실행이 시작할 때 확인한 identity와 다릅니다 — 실행 도중 신뢰 입력이 바뀐 것으로 보여 중단합니다.",
+      };
+    }
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — identitiesMatch()는
+    // handoffId/projectId/specVersion/specIntegrity만 비교한다. projectName은
+    // BootstrapRequestIdentity에 없는 별도 필드라(manifest.json에만 있음) 이 비교에
+    // 포함되지 않았다 — spec 내용/식별자는 그대로인데 manifest.json의 projectName만 바뀌면
+    // 최종 생성물의 developerInstructions/reviewInstructions 등에 다른 프로젝트 이름이
+    // 그대로 반영될 수 있었다. 최초 신뢰 입력에서 캡처한 projectName과도 함께 대조한다.
+    if (revalidatedTrustedInput.input.projectName !== projectName) {
+      return {
+        status: "BLOCKED",
+        code: "EXPECTED_IDENTITY_MISMATCH",
+        detail: "write 직전 재검증한 projectName이 이 실행이 시작할 때 확인한 projectName과 다릅니다 — 실행 도중 신뢰 입력이 바뀐 것으로 보여 중단합니다.",
+      };
+    }
 
-    cur = { ...cur, stage: "EXECUTION_DATA_GENERATED", updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, MEDIUM) — 이전에는 배열
+    // literal(`[writeJsonAtomic(...), writeJsonAtomic(...), writeJsonAtomic(...)]`)이 세
+    // 호출을 모두 즉시 평가해, 첫 번째가 실패해도 나머지를 계속 썼다(불필요한 부분 갱신).
+    // 순서대로 실행해 첫 실패에서 즉시 멈추고, 그때까지 이미 쓴 파일은 정리(삭제)한다 —
+    // generation.json이 아직 쓰이지 않았으므로 다음 실행은 어차피 GENERATED_DATA_INVALID로
+    // 이 상태를 다시 잡지만(§ generationManifestPath 주석), 불필요한 부분 갱신 파일을
+    // 남기지 않는 편이 더 안전하다.
+    const writeSteps: Array<{ path: string; data: unknown }> = [
+      { path: generatedManifestPath(resolvedRoot), data: generated.manifestFile },
+      { path: generatedTaskRegistryPath(resolvedRoot), data: generated.taskRegistry },
+      { path: generatedExecutionPolicyPath(resolvedRoot), data: generated.executionPolicy },
+    ];
+    const writtenSoFar: string[] = [];
+    let writeFailure: { ok: false; detail: string } | undefined;
+    for (const step of writeSteps) {
+      const w = writeJsonAtomic(step.path, step.data, projectRootRealNow);
+      if (!w.ok) {
+        writeFailure = w;
+        break;
+      }
+      writtenSoFar.push(step.path);
+    }
+    if (writeFailure) {
+      for (const p of writtenSoFar) {
+        safeUnlinkWithinRoot(p, projectRootRealNow);
+      }
+      return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: writeFailure.detail };
+    }
+
+    // § generationManifestPath 상단 주석 — 3개 파일이 모두 성공적으로 쓰인 "직후"에만 이
+    // 파일을 쓴다. 실제로 디스크에 쓰인 내용을 다시 읽어 해시하므로(재구성된 값이 아니라)
+    // 이 시점 이후 어떤 이유로든 다시 읽었을 때 실제 파일과의 불일치는 곧 "이 3개가 이
+    // generation.json이 기록한 것과 다른 상태로 바뀌었다"는 뜻이 된다.
+    const writtenManifest = readTrustedGeneratedFile(generatedManifestPath(resolvedRoot), projectRootRealNow);
+    const writtenTaskRegistry = readTrustedGeneratedFile(generatedTaskRegistryPath(resolvedRoot), projectRootRealNow);
+    const writtenExecutionPolicy = readTrustedGeneratedFile(generatedExecutionPolicyPath(resolvedRoot), projectRootRealNow);
+    if (!writtenManifest.ok || !writtenTaskRegistry.ok || !writtenExecutionPolicy.ok) {
+      return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: "write 직후 생성된 파일을 신뢰할 수 있게 재확인하지 못했습니다." };
+    }
+
+    // GPT Independent Reviewer 지적(SI-3.3 REVISE 3회차 재검증, HIGH) — 위 write 직전
+    // 재검증과 실제 3개 파일 write 사이에도(비록 그 사이에 await은 없지만, 실제 디스크 I/O가
+    // 걸리는 동안 다른 프로세스가 파일을 바꿀 수 있는 여지가 있다) 여전히 이론적인 TOCTOU
+    // 창이 남는다 — 여러 개의 독립된 파일에 걸친 진짜 원자적 트랜잭션은 표준 파일시스템
+    // API로 만들 수 없다(요구사항: 과도한 새 transaction framework 금지). "이 3개 파일을
+    // COMPLETED로 확정해도 되는가"의 최종 관문인 generation.json/stage 전이 직전에 한 번 더
+    // 같은 재검증을 반복해 그 창을 최대한 좁힌다 — 여기서 실패하면 이미 쓴 3개 파일이
+    // 신뢰할 수 없는 입력을 반영한 채로 남지 않도록 정리(삭제)를 시도한 뒤 BLOCKED한다
+    // (삭제 자체가 실패해도 stage는 EXECUTION_DATA_GENERATED로 전진시키지 않으므로, 다음
+    // 실행이 generation.json 부재로 GENERATED_DATA_INVALID를 통해 이 상태를 다시 잡는다 —
+    // § generationManifestPath 상단 주석과 동일한 방어선을 재사용).
+    const revalidatedTrustedInputBeforePublish = evaluateTrustedPlannerInput(resolvedRoot, projectRootRealNow, expectedIdentity);
+    // § 위 write 직전 재검증의 projectName 비교 주석과 동일한 이유로 여기서도 함께 대조한다.
+    const identityStillMatches =
+      revalidatedTrustedInputBeforePublish.ok &&
+      identitiesMatch(revalidatedTrustedInputBeforePublish.input.identity, identity) &&
+      revalidatedTrustedInputBeforePublish.input.projectName === projectName;
+    if (!identityStillMatches) {
+      for (const p of [generatedManifestPath(resolvedRoot), generatedTaskRegistryPath(resolvedRoot), generatedExecutionPolicyPath(resolvedRoot)]) {
+        safeUnlinkWithinRoot(p, projectRootRealNow);
+      }
+      return {
+        status: "BLOCKED",
+        code: revalidatedTrustedInputBeforePublish.ok ? "EXPECTED_IDENTITY_MISMATCH" : revalidatedTrustedInputBeforePublish.code,
+        detail: "생성 파일 write 직후 재검증한 신뢰 입력이 이 실행이 시작할 때와 다릅니다 — 실행 도중 신뢰 입력이 바뀐 것으로 보여 방금 쓴 파일을 정리하고 중단합니다.",
+      };
+    }
+
+    const generationManifest: GenerationManifest = {
+      generationId: randomUUID(),
+      manifestSha256: sha256Hex(writtenManifest.content),
+      taskRegistrySha256: sha256Hex(writtenTaskRegistry.content),
+      executionPolicySha256: sha256Hex(writtenExecutionPolicy.content),
+    };
+    const generationWrite = writeJsonAtomic(generationManifestPath(resolvedRoot), generationManifest, projectRootRealNow);
+    if (!generationWrite.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: generationWrite.detail };
+
+    cur = { ...cur, stage: "EXECUTION_DATA_GENERATED", updatedAt: nowIso() };
+    const w = persist(cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
 
   if (cur.stage === "EXECUTION_DATA_GENERATED") {
-    // 저장된 파일을 다시 읽어 round-trip 무결성을 재확인한다(project-bootstrap.ts의
-    // preserveMasterSpec 재확인 패턴과 동일한 원칙 — 쓰기 도중 손상을 여기서 잡는다). 로직은
-    // readyOutcome()이 COMPLETED 이후 재확인할 때와 동일한 reloadAndValidateGeneratedData()를
-    // 그대로 재사용한다(복제 금지).
     const reloaded = reloadAndValidateGeneratedData(resolvedRoot, identity.projectId);
     if (!reloaded.ok) {
       return { status: "BLOCKED", code: "GENERATED_DATA_INVALID", detail: `저장된 실행 데이터 재확인 실패: ${reloaded.detail}` };
     }
-    cur = { ...cur, stage: "EXECUTION_DATA_VALIDATED", updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    cur = { ...cur, stage: "EXECUTION_DATA_VALIDATED", updatedAt: nowIso() };
+    const w = persist(cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
 
   if (cur.stage === "EXECUTION_DATA_VALIDATED") {
-    cur = { ...cur, stage: "COMPLETED", updatedAt: new Date().toISOString() };
-    const w = writeJsonAtomic(plannerStateFilePath(resolvedRoot), cur);
+    cur = { ...cur, stage: "COMPLETED", updatedAt: nowIso() };
+    const w = persist(cur);
     if (!w.ok) return { status: "BLOCKED", code: "STATE_WRITE_FAILED", detail: w.detail };
   }
 
