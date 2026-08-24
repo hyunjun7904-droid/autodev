@@ -34,8 +34,25 @@ export type GptErrorCode =
   | "TIMEOUT"
   | "INVALID_OUTPUT"
   | "API_ERROR"
-  | "GPT_REVIEW_TEMPORARILY_UNAVAILABLE";
+  | "GPT_REVIEW_TEMPORARILY_UNAVAILABLE"
+  // SI-3.8A — GPT Reviewer API Budget Guard(gpt-budget-guard.ts)가 실제 OpenAI API 호출
+  // 직전에 payload/추정 토큰 상한 초과를 감지해 호출 자체를 막았을 때만 쓰인다. 재시도로
+  // 해결되지 않으므로 항상 transient=false다.
+  | "BUDGET_EXCEEDED";
 
+// SI-3.8A — GPT Reviewer API Budget Guard가 OpenAI API 호출을 막았을 때 별도의
+// "WAITING_API_BUDGET" enum 값을 추가하는 대신 기존 WAITING_HUMAN을 그대로 재사용하기로
+// 했다: "WAITING_HUMAN" 문자열은 이 파일뿐 아니라 run.ts(Telegram controller를 유지한 채
+// 대기할지 판단), autodev.ts(decideNextAction의 "이미 WAITING_HUMAN이면 자동 재실행하지
+// 않음" 게이트), dashboard-html.ts/live-snapshot.ts(사람 승인 필요 UI 신호)까지 exact-match
+// 문자열 비교로 광범위하게 이미 소비되고 있다 — 새 상태값을 추가하면 이 소비처들이 전부
+// "WAITING_API_BUDGET"을 인식하지 못해 자동 재실행/조기 종료/UI 미표시 같은 실제 회귀가
+// 생긴다(SI-3.8A 리뷰에서 run.ts의 waitWhileWaitingHuman()이 실제로 이렇게 깨지는 것을
+// 확인함). Task 지시("Core-wide 예상 외 변경이 필요하면 임의로 확대하지 말고 STOP 후
+// 보고")에 따라 이 Task 범위에서 그 소비처들을 전부 고치는 대신, AUTH_ERROR/QUOTA_EXCEEDED/
+// GPT_REVIEW_TEMPORARILY_UNAVAILABLE이 이미 쓰는 것과 동일한 패턴(기존 WAITING_HUMAN +
+// deferredHumanTasks의 "BUDGET_EXCEEDED: ..." 항목 + lastGptDecision.errorCode로 구체적
+// 사유 구분)을 그대로 따른다.
 export type OrchestratorStatus =
   | "IDLE"
   | "CLAUDE_WORKING"

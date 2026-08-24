@@ -36,7 +36,11 @@ export interface OrchestratorDeps {
     reviewCycle: number,
     task: string,
     allowedPathPrefixes?: string[],
-    projectContext?: ReviewProjectContext
+    projectContext?: ReviewProjectContext,
+    /** SI-3.8A — 이 loop의 gptCallCount/gptRawCallTotal(아래 while 루프의 로컬 카운터)을
+     *  Budget Guard 관측값으로 그대로 전달한다(§ gpt-budget-guard.ts). */
+    gptCallCount?: number,
+    gptRawCallTotal?: number
   ) => Promise<GptReviewerReturn>;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   claudeLimitWaitMs?: number;
@@ -102,11 +106,13 @@ function selectDefaultGptReviewer(executor?: SafeExecutorContext): (
   reviewCycle: number,
   task: string,
   allowedPathPrefixes?: string[],
-  projectContext?: ReviewProjectContext
+  projectContext?: ReviewProjectContext,
+  gptCallCount?: number,
+  gptRawCallTotal?: number
 ) => Promise<GptReviewerReturn> {
   if (process.env.AUTOMATION_DRY_RUN !== "false") return fakeReviewClaudeResult;
-  return (result, reviewCycle, task, allowedPathPrefixes, projectContext) =>
-    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor });
+  return (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal) =>
+    realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor, gptCallCount, gptRawCallTotal });
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -244,7 +250,9 @@ export async function runOrchestrator(
     }
 
     emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
-    const gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext);
+    // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
+    // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
+    const gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal);
 
     // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
     // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
@@ -259,7 +267,8 @@ export async function runOrchestrator(
     if (
       gptResult.errorCode === "AUTH_ERROR" ||
       gptResult.errorCode === "QUOTA_EXCEEDED" ||
-      gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE"
+      gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" ||
+      gptResult.errorCode === "BUDGET_EXCEEDED"
     ) {
       state.deferredHumanTasks.push(`${gptResult.errorCode}: ${gptResult.feedback}`);
     }
@@ -302,6 +311,12 @@ export async function runOrchestrator(
       break;
     }
     if (decision === "BLOCK" || decision === "HUMAN_REQUIRED") {
+      // SI-3.8A — Budget Guard가 OpenAI API 호출 자체를 막은 경우도 별도 enum 값을 새로
+      // 만들지 않고 기존 WAITING_HUMAN을 그대로 쓴다(§ types.ts OrchestratorStatus 주석 —
+      // run.ts/autodev.ts/dashboard-html.ts/live-snapshot.ts가 전부 "WAITING_HUMAN" 문자열을
+      // exact-match로 이미 소비하고 있어, 새 상태값은 그 소비처들을 전부 고쳐야 하는
+      // Core-wide 변경이 된다). 구체적 사유는 errorCode==="BUDGET_EXCEEDED"와
+      // deferredHumanTasks의 "BUDGET_EXCEEDED: ..." 항목(위 push)으로 이미 구분 가능하다.
       setStatus("WAITING_HUMAN");
       emitEvent({
         eventType: "REVIEW_BLOCKED",

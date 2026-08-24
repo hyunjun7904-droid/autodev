@@ -9,6 +9,7 @@ import { PROJECT_ROOT } from "./safe-executor";
 import { validateReadPath } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
 import { log, sanitizeForLog } from "./logger";
+import { resolveGptBudgetGuardConfig, evaluateGptBudgetGuard } from "./gpt-budget-guard";
 
 // 실제 OpenAI Responses API 기반 리뷰어. AUTOMATION_DRY_RUN=false일 때만 orchestrator가
 // 이 모듈을 선택한다. OPENAI_API_KEY는 client 생성자가 process.env에서 자동으로 읽는다 —
@@ -277,15 +278,47 @@ export async function reviewClaudeResultOnce(
   task = "(task 미지정)",
   allowedPathPrefixes?: string[],
   projectContext: ReviewProjectContext = DEFAULT_REVIEW_PROJECT_CONTEXT,
-  executor?: SafeExecutorContext
+  executor?: SafeExecutorContext,
+  /** orchestrator.ts가 자신의 loop-local 카운터를 그대로 넘긴다(§ GptBudgetGuardInput) —
+   *  이 함수 자체는 이 값을 계산/추적하지 않는다(관측 목적 pass-through일 뿐). */
+  gptCallCount?: number,
+  gptRawCallTotal?: number
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
   const { input, scopeViolations } = buildReviewInput(task, result, reviewCycle, effectiveAllowedPathPrefixes, projectContext, executor);
+  const instructions = buildSystemInstructions(projectContext);
+
+  // GPT Reviewer API Budget Guard(SI-3.8A) — 실제 OpenAI API를 호출하기 직전의 마지막
+  // deterministic 검문소다. 여기서 BLOCK이면 getClient()조차 호출하지 않는다(아래 try 블록
+  // 진입 자체를 하지 않음) — API 호출 0회를 구조적으로 보장한다. 재시도로 해결되는 문제가
+  // 아니므로 transient는 항상 false다(reviewClaudeResultWithRetry가 즉시 반환하고 재시도하지
+  // 않음).
+  const budgetGuardResult = evaluateGptBudgetGuard(
+    { instructions, input, reviewCycle, gptCallCount, gptRawCallTotal },
+    resolveGptBudgetGuardConfig()
+  );
+  if (budgetGuardResult.verdict === "BLOCK") {
+    log(`GPT Budget Guard BLOCK(${budgetGuardResult.blockCode}) — OpenAI API 호출 생략`, {
+      reviewCycle,
+      payloadChars: budgetGuardResult.payloadChars,
+      estimatedInputTokens: budgetGuardResult.estimatedInputTokens,
+      config: budgetGuardResult.config,
+    });
+    return {
+      decision: "HUMAN_REQUIRED",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: `GPT Budget Guard: ${budgetGuardResult.reason}`,
+      nextTask: null,
+      errorCode: "BUDGET_EXCEEDED",
+      transient: false,
+      scopeViolations,
+    };
+  }
 
   try {
     const response = await getClient().responses.create({
       model: MODEL,
-      instructions: buildSystemInstructions(projectContext),
+      instructions,
       input,
       text: {
         format: {
@@ -371,6 +404,13 @@ export interface ReviewRetryOptions {
    *  module-level singleton을 쓴다(하위 호환) — 실제 운용은 orchestrator.ts가 항상 명시적으로
    *  넘긴다. */
   executor?: SafeExecutorContext;
+  /** SI-3.8A — 호출부(orchestrator.ts)의 GPT 호출 횟수 카운터를 Budget Guard 관측값으로
+   *  그대로 전달한다(§ gpt-budget-guard.ts GptBudgetGuardInput.gptCallCount/
+   *  gptRawCallTotal) — 지정하지 않으면 undefined로 전달될 뿐, 이 값 자체로 BLOCK하지
+   *  않는다(그 상한은 orchestrator.ts의 MAX_GPT_CALLS/MAX_GPT_RAW_CALLS가 이미 별도로
+   *  강제한다). */
+  gptCallCount?: number;
+  gptRawCallTotal?: number;
 }
 
 export async function reviewClaudeResultWithRetry(
@@ -385,7 +425,7 @@ export async function reviewClaudeResultWithRetry(
   const allowedPathPrefixes = opts.allowedPathPrefixes ?? projectContext.scopeDirs;
 
   for (let i = 0; i < MAX_ATTEMPTS; i++) {
-    const r = await attempt(result, reviewCycle, task, allowedPathPrefixes, projectContext, opts.executor);
+    const r = await attempt(result, reviewCycle, task, allowedPathPrefixes, projectContext, opts.executor, opts.gptCallCount, opts.gptRawCallTotal);
     if (!r.transient) {
       return { ...r, gptTransportRetry: i };
     }
