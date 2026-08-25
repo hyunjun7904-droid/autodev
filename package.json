@@ -12,6 +12,7 @@
     "smoke-test": "npm run build && node dist/smoke-test.js",
     "real-source-catalog-smoke-test": "npm run build && node dist/real-source-catalog-smoke-test.js",
     "final-reviewer-benchmark": "npm run build && node dist/final-reviewer-benchmark.js",
+    "final-reviewer-benchmark-groq": "npm run build && node dist/final-reviewer-benchmark-groq.js",
     "playwright-browser-backend-smoke-test": "npm run build && node dist/playwright-browser-backend-smoke-test.js",
     "gpt-smoke-test": "npm run build && node dist/gpt-smoke-test.js",
     "test:safe-executor": "npm run build && node dist/safe-executor-tests.js",

@@ -26,9 +26,9 @@ import type { GptReviewResult } from "./types";
 // 기본값(env 미지정)은 기존 7B benchmark와 완전히 동일하게 재현된다(하위 호환, production
 // 코드는 건드리지 않음). 이 env var로만 override 가능 — corpus/판정 로직은 변경하지 않는다.
 const QUALIFIED_MODEL = process.env.FINAL_REVIEWER_BENCHMARK_MODEL ?? "qwen2.5-coder:7b";
-const RUNS_PER_CASE = 2;
+export const RUNS_PER_CASE = 2;
 
-const BENCHMARK_PROJECT_CONTEXT: ReviewProjectContext = {
+export const BENCHMARK_PROJECT_CONTEXT: ReviewProjectContext = {
   projectName: "AutoDev Core (Local Final Reviewer Qualification Benchmark)",
   instructions:
     "AutoDev Core 저장소 자체에 대한 검토입니다. 이 저장소는 자동 개발 오케스트레이션 엔진의 " +
@@ -47,7 +47,10 @@ const BENCHMARK_PROJECT_CONTEXT: ReviewProjectContext = {
 // "(프로젝트 규칙 파일이 지정되지 않음)").
 const NO_RULES_PATH_PLACEHOLDER = "(프로젝트 규칙 파일이 지정되지 않음)";
 
-function buildCaseInput(c: BenchmarkCase): string {
+/** Groq qualification 등 다른 provider의 benchmark runner가 production payload 모양을
+ *  복제하지 않고 그대로 재사용할 수 있도록 export한다(§ Task 요구사항 "기존 benchmark corpus와
+ *  evaluator 재사용" — 로직 복제 없음). */
+export function buildCaseInput(c: BenchmarkCase): string {
   return [
     `# Task\n${c.taskSummary}`,
     `# Review cycle\n1`,
@@ -61,7 +64,7 @@ function buildCaseInput(c: BenchmarkCase): string {
   ].join("\n\n");
 }
 
-interface RunOutcome {
+export interface RunOutcome {
   parseOk: boolean;
   decision?: string;
   severity?: { critical: number; high: number; medium: number };
@@ -80,8 +83,10 @@ async function runCaseOnce(instructions: string, input: string): Promise<RunOutc
   }
 }
 
-/** case 하나의 두 run 결과로부터 "이 case가 요구사항을 만족했는가"를 판정한다(§ Task 요구사항 8). */
-function evaluateCase(c: BenchmarkCase, runs: RunOutcome[]): { ok: boolean; notes: string[] } {
+/** case 하나의 두 run 결과로부터 "이 case가 요구사항을 만족했는가"를 판정한다(§ Task 요구사항 8).
+ *  PASS 기준의 단일 정의 — 다른 provider(Groq 등)의 qualification runner도 이 함수를 그대로
+ *  import해 쓴다(재구현/복제 금지, 기준 drift 방지). */
+export function evaluateCase(c: BenchmarkCase, runs: RunOutcome[]): { ok: boolean; notes: string[] } {
   const notes: string[] = [];
   let ok = true;
 
@@ -131,7 +136,7 @@ function evaluateCase(c: BenchmarkCase, runs: RunOutcome[]): { ok: boolean; note
   return { ok, notes };
 }
 
-interface CaseReport {
+export interface CaseReport {
   id: string;
   category: string;
   expected: BenchmarkExpectedClass;
@@ -214,4 +219,11 @@ async function main(): Promise<void> {
   if (!overallOk) process.exitCode = 1;
 }
 
-main();
+// final-reviewer-benchmark-groq.ts가 이 파일의 evaluator/헬퍼(evaluateCase/buildCaseInput 등)를
+// import만 하고 실제 로컬 Ollama를 호출하지 않도록, 이 스크립트가 직접 실행(entry point)될
+// 때만 main()을 실행한다(§ Groq qualification 요구사항 "Ollama/OpenAI/OpenRouter/NVIDIA 호출
+// 금지" — import 시 부작용으로 Ollama가 호출되는 버그를 막는다). `npm run final-reviewer-benchmark`
+// (node dist/final-reviewer-benchmark.js)로 직접 실행하는 기존 동작은 바뀌지 않는다.
+if (require.main === module) {
+  main();
+}
