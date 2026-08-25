@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "regression": "npm run build && node dist/full-regression-runner.js",
     "dry-run": "npm run build && node dist/dry-run.js",
     "test:runner": "npm run build && node dist/runner-tests.js",
     "smoke-test": "npm run build && node dist/smoke-test.js",
