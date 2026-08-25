@@ -14,10 +14,9 @@ import type { UsageLedgerEntryInput } from "./usage-ledger";
 import { isProductionRuntime } from "./runtime-origin";
 import type { ReviewProvider, ReviewProviderResult } from "./review-provider";
 import { DEFAULT_REVIEWER_DATA_CLASSIFICATION } from "./review-provider";
-import { openAIReviewProvider } from "./openai-review-provider";
+import { finalReviewerProductionProvider, resolveFinalReviewerProductionSecurityRegistry } from "./final-reviewer-provider-selection";
 import { evaluateProviderSecurity } from "./provider-security-gate";
 import type { DataClassification, ProviderSecurityRegistry } from "./provider-security-gate";
-import { resolveOpenAiProviderSecurityRegistry } from "./openai-provider-security-metadata";
 import {
   buildTaskIdentity,
   buildScopeKey,
@@ -32,10 +31,18 @@ import type { ReviewBaseline, ReviewPayloadMode, FileContentReader, ReviewFileSt
 
 // Reviewer Core — 실제 AI review provider의 SDK/transport를 직접 알지 못한다(Phase SI-3.8E,
 // Reviewer Provider Abstraction). AUTOMATION_DRY_RUN=false일 때만 orchestrator가 이 모듈을
-// 선택한다. 실제 provider transport(현재는 OpenAI Responses API 하나)는
-// openai-review-provider.ts로 분리되어 있고, 이 파일은 review-provider.ts의 ReviewProvider
-// contract만으로 그 provider를 호출한다 — provider가 API key를 어떻게 읽는지, 실제 요청을
-// 어떻게 만드는지는 이 파일이 몰라도 된다.
+// 선택한다. 이 파일은 review-provider.ts의 ReviewProvider contract만으로 provider를 호출한다 —
+// provider가 API key를 어떻게 읽는지, 실제 요청을 어떻게 만드는지는 이 파일이 몰라도 된다.
+//
+// Production Final Reviewer Wiring — production default provider/security registry(아래
+// reviewClaudeResultOnce의 provider/securityGateOverrides 기본값)는 이제
+// final-reviewer-provider-selection.ts가 결정한다(qualification을 통과한 Groq
+// openai/gpt-oss-120b, 4/4 QUALIFIED). 실제 transport(chat-completion-review-provider.ts 공용
+// factory)는 여전히 이 파일이 모른다 — 이 파일은 어느 provider를 기본값으로 쓸지 그 선택
+// 모듈에 위임할 뿐이다. OpenAI provider(openai-review-provider.ts)는 삭제되지 않았고
+// review-provider-tests.ts 등에서 명시적으로 주입하는 provider로 계속 존재하지만, 더 이상 이
+// 파일의 production 기본값이 아니다 — silent fallback도 없다(이 파일은 provider.review()가
+// 실패해도 다른 provider로 자동 전환하지 않는다, § 아래 provider.review() 호출부).
 //
 // AutoDev 범용화 Phase A Task A6 — 이 파일(Core)은 이제 어떤 프로젝트를 리뷰하고 있는지
 // 전혀 모른다. "MOVAN ERP 프로젝트의 리뷰어"라고 가정하지 않고, 프로젝트 이름/검토
@@ -498,18 +505,20 @@ export async function reviewClaudeResultOnce(
    *  동작한다 — 기존 동작을 바꾸지 않는다. */
   baseline?: ReviewBaseline,
   /** Phase SI-3.8E — Reviewer Provider Abstraction. 지정하지 않으면 production default인
-   *  OpenAIReviewProvider(§ openai-review-provider.ts)를 쓴다. tests가 실제 OpenAI 호출 없이
-   *  Reviewer Core(payload 구성/Budget Guard/baseline/Final Consistency Cross-check)를
-   *  검증하기 위한 주입 지점이다 — provider 선택/routing 로직이 아니다(§ 요구사항 6 Provider
-   *  Selection, 이 Task는 production default를 바꾸지 않는다). */
-  provider: ReviewProvider = openAIReviewProvider,
+   *  finalReviewerProductionProvider(§ final-reviewer-provider-selection.ts, Groq
+   *  openai/gpt-oss-120b)를 쓴다. tests가 실제 네트워크 호출 없이 Reviewer Core(payload 구성/
+   *  Budget Guard/baseline/Final Consistency Cross-check)를 검증하기 위한 주입 지점이기도
+   *  하다 — provider 선택/routing 로직 자체는 아니다(그 판단은 이제
+   *  final-reviewer-provider-selection.ts 하나가 담당한다). */
+  provider: ReviewProvider = finalReviewerProductionProvider,
   /** Phase SI-3.8E Security Ordering Correction — Provider Security Gate(provider-security-gate.ts)
-   *  override 지점. 지정하지 않으면 production default(§ 요구사항 1/2/3): classification은
-   *  항상 DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL), registry는
-   *  resolveOpenAiProviderSecurityRegistry()(OpenAI 하나만 아는 registry, ZDR verified 여부에
-   *  따라 zero/bounded)를 쓴다. tests가 fake provider를 위한 호환 metadata를 주입하거나(§
-   *  요구사항 6 테스트), Security Gate가 실제로 BLOCK하는 경로를 검증하기 위한 seam이다 —
-   *  provider 선택/routing과 마찬가지로 이 값 자체는 production 기본값을 바꾸지 않는다. */
+   *  override 지점. 지정하지 않으면 production default: classification은 항상
+   *  DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL), registry는
+   *  resolveFinalReviewerProductionSecurityRegistry()(§ final-reviewer-provider-selection.ts,
+   *  Groq 하나만 아는 registry, AUTODEV_GROQ_ZDR_VERIFIED 여부에 따라 zero/bounded)를 쓴다.
+   *  tests가 fake provider를 위한 호환 metadata를 주입하거나, Security Gate가 실제로 BLOCK하는
+   *  경로를 검증하기 위한 seam이다 — provider 선택과 마찬가지로 이 값 자체는 production
+   *  기본값을 바꾸지 않는다. */
   securityGateOverrides?: { classification?: DataClassification; registry?: ProviderSecurityRegistry }
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
@@ -565,9 +574,11 @@ export async function reviewClaudeResultOnce(
   // BLOCK한다 — 어떤 provider도 이 registry에 없다는 이유만으로 자동 allow되지 않는다(§
   // 요구사항 5 Provider identity). classification 판정 자체는 이 함수가 임의로 하지 않는다 —
   // 지정하지 않으면 review-provider.ts의 DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL)을
-  // 그대로 쓴다.
+  // 그대로 쓴다. production default registry는 Groq만 아는
+  // resolveFinalReviewerProductionSecurityRegistry()다(§ final-reviewer-provider-selection.ts) —
+  // AUTODEV_GROQ_ZDR_VERIFIED가 "true"로 명시 검증되지 않으면 이 Gate가 항상 BLOCK한다(fail-closed).
   const dataClassification = securityGateOverrides?.classification ?? DEFAULT_REVIEWER_DATA_CLASSIFICATION;
-  const securityRegistry = securityGateOverrides?.registry ?? resolveOpenAiProviderSecurityRegistry();
+  const securityRegistry = securityGateOverrides?.registry ?? resolveFinalReviewerProductionSecurityRegistry();
   const securityResult = evaluateProviderSecurity({ classification: dataClassification, providerId: provider.id }, securityRegistry);
   if (securityResult.verdict === "BLOCK") {
     log(`GPT Provider Security Gate BLOCK(${securityResult.blockCode}) — provider 호출 생략`, {

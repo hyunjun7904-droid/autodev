@@ -86,8 +86,8 @@ function makeFakeProvider(responses: ReviewProviderResult[], opts: { id?: string
 /** Provider Security Gate를 통과시키기 위한 완전히 컴플라이언트한 registry override — CONFIDENTIAL
  *  기본 등급 요구사항(no-training + zero retention)을 모두 만족한다. Reviewer Core 로직(재시도/
  *  파싱/usage 등)만 독립적으로 검증하려는 시나리오가 Security Gate를 의도적으로 우회하기 위해
- *  쓴다 — production 기본값(resolveOpenAiProviderSecurityRegistry, ZDR 미검증 시 BLOCK)은
- *  전혀 바뀌지 않는다. */
+ *  쓴다 — production 기본값(resolveFinalReviewerProductionSecurityRegistry, ZDR 미검증 시
+ *  BLOCK)은 전혀 바뀌지 않는다. */
 function passingSecurityOverrides(providerId: string): { registry: ProviderSecurityRegistry } {
   const metadata: ProviderSecurityMetadata = {
     providerId,
@@ -545,7 +545,7 @@ async function scenarioO_unknownProviderBlocksAndFakeCannotBypassGate(): Promise
   const fake = makeFakeProvider([{ ok: true, outputText: passOutputText(), model: { provider: "definitely-not-openai", name: "fake-model" } }], {
     id: "definitely-not-openai",
   });
-  // securityGateOverrides를 전혀 주지 않음 — production 기본 registry(OpenAI 하나만 앎)를 그대로 쓴다.
+  // securityGateOverrides를 전혀 주지 않음 — production 기본 registry(Groq 하나만 앎)를 그대로 쓴다.
   const result = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK, undefined, undefined, undefined, undefined, undefined, undefined, fake.provider);
   check("O) registry에 없는 provider → PROVIDER_SECURITY_BLOCKED", result.errorCode === "PROVIDER_SECURITY_BLOCKED");
   check("O) provider.review 호출 0회(fake provider가 Security Gate를 우회하지 못함)", fake.callCount() === 0);
@@ -654,9 +654,13 @@ async function scenarioH_orchestratorUsesSameProviderAbstractionAndSecurityGate(
   const originalDryRun = process.env.AUTOMATION_DRY_RUN;
   const originalApiKey = process.env.OPENAI_API_KEY;
   const originalZdr = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
+  const originalGroqApiKey = process.env.GROQ_API_KEY;
+  const originalGroqZdr = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
   process.env.AUTOMATION_DRY_RUN = "false"; // 실제 gpt-reviewer.ts 경로(realReviewClaudeResult) 선택
   delete process.env.OPENAI_API_KEY;
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED; // ZDR 미검증 기본값 고정.
+  delete process.env.GROQ_API_KEY; // production default provider(Groq)도 동일하게 미구성 고정.
+  delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
 
   try {
     let claudeCalls = 0;
@@ -683,6 +687,10 @@ async function scenarioH_orchestratorUsesSameProviderAbstractionAndSecurityGate(
     else process.env.OPENAI_API_KEY = originalApiKey;
     if (originalZdr === undefined) delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
     else process.env.AUTODEV_OPENAI_ZDR_VERIFIED = originalZdr;
+    if (originalGroqApiKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = originalGroqApiKey;
+    if (originalGroqZdr === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+    else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdr;
   }
 }
 
@@ -697,9 +705,13 @@ async function scenarioI_agentOrchestratorUsesSameProviderAbstractionAndSecurity
   const originalDryRun = process.env.AUTOMATION_DRY_RUN;
   const originalApiKey = process.env.OPENAI_API_KEY;
   const originalZdr = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
+  const originalGroqApiKey = process.env.GROQ_API_KEY;
+  const originalGroqZdr = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
   process.env.AUTOMATION_DRY_RUN = "false"; // 실제 reviewerRunner(realReviewClaudeResult) 선택
   delete process.env.OPENAI_API_KEY;
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
+  delete process.env.GROQ_API_KEY; // production default provider(Groq)도 동일하게 미구성 고정.
+  delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
 
   try {
     let developerCalls = 0;
@@ -726,6 +738,10 @@ async function scenarioI_agentOrchestratorUsesSameProviderAbstractionAndSecurity
     else process.env.OPENAI_API_KEY = originalApiKey;
     if (originalZdr === undefined) delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
     else process.env.AUTODEV_OPENAI_ZDR_VERIFIED = originalZdr;
+    if (originalGroqApiKey === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = originalGroqApiKey;
+    if (originalGroqZdr === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+    else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdr;
   }
 }
 
@@ -733,9 +749,22 @@ async function main(): Promise<void> {
   const originalApiKeyOuter = process.env.OPENAI_API_KEY;
   const originalZdrOuter = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
   const originalZdrAtOuter = process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT;
+  // Production Final Reviewer Wiring — reviewClaudeResultOnce()의 production default
+  // provider/registry가 이제 Groq(§ final-reviewer-provider-selection.ts)이므로, "override
+  // 없음" 시나리오(K/O/P/Q/H/I 등)가 정말로 fail-closed로 BLOCK되는지는 이 프로세스의 실제
+  // Groq 자격증명/ZDR 상태와 무관해야 한다 — OPENAI_API_KEY/ZDR와 동일하게 GROQ_API_KEY/
+  // AUTODEV_GROQ_ZDR_VERIFIED도 이 파일 실행 동안 일시적으로 제거한다(그렇지 않으면 이
+  // 배포처럼 GROQ_API_KEY+ZDR이 실제로 구성된 환경에서는 default 경로가 실제 Groq 네트워크
+  // 요청을 시도하게 된다 — § 요구사항 15와 동일한 이유).
+  const originalGroqApiKeyOuter = process.env.GROQ_API_KEY;
+  const originalGroqZdrOuter = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  const originalGroqZdrAtOuter = process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
   delete process.env.OPENAI_API_KEY; // 이 파일 전체가 실제 네트워크 요청을 만들 수 없게 한다(§ 요구사항 15).
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED; // 기본은 항상 ZDR 미검증 상태에서 시작.
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT;
+  delete process.env.GROQ_API_KEY;
+  delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  delete process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
 
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -765,6 +794,12 @@ async function main(): Promise<void> {
     else process.env.AUTODEV_OPENAI_ZDR_VERIFIED = originalZdrOuter;
     if (originalZdrAtOuter === undefined) delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT;
     else process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT = originalZdrAtOuter;
+    if (originalGroqApiKeyOuter === undefined) delete process.env.GROQ_API_KEY;
+    else process.env.GROQ_API_KEY = originalGroqApiKeyOuter;
+    if (originalGroqZdrOuter === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+    else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdrOuter;
+    if (originalGroqZdrAtOuter === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
+    else process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT = originalGroqZdrAtOuter;
     for (const dir of tempDirs) {
       try {
         rmSync(dir, { recursive: true, force: true });

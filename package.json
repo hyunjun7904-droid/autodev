@@ -24,6 +24,7 @@
     "test:gpt-budget-guard": "npm run build && node dist/gpt-budget-guard-tests.js",
     "test:gpt-budget-guard-integration": "npm run build && node dist/gpt-budget-guard-integration-tests.js",
     "test:review-provider": "npm run build && node dist/review-provider-tests.js",
+    "test:final-reviewer-provider-selection": "npm run build && node dist/final-reviewer-provider-selection-tests.js",
     "test:provider-security-gate": "npm run build && node dist/provider-security-gate-tests.js",
     "test:provider-pool": "npm run build && node dist/provider-pool-tests.js",
     "test:provider-pool-security-metadata": "npm run build && node dist/provider-pool-security-metadata-tests.js",
