@@ -415,6 +415,9 @@ async function scenarioBlockOnOutOfScopeFile(): Promise<void> {
     nextTask: null,
   });
 
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — checkpoint.ts의
+  // 범위 재검증(computeCommitPlan)이 이 단일 호출 안에서 그대로 BLOCK한다(GPT가 범위 위반을
+  // 못 잡고 PASS를 반환해도).
   const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: alwaysPassReviewer } });
 
   check("[9-A] outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");

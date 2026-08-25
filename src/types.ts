@@ -95,6 +95,26 @@ export type DevAutoAction =
 
 export type ActionType = HighRiskAction | DevAutoAction;
 
+// Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — Reviewer가 PASS(APPROVED)했더라도
+// 사람이 명시적으로 APPROVE하기 전까지는 checkpoint(git commit)를 진행하지 않는다(§
+// autodev.ts decideNextAction/approveHumanFinalReview). 정확히 하나의 대기 중인 gate만
+// 표현한다 — 동시에 여러 task가 이 gate를 거칠 수 없다(Project Lock이 이미 동일 project에
+// 대한 동시 writer를 막는다). taskId+reviewCycle 조합이 "이 승인이 정확히 어떤 reviewer
+// 승인 결과에 결합되는지"를 표현하는 최소 identity다 — 새로운 토큰 체계를 추가하지 않고
+// 기존 task-registry.ts TaskDefinition.id/orchestrator reviewCycle을 그대로 재사용한다.
+export interface HumanFinalReviewGate {
+  /** task-registry.ts TaskDefinition.id — 이 승인이 어떤 task에 결합되는지(stale approval이
+   *  다른 task에서 재사용되는 것을 막는다). */
+  taskId: string;
+  /** 이 gate를 만든 시점의 CoreState.reviewCycle(= reviewer가 APPROVED한 시점) — task/
+   *  reviewCycle 둘 다 정확히 일치해야 유효한 승인으로 취급한다. */
+  reviewCycle: number;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+  requestedAt: string;
+  approvedAt?: string;
+  rejectedAt?: string;
+}
+
 // AutoDev 범용화 Phase A Task A5 — Core 상태와 프로젝트 전용 상태 분리.
 //
 // 지금까지 ProjectState 하나에 AutoDev Core가 실제로 읽고/쓰는 필드(currentTask,
@@ -151,6 +171,12 @@ export interface CoreState {
    *  taskDef.phase로 그대로 갱신한다(어느 프로젝트의 taskRegistry든 동일). 이 값의 의미
    *  자체(Phase 번호 체계)는 프로젝트가 정하지만, 갱신 코드는 Core에 있다. */
   currentPhase: number;
+
+  /** Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — reviewer가 APPROVED한 뒤
+   *  checkpoint 전 사람의 최종 승인을 기다리는 동안(status="WAITING_HUMAN")에만 채워진다.
+   *  checkpoint 성공 후에는 null로 되돌린다(§ autodev.ts). 지정하지 않으면(undefined) 이
+   *  gate가 전혀 없다는 뜻 — 기존 project-state.json 파일과 100% 하위 호환된다. */
+  humanFinalReview?: HumanFinalReviewGate | null;
 }
 
 /**

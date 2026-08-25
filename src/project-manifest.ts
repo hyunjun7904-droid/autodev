@@ -66,6 +66,17 @@ export interface ProjectManifest {
    * 켜진다 — 어떤 project도 "silent" 강제 대상이 아니다).
    */
   remoteGitSafety?: RemoteGitSafetyPolicy;
+  /**
+   * Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate(autodev.ts) — 지정하면(그리고
+   * enabled===true) 이 project는 GPT Reviewer가 APPROVED한 뒤에도 checkpoint(git commit)
+   * 전에 사람의 명시적 최종 승인(approveHumanFinalReview())을 기다린다. 지정하지 않으면
+   * (기본값, 기존 manifest는 전부 이 필드가 없다) 이 Gate는 완전히 비활성화되고 AutoDev의
+   * 기존 동작(Reviewer PASS → 즉시 checkpoint)을 그대로 유지한다 — remoteGitSafety와 동일한
+   * 설계: 어떤 project도 이 Gate의 "silent" 강제 대상이 아니다(project가 스스로 opt-in해야만
+   * 켜진다). AutoDev Core(autodev.ts) 자신은 이 필드를 어떤 프로젝트 이름으로도 분기하지
+   * 않는다 — Project Adapter/Manifest가 명시적으로 주입하는 값만 본다.
+   */
+  humanFinalReviewPolicy?: HumanFinalReviewPolicy;
 }
 
 export interface RemoteGitSafetyPolicy {
@@ -73,6 +84,12 @@ export interface RemoteGitSafetyPolicy {
   remoteName?: string;
   /** 지정하면 이 branch가 아닐 때 즉시 UNEXPECTED_BRANCH로 BLOCK한다. */
   expectedBranch?: string;
+}
+
+export interface HumanFinalReviewPolicy {
+  /** true일 때만 Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate가 활성화된다. false
+   *  또는 이 policy 자체를 지정하지 않으면 기존 AutoDev 기본 동작(즉시 checkpoint)이다. */
+  enabled: boolean;
 }
 
 /** manifest.remoteGitSafety가 명시적으로 주입됐을 때만 검증한다 — validateProjectManifest와
@@ -94,6 +111,25 @@ export function validateRemoteGitSafetyPolicy(policy: RemoteGitSafetyPolicy, pro
  *  않게 하는 단일 출처. */
 export function resolveRemoteGitSafetyPolicy(policy: RemoteGitSafetyPolicy): Required<Pick<RemoteGitSafetyPolicy, "remoteName">> & RemoteGitSafetyPolicy {
   return { ...policy, remoteName: policy.remoteName ?? DEFAULT_REMOTE_NAME };
+}
+
+/** manifest.humanFinalReviewPolicy가 명시적으로 주입됐을 때만 검증한다 — 잘못된 필드는 즉시
+ *  throw하고, 절대 permissive한 기본값으로 대체하지 않는다. */
+export function validateHumanFinalReviewPolicy(policy: HumanFinalReviewPolicy, projectLabel = "(project)"): void {
+  if (!policy || typeof policy !== "object") {
+    throw new Error(`Invalid HumanFinalReviewPolicy(${projectLabel}): policy가 비어있거나 객체가 아닙니다.`);
+  }
+  if (typeof policy.enabled !== "boolean") {
+    throw new Error(`Invalid HumanFinalReviewPolicy(${projectLabel}): enabled가 boolean이어야 합니다.`);
+  }
+}
+
+/** manifest.humanFinalReviewPolicy?.enabled === true일 때만 Minimal HUMAN_FINAL_REVIEW
+ *  Runtime Checkpoint Gate가 켜진다 — autodev.ts를 포함한 모든 호출부가 이 단일 함수로만
+ *  판단한다(중복된 "?? false" 판정을 여기저기 반복하지 않는다). manifest.humanFinalReviewPolicy가
+ *  없으면(기존 project 전부 해당) 항상 false — 기본값은 기존 AutoDev 동작(즉시 checkpoint)이다. */
+export function isHumanFinalReviewEnabled(manifest: Pick<ProjectManifest, "humanFinalReviewPolicy">): boolean {
+  return manifest.humanFinalReviewPolicy?.enabled === true;
 }
 
 /**
@@ -134,5 +170,8 @@ export function validateProjectManifest(manifest: ProjectManifest): void {
   validateProjectExecutionPolicy(manifest.executionPolicy, manifest.projectId);
   if (manifest.remoteGitSafety !== undefined) {
     validateRemoteGitSafetyPolicy(manifest.remoteGitSafety, manifest.projectId);
+  }
+  if (manifest.humanFinalReviewPolicy !== undefined) {
+    validateHumanFinalReviewPolicy(manifest.humanFinalReviewPolicy, manifest.projectId);
   }
 }

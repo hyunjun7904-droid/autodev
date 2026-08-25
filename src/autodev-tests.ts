@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { decideNextAction, runAutodevOnce } from "./autodev";
+import { decideNextAction, runAutodevOnce, approveHumanFinalReview, rejectHumanFinalReview } from "./autodev";
 import { DEFAULT_STATE_PATH } from "./state";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
@@ -180,6 +180,16 @@ function buildPlannerManifest(root: string, statePath: string): ProjectManifest 
   };
 }
 
+// Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate는 project가 명시적으로 opt-in해야만
+// 켜진다(§ project-manifest.ts ProjectManifest.humanFinalReviewPolicy) — buildPlannerManifest()
+// 자체는 opt-in하지 않는다(기본값 OFF, 위 A)/B)의 나머지 시나리오는 전부 이 Gate와 무관하게
+// 기존 AutoDev 동작을 그대로 검증한다). 이 Gate 자체를 검증하는 시나리오(아래 E)만 이 변형을
+// 쓴다 — buildPlannerManifestWithRemoteGitSafety와 동일한 "기존 manifest 위에 opt-in 필드만
+// 추가" 패턴이다.
+function buildPlannerManifestWithHumanFinalReview(root: string, statePath: string): ProjectManifest {
+  return { ...buildPlannerManifest(root, statePath), humanFinalReviewPolicy: { enabled: true } };
+}
+
 function fakePassReviewer(): (result: ClaudeResult, reviewCycle: number, task: string, allowedPathPrefixes?: string[]) => Promise<GptReviewerReturn> {
   return async () => ({ decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null });
 }
@@ -278,6 +288,9 @@ async function scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint(): P
     };
   };
 
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — Remote Git Safety의
+  // "run 도중 remote 변경 → checkpoint 직전 재확인 BLOCK" 판정 자체가 기존과 동일한 단일
+  // runAutodevOnce() 호출 안에서 일어나는지 검증한다.
   const result = await runAutodevOnce({
     manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
@@ -323,6 +336,9 @@ async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
     };
   };
 
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — reviewer APPROVED
+  // 즉시 checkpoint까지 단일 호출로 이어지는 기존 AutoDev 동작을 그대로 검증한다(§ HFR
+  // 요구사항 1 — default OFF → 자동 checkpoint).
   const result = await runAutodevOnce({
     manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
@@ -338,6 +354,7 @@ async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
   check("runAutodevOnce happy path: status='READY'(다음 task 대기)", finalState.status === "READY");
   check("runAutodevOnce happy path: currentTask가 P2.1을 가리킴", typeof finalState.currentTask === "string" && finalState.currentTask.includes("P2.1"));
   check("runAutodevOnce happy path: gitCheckpoint가 실제 commit hash로 갱신됨", finalState.gitCheckpoint === result.checkpoint?.commitHash);
+  check("runAutodevOnce happy path: humanFinalReview gate가 비활성 상태이므로 null(생성된 적 없음)", finalState.humanFinalReview === null);
 
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
   check("runAutodevOnce happy path: product commit + administrative commit 2건 생성(+init 1건=3건)", log.trim().split("\n").length === 3);
@@ -362,6 +379,9 @@ async function scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile(): Promis
     };
   };
 
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — fakePassReviewer는
+  // 무조건 PASS를 반환하므로(범위 밖 파일을 실제로 검사하지 않음) 실제 out-of-scope 검증은
+  // checkpoint.ts(computeCommitPlan)가 담당하며, 그 검증은 이 단일 호출 안에서 그대로 일어난다.
   const result = await runAutodevOnce({
     manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
@@ -585,6 +605,299 @@ async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
   check("runAutodevOnce 모든 task 완료: Claude worker 호출 0회", claudeCalls === 0);
 }
 
+// ---------------------------------------------------------------------------
+// E) Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — Reviewer APPROVED와 checkpoint
+//    사이의 fail-closed gate를 직접 검증한다(§ Task 요구사항 13, Test 1~7).
+// ---------------------------------------------------------------------------
+
+// Test 1 — Reviewer APPROVED 후 Human 대기: checkpoint=0, completedTasks 변화 없음, next
+// task 이동 없음.
+async function scenarioHumanFinalReviewGatePausesBeforeCheckpoint(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-test1-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-test1-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("HFR Test1: outcome=RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW", result.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW");
+  check("HFR Test1: checkpoint 시도 자체가 없음(undefined)", result.checkpoint === undefined);
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR Test1: status='WAITING_HUMAN'", state.status === "WAITING_HUMAN");
+  check("HFR Test1: humanFinalReview.status='PENDING'", state.humanFinalReview?.status === "PENDING");
+  check("HFR Test1: humanFinalReview.taskId='P1.2'", state.humanFinalReview?.taskId === "P1.2");
+  check("HFR Test1: completedTasks 변화 없음(next task 이동 없음)", !state.completedTasks.includes("P1.2"));
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("HFR Test1: checkpoint count=0(init 1건만)", log.split("\n").length === 1);
+}
+
+// Test 2 — Human approval 없이 재실행: 여전히 checkpoint=0, Task COMPLETE 금지.
+async function scenarioHumanFinalReviewRerunWithoutApprovalStaysBlocked(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-test2-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-test2-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  // 승인 없이 다시 실행 — decideNextAction()이 gate.status==="PENDING"이므로 여전히 STOP이며
+  // RESUME_APPROVED_CHECKPOINT로 진입하지 않는다.
+  const secondResult = await runAutodevOnce({ manifest });
+
+  check("HFR Test2: 승인 없는 재실행 outcome=STOPPED", secondResult.outcome === "STOPPED");
+  check("HFR Test2: checkpoint 시도 자체가 없음", secondResult.checkpoint === undefined);
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR Test2: completedTasks 변화 없음(Task COMPLETE 금지)", !state.completedTasks.includes("P1.2"));
+  check("HFR Test2: status는 여전히 WAITING_HUMAN", state.status === "WAITING_HUMAN");
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("HFR Test2: checkpoint count=0(init 1건만)", log.split("\n").length === 1);
+}
+
+// Test 3 — 유효한 Human APPROVE 후 resume: 기존 checkpoint path 실행, Task COMPLETE,
+// completedTasks 기록, checkpoint SHA 기록, next runnable task 계산.
+async function scenarioHumanFinalReviewValidApproveResumesCheckpoint(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-test3-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-test3-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  const approval = approveHumanFinalReview(statePath, "P1.2");
+  check("HFR Test3: approveHumanFinalReview ok=true", approval.ok === true);
+
+  const result = await runAutodevOnce({ manifest });
+
+  check("HFR Test3: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("HFR Test3: checkpoint.ok=true", result.checkpoint?.ok === true);
+  check("HFR Test3: commitHash(checkpoint SHA) 기록됨", typeof result.checkpoint?.commitHash === "string");
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR Test3: completedTasks에 P1.2 기록됨(Task COMPLETE)", state.completedTasks.includes("P1.2"));
+  check("HFR Test3: gitCheckpoint가 실제 commit hash로 갱신됨", state.gitCheckpoint === result.checkpoint?.commitHash);
+  check("HFR Test3: next runnable task 계산됨(P2.1)", typeof state.currentTask === "string" && state.currentTask.includes("P2.1"));
+}
+
+// Test 4 — 다른 Task의 stale approval: checkpoint 금지(순수 decideNextAction 판정으로 검증).
+function scenarioHumanFinalReviewStaleApprovalForOtherTaskIsRejected(): void {
+  const nowIso = new Date().toISOString();
+  const validReview = { decision: "PASS" as const, severity: { critical: 0, high: 0, medium: 0 }, feedback: "", nextTask: null };
+
+  // 현재 next task는 P1.2이지만, gate는 이미 완료된 P1.1(예: 이전 task의 승인)을 가리키는
+  // stale approval이다.
+  const staleForCompletedTask = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: validReview,
+    humanFinalReview: { taskId: "P1.1", reviewCycle: 1, status: "APPROVED", requestedAt: nowIso, approvedAt: nowIso },
+  });
+  check(
+    "HFR Test4: 이미 완료된(다른) task용 stale approval → RESUME으로 취급되지 않음(STOP)",
+    decideNextAction(staleForCompletedTask, PLANNER_FIXTURE_REGISTRY).kind === "STOP"
+  );
+
+  // gate는 아직 도달하지 않은 미래 task(P2.1)를 가리킨다 — 현재 next task(P1.2)와 다르다.
+  const approvalForFutureTask = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: validReview,
+    humanFinalReview: { taskId: "P2.1", reviewCycle: 1, status: "APPROVED", requestedAt: nowIso, approvedAt: nowIso },
+  });
+  check(
+    "HFR Test4: 현재 next task(P1.2)와 다른 task용 approval → RESUME으로 취급되지 않음(STOP)",
+    decideNextAction(approvalForFutureTask, PLANNER_FIXTURE_REGISTRY).kind === "STOP"
+  );
+}
+
+// Test 5 — Reviewer REVISE/BLOCKED: Human Final Review로 진입시키지 않는다(기존
+// REVISE/BLOCKED 경로 그대로 유지).
+async function scenarioHumanFinalReviewReviewerNotApprovedNeverEntersGate(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => ({
+    success: true,
+    summary: "테스트: 항상 REVISE",
+    changedFiles: [],
+    tests: [{ name: "proj:check", pass: true }],
+    rawOutput: "",
+  });
+  const alwaysRevise = async (): Promise<GptReviewerReturn> => ({
+    decision: "REVISE",
+    severity: { critical: 0, high: 0, medium: 1 },
+    feedback: "테스트: 항상 REVISE(HUMAN_FINAL_REVIEW 진입 방지 확인용)",
+    nextTask: "다시 시도",
+  });
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise } });
+
+  check("HFR Test5: outcome=RAN_TASK_NOT_APPROVED(Human Final Review 진입 안 함)", result.outcome === "RAN_TASK_NOT_APPROVED");
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR Test5: humanFinalReview gate가 생성되지 않음", !state.humanFinalReview);
+}
+
+// Test 6 — corrupted approval/state: fail-closed(checkpoint 금지). decideNextAction()
+// 판정 자체가 여러 손상/불일치 조합에서 모두 STOP인지 확인하고, approveHumanFinalReview()의
+// 자체 검증(잘못된 taskId)도 함께 확인한다.
+function scenarioHumanFinalReviewCorruptedOrInconsistentStateFailsClosed(): void {
+  const nowIso = new Date().toISOString();
+  const validGate = { taskId: "P1.2", reviewCycle: 1, status: "APPROVED" as const, requestedAt: nowIso, approvedAt: nowIso };
+  const validReview = { decision: "PASS" as const, severity: { critical: 0, high: 0, medium: 0 }, feedback: "", nextTask: null };
+
+  const missingGate = baseState({ status: "WAITING_HUMAN", completedTasks: ["P1.1"], reviewCycle: 1, lastGptDecision: validReview });
+  check("HFR Test6: gate 자체가 없음 → STOP", decideNextAction(missingGate, PLANNER_FIXTURE_REGISTRY).kind === "STOP");
+
+  const pendingGate = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: validReview,
+    humanFinalReview: { ...validGate, status: "PENDING", approvedAt: undefined },
+  });
+  check("HFR Test6: gate.status=PENDING(아직 승인 안 됨) → STOP", decideNextAction(pendingGate, PLANNER_FIXTURE_REGISTRY).kind === "STOP");
+
+  const rejectedGate = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: validReview,
+    humanFinalReview: { ...validGate, status: "REJECTED" },
+  });
+  check("HFR Test6: gate.status=REJECTED → STOP", decideNextAction(rejectedGate, PLANNER_FIXTURE_REGISTRY).kind === "STOP");
+
+  const mismatchedCycle = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 2,
+    lastGptDecision: validReview,
+    humanFinalReview: validGate,
+  });
+  check("HFR Test6: reviewCycle 불일치(다른 개발 cycle의 승인) → STOP", decideNextAction(mismatchedCycle, PLANNER_FIXTURE_REGISTRY).kind === "STOP");
+
+  const inconsistentReviewerDecision = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: { ...validReview, decision: "REVISE" },
+    humanFinalReview: validGate,
+  });
+  check(
+    "HFR Test6: lastGptDecision이 PASS가 아닌데 gate만 APPROVED(상태 불일치) → STOP",
+    decideNextAction(inconsistentReviewerDecision, PLANNER_FIXTURE_REGISTRY).kind === "STOP"
+  );
+
+  const noReviewerDecision = baseState({
+    status: "WAITING_HUMAN",
+    completedTasks: ["P1.1"],
+    reviewCycle: 1,
+    lastGptDecision: null,
+    humanFinalReview: validGate,
+  });
+  check("HFR Test6: lastGptDecision 자체가 없음(손상) → STOP", decideNextAction(noReviewerDecision, PLANNER_FIXTURE_REGISTRY).kind === "STOP");
+}
+
+async function scenarioHumanFinalReviewApproveRejectsWrongTaskId(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-test6b-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-test6b-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  // 실제 대기 중인 task는 P1.2인데 다른 taskId로 승인을 시도 — 모호하면 승인으로 간주하지
+  // 않는다(fail-closed).
+  const wrongApproval = approveHumanFinalReview(statePath, "P2.1");
+  check(
+    "HFR Test6: 잘못된 taskId로 approve 시도 → ok=false(TASK_MISMATCH)",
+    wrongApproval.ok === false && (wrongApproval.reason ?? "").startsWith("TASK_MISMATCH")
+  );
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR Test6: 잘못된 approve 시도 후에도 gate는 여전히 PENDING", state.humanFinalReview?.status === "PENDING");
+
+  const secondResult = await runAutodevOnce({ manifest });
+  check("HFR Test6: 잘못된 approve 시도 후 재실행해도 checkpoint 진행 안 됨(STOPPED)", secondResult.outcome === "STOPPED");
+}
+
+// Test 7 — checkpoint exactly once: valid approval 후 resume을 반복해도 동일 Task
+// checkpoint가 중복 생성되거나 completedTasks가 중복되지 않는다.
+async function scenarioHumanFinalReviewCheckpointExactlyOnceOnRepeatedResume(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-test7-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-test7-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  approveHumanFinalReview(statePath, "P1.2");
+
+  const firstResume = await runAutodevOnce({ manifest });
+  check("HFR Test7: 1차 resume outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", firstResume.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+
+  // checkpoint 이후 같은 taskId로 다시 approve를 시도해도(예: 사람이 실수로 버튼을 두 번
+  // 누름) gate는 이미 소비되어(status="READY", humanFinalReview=null) 거부되어야 한다.
+  const repeatApproval = approveHumanFinalReview(statePath, "P1.2");
+  check("HFR Test7: checkpoint 이후 같은 task 재승인 시도 → ok=false(이미 소비된 gate)", repeatApproval.ok === false);
+
+  const stateAfter = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "HFR Test7: completedTasks에 P1.2가 정확히 한 번만 존재(중복 없음)",
+    stateAfter.completedTasks.filter((id) => id === "P1.2").length === 1
+  );
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("HFR Test7: P1.2 checkpoint가 정확히 한 번만 생성됨(product+admin=2건, +init 1건=3건)", log.split("\n").length === 3);
+}
+
+// rejectHumanFinalReview()도 최소한으로 검증한다 — REJECT는 checkpoint를 진행시키지 않고,
+// 코드 변경은 working tree에 그대로 남긴다(§ 요구사항 9).
+async function scenarioHumanFinalReviewRejectKeepsCheckpointBlocked(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithHumanFinalReview(repo, statePath);
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/hfr-reject-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/hfr-reject-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  const rejection = rejectHumanFinalReview(statePath, "P1.2");
+  check("HFR reject: rejectHumanFinalReview ok=true", rejection.ok === true);
+
+  const afterReject = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("HFR reject: gate.status='REJECTED'", afterReject.humanFinalReview?.status === "REJECTED");
+
+  // REJECT 이후 재실행해도 checkpoint가 진행되면 안 된다(gate.status!=="APPROVED").
+  const afterRejectRun = await runAutodevOnce({ manifest });
+  check("HFR reject: REJECT 후 재실행 outcome=STOPPED(checkpoint 진행 안 됨)", afterRejectRun.outcome === "STOPPED");
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("HFR reject: commit이 생성되지 않음(init 1건만)", log.split("\n").length === 1);
+  check("HFR reject: developer가 만든 변경이 working tree에 그대로 보존됨", existsSync(join(repo, "proj", "hfr-reject-marker.txt")));
+}
+
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -604,6 +917,16 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceFinalNonGateTaskEmitsProjectCompleted();
     await scenarioRunAutodevOnceBlockedByRemoteGitAtStart();
     await scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint();
+
+    await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();
+    await scenarioHumanFinalReviewRerunWithoutApprovalStaysBlocked();
+    await scenarioHumanFinalReviewValidApproveResumesCheckpoint();
+    scenarioHumanFinalReviewStaleApprovalForOtherTaskIsRejected();
+    await scenarioHumanFinalReviewReviewerNotApprovedNeverEntersGate();
+    scenarioHumanFinalReviewCorruptedOrInconsistentStateFailsClosed();
+    await scenarioHumanFinalReviewApproveRejectsWrongTaskId();
+    await scenarioHumanFinalReviewCheckpointExactlyOnceOnRepeatedResume();
+    await scenarioHumanFinalReviewRejectKeepsCheckpointBlocked();
   } finally {
     for (const dir of tempDirs) {
       try {

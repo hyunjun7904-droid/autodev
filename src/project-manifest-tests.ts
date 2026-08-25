@@ -181,7 +181,9 @@ async function scenarioFixtureManifestIsolatesFromOtherProjects(): Promise<void>
   };
 
   // statePath/cwd를 opts로 넘기지 않는다 — manifest.statePath/manifest.targetProjectRoot가
-  // 실제로 쓰이는지 확인하기 위함이다.
+  // 실제로 쓰이는지 확인하기 위함이다. 이 fixture manifest는 humanFinalReviewPolicy를
+  // 지정하지 않는다(기본값 OFF) — reviewer APPROVED 즉시 checkpoint까지 진행되는 기존
+  // AutoDev 동작을 그대로 검증한다(§ HFR 요구사항 1 — default OFF).
   const result = await runAutodevOnce({
     manifest: fixtureManifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
@@ -286,6 +288,34 @@ async function scenarioInvalidManifestFailsFastWithoutSilentFallback(): Promise<
   check("D) projectId가 빈 문자열인 manifest는 validateProjectManifest에서 즉시 실패", threwBadProjectId);
 
   check("D) 위 invalid manifest 시나리오에서 claudeRunner가 한 번도 호출되지 않음(검증 단계에서 이미 차단)", !claudeRunnerCalled);
+
+  // D-4) humanFinalReviewPolicy — 지정하지 않으면 유효(기본 OFF), enabled가 boolean이 아니면
+  // 즉시 실패(silent fallback 아님), enabled:true는 유효(§ Generic HUMAN_FINAL_REVIEW opt-in).
+  let unspecifiedHfrValidated = false;
+  try {
+    validateProjectManifest(validShapeManifest);
+    unspecifiedHfrValidated = true;
+  } catch {
+    unspecifiedHfrValidated = false;
+  }
+  check("D) humanFinalReviewPolicy를 지정하지 않은 manifest는 유효함(기본값 OFF)", unspecifiedHfrValidated);
+
+  let threwBadHfrPolicy = false;
+  try {
+    validateProjectManifest({ ...validShapeManifest, humanFinalReviewPolicy: { enabled: "yes" as unknown as boolean } });
+  } catch {
+    threwBadHfrPolicy = true;
+  }
+  check("D) humanFinalReviewPolicy.enabled가 boolean이 아니면 즉시 실패", threwBadHfrPolicy);
+
+  let enabledHfrValidated = false;
+  try {
+    validateProjectManifest({ ...validShapeManifest, humanFinalReviewPolicy: { enabled: true } });
+    enabledHfrValidated = true;
+  } catch {
+    enabledHfrValidated = false;
+  }
+  check("D) humanFinalReviewPolicy={enabled:true}는 유효한 manifest로 통과함", enabledHfrValidated);
 }
 
 // ---------------------------------------------------------------------------

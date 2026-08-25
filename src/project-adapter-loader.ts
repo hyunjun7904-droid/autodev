@@ -1,7 +1,7 @@
 import { resolve, dirname, extname } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { validateProjectManifest } from "./project-manifest";
-import type { ProjectManifest, RemoteGitSafetyPolicy } from "./project-manifest";
+import type { ProjectManifest, RemoteGitSafetyPolicy, HumanFinalReviewPolicy } from "./project-manifest";
 import { validateProjectExecutionPolicy } from "./project-policy";
 import type { ProjectExecutionPolicy, AllowedCommandSpec } from "./project-policy";
 import type { TaskDefinition, RequiredTestCommand } from "./task-registry";
@@ -181,6 +181,21 @@ function buildRemoteGitSafetyFromData(raw: unknown, projectLabel: string): Remot
   };
 }
 
+// Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — project config의
+// humanFinalReviewPolicy(raw JSON)를 HumanFinalReviewPolicy로 읽는다. § buildRemoteGitSafetyFromData와
+// 동일한 관례: shape의 source of truth는 project-manifest.ts이고, 이 함수는 그 필드(enabled)만
+// 그대로 옮길 뿐 실제 타입/값 검증은 validateProjectManifest()의 validateHumanFinalReviewPolicy()에
+// 위임한다. raw.humanFinalReviewPolicy가 없으면 undefined를 그대로 반환해 기존 project config
+// (이 필드 없음)의 동작(Gate 비활성 — 즉시 checkpoint)을 완전히 보존한다 — 이 로더 자신은 어떤
+// 프로젝트 이름으로도 분기하지 않는다.
+function buildHumanFinalReviewPolicyFromData(raw: unknown, projectLabel: string): HumanFinalReviewPolicy | undefined {
+  if (raw === undefined) return undefined;
+  if (!isPlainObject(raw)) {
+    throw new Error(`Invalid project config(${projectLabel}): humanFinalReviewPolicy가 비어있거나 객체가 아닙니다.`);
+  }
+  return { enabled: raw.enabled as boolean };
+}
+
 function buildTaskDefinitionFromData(raw: unknown, index: number, projectLabel: string): TaskDefinition {
   if (!isPlainObject(raw)) {
     throw new Error(`Invalid project config(${projectLabel}): taskRegistry[${index}]가 객체가 아닙니다.`);
@@ -294,6 +309,7 @@ export function loadProjectAdapter(adapterPath: string | undefined): ProjectMani
   const taskRegistry = loadTaskRegistry(configDir, raw, projectLabel);
   const executionPolicy = buildExecutionPolicyFromData(raw.executionPolicy, projectLabel);
   const remoteGitSafety = buildRemoteGitSafetyFromData(raw.remoteGitSafety, projectLabel);
+  const humanFinalReviewPolicy = buildHumanFinalReviewPolicyFromData(raw.humanFinalReviewPolicy, projectLabel);
 
   const manifest: ProjectManifest = {
     projectId: raw.projectId as string,
@@ -307,6 +323,7 @@ export function loadProjectAdapter(adapterPath: string | undefined): ProjectMani
     executionPolicy,
     ...(raw.rulesPath !== undefined ? { rulesPath: raw.rulesPath as string } : {}),
     ...(remoteGitSafety !== undefined ? { remoteGitSafety } : {}),
+    ...(humanFinalReviewPolicy !== undefined ? { humanFinalReviewPolicy } : {}),
   };
 
   validateProjectManifest(manifest);

@@ -1,10 +1,11 @@
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { configureSafeExecutor, validateReadPath, validateWritePath } from "./safe-executor";
-import { decideNextAction, runAutodevOnce } from "./autodev";
+import { decideNextAction, runAutodevOnce, approveHumanFinalReview } from "./autodev";
+import type { GptReviewerReturn } from "./orchestrator";
 import type { ClaudeResult } from "./types";
 
 // AutoDev 범용화 Phase C Task C1 — External Project Adapter를 data-only(JSON)로 전환한
@@ -650,6 +651,147 @@ async function scenarioRemoteGitSafetyVisibleToRunAutodevOnce(): Promise<void> {
   check("T) [E2E] Gate가 막았으므로 Claude worker가 전혀 호출되지 않음", claudeCalls === 0);
 }
 
+// ---------------------------------------------------------------------------
+// U~Z) Generic HUMAN_FINAL_REVIEW opt-in — project config의 humanFinalReviewPolicy 필드가
+// project-adapter-loader.ts를 거쳐 실제 ProjectManifest.humanFinalReviewPolicy로 전달되는지
+// 검증한다(§ buildRemoteGitSafetyFromData와 동일한 data-path passthrough 관례).
+// ---------------------------------------------------------------------------
+function fakePassReviewerForHfr(): () => Promise<GptReviewerReturn> {
+  return async () => ({ decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null });
+}
+
+function scenarioHumanFinalReviewPolicyAbsentIsUndefined(): void {
+  const dir = makeTempDir("autodev-adapter-loader-hfr-absent-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-hfr-absent-root-");
+  const configPath = writeJson(dir, "manifest.json", baseRemoteGitSafetyConfigFields(dir, fixtureRoot));
+  const manifest = loadProjectAdapter(configPath);
+  check(
+    "U) humanFinalReviewPolicy가 없는 project config → manifest.humanFinalReviewPolicy === undefined(backward compatible, 기본 OFF)",
+    manifest.humanFinalReviewPolicy === undefined
+  );
+}
+
+function scenarioHumanFinalReviewPolicyValidPassesThrough(): void {
+  const dir = makeTempDir("autodev-adapter-loader-hfr-valid-");
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-hfr-valid-root-");
+  const configPath = writeJson(dir, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+    humanFinalReviewPolicy: { enabled: true },
+  });
+  const manifest = loadProjectAdapter(configPath);
+  check("V) humanFinalReviewPolicy={enabled:true}가 loader 결과(ProjectManifest)에 그대로 존재함", manifest.humanFinalReviewPolicy !== undefined);
+  check("V) humanFinalReviewPolicy.enabled=true가 그대로 passthrough됨", manifest.humanFinalReviewPolicy?.enabled === true);
+
+  const dir2 = makeTempDir("autodev-adapter-loader-hfr-false-");
+  const configPath2 = writeJson(dir2, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir2, fixtureRoot),
+    humanFinalReviewPolicy: { enabled: false },
+  });
+  const manifest2 = loadProjectAdapter(configPath2);
+  check("V) humanFinalReviewPolicy={enabled:false}도 정상적으로 로드되어 존재함(명시적 OFF)", manifest2.humanFinalReviewPolicy !== undefined);
+  check("V) humanFinalReviewPolicy.enabled=false가 그대로 passthrough됨", manifest2.humanFinalReviewPolicy?.enabled === false);
+}
+
+function scenarioHumanFinalReviewPolicyInvalidEnabledFailsFast(): void {
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-hfr-bad-enabled-root-");
+  const dir = makeTempDir("autodev-adapter-loader-hfr-bad-enabled-");
+  const configPath = writeJson(dir, "manifest.json", {
+    ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+    humanFinalReviewPolicy: { enabled: "yes" },
+  });
+  let threw = false;
+  try {
+    loadProjectAdapter(configPath);
+  } catch {
+    threw = true;
+  }
+  check("W) humanFinalReviewPolicy.enabled가 boolean이 아니면 즉시 실패(fail-closed)", threw);
+}
+
+function scenarioHumanFinalReviewPolicyInvalidShapeFailsClosed(): void {
+  const fixtureRoot = makeTempDir("autodev-adapter-loader-hfr-bad-shape-root-");
+  const badValues: unknown[] = ["true", 1, [true], null];
+  for (let i = 0; i < badValues.length; i++) {
+    const dir = makeTempDir(`autodev-adapter-loader-hfr-bad-shape-${i}-`);
+    const configPath = writeJson(dir, "manifest.json", {
+      ...baseRemoteGitSafetyConfigFields(dir, fixtureRoot),
+      humanFinalReviewPolicy: badValues[i],
+    });
+    let threw = false;
+    try {
+      loadProjectAdapter(configPath);
+    } catch {
+      threw = true;
+    }
+    check(`X) humanFinalReviewPolicy가 object shape이 아니면(${JSON.stringify(badValues[i])}) 즉시 실패(fail-closed)`, threw);
+  }
+}
+
+// Y) [E2E] loader가 반환한 manifest.humanFinalReviewPolicy를 실제 runAutodevOnce()가
+//    사용하는지 확인한다 — enabled:true인 project config에서는 reviewer APPROVED 직후
+//    checkpoint 대신 RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW로 멈추고, 사람이 명시적으로
+//    APPROVE한 뒤에만 checkpoint까지 이어진다(§ autodev.ts isHumanFinalReviewEnabled).
+async function scenarioHumanFinalReviewPolicyVisibleToRunAutodevOnce(): Promise<void> {
+  const dir = makeTempDir("autodev-adapter-loader-hfr-e2e-");
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "AutoDev Test"], { cwd: dir });
+  writeText(dir, ".gitkeep", "");
+
+  writeJson(dir, "task-registry.json", [VALID_FIXTURE_TASK]);
+  writeJson(dir, "project-state.json", {
+    currentPhase: 1,
+    gitCheckpoint: "test",
+    currentTask: null,
+    reviewCycle: 0,
+    lastClaudeResult: null,
+    lastGptDecision: null,
+    status: "READY",
+    claudeLimitWaitCount: 0,
+    deferredHumanTasks: [],
+    completedTasks: [],
+  });
+  const statePath = join(dir, "project-state.json");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "hfr-e2e-project",
+    projectName: "HFR E2E Project",
+    targetProjectRoot: ".",
+    statePath: "project-state.json",
+    taskRegistryPath: "task-registry.json",
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+    humanFinalReviewPolicy: { enabled: true },
+  });
+  // manifest.json/task-registry.json/project-state.json은 이 fixture project의 project-state
+  // bookkeeping 파일이지 F1 task가 만드는 산출물이 아니다 — task의 allowedPathPrefixes(fixture/)
+  // 밖에 있으므로, checkpoint.ts의 범위 재검증이 "예상치 못한 변경"으로 BLOCK하지 않도록 init
+  // commit에 미리 포함시킨다(§ 다른 E2E 시나리오와 달리 이 시나리오는 실제로 checkpoint까지
+  // 도달하므로, RGS E2E 시나리오에는 없던 이 문제가 여기서 처음 드러난다).
+  spawnSync("git", ["add", "-A"], { cwd: dir });
+  spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: dir });
+
+  const manifest = loadProjectAdapter(configPath);
+  check("Y) [E2E] loader 결과에 humanFinalReviewPolicy가 존재함(runAutodevOnce에 넘기기 전 사전조건)", manifest.humanFinalReviewPolicy?.enabled === true);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    mkdirSync(join(dir, "fixture"), { recursive: true });
+    writeText(join(dir, "fixture"), "marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["fixture/marker.txt"], tests: [{ name: "fixture:test", pass: true }], rawOutput: "" };
+  };
+  const firstResult = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewerForHfr() } });
+  check(
+    "Y) [E2E] loader→runAutodevOnce data path: humanFinalReviewPolicy.enabled=true → outcome=RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW(즉시 checkpoint 아님)",
+    firstResult.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW"
+  );
+
+  const approval = approveHumanFinalReview(statePath, "F1");
+  check("Y) [E2E] approveHumanFinalReview ok=true", approval.ok === true);
+  const result = await runAutodevOnce({ manifest });
+  check("Y) [E2E] 사람 APPROVE 후 resume outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+}
+
 async function main(): Promise<void> {
   try {
     scenarioMissingAdapterPathFailsFast();
@@ -671,6 +813,11 @@ async function main(): Promise<void> {
     scenarioRemoteGitSafetyInvalidShapeFailsClosed();
     scenarioRemoteGitSafetyValidConfigPassesManifestValidation();
     await scenarioRemoteGitSafetyVisibleToRunAutodevOnce();
+    scenarioHumanFinalReviewPolicyAbsentIsUndefined();
+    scenarioHumanFinalReviewPolicyValidPassesThrough();
+    scenarioHumanFinalReviewPolicyInvalidEnabledFailsFast();
+    scenarioHumanFinalReviewPolicyInvalidShapeFailsClosed();
+    await scenarioHumanFinalReviewPolicyVisibleToRunAutodevOnce();
   } finally {
     for (const dir of tempDirs) {
       try {

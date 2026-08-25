@@ -237,6 +237,8 @@ async function scenarioRestartResumesWithPartialChangePreserved(): Promise<void>
 
   check("C) 2회차: 같은 프로세스 재진입이 lock에 막히지 않음(BLOCKED_PROJECT_LOCK 아님)", secondAttempt.outcome !== "BLOCKED_PROJECT_LOCK");
   check("C) 2회차: developer가 정확히 1회만 호출됨(중복 실행 없음)", secondClaudeCalls === 1);
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — reviewer APPROVED
+  // 즉시 checkpoint까지 이어지는 기존 동작을 그대로 유지한다.
   check("C) 2회차: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED(재개 후 정상 완료)", secondAttempt.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   const finalContent = readFileSync(join(root, "proj", "partial.txt"), "utf-8");
   check("C) 2회차: 최종 파일에 1회차(step1)와 2회차(step2) 내용이 모두 남음(처음부터 다시 만들지 않음)", finalContent.includes("step1") && finalContent.includes("step2-after-restart"));
@@ -284,6 +286,8 @@ async function scenarioUnrelatedChangeBetweenRestartsBlocksCheckpoint(): Promise
     },
   });
 
+  // 이 manifest는 humanFinalReviewPolicy를 지정하지 않는다(기본값 OFF) — checkpoint.ts의
+  // 범위 재검증(computeCommitPlan)이 이 단일 호출 안에서 그대로 BLOCK한다.
   check("D) 무관한 변경이 섞이면 outcome=RAN_TASK_CHECKPOINT_BLOCKED", secondAttempt.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
   check(
     "D) unexpectedFiles에 other/unrelated-stray-file.txt 포함",
@@ -326,7 +330,10 @@ function baseApproval(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest
 async function scenarioDuplicateResumeDoesNotDoubleRun(): Promise<void> {
   const root = makeTempGitRepo("frh-duplicate-resume-");
   const statePath = makeStateFile(root, { status: "WAITING_HUMAN" });
-  const manifest = buildManifest(root, statePath);
+  // 이 시나리오는 "old Auto Resume 경로가 HFR gate를 우회하지 못함"을 직접 검증하는 전용
+  // 시나리오다(§ HFR 요구사항 7) — 이 project는 humanFinalReviewPolicy를 명시적으로
+  // opt-in한다. buildManifest() 자체(다른 시나리오가 공유)는 기본값 OFF를 유지한다.
+  const manifest = { ...buildManifest(root, statePath), humanFinalReviewPolicy: { enabled: true } };
   const approval = baseApproval({});
 
   let claudeCalls = 0;
@@ -349,11 +356,23 @@ async function scenarioDuplicateResumeDoesNotDoubleRun(): Promise<void> {
   const first = await performAutoResume(approval, manifest, { orchestratorDeps });
   check("E) 1차 resume: COMPLETED", first.kind === "COMPLETED");
   check("E) 1차 resume: developer 정확히 1회 호출", claudeCalls === 1);
+  // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — reviewer APPROVED 직후에도 이
+  // task는 아직 "완료"가 아니다(사람의 최종 승인 대기 중) — 1차 resume의 실제 outcome은
+  // AWAITING_HUMAN_FINAL_REVIEW다.
+  if (first.kind === "COMPLETED") {
+    check("E) 1차 resume: 실제 outcome은 아직 AWAITING_HUMAN_FINAL_REVIEW(체크포인트 전)", first.result.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW");
+  }
 
+  // 같은 approval을 재사용한 2차 resume 시도 — RH1이 아직 completedTasks에 없으므로(위
+  // gate가 checkpoint 전에 먼저 멈췄다) STALE_APPROVAL_TASK_ALREADY_COMPLETED로는 막히지
+  // 않는다. 대신 auto-resume.ts가 "이 WAITING_HUMAN은 Human Final Review gate가 대기 중"
+  // 이라는 것을 직접 인식해 developer/reviewer를 처음부터 재실행하는 옛 Auto Resume 경로
+  // 자체를 거부한다(§ auto-resume.ts — approveHumanFinalReview()를 통해서만 이 gate를
+  // 넘길 수 있다).
   const second = await performAutoResume(approval, manifest, { orchestratorDeps });
-  check("E) 2차 resume(같은 approval 재사용): BLOCKED(STALE — 이미 완료된 task)", second.kind === "BLOCKED");
+  check("E) 2차 resume(같은 approval 재사용): BLOCKED(Human Final Review gate 대기 중)", second.kind === "BLOCKED");
   if (second.kind === "BLOCKED") {
-    check("E) 2차 resume 사유=STALE_APPROVAL_TASK_ALREADY_COMPLETED", second.reason === "STALE_APPROVAL_TASK_ALREADY_COMPLETED");
+    check("E) 2차 resume 사유=HUMAN_FINAL_REVIEW_GATE_PENDING", second.reason === "HUMAN_FINAL_REVIEW_GATE_PENDING");
   }
   check("E) 2차 resume에서 developer가 추가로 호출되지 않음(여전히 1회)", claudeCalls === 1);
   check("E) 2차 resume에서 GPT reviewer도 추가로 호출되지 않음", gptCalls === 0);

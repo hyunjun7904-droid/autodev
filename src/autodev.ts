@@ -7,7 +7,7 @@ import type { DeveloperProjectContext } from "./claude-developer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
-import { validateProjectManifest, resolveRemoteGitSafetyPolicy } from "./project-manifest";
+import { validateProjectManifest, resolveRemoteGitSafetyPolicy, isHumanFinalReviewEnabled } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
 import { checkRemoteSafeToStart, checkRemoteUnchangedSince } from "./remote-git-safety";
 import type { RemoteGitSnapshot } from "./remote-git-safety";
@@ -29,7 +29,7 @@ import { isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import { randomUUID } from "node:crypto";
 import { log } from "./logger";
-import type { CoreState, ClaudeResult } from "./types";
+import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
 // manifest.taskRegistry 데이터) → Claude 실제 개발 → targeted tests(AutoDev가 직접
@@ -108,7 +108,12 @@ import type { CoreState, ClaudeResult } from "./types";
 
 export type AutodevDecision =
   | { kind: "STOP"; reason: string; setWaitingHuman: boolean }
-  | { kind: "RUN_TASK"; task: TaskDefinition };
+  | { kind: "RUN_TASK"; task: TaskDefinition }
+  /** Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — 사람이 이 정확한 task/reviewCycle의
+   *  reviewer 승인 결과에 대해 명시적으로 APPROVE했다(§ approveHumanFinalReview). runAutodevOnce()는
+   *  이 kind일 때 Developer/GPT Reviewer를 다시 호출하지 않고, 이미 저장된 승인 결과로 곧바로
+   *  checkpoint를 진행한다. */
+  | { kind: "RESUME_APPROVED_CHECKPOINT"; task: TaskDefinition };
 
 // state만 보고 순수하게 판단한다(부수효과 없음) — 테스트에서 이 함수만 독립적으로 검증한다.
 // taskRegistry는 호출부가 항상 명시적으로 주입해야 한다(Phase A Task A7 — 기본값 제거,
@@ -125,6 +130,27 @@ export function decideNextAction(
   const status = state.status as unknown as string;
 
   if (status === "WAITING_HUMAN") {
+    // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — 사람이 이미 이 정확한 task/
+    // reviewCycle/reviewer 승인에 대해 명시적으로 APPROVE했는지 확인한다(§
+    // approveHumanFinalReview, autodev.ts). 아래 조건 중 하나라도 어긋나면(다른 task용 stale
+    // approval, reviewCycle 불일치, reviewer decision이 PASS가 아니었음, 이미
+    // completedTasks에 있음, gate 자체가 없거나 PENDING/REJECTED, registry상 "다음 task"가
+    // gate의 taskId와 다름) 절대 RESUME으로 취급하지 않고 기존 WAITING_HUMAN STOP으로
+    // fail-closed한다 — 모호하면 승인으로 간주하지 않는다.
+    const gate = state.humanFinalReview;
+    const completedForGate = state.completedTasks ?? [];
+    if (
+      gate &&
+      gate.status === "APPROVED" &&
+      gate.reviewCycle === state.reviewCycle &&
+      state.lastGptDecision?.decision === "PASS" &&
+      !completedForGate.includes(gate.taskId)
+    ) {
+      const resumedTask = getNextTask(taskRegistry, completedForGate);
+      if (resumedTask && resumedTask.id === gate.taskId) {
+        return { kind: "RESUME_APPROVED_CHECKPOINT", task: resumedTask };
+      }
+    }
     return {
       kind: "STOP",
       reason: "이미 WAITING_HUMAN 상태 — 사람 확인 대기 중이므로 자동 실행하지 않습니다.",
@@ -146,6 +172,83 @@ export function decideNextAction(
   }
 
   return { kind: "RUN_TASK", task: nextTask };
+}
+
+export interface HumanFinalReviewActionResult {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * 사람이 Human Final Review를 명시적으로 APPROVE한다(§ 요구사항 7/§13 — 새로운 UI/CLI/
+ * 서비스를 만들지 않고, project-state.json에 이미 있는 task ID/reviewCycle에 결합된 최소
+ * 구조로 표현한다). 호출부(향후 CLI/Telegram/Dashboard wiring — 이 Task 범위 밖)는 사람이
+ * 확인한 taskId를 그대로 넘겨야 한다: taskId가 현재 대기 중인 gate와 다르면(stale
+ * approval) 거부한다.
+ *
+ * state.status는 여전히 "WAITING_HUMAN"으로 남겨둔다 — decideNextAction()이 이 값과
+ * gate.status==="APPROVED"를 함께 확인해야만 RESUME_APPROVED_CHECKPOINT를 반환하기
+ * 때문이다. 여기서 상태를 "READY"로 바꾸면 decideNextAction()이 이 승인 정보를 확인하지
+ * 않고 곧바로 getNextTask()로 같은 task를 다시 골라 Developer/Reviewer를 처음부터
+ * 재실행하게 된다 — § 요구사항 8이 명시적으로 금지하는 상황이다.
+ */
+export function approveHumanFinalReview(
+  statePath: string,
+  taskId: string,
+  now: () => Date = () => new Date()
+): HumanFinalReviewActionResult {
+  const state = loadState(statePath);
+  if ((state.status as unknown as string) !== "WAITING_HUMAN") {
+    return { ok: false, reason: `UNEXPECTED_STATE(${state.status})` };
+  }
+  const gate = state.humanFinalReview;
+  if (!gate || gate.status !== "PENDING") {
+    return { ok: false, reason: "NO_PENDING_HUMAN_FINAL_REVIEW" };
+  }
+  if (gate.taskId !== taskId) {
+    return { ok: false, reason: `TASK_MISMATCH(expected=${gate.taskId}, got=${taskId})` };
+  }
+  if (gate.reviewCycle !== state.reviewCycle) {
+    return { ok: false, reason: "STALE_REVIEW_CYCLE" };
+  }
+  if ((state.completedTasks ?? []).includes(taskId)) {
+    return { ok: false, reason: "TASK_ALREADY_COMPLETED" };
+  }
+  if (state.lastGptDecision?.decision !== "PASS") {
+    return { ok: false, reason: "REVIEWER_DECISION_NOT_APPROVED" };
+  }
+  state.humanFinalReview = { ...gate, status: "APPROVED", approvedAt: now().toISOString() };
+  saveState(state, statePath);
+  return { ok: true };
+}
+
+/** 사람이 Human Final Review를 명시적으로 REJECT한다 — 이후 어떤 재실행도 checkpoint를
+ *  진행하지 않는다(gate.status가 "APPROVED"가 아니게 되므로 decideNextAction()이 항상
+ *  기존 WAITING_HUMAN STOP을 반환한다). 코드 변경 자체는 삭제/되돌리지 않고 working
+ *  tree에 그대로 남겨(§ 요구사항 9 — 새로운 복잡한 revise workflow를 만들지 않는다) 사람이
+ *  직접 조치할 수 있게 한다. */
+export function rejectHumanFinalReview(
+  statePath: string,
+  taskId: string,
+  now: () => Date = () => new Date()
+): HumanFinalReviewActionResult {
+  const state = loadState(statePath);
+  if ((state.status as unknown as string) !== "WAITING_HUMAN") {
+    return { ok: false, reason: `UNEXPECTED_STATE(${state.status})` };
+  }
+  const gate = state.humanFinalReview;
+  if (!gate || gate.status !== "PENDING") {
+    return { ok: false, reason: "NO_PENDING_HUMAN_FINAL_REVIEW" };
+  }
+  if (gate.taskId !== taskId) {
+    return { ok: false, reason: `TASK_MISMATCH(expected=${gate.taskId}, got=${taskId})` };
+  }
+  state.humanFinalReview = { ...gate, status: "REJECTED", rejectedAt: now().toISOString() };
+  state.deferredHumanTasks.push(
+    `HUMAN_FINAL_REVIEW_REJECTED(${taskId}): 사람이 checkpoint를 거절했습니다 — 코드 변경은 working tree에 그대로 남아있습니다.`
+  );
+  saveState(state, statePath);
+  return { ok: true };
 }
 
 export interface AutodevRunOptions {
@@ -204,6 +307,12 @@ export type AutodevRunOutcome =
   | "RAN_TASK_APPROVED_AND_CHECKPOINTED"
   | "RAN_TASK_NOT_APPROVED"
   | "RAN_TASK_CHECKPOINT_BLOCKED"
+  /** Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — reviewer가 APPROVED했지만 사람의
+   *  명시적 최종 승인(approveHumanFinalReview())이 아직 없어 checkpoint를 진행하지 않고
+   *  WAITING_HUMAN으로 대기 상태를 전환한 경우. checkpoint/completedTasks/next task 진행
+   *  전부 0건이다 — 사람이 승인한 뒤 동일 project를 다시 실행해야 checkpoint까지 이어진다
+   *  (§ decideNextAction의 RESUME_APPROVED_CHECKPOINT). */
+  | "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW"
   /** Phase G Task G7 — 같은 project를 다른 프로세스가 이미 쓰고 있거나(PROJECT_ALREADY_LOCKED)
    *  lock 상태를 신뢰할 수 없어서(LOCK_STATE_UNCERTAIN/CORRUPT_LOCK) 이 실행 자체를 시작하지
    *  않은 경우. state.json/git 어느 쪽도 건드리지 않는다 — reason에 어떤 lock 코드였는지 남는다. */
@@ -562,81 +671,114 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     }
 
   const taskDef = decision.task;
-  console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
-  emitEvent(events, { eventType: "TASK_STARTED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "task_selection", outcome: "PENDING" });
+  // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — 이 kind일 때는 사람이 이미 이
+  // 정확한 task/reviewCycle의 reviewer 승인 결과에 APPROVE했다(§ decideNextAction). 아래
+  // 코드는 이 플래그로 "Developer/GPT Reviewer를 다시 호출할지" 자체를 분기한다.
+  const isResumingApprovedCheckpoint = decision.kind === "RESUME_APPROVED_CHECKPOINT";
 
-  // Phase F Task F4.1 — pre-development advisory(planner/research). taskDef의 신호가
-  // 없으면 즉시 undefined이고 LLM 호출이 전혀 없다.
-  const preAdvisory = await runPreDevelopmentAdvisory(taskDef, opts.advisoryReadOnlyRunner);
-  if (preAdvisory && preAdvisory.length > 0) {
-    console.log(`[autodev] task ${taskDef.id} — pre-development advisory 실행: ${preAdvisory.map((r) => `${r.role}=${r.status}`).join(", ")}`);
-  }
-  emitAdvisoryAgentEvents(events, runId, manifest.projectId, taskDef.id, "pre_development", preAdvisory);
+  let finalState: CoreState;
+  let preAdvisory: AgentStepResult[] | undefined;
 
-  // manifest.developerInstructions/reviewInstructions는 Claude Developer/GPT Reviewer
-  // Core(claude-developer.ts/gpt-reviewer.ts)가 전혀 모르는 프로젝트별 내용이다 — 이 파일이
-  // ProjectManifest로부터 조립해 명시적으로 주입한다(Phase A Task A6). 어떤 manifest가
-  // 주입되든(MOVAN이든 fixture든) 동일한 방식으로 조립되므로 이 파일은 프로젝트를 가리지 않는다.
-  //
-  // Phase F Task F4.1 — pre-development advisory가 실행됐다면 그 요약(summary)만 추가
-  // 안내로 덧붙인다(rawOutput 전체는 재전송하지 않는다 — § 토큰 효율).
-  const developerContext: DeveloperProjectContext = {
-    projectName: manifest.projectName,
-    instructions:
-      preAdvisory && preAdvisory.length > 0
-        ? `${manifest.developerInstructions}\n\n# Pre-development advisory 참고\n${preAdvisory.map((r) => `[${r.role}] ${r.summary}`).join("\n")}`
-        : manifest.developerInstructions,
-  };
-  const reviewContext: ReviewProjectContext = {
-    projectName: manifest.projectName,
-    instructions: manifest.reviewInstructions,
-    scopeDirs: manifest.reviewScopeDirs,
-    rulesPath: manifest.rulesPath,
-  };
-
-  const defaultClaudeRunner = (task: string, attempt: number) =>
-    runDeveloperTaskViaSafeExecutor(task, attempt, {
-      requiredTests: taskDef.requiredTests,
-      allowedPathPrefixes: taskDef.allowedPathPrefixes,
-      projectContext: developerContext,
-      // manifest.reviewScopeDirs는 GPT reviewer가 스캔하는 것과 동일한 "프로젝트 전체 소스
-      // 범위"다 — claude-developer.ts가 DeveloperResult.changedFiles를 계산할 때도 같은
-      // 범위를 쓴다(이전에는 이 파일에 ["web/", "automation/"]로 하드코딩돼 있었다).
-      changeScopeDirs: manifest.reviewScopeDirs,
-      // Phase C Task C2 — 이 run 전용 executorContext를 명시적으로 넘긴다. Developer는
-      // module-level Safe Executor singleton을 전혀 거치지 않고 이 context의 root/policy로만
-      // 파일/명령을 검증·실행한다.
-      executor: executorContext,
+  if (isResumingApprovedCheckpoint) {
+    // 이미 디스크에 저장된 승인된 상태(state, 이 함수 상단에서 loadState()로 읽은 값 —
+    // reviewer가 APPROVED한 시점에 orchestrator.ts가 저장한 lastGptDecision/lastClaudeResult가
+    // 그대로 남아있다)를 그대로 checkpoint 판단에 재사용한다. Developer/GPT Reviewer는 이
+    // 분기에서 전혀 호출되지 않는다.
+    console.log(
+      `[autodev] task ${taskDef.id} — Human Final Review APPROVE 확인됨(reviewCycle=${state.reviewCycle}). developer/reviewer 재실행 없이 checkpoint로 재개합니다.`
+    );
+    emitEvent(events, {
+      eventType: "TASK_STARTED",
+      runId,
+      projectId: manifest.projectId,
+      taskId: taskDef.id,
+      executionPhase: "checkpoint",
+      outcome: "PENDING",
+      reason: "HUMAN_FINAL_REVIEW_APPROVED_RESUME",
     });
+    finalState = state;
+  } else {
+    console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
+    emitEvent(events, { eventType: "TASK_STARTED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "task_selection", outcome: "PENDING" });
 
-  const { finalState } = await runOrchestrator(taskDef.prompt, {
-    statePath,
-    allowedPathPrefixes: taskDef.allowedPathPrefixes,
-    claudeRunner: defaultClaudeRunner,
-    projectContext: reviewContext,
-    // Phase C Task C2 — deps.gptReviewer를 명시적으로 지정하지 않는 한(테스트가 흔히 그렇게
-    // 한다) orchestrator의 기본 real GPT reviewer가 이 context를 써서 rules 파일/실제 git
-    // 변경을 읽는다 — module-level singleton에 의존하지 않는다.
-    executor: executorContext,
-    // Phase G Task G2 — REVISE loop의 각 cycle마다(DEVELOPER_RETRY_STARTED/TEST_COMPLETED/
-    // REVIEW_STARTED/REVIEW_APPROVED·REVISE·BLOCKED/REVIEW_CYCLE_EXHAUSTED) event를 남기는
-    // instrumentation은 orchestrator.ts 자신이 담당한다 — 이 파일은 events/runId/taskId/
-    // projectId만 넘긴다.
-    events,
-    // Phase SI-3.8B — Usage Ledger instrumentation은 orchestrator.ts 자신이 담당한다(§
-    // recordGptReviewUsage) — 이 파일은 ledger/runId/taskId/projectId만 넘긴다.
-    ledger,
-    runId,
-    taskId: taskDef.id,
-    projectId: manifest.projectId,
-    ...opts.orchestratorDeps,
-  });
+    // Phase F Task F4.1 — pre-development advisory(planner/research). taskDef의 신호가
+    // 없으면 즉시 undefined이고 LLM 호출이 전혀 없다.
+    preAdvisory = await runPreDevelopmentAdvisory(taskDef, opts.advisoryReadOnlyRunner);
+    if (preAdvisory && preAdvisory.length > 0) {
+      console.log(`[autodev] task ${taskDef.id} — pre-development advisory 실행: ${preAdvisory.map((r) => `${r.role}=${r.status}`).join(", ")}`);
+    }
+    emitAdvisoryAgentEvents(events, runId, manifest.projectId, taskDef.id, "pre_development", preAdvisory);
+
+    // manifest.developerInstructions/reviewInstructions는 Claude Developer/GPT Reviewer
+    // Core(claude-developer.ts/gpt-reviewer.ts)가 전혀 모르는 프로젝트별 내용이다 — 이 파일이
+    // ProjectManifest로부터 조립해 명시적으로 주입한다(Phase A Task A6). 어떤 manifest가
+    // 주입되든(MOVAN이든 fixture든) 동일한 방식으로 조립되므로 이 파일은 프로젝트를 가리지 않는다.
+    //
+    // Phase F Task F4.1 — pre-development advisory가 실행됐다면 그 요약(summary)만 추가
+    // 안내로 덧붙인다(rawOutput 전체는 재전송하지 않는다 — § 토큰 효율).
+    const developerContext: DeveloperProjectContext = {
+      projectName: manifest.projectName,
+      instructions:
+        preAdvisory && preAdvisory.length > 0
+          ? `${manifest.developerInstructions}\n\n# Pre-development advisory 참고\n${preAdvisory.map((r) => `[${r.role}] ${r.summary}`).join("\n")}`
+          : manifest.developerInstructions,
+    };
+    const reviewContext: ReviewProjectContext = {
+      projectName: manifest.projectName,
+      instructions: manifest.reviewInstructions,
+      scopeDirs: manifest.reviewScopeDirs,
+      rulesPath: manifest.rulesPath,
+    };
+
+    const defaultClaudeRunner = (task: string, attempt: number) =>
+      runDeveloperTaskViaSafeExecutor(task, attempt, {
+        requiredTests: taskDef.requiredTests,
+        allowedPathPrefixes: taskDef.allowedPathPrefixes,
+        projectContext: developerContext,
+        // manifest.reviewScopeDirs는 GPT reviewer가 스캔하는 것과 동일한 "프로젝트 전체 소스
+        // 범위"다 — claude-developer.ts가 DeveloperResult.changedFiles를 계산할 때도 같은
+        // 범위를 쓴다(이전에는 이 파일에 ["web/", "automation/"]로 하드코딩돼 있었다).
+        changeScopeDirs: manifest.reviewScopeDirs,
+        // Phase C Task C2 — 이 run 전용 executorContext를 명시적으로 넘긴다. Developer는
+        // module-level Safe Executor singleton을 전혀 거치지 않고 이 context의 root/policy로만
+        // 파일/명령을 검증·실행한다.
+        executor: executorContext,
+      });
+
+    const orchestratorResult = await runOrchestrator(taskDef.prompt, {
+      statePath,
+      allowedPathPrefixes: taskDef.allowedPathPrefixes,
+      claudeRunner: defaultClaudeRunner,
+      projectContext: reviewContext,
+      // Phase C Task C2 — deps.gptReviewer를 명시적으로 지정하지 않는 한(테스트가 흔히 그렇게
+      // 한다) orchestrator의 기본 real GPT reviewer가 이 context를 써서 rules 파일/실제 git
+      // 변경을 읽는다 — module-level singleton에 의존하지 않는다.
+      executor: executorContext,
+      // Phase G Task G2 — REVISE loop의 각 cycle마다(DEVELOPER_RETRY_STARTED/TEST_COMPLETED/
+      // REVIEW_STARTED/REVIEW_APPROVED·REVISE·BLOCKED/REVIEW_CYCLE_EXHAUSTED) event를 남기는
+      // instrumentation은 orchestrator.ts 자신이 담당한다 — 이 파일은 events/runId/taskId/
+      // projectId만 넘긴다.
+      events,
+      // Phase SI-3.8B — Usage Ledger instrumentation은 orchestrator.ts 자신이 담당한다(§
+      // recordGptReviewUsage) — 이 파일은 ledger/runId/taskId/projectId만 넘긴다.
+      ledger,
+      runId,
+      taskId: taskDef.id,
+      projectId: manifest.projectId,
+      ...opts.orchestratorDeps,
+    });
+    finalState = orchestratorResult.finalState;
+  }
 
   // orchestrator.ts가 이미 이 실행의 구체적인 사유(HUMAN_APPROVAL_REQUIRED 사전 게이트/
   // REVIEW_STARTED·APPROVED·REVISE·BLOCKED/TEST_COMPLETED/REVIEW_CYCLE_EXHAUSTED 등)를
   // cycle 단위로 기록했다(§ runOrchestrator에 넘긴 events/runId/taskId/projectId). 여기서는
   // 그 결과를 요약하는 run-level bookend event만 남긴다.
-  if (finalState.status !== "APPROVED") {
+  // isResumingApprovedCheckpoint일 때는 finalState(=state)가 이미 WAITING_HUMAN이다(Human
+  // Final Review 대기 중이었으므로) — orchestrator를 다시 호출하지 않았으니 이 "orchestrator가
+  // APPROVED로 끝나지 않음" 판정 자체를 건너뛴다. decideNextAction()이 이 kind를 반환하기
+  // 전에 이미 gate.status==="APPROVED" && lastGptDecision.decision==="PASS"를 확인했다.
+  if (!isResumingApprovedCheckpoint && finalState.status !== "APPROVED") {
     console.log(`[autodev] task ${taskDef.id} — orchestrator가 APPROVED로 끝나지 않음(status=${finalState.status}). checkpoint 생략.`);
     // claude 구조적 실패/GPT 호출 상한 초과처럼 orchestrator.ts에서 cycle 단위 event 이름이
     // 따로 없는 나머지 WAITING_HUMAN 사유까지 이 HUMAN_APPROVAL_REQUIRED 하나로 포괄한다.
@@ -690,16 +832,80 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   // Phase F Task F4.1 — post-development/pre-checkpoint advisory(qa/security). reviewer가
   // 이미 APPROVED로 판정한 뒤에만 실행하고, 그 결과는 아래 checkpoint 진행 여부에 절대
   // 영향을 주지 않는다(순수 정보 — deterministic test PASS/FAIL이나 GPT reviewer의 APPROVED
-  // 판정을 advisory 의견으로 우회/강제하지 않는다).
-  const postAdvisory = finalState.lastClaudeResult
-    ? await runPostDevelopmentAdvisory(taskDef, finalState.lastClaudeResult, opts.advisoryReadOnlyRunner)
-    : undefined;
+  // 판정을 advisory 의견으로 우회/강제하지 않는다). Human Final Review 재개(resume) 시에는
+  // 이미 이 advisory가 fresh 실행 때 끝났으므로(아래 gate가 그 결과를 agentAdvisory로 이미
+  // 반환했다) 불필요한 LLM 재호출을 피하기 위해 건너뛴다.
+  const postAdvisory =
+    !isResumingApprovedCheckpoint && finalState.lastClaudeResult
+      ? await runPostDevelopmentAdvisory(taskDef, finalState.lastClaudeResult, opts.advisoryReadOnlyRunner)
+      : undefined;
   if (postAdvisory && postAdvisory.length > 0) {
     console.log(`[autodev] task ${taskDef.id} — post-development advisory 실행: ${postAdvisory.map((r) => `${r.role}=${r.status}`).join(", ")}`);
   }
   emitAdvisoryAgentEvents(events, runId, manifest.projectId, taskDef.id, "post_development", postAdvisory);
   const agentAdvisory = [...(preAdvisory ?? []), ...(postAdvisory ?? [])];
   const agentAdvisoryField = agentAdvisory.length > 0 ? { agentAdvisory } : {};
+
+  if (!isResumingApprovedCheckpoint && isHumanFinalReviewEnabled(manifest)) {
+    // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — project-agnostic opt-in(§
+    // project-manifest.ts ProjectManifest.humanFinalReviewPolicy/isHumanFinalReviewEnabled).
+    // 이 project가 manifest.humanFinalReviewPolicy.enabled===true로 명시적으로 opt-in한
+    // 경우에만 이 분기에 들어온다 — AutoDev Core는 어떤 프로젝트 이름으로도 분기하지 않는다.
+    // opt-in하지 않은 project(기본값, 기존 project 전부 해당)는 이 조건이 항상 false이므로
+    // 곧바로 아래 기존 checkpoint 코드로 진행해 기존 AutoDev 동작(Reviewer PASS → 즉시
+    // checkpoint)을 100% 그대로 유지한다.
+    //
+    // reviewer가 방금 APPROVED(finalState.status==="APPROVED")했더라도, 사람이 명시적으로
+    // APPROVE하기 전까지는 checkpoint(git commit)를 진행하지 않는다 — Reviewer PASS는 자동
+    // 완료 승인이 아니다. post-development advisory(qa/security)는 사람이 최종 승인 여부를
+    // 판단할 때 참고할 수 있도록 이미 위에서 실행되어 agentAdvisoryField에 담겨 있다 — 이
+    // 지점 이후의 코드(§ checkpoint)는 이제 decideNextAction()의 RESUME_APPROVED_CHECKPOINT
+    // 경로(위 isResumingApprovedCheckpoint 분기)로만 도달한다 — 사람의 새 승인 없이는 같은
+    // 실행 안에서도, 이후 재실행에서도 절대 도달하지 않는다(checkpoint=0/completedTasks
+    // 변화=0/next task 진행=0 보장).
+    const gate: HumanFinalReviewGate = {
+      taskId: taskDef.id,
+      reviewCycle: finalState.reviewCycle,
+      status: "PENDING",
+      requestedAt: new Date().toISOString(),
+    };
+    const gated = loadState(statePath);
+    gated.status = "WAITING_HUMAN";
+    gated.humanFinalReview = gate;
+    gated.deferredHumanTasks.push(
+      `HUMAN_FINAL_REVIEW_PENDING(${taskDef.id}): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다(approveHumanFinalReview() 호출 후 재실행하세요).`
+    );
+    emitEvent(
+      events,
+      {
+        eventType: "HUMAN_APPROVAL_REQUIRED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "checkpoint",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reason: `HUMAN_FINAL_REVIEW_PENDING(${taskDef.id})`,
+      },
+      auditFailures
+    );
+    if (auditFailures.length > 0) gated.deferredHumanTasks.push(...auditFailures);
+    saveState(gated, statePath);
+    console.log(
+      `[autodev] task ${taskDef.id} — reviewer APPROVED. Human Final Review 대기(checkpoint 보류) — 사람이 승인해야 다음 실행에서 checkpoint가 진행됩니다.`
+    );
+    // Phase G Task G7과 동일한 원칙 — reviewer가 이미 APPROVED한 실제 코드 변경이 아직
+    // commit되지 않은 채 working tree에 그대로 있다. 다른 writer가 이 위에서 시작하지
+    // 못하도록 이 프로세스가 살아있는 동안 lock을 유지한다.
+    lockShouldRelease = false;
+    return {
+      outcome: "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW",
+      taskId: taskDef.id,
+      orchestratorStatus: String(finalState.status),
+      reason: `HUMAN_FINAL_REVIEW_PENDING(${taskDef.id}): reviewer APPROVED — 사람의 최종 승인 대기 중(checkpoint 보류).`,
+      ...agentAdvisoryField,
+    };
+  }
 
   // Claude/GPT의 자체 보고를 신뢰하지 않는다 — orchestrator가 강제 REVISE 안전장치를
   // 이미 적용했지만(§ 요구사항 6), checkpoint 직전에도 다시 한번 독립적으로 확인한다.
@@ -948,6 +1154,14 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   updated.gitCheckpoint = checkpoint.commitHash ?? updated.gitCheckpoint;
   updated.currentPhase = taskDef.phase;
   updated.lastGptDecision = finalState.lastGptDecision;
+  // checkpoint가 실제로 성공했으므로 이 gate는 완전히 소비됐다 — 다음 실행에서 stale하게
+  // 남아 재해석되지 않도록 명시적으로 비운다(§ 요구사항 13 Test 7 — checkpoint exactly once).
+  updated.humanFinalReview = null;
+  // resume 경로는 runOrchestrator()를 다시 호출하지 않으므로(§ isResumingApprovedCheckpoint)
+  // 그 함수가 매 fresh 실행 시작마다 하던 deferredHumanTasks 초기화가 이 경로에는 일어나지
+  // 않는다 — 이 gate가 대기 중일 때 남긴 안내 메시지(HUMAN_FINAL_REVIEW_PENDING)만 정확히
+  // 지금 소비된 것이므로 명시적으로 제거한다(다른 무관한 기존 항목은 그대로 보존한다).
+  updated.deferredHumanTasks = updated.deferredHumanTasks.filter((t) => !t.startsWith(`HUMAN_FINAL_REVIEW_PENDING(${taskDef.id})`));
   if (auditFailures.length > 0) updated.deferredHumanTasks.push(...auditFailures);
 
   const next = getNextTask(manifest.taskRegistry, updated.completedTasks);

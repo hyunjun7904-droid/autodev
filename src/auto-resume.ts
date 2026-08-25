@@ -99,6 +99,17 @@ export async function performAutoResume(
   if ((state.status as unknown as string) !== "WAITING_HUMAN") {
     return { kind: "BLOCKED", reason: `STALE_APPROVAL_UNEXPECTED_STATE(${state.status})` };
   }
+  // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate와의 경계 — 이 WAITING_HUMAN이 실제로는
+  // "reviewer가 이미 APPROVED했고 사람의 최종 승인만 기다리는 중"이라면(§ autodev.ts
+  // decideNextAction의 humanFinalReview gate), 이 함수(옛 Auto Resume — "처음부터 다시
+  // 시도한다"는 의미, § 파일 상단 주석)가 아래에서 status를 "READY"로 되돌려 developer/
+  // reviewer를 처음부터 재실행하면 안 된다 — 이미 나온 reviewer 승인 결과를 버리고 불필요하게
+  // 재실행하는 것이며, 승인 대기 중인 gate를 조용히 우회하는 결과가 된다(§ 요구사항 8 —
+  // Developer/Reviewer 재실행 금지). approveHumanFinalReview()를 통해서만 이 gate를 넘길 수
+  // 있다 — 이 함수는 그 경로가 아니므로 fail-closed로 거부한다.
+  if (state.humanFinalReview) {
+    return { kind: "BLOCKED", reason: "HUMAN_FINAL_REVIEW_GATE_PENDING" };
+  }
 
   // 3) Git Safety 재확인 — 불일치 시 어떤 git 명령도 실행하지 않고 중단한다.
   const gitCheck = checkGitSafeToResume(cwd, approval);

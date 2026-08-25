@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { checkGitSafeToResume, performAutoResume } from "./auto-resume";
+import { runAutodevOnce, approveHumanFinalReview } from "./autodev";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -245,7 +246,10 @@ async function scenarioSafePathCompletesWithoutRealApiCalls(): Promise<void> {
   const root = makeGitRepo("auto-resume-completed-path-");
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
-  const manifest = buildResumeManifest(root, statePath);
+  // 이 시나리오는 "auto-resume이 HFR gate를 우회하지 못함"을 직접 검증하는 전용
+  // 시나리오다(§ HFR 요구사항 7) — 이 project는 humanFinalReviewPolicy를 명시적으로
+  // opt-in한다. buildResumeManifest() 자체(다른 시나리오가 공유)는 기본값 OFF를 유지한다.
+  const manifest = { ...buildResumeManifest(root, statePath), humanFinalReviewPolicy: { enabled: true } };
   const approval = baseApproval({ expectedGitHead: headHash(root), expectedBranch: branchName(root) });
 
   let claudeRunnerCalled: boolean = false;
@@ -266,9 +270,25 @@ async function scenarioSafePathCompletesWithoutRealApiCalls(): Promise<void> {
   check("모든 안전 재검사를 통과하면 실제 실행까지 이어짐(COMPLETED)", outcome.kind === "COMPLETED");
   check("실제 실행은 injected fake claudeRunner를 통해서만 일어남(실제 Claude CLI 호출 아님)", claudeRunnerCalled);
   check("실제 실행은 injected fake gptReviewer를 통해서만 일어남(실제 OpenAI API 호출 아님)", gptReviewerCalled);
+  // HUMAN_FINAL_REVIEW gate — Auto Resume이 developer/reviewer를 다시 실행해 reviewer가
+  // 다시 APPROVED하더라도, checkpoint 전 사람의 최종 승인이 여전히 필요하다(§ 요구사항 —
+  // Human Final Review는 Reviewer/Auto Resume 어느 경로로 도달했든 동일하게 적용된다).
   if (outcome.kind === "COMPLETED") {
-    check("COMPLETED 결과의 outcome은 RAN_TASK_APPROVED_AND_CHECKPOINTED", outcome.result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+    check(
+      "COMPLETED 결과의 outcome은 RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW(재실행된 reviewer도 Human Final Review를 거쳐야 함)",
+      outcome.result.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW"
+    );
   }
+
+  const stateAfterAutoResume = JSON.parse(readFileSync(statePath, "utf-8")) as CoreState;
+  check("Auto Resume 직후에는 아직 completedTasks에 R1이 추가되지 않음(사람 최종 승인 대기 중)", !stateAfterAutoResume.completedTasks.includes("R1"));
+  check("Auto Resume 직후 status='WAITING_HUMAN'(Human Final Review 대기)", (stateAfterAutoResume.status as unknown as string) === "WAITING_HUMAN");
+
+  // 사람이 명시적으로 APPROVE한 뒤에만(Gate를 실제로 거쳐) checkpoint까지 이어진다.
+  const approval2 = approveHumanFinalReview(statePath, "R1");
+  check("Human Final Review approveHumanFinalReview ok=true", approval2.ok === true);
+  const resumedResult = await runAutodevOnce({ manifest, statePath });
+  check("Human Final Review 승인 후 resume outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", resumedResult.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
 
   const stateAfter = JSON.parse(readFileSync(statePath, "utf-8")) as CoreState;
   check("성공 이후 completedTasks에 R1이 추가됨(Gate를 실제로 거쳐 완료)", stateAfter.completedTasks.includes("R1"));
