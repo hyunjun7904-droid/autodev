@@ -91,6 +91,7 @@
     "test:self-dev-completion-hook": "npm run build && node dist/self-dev-completion-hook-tests.js",
     "test:self-dev-terminal-status": "npm run build && node dist/self-dev-terminal-status-tests.js",
     "test:runtime-origin": "npm run build && node dist/runtime-origin-tests.js",
+    "test:full-regression-runner": "npm run build && node dist/full-regression-runner-tests.js",
     "telegram-smoke-test": "npm run build && node dist/telegram-smoke-test.js",
     "telegram-controller": "npm run build && node dist/telegram-controller-main.js",
     "notify:task-completed": "npm run build && node dist/notify-task-completed.js",

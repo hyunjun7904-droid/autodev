@@ -74,13 +74,26 @@ async function main(): Promise<void> {
   // 이 subprocess의 stdin은 즉시 닫혀 있어(execAndClassify 자체가 이미 그렇게 동작) 응답할
   // 방법이 없고, 그대로면 timeout까지 hang한다 — 그 hang이 TIMEOUT이 아니라 USAGE_LIMIT으로
   // 분류되는지 검증한다.
-  const interactiveMenuScript =
-    "Write-Output 'Claude usage limit reached.'; " +
-    "Write-Output '1) Wait for your limit to reset'; " +
-    "Write-Output '2) Upgrade your plan'; " +
-    "Write-Output '3) Cancel'; " +
-    "Start-Sleep -Seconds 5";
-  const usageLimitHang = await execAndClassify("powershell", ["-NoProfile", "-Command", interactiveMenuScript], 800);
+  //
+  // TIMING_FLAKINESS 조사·수정(2026-08-26) — 이 fixture는 Windows PowerShell(5.1)이 아니라
+  // 이미 실행 중인 것과 동일한 node 실행파일(process.execPath)로 만든다. 실측 진단 결과
+  // (repo 밖 TEMP 스크립트로 재현, 8/8) powershell.exe는 -NoProfile로도 실제 Write-Output
+  // 실행에 도달하기까지 이 환경에서 일관되게 약 1.3~1.4초가 걸렸다(호스트 초기화
+  // 오버헤드) — 이 timeout(800ms)보다 길어서 Write-Output이 실행되기도 전에 SIGKILL로
+  // 종료되어 stdout이 항상 빈 문자열이었다(재현 5/5). classifySubprocessOutcome/
+  // detectUsageLimitSignal 자체는 이미 도착한 stdout+stderr를 정확히 검사하므로 production
+  // 판정 로직에는 결함이 없다(PRODUCTION_BUG 아님) — 문제는 이 test fixture가 고른
+  // 인터프리터의 시작 지연이 test의 timeout 예산을 초과한다는 점이었다. node -e는 이
+  // 환경에서 실제 stdout 도착까지 약 70~150ms(8/8 재현) — 800ms 안에 안정적으로 들어온다.
+  // timeout 숫자 자체는 그대로 두고(임의로 늘리지 않는다), 시간에 덜 민감한 fixture로만
+  // 바꾼다.
+  const menuText =
+    "Claude usage limit reached.\n" +
+    "1) Wait for your limit to reset\n" +
+    "2) Upgrade your plan\n" +
+    "3) Cancel\n";
+  const interactiveMenuNodeScript = `process.stdout.write(${JSON.stringify(menuText)}); setInterval(() => {}, 1000);`;
+  const usageLimitHang = await execAndClassify(process.execPath, ["-e", interactiveMenuNodeScript], 800);
   check(
     "USAGE_LIMIT: 대화형 1/2/3 메뉴로 hang하는 상황이 TIMEOUT이 아니라 USAGE_LIMIT으로 분류됨(mock 재현)",
     usageLimitHang.success === false && usageLimitHang.errorCode === "USAGE_LIMIT"
