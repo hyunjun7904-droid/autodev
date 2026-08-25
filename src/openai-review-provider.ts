@@ -39,9 +39,14 @@ const RESULT_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-/** 테스트/parity 검증 전용 export — RESULT_SCHEMA 원문이 SI-3.8D 시점과 동일한지 스냅샷
- *  비교하기 위함이다(review-provider-tests.ts). Reviewer Core는 이 값을 참조하지 않는다
- *  (JSON.parse만 수행 — § review-provider.ts 상단 주석). */
+/** RESULT_SCHEMA 원문이 SI-3.8D 시점과 동일한지 스냅샷 비교하는 parity 테스트
+ *  (review-provider-tests.ts)뿐 아니라, Phase SI-3.9(Local Final Reviewer Qualification)의
+ *  final-reviewer-benchmark.ts가 다른 provider(Ollama)에게 동일한 구조화 출력 schema를
+ *  강제할 때도 이 값을 그대로 가져다 쓴다(§ Task 요구사항 7 "기존 production reviewer의
+ *  structured schema를 최대한 동일하게 적용" — schema를 provider별로 복제하지 않는다).
+ *  Reviewer Core(gpt-reviewer.ts)는 여전히 이 값을 참조하지 않는다(JSON.parse만 수행 —
+ *  § review-provider.ts 상단 주석) — provider가 실제로 무엇을 요청하는지와 Core가 응답을
+ *  어떻게 파싱하는지는 별개다. */
 export const OPENAI_REVIEW_RESULT_SCHEMA = RESULT_SCHEMA;
 
 // 30초는 실제로 너무 짧다는 것이 SI-3.8 이전에 이미 확인됐다 — 구조화 출력(json_schema)으로

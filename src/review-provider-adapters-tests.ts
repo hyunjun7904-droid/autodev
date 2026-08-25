@@ -250,6 +250,27 @@ async function scenarioC_ollamaAdapter(): Promise<void> {
   const malformedResult = await malformedProvider.review({ instructions: "sys", input: "usr" });
   check("C4) malformed 응답 → ok:false", malformedResult.ok === false);
   if (!malformedResult.ok) check("C4) errorCode=API_ERROR", malformedResult.errorCode === "API_ERROR");
+
+  // C5) Claude code-review 지적(Phase SI-3.9) — 구조화 출력 `format` 파라미터가 지정되면
+  // 요청 body에 그대로 실리고, 지정하지 않으면(기존 호출부 전부) body에 그 필드 자체가
+  // 아예 없어야 한다(하위 호환 — 기존 동작 변경 없음).
+  const FAKE_SCHEMA = { type: "object", properties: { decision: { type: "string" } } };
+  const withFormatFetch = makeFakeOllamaFetch((req) => {
+    const body = req.body as Record<string, unknown>;
+    check("C5) format 지정 시 요청 body.format이 그대로 전달됨", JSON.stringify(body.format) === JSON.stringify(FAKE_SCHEMA));
+    return { ok: true, response: { status: 200, bodyText: JSON.stringify({ model: "llama3", message: { role: "assistant", content: "{}" } }) } };
+  });
+  const withFormatProvider = createOllamaReviewProvider("llama3", withFormatFetch.fetch, DEFAULT_OLLAMA_BASE_URL, FAKE_SCHEMA);
+  await withFormatProvider.review({ instructions: "sys", input: "usr" });
+  check("C5) format 지정 시 httpFetch가 정확히 1회 호출됨", withFormatFetch.callCount() === 1);
+
+  const withoutFormatFetch = makeFakeOllamaFetch((req) => {
+    const body = req.body as Record<string, unknown>;
+    check("C5) format 미지정 시 요청 body에 format 필드 자체가 없음", !("format" in body));
+    return { ok: true, response: { status: 200, bodyText: JSON.stringify({ model: "llama3", message: { role: "assistant", content: "{}" } }) } };
+  });
+  const withoutFormatProvider = createOllamaReviewProvider("llama3", withoutFormatFetch.fetch);
+  await withoutFormatProvider.review({ instructions: "sys", input: "usr" });
 }
 
 // =========================================================

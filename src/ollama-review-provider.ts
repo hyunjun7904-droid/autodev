@@ -171,7 +171,16 @@ function classifyOllamaFailure(outcome: Extract<OllamaHttpOutcome, { ok: false }
 export function createOllamaReviewProvider(
   model: string,
   httpFetch: OllamaHttpFetch = nodeOllamaHttpFetch,
-  baseUrl: string = DEFAULT_OLLAMA_BASE_URL
+  baseUrl: string = DEFAULT_OLLAMA_BASE_URL,
+  /** Phase SI-3.9(Local Final Reviewer Qualification) — 지정하면 Ollama `/api/chat`의
+   *  구조화 출력(`format`, 공식 문서: https://ollama.com/blog/structured-outputs, JSON
+   *  Schema를 그대로 받는다)으로 전달된다. 지정하지 않으면 기존과 동일하게 이 필드를
+   *  전혀 보내지 않는다(하위 호환 — 이 파라미터를 쓰지 않는 기존 호출부/테스트는 동작이
+   *  전혀 바뀌지 않는다). Reviewer Core가 이미 JSON.parse(outputText)로 파싱을 강제하므로,
+   *  이 스키마는 그 파싱이 신뢰성 있게 성공하도록 provider 응답 자체를 구조화하는 용도일
+   *  뿐이다 — 파싱/검증 책임은 여전히 Reviewer Core에 있다(§ review-provider.ts).
+   */
+  format?: Record<string, unknown>
 ): ReviewProvider {
   assertLocalBaseUrl(baseUrl);
   return {
@@ -185,6 +194,7 @@ export function createOllamaReviewProvider(
           { role: "system", content: request.instructions },
           { role: "user", content: request.input },
         ],
+        ...(format ? { format } : {}),
       };
       const outcome = await httpFetch({ url: `${baseUrl}/api/chat`, body, timeoutMs: 120_000 });
       if (!outcome.ok) {
