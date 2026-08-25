@@ -1,4 +1,6 @@
 import { runAutodevOnce } from "./autodev";
+import type { AutodevRunResult } from "./autodev";
+import { runAutodevContinuous } from "./continuous-runner";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { loadState } from "./state";
 import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
@@ -43,6 +45,15 @@ function resolveAdapterPathFromArgs(): string | undefined {
   const fromEnv = process.env.AUTODEV_PROJECT_ADAPTER;
   if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
   return undefined;
+}
+
+// Generic Continuous Runner(continuous-runner.ts) opt-in 여부. 지정하지 않으면(기본값)
+// 기존 one-shot 동작(runAutodevOnce() 1회)이 100% 그대로 유지된다 — 어떤 프로젝트 이름도
+// 여기서 분기하지 않는다.
+function isContinuousModeRequested(): boolean {
+  if (process.argv.includes("--continuous")) return true;
+  const fromEnv = process.env.AUTODEV_CONTINUOUS_RUN;
+  return fromEnv === "true" || fromEnv === "1";
 }
 
 let interrupted = false;
@@ -100,7 +111,23 @@ async function main(): Promise<void> {
   const controllerSupervisor = await ensureTelegramControllerStarted(manifest);
 
   try {
-    const result = await runAutodevOnce({ manifest });
+    const continuous = isContinuousModeRequested();
+    let result: AutodevRunResult;
+    if (continuous) {
+      const continuousResult = await runAutodevContinuous({ manifest });
+      const stopDetail =
+        continuousResult.stop.kind === "OUTCOME_STOP"
+          ? `outcome=${continuousResult.stop.outcome}${continuousResult.stop.reason ? `, reason=${continuousResult.stop.reason}` : ""}`
+          : continuousResult.stop.kind === "LIVELOCK_NO_PROGRESS"
+            ? `taskId=${continuousResult.stop.taskId}`
+            : `maxIterations=${continuousResult.stop.maxIterations}`;
+      console.log(
+        `[run] continuous 종료: ${continuousResult.iterations.length}회 실행, stop=${continuousResult.stop.kind}(${stopDetail})`
+      );
+      result = continuousResult.finalResult;
+    } else {
+      result = await runAutodevOnce({ manifest });
+    }
     console.log(`[run] 종료: outcome=${result.outcome}${result.reason ? `, reason=${result.reason}` : ""}`);
 
     let waitingHuman = false;

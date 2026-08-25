@@ -30,6 +30,7 @@
     "test:review-provider-adapters": "npm run build && node dist/review-provider-adapters-tests.js",
     "test:policy": "npm run build && node dist/policy-tests.js",
     "test:autodev": "npm run build && node dist/autodev-tests.js",
+    "test:continuous-runner": "npm run build && node dist/continuous-runner-tests.js",
     "test:task-registry": "npm run build && node dist/task-registry-tests.js",
     "test:spec-intake": "npm run build && node dist/spec-intake-tests.js",
     "test:project-bootstrap": "npm run build && node dist/project-bootstrap-tests.js",
