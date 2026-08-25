@@ -22,7 +22,10 @@ import type { GptReviewResult } from "./types";
 // 요구사항 2 "모델 자동 설치/다운로드 금지"). QUALIFIED_MODEL이 로컬에 이미 설치되어 있지
 // 않으면 probe가 실패하고 이 스크립트는 즉시 MODEL_NOT_AVAILABLE로 종료한다.
 
-const QUALIFIED_MODEL = "qwen2.5-coder:7b";
+// Phase SI-3.9 qwen2.5-coder:14b qualification-only session — model-selection seam.
+// 기본값(env 미지정)은 기존 7B benchmark와 완전히 동일하게 재현된다(하위 호환, production
+// 코드는 건드리지 않음). 이 env var로만 override 가능 — corpus/판정 로직은 변경하지 않는다.
+const QUALIFIED_MODEL = process.env.FINAL_REVIEWER_BENCHMARK_MODEL ?? "qwen2.5-coder:7b";
 const RUNS_PER_CASE = 2;
 
 const BENCHMARK_PROJECT_CONTEXT: ReviewProjectContext = {
