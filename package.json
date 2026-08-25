@@ -79,6 +79,7 @@
     "test:telegram-callback-client": "npm run build && node dist/telegram-callback-client-tests.js",
     "test:telegram-approval-provider": "npm run build && node dist/telegram-approval-provider-tests.js",
     "test:auto-resume": "npm run build && node dist/auto-resume-tests.js",
+    "test:human-resume-continuous": "npm run build && node dist/human-resume-continuous-tests.js",
     "test:project-lock": "npm run build && node dist/project-lock-tests.js",
     "test:project-lock-integration": "npm run build && node dist/project-lock-integration-tests.js",
     "test:remote-git-safety": "npm run build && node dist/remote-git-safety-tests.js",

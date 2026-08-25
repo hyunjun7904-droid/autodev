@@ -2,11 +2,13 @@ import { loadState, saveState } from "./state";
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 import { runAutodevOnce } from "./autodev";
 import type { AutodevRunResult } from "./autodev";
+import { resolveRemoteGitSafetyPolicy } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
 import type { EventStore } from "./event-store";
 import type { ApprovalRequest } from "./approval";
 import type { OrchestratorDeps } from "./orchestrator";
 import { peekProjectLock } from "./project-lock";
+import { checkRemoteSafeToStart } from "./remote-git-safety";
 
 // Safe Auto Resume — Phase G Task G6.
 //
@@ -35,6 +37,18 @@ import { peekProjectLock } from "./project-lock";
 //      runAutodevOnce() 하나(project-lock.ts를 직접 쓰는 유일한 지점)가 전담한다(§ 요구사항
 //      14, 두 실행 경로가 서로 다른 lock 구현을 갖지 않는다). Telegram callback에는 lock을
 //      강제로 삭제/탈취하는 기능이 없다(§ 요구사항 11).
+//   5) Remote Git Safety 사전 재확인(checkRemoteSafeToStart, remote-git-safety.ts) —
+//      manifest.remoteGitSafety가 지정된 project에서만 활성화된다(§ project-manifest.ts,
+//      지정하지 않으면 완전히 no-op). Project Lock 사전 확인과 동일한 원칙 — remote가 이미
+//      앞서 있다면 아래 state.status READY 전환조차 시도하지 않고 즉시 BLOCKED로 중단한다.
+//      이 사전 확인이 없으면(2026-08-26 Human Resume + Continuous Runner regression 조사에서
+//      실제로 재현/증명함): state.status를 READY로 먼저 써둔 뒤 runAutodevOnce() 내부의
+//      authoritative Remote Git Safety Gate가 BLOCKED_REMOTE_GIT을 반환해도 그 분기는
+//      state.json을 다시 읽거나 쓰지 않으므로(§ autodev.ts), WAITING_HUMAN이 사람의 재확인
+//      없이 다음 실행이 자동으로 진행할 수 있는 "READY" 상태로 orphan된다. 이 사전 확인도
+//      Project Lock peek과 마찬가지로 최종 판정이 아니다 — 통과해도 그 사이 remote가 다시
+//      바뀔 수 있고, 그 최종 승부는 여전히 runAutodevOnce() 내부의 authoritative Gate가
+//      가른다(새 판정 로직을 만들지 않음 — checkRemoteSafeToStart()를 그대로 재사용).
 //
 // 이 중 하나라도 실패하면 WAITING_HUMAN 상태(state.status)를 그대로 둔 채(변경하지 않고)
 // BLOCKED를 반환한다 — 안전한 경우에만 state.status를 "READY"로 바꿔 다음 실행이 이 task를
@@ -124,6 +138,18 @@ export async function performAutoResume(
   const lockPeek = peekProjectLock(manifest.projectId, manifest.targetProjectRoot);
   if (lockPeek.locked) {
     return { kind: "BLOCKED", reason: `PROJECT_ALREADY_LOCKED: ${lockPeek.reason}` };
+  }
+
+  // 5) Remote Git Safety 사전 재확인 — Project Lock peek과 동일한 원칙으로, 아래
+  //    state.status READY 전환(쓰기)조차 remote가 이미 앞서 있다면 시도하지 않는다. 이
+  //    사전 확인이 없으면 runAutodevOnce()의 authoritative Gate가 BLOCKED_REMOTE_GIT을
+  //    반환해도 state.json을 다시 건드리지 않아 WAITING_HUMAN이 READY로 orphan된다(§ 파일
+  //    상단 주석 5)).
+  if (manifest.remoteGitSafety) {
+    const remotePreCheck = checkRemoteSafeToStart(cwd, resolveRemoteGitSafetyPolicy(manifest.remoteGitSafety));
+    if (!remotePreCheck.ok) {
+      return { kind: "BLOCKED", reason: `REMOTE_GIT_BLOCKED: ${remotePreCheck.reason}` };
+    }
   }
 
   // 안전 확인 완료 — WAITING_HUMAN을 벗어나 decideNextAction()이 이 미완료 task를 다시
