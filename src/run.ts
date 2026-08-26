@@ -4,6 +4,7 @@ import { runAutodevContinuous } from "./continuous-runner";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { loadState } from "./state";
 import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
+import { assertProductionRuntimeForContinuousLaunch } from "./runtime-origin";
 import { log } from "./logger";
 
 // AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체, Phase C Task C1 — project adapter
@@ -107,11 +108,22 @@ async function main(): Promise<void> {
   const manifest = loadProjectAdapter(resolveAdapterPathFromArgs());
   log("AutoDev 시작", { project: manifest.projectId, AUTOMATION_DRY_RUN: process.env.AUTOMATION_DRY_RUN ?? "(unset)" });
 
+  const continuous = isContinuousModeRequested();
+  // AutoDev 신뢰성 수정(2026-08-26) — continuous 모드는 controller를 띄우거나 실제 task를
+  // 시작하기 전, 어떤 부수효과도 만들지 않은 이 시점에 production runtime을 먼저 확인한다(§
+  // runtime-origin.ts assertProductionRuntimeForContinuousLaunch). one-shot 모드는 검사 대상이
+  // 아니다 — 기존 동작 그대로다.
+  const productionPreflight = assertProductionRuntimeForContinuousLaunch(continuous);
+  if (!productionPreflight.ok) {
+    console.error(`[run] FATAL: ${productionPreflight.reason}`);
+    process.exitCode = 1;
+    return;
+  }
+
   installShutdownHandlers();
   const controllerSupervisor = await ensureTelegramControllerStarted(manifest);
 
   try {
-    const continuous = isContinuousModeRequested();
     let result: AutodevRunResult;
     if (continuous) {
       const continuousResult = await runAutodevContinuous({ manifest });

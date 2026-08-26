@@ -47,6 +47,26 @@ const NO_SCOPE_CONFIGURED = ["__autodev_no_project_scope_configured__/"];
 
 export type DeveloperErrorCode = ClaudeErrorCode | "TASK_ACTION_LIMIT" | "PROTOCOL_ERROR" | "NO_PROGRESS_STAGNATION";
 
+// AutoDev 신뢰성 수정(2026-08-26, "JARVIS 재개 전 확인된 신뢰성 gap #2") — Claude CLI
+// TIMEOUT/일시적 프로세스 가용성 실패 하나만으로 즉시 WAITING_HUMAN으로 전환하지 않는다.
+// USAGE_LIMIT은 이미 runDeveloperTaskViaSafeExecutor 내부에서 자체적으로 훨씬 큰 예산
+// (DEVELOPER_USAGE_LIMIT_MAX_RETRIES=12회, 매회 30분 대기)으로 재시도하므로 여기서 다시
+// 재시도하지 않는다(중복 대기 방지) — orchestrator.ts의 isUsageLimitResult() 분기가 그
+// 결과를 이미 별도로 처리한다. AUTH_REQUIRED(사람 로그인 필요)/NON_ZERO_EXIT(실제 exit
+// code 실패 — 결정적 오류로 취급)/INVALID_OUTPUT(파싱 불가능한 응답)/
+// TRUSTED_EXECUTABLE_NOT_FOUND·EXECUTABLE_IDENTITY_UNTRUSTED·EXECUTABLE_SHADOWING_DETECTED
+// (실행 파일 신뢰 검증 실패 — 보안 성격, 무작정 재시도하면 안 됨)/TASK_ACTION_LIMIT·
+// PROTOCOL_ERROR·NO_PROGRESS_STAGNATION(Claude 자신의 결정적 동작 문제, 재시도해도 같은
+// 결과가 반복될 가능성이 높음)는 재시도 대상이 아니다 — 즉시 WAITING_HUMAN으로 넘어간다.
+export const DEVELOPER_TRANSIENT_ERROR_CODES: ReadonlySet<DeveloperErrorCode> = new Set<DeveloperErrorCode>([
+  "TIMEOUT",
+  "CLI_NOT_FOUND",
+]);
+
+export function isTransientDeveloperFailure(result: Pick<DeveloperResult, "success" | "errorCode">): boolean {
+  return !result.success && result.errorCode !== undefined && DEVELOPER_TRANSIENT_ERROR_CODES.has(result.errorCode);
+}
+
 export interface DeveloperResult {
   success: boolean;
   summary: string;
@@ -614,5 +634,66 @@ export async function runDeveloperTaskViaSafeExecutor(
     errorCode: "TASK_ACTION_LIMIT",
     deferredHumanTasks,
     ...usageFields(),
+  };
+}
+
+// initial attempt + 재시도 2회 = 총 3회(§ 요구사항 B "initial attempt / automatic retry #1 /
+// automatic retry #2"). 무한 재시도가 아니다 — 3회 모두 같은 종류의 transient 실패면 아래
+// exhausted 분기가 즉시 반환한다(추가 대기/재시도 없음).
+const DEVELOPER_TRANSIENT_MAX_ATTEMPTS = 3;
+// 1차 실패→15초, 2차 실패→30초 대기 후 재시도(gpt-reviewer.ts reviewClaudeResultWithRetry의
+// RETRY_WAITS_MS와 동일한 관례 — 점진적으로 늘어나는 짧은 대기).
+const DEVELOPER_TRANSIENT_RETRY_WAITS_MS = [15_000, 30_000];
+
+export interface DeveloperRetryDeps {
+  /** 테스트 전용 override — 기본은 항상 실제 runDeveloperTaskViaSafeExecutor. */
+  attempt?: (task: string, attempt: number, opts?: DeveloperTaskOptions) => Promise<DeveloperResult>;
+  /** 테스트 전용 override — 기본은 항상 실제 setTimeout 기반 대기. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * runDeveloperTaskViaSafeExecutor()를 감싸 TIMEOUT/CLI_NOT_FOUND처럼 명확히 일시적인 실패에
+ * 대해서만 짧게 재시도한다(§ isTransientDeveloperFailure) — orchestrator.ts는 이 함수가 반환한
+ * 최종 DeveloperResult 하나만 보므로, 재시도는 orchestrator 입장에서 완전히 투명하다(GPT
+ * reviewer 쪽 reviewClaudeResultWithRetry와 동일한 설계, § gpt-reviewer.ts). 재시도마다
+ * attempt()를 처음부터 다시 호출하므로 매 시도는 새 transcript로 시작하는 완전히 새로운
+ * stateless 호출이다(기존 --no-session-persistence 정책 그대로 유지 — 세션을 이어붙이지
+ * 않는다). 3회 모두 같은 종류의 transient 실패로 끝나면, 마지막 결과를 그대로 반환하되
+ * summary/deferredHumanTasks에 "반복된 일시적 실패로 사람 확인이 필요하다"는 사유를 명시적으로
+ * 남긴다 — orchestrator.ts는 이미 DeveloperResult.deferredHumanTasks를 성공/실패와 무관하게
+ * state.deferredHumanTasks에 병합하므로(§ orchestrator.ts claudeDeferred), 이 함수는
+ * orchestrator.ts/autodev.ts를 전혀 건드리지 않고도 WAITING_HUMAN 전환 시 그 사유가 승인
+ * 기록/Telegram 알림에 그대로 드러나게 한다.
+ */
+export async function runDeveloperTaskWithRetry(
+  task: string,
+  attempt: number,
+  opts: DeveloperTaskOptions = {},
+  retryDeps: DeveloperRetryDeps = {}
+): Promise<DeveloperResult> {
+  const attemptFn = retryDeps.attempt ?? runDeveloperTaskViaSafeExecutor;
+  const sleep = retryDeps.sleep ?? defaultDeveloperSleep;
+
+  let last: DeveloperResult | undefined;
+  for (let i = 0; i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS; i++) {
+    const result = await attemptFn(task, attempt, opts);
+    last = result;
+    if (!isTransientDeveloperFailure(result)) return result;
+    log(`developer transient 실패(${result.errorCode}) — 시도 ${i + 1}/${DEVELOPER_TRANSIENT_MAX_ATTEMPTS} 실패, 재시도 예정`);
+    if (i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS - 1) await sleep(DEVELOPER_TRANSIENT_RETRY_WAITS_MS[i]);
+  }
+
+  const exhausted = last as DeveloperResult;
+  log(
+    `developer transient 재시도 소진(${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회, 마지막 오류=${exhausted.errorCode}) — WAITING_HUMAN으로 넘어갑니다`
+  );
+  return {
+    ...exhausted,
+    summary: `Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류(${exhausted.errorCode})로 실패했습니다 — 반복된 timeout/일시적 실패로 사람 확인이 필요합니다. 마지막 오류: ${exhausted.summary}`,
+    deferredHumanTasks: [
+      ...(exhausted.deferredHumanTasks ?? []),
+      `DEVELOPER_TRANSIENT_RETRY_EXHAUSTED(${exhausted.errorCode}): Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류로 응답하지 못했습니다.`,
+    ],
   };
 }

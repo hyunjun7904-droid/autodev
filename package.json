@@ -97,6 +97,7 @@
     "test:self-dev-completion-hook": "npm run build && node dist/self-dev-completion-hook-tests.js",
     "test:self-dev-terminal-status": "npm run build && node dist/self-dev-terminal-status-tests.js",
     "test:runtime-origin": "npm run build && node dist/runtime-origin-tests.js",
+    "test:claude-developer-retry": "npm run build && node dist/claude-developer-retry-tests.js",
     "test:full-regression-runner": "npm run build && node dist/full-regression-runner-tests.js",
     "test:generic-launch-readiness-e2e": "npm run build && node dist/generic-launch-readiness-e2e-tests.js",
     "telegram-smoke-test": "npm run build && node dist/telegram-smoke-test.js",

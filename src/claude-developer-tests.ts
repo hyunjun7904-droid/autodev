@@ -721,11 +721,21 @@ function scenarioS_sourceRegressionProductionPathCannotBypassSafeExecutor(): voi
     validateAndExecuteCallSites === 2
   );
 
-  // 4) production 경로(AUTOMATION_DRY_RUN="false")는 runDeveloperTaskViaSafeExecutor만
-  //    선택한다 — orchestrator.ts가 다른 runner로 조용히 대체되지 않았는지 확인한다.
+  // 4) production 경로(AUTOMATION_DRY_RUN="false")는 runDeveloperTaskWithRetry(TIMEOUT/
+  //    CLI_NOT_FOUND 같은 transient 실패만 재시도하는 얇은 wrapper, § AutoDev 신뢰성 수정
+  //    2026-08-26)만 선택한다 — orchestrator.ts가 다른 runner로 조용히 대체되지 않았는지
+  //    확인한다.
   check(
-    "소스 회귀(C4.1): orchestrator.ts의 selectDefaultClaudeRunner가 dry-run=false일 때 runDeveloperTaskViaSafeExecutor를 씀",
-    /AUTOMATION_DRY_RUN\s*!==\s*"false"[\s\S]{0,80}return[\s\S]{0,200}runDeveloperTaskViaSafeExecutor/.test(orchestratorSource)
+    "소스 회귀: orchestrator.ts의 selectDefaultClaudeRunner가 dry-run=false일 때 runDeveloperTaskWithRetry를 씀",
+    /AUTOMATION_DRY_RUN\s*!==\s*"false"[\s\S]{0,80}return[\s\S]{0,200}runDeveloperTaskWithRetry/.test(orchestratorSource)
+  );
+
+  // 5) 그 wrapper(runDeveloperTaskWithRetry) 자신도 실제 작업은 여전히
+  //    runDeveloperTaskViaSafeExecutor(Safe Executor 경유)에만 위임한다 — 재시도 정책이
+  //    Safe Executor를 우회하는 새 실행 경로를 만들지 않았는지 확인한다.
+  check(
+    "소스 회귀: claude-developer.ts의 runDeveloperTaskWithRetry 기본 attempt는 runDeveloperTaskViaSafeExecutor",
+    /retryDeps\.attempt\s*\?\?\s*runDeveloperTaskViaSafeExecutor/.test(claudeDeveloperSource)
   );
 }
 

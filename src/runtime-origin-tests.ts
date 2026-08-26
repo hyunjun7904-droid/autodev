@@ -1,4 +1,4 @@
-import { isProductionRuntime } from "./runtime-origin";
+import { isProductionRuntime, assertProductionRuntimeForContinuousLaunch } from "./runtime-origin";
 
 // Production Runtime Origin Gate 테스트 — 2026-08-22 incident 대응. isProductionRuntime()이
 // AUTOMATION_DRY_RUN="false"와 AUTODEV_PRODUCTION_RUNTIME="true" 둘 다 명시적으로 참일
@@ -48,9 +48,39 @@ function scenarioFailClosedEvenWithLooseTruthyValues(): void {
   withEnv("False", "true", () => check("9) AUTOMATION_DRY_RUN='False'(대소문자 다름) → false(정확히 'false' 문자열만 허용)", isProductionRuntime() === false));
 }
 
+// AutoDev 신뢰성 수정(2026-08-26, Part A) — continuous 모드 fail-fast preflight 검증.
+// "5. Production continuous run uses persistent EventStore/approval path"의 전제 조건 —
+// continuous=true인데 isProductionRuntime()이 false면 시작 자체가 막혀야 하고, 시작이
+// 막히지 않는 모든 경우(one-shot 전부 + continuous인데 production runtime도 참인 경우)는
+// ok:true여야 한다.
+function scenarioContinuousLaunchPreflight(): void {
+  withEnv(undefined, undefined, () => {
+    const r = assertProductionRuntimeForContinuousLaunch(true);
+    check("10) continuous=true, 둘 다 미설정 → BLOCK(ok:false)", r.ok === false);
+    check("10b) BLOCK 사유에 '두 환경변수'/production 안내가 담김", r.ok === false && r.reason.length > 0);
+  });
+  withEnv("false", undefined, () => {
+    const r = assertProductionRuntimeForContinuousLaunch(true);
+    check("11) continuous=true, AUTOMATION_DRY_RUN만 false → BLOCK(ok:false)", r.ok === false);
+  });
+  withEnv("false", "true", () => {
+    const r = assertProductionRuntimeForContinuousLaunch(true);
+    check("12) continuous=true, 둘 다 명시적으로 참(start-autodev.ps1과 동일) → ok:true", r.ok === true);
+  });
+  withEnv(undefined, undefined, () => {
+    const r = assertProductionRuntimeForContinuousLaunch(false);
+    check("13) continuous=false(one-shot), production runtime 미설정 → 검사 대상 아님(ok:true, 기존 동작 보존)", r.ok === true);
+  });
+  withEnv("true", "true", () => {
+    const r = assertProductionRuntimeForContinuousLaunch(true);
+    check("14) continuous=true, AUTOMATION_DRY_RUN='true'(dry-run 명시) + PRODUCTION_RUNTIME=true → 여전히 BLOCK", r.ok === false);
+  });
+}
+
 function main(): void {
   scenarioTruthTable();
   scenarioFailClosedEvenWithLooseTruthyValues();
+  scenarioContinuousLaunchPreflight();
 
   console.log("\n=== runtime-origin.ts 테스트 결과 ===");
   for (const r of results) console.log(r);

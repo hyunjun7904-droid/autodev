@@ -1,6 +1,6 @@
 import { loadState, saveState, DEFAULT_STATE_PATH } from "./state";
 import { runClaudeTask as fakeRunClaudeTask } from "./fake-claude-runner";
-import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
+import { runDeveloperTaskWithRetry } from "./claude-developer";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
 import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
@@ -127,7 +127,12 @@ function isUsageLimitResult(result: ClaudeResult): boolean {
 // 모든 파일/명령 접근은 safe-executor.ts가 코드로 검증한다(§ claude-developer.ts).
 function selectDefaultClaudeRunner(): (task: string, attempt: number) => Promise<ClaudeResult> {
   if (process.env.AUTOMATION_DRY_RUN !== "false") return fakeRunClaudeTask;
-  return (task: string, attempt: number) => runDeveloperTaskViaSafeExecutor(task, attempt);
+  // AutoDev 신뢰성 수정(2026-08-26) — autodev.ts와 동일하게 TIMEOUT/CLI_NOT_FOUND 같은 일시적
+  // 실패를 즉시 WAITING_HUMAN으로 넘기지 않고 재시도한다(§ claude-developer.ts
+  // runDeveloperTaskWithRetry). deps.claudeRunner를 명시적으로 지정하지 않은 호출부(테스트는
+  // 항상 명시적으로 지정하거나 AUTOMATION_DRY_RUN을 "false"로 두지 않으므로 영향 없음)를 위한
+  // fallback이다.
+  return (task: string, attempt: number) => runDeveloperTaskWithRetry(task, attempt);
 }
 function selectDefaultGptReviewer(executor?: SafeExecutorContext): (
   result: ClaudeResult,

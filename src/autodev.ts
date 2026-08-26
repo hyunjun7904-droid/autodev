@@ -2,7 +2,7 @@ import { relative, sep } from "node:path";
 import { loadState, saveState } from "./state";
 import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
-import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
+import { runDeveloperTaskWithRetry } from "./claude-developer";
 import type { DeveloperProjectContext } from "./claude-developer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
@@ -730,8 +730,14 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       rulesPath: manifest.rulesPath,
     };
 
+    // AutoDev 신뢰성 수정(2026-08-26) — runDeveloperTaskViaSafeExecutor를 직접 부르지 않고
+    // runDeveloperTaskWithRetry로 감싼다. TIMEOUT/CLI_NOT_FOUND처럼 명확히 일시적인 실패는
+    // 최대 2회까지 자동 재시도(총 3회 시도)한 뒤에도 계속되면 그때 실패로 반환한다(§
+    // claude-developer.ts isTransientDeveloperFailure) — orchestrator.ts는 이 재시도를
+    // 전혀 모른 채 최종 결과 하나만 받으므로 기존 REVISE/WAITING_HUMAN 상태 머신은 손대지
+    // 않는다.
     const defaultClaudeRunner = (task: string, attempt: number) =>
-      runDeveloperTaskViaSafeExecutor(task, attempt, {
+      runDeveloperTaskWithRetry(task, attempt, {
         requiredTests: taskDef.requiredTests,
         allowedPathPrefixes: taskDef.allowedPathPrefixes,
         projectContext: developerContext,
