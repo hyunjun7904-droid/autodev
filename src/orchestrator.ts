@@ -8,6 +8,7 @@ import type { ReviewBaseline } from "./review-baseline";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
+import { computeFailureFingerprint, classifyFailureCategory, createStagnationTracker } from "./failure-stagnation";
 import { buildTestSummary, isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import type { EventStore } from "./event-store";
@@ -240,6 +241,9 @@ export async function runOrchestrator(
   // gptRawCallTotal과 동일한 이유로 project-state.json에 저장하지 않는다 — § review-baseline.ts
   // 상단 주석). 첫 round는 항상 undefined(FULL)로 시작한다.
   let reviewBaseline: ReviewBaseline | undefined;
+  // Phase 6 — 같은 실패가 reviewCycle 내내 반복되는지 감지하는 loop-local tracker(위
+  // gptCallCount와 동일하게 project-state.json에 영속화하지 않는다).
+  const stagnationTracker = createStagnationTracker();
 
   while (true) {
     setStatus("CLAUDE_WORKING");
@@ -356,6 +360,24 @@ export async function runOrchestrator(
     // 그대로 쓴다(Phase F Task F4) — agent-orchestrator.ts(F2/F3)의 REVISE loop도 동일한
     // 함수를 쓰므로 두 실행경로의 판정이 서로 달라질 위험이 없다.
     const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
+
+    // Phase 6 — 같은 required test 실패가 반복되는지 deterministic fingerprint로 감지한다.
+    // 5회 REVISE 제한 자체는 바꾸지 않는다 — 반복이 처음 확인되는 시점(2회 연속)에 그
+    // 사실과 보수적으로 분류된 category를 deferredHumanTasks에 남겨, 사람이 나중에
+    // WAITING_HUMAN을 받았을 때 "무엇이 반복됐는지" 바로 알 수 있게 한다.
+    if (requiredTestsFailed) {
+      const claudeErrorCode = (claudeResult as ClaudeResult & { errorCode?: string }).errorCode;
+      const fingerprint = computeFailureFingerprint(deps.taskId ?? task, claudeResult.tests);
+      const repeatCount = stagnationTracker.observe(fingerprint);
+      if (repeatCount === 2) {
+        const category = classifyFailureCategory(claudeErrorCode, gptResult.errorCode, claudeResult.tests);
+        log("STAGNATION_DETECTED — 동일한 required test 실패가 반복됨", { category, reviewCycle: state.reviewCycle });
+        state.deferredHumanTasks.push(
+          `STAGNATION_DETECTED(${category}): reviewCycle=${state.reviewCycle}에서 동일한 required test 실패가 2회 연속 반복됨`
+        );
+      }
+    }
+
     const decision = applyReviewDecisionPolicy(gptResult, requiredTestsFailed);
     if (decision !== gptResult.decision) {
       log("Core 안전장치가 GPT decision을 override함", {

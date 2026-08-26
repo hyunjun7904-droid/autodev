@@ -2,7 +2,24 @@ export interface ClaudeResult {
   success: boolean;
   summary: string;
   changedFiles: string[];
-  tests: { name: string; pass: boolean }[];
+  tests: {
+    name: string;
+    pass: boolean;
+    /**
+     * AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+     * 실패한 required test가 실제로 실행됐고 evidence가 있을 때만 채운다(성공한 테스트나
+     * "명령 자체를 실행하지 못함" 같은 경우는 생략 — 추측성 값을 만들지 않는다). exitCode/
+     * stderr·stdout 꼬리(마지막 부분 — assertion/error가 보통 끝에 있다)는 이미
+     * safe-executor.ts가 sanitizeForLog로 secret을 redact하고 20,000자로 자른 값을 다시
+     * bounded 크기로만 보존한다. "pass=false"만 남기고 원인을 버리지 않기 위한 필드다.
+     */
+    failureEvidence?: {
+      command: string;
+      exitCode?: number | null;
+      stderrTail?: string;
+      stdoutTail?: string;
+    };
+  }[];
   rawOutput: string;
   /** Phase G Task G3.1 — 실제 Claude CLI JSON 출력(§ claude-runner.ts parseClaudeJsonOutput)이
    *  제공한 경우만 채운다. 제공하지 않으면 undefined(추정하지 않음). */

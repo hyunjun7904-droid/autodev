@@ -71,7 +71,13 @@ export interface DeveloperResult {
   success: boolean;
   summary: string;
   changedFiles: string[];
-  tests: { name: string; pass: boolean }[];
+  tests: {
+    name: string;
+    pass: boolean;
+    /** Phase 5 — 실패한 required test의 실제 근거(command/exitCode/stdout·stderr 꼬리).
+     *  § types.ts ClaudeResult.tests의 동일 필드와 구조를 맞춘다. */
+    failureEvidence?: { command: string; exitCode?: number | null; stderrTail?: string; stdoutTail?: string };
+  }[];
   rawOutput: string;
   errorCode?: DeveloperErrorCode;
   deferredHumanTasks?: string[];
@@ -255,18 +261,50 @@ function getActualChangedFiles(scopeDirs: string[], executor: SafeExecutorContex
   return all.map((c) => c.path);
 }
 
+// Phase 5 — required test가 실제로 실행됐다면(denyReason이 아니라 실제 spawn 결과) 그
+// stdout/stderr의 "꼬리"(마지막 부분)를 보존한다. assertion/error 메시지는 보통 출력의
+// 끝부분에 나온다 — 전체를 다 보내면 다음 라운드/Reviewer 프롬프트가 불필요하게 커지므로
+// bounded 크기로만 자른다(safe-executor.ts가 이미 20,000자로 자르고 secret을 redact한
+// 값을 다시 여기서 4,000자로 좁힌다).
+const FAILURE_EVIDENCE_TAIL_CHARS = 4_000;
+function tailChars(s: string | undefined, max: number): string | undefined {
+  if (!s) return undefined;
+  return s.length > max ? s.slice(-max) : s;
+}
+
 async function runRequiredTests(
   requiredTests: RequiredTestCommand[] | undefined,
   executor: SafeExecutorContext | undefined
-): Promise<{ name: string; pass: boolean }[]> {
+): Promise<DeveloperResult["tests"]> {
   if (!requiredTests || requiredTests.length === 0) return [];
   const doValidateAndExecute = executor?.validateAndExecute ?? validateAndExecute;
-  const results: { name: string; pass: boolean }[] = [];
+  const results: DeveloperResult["tests"] = [];
   for (const t of requiredTests) {
     const res = await doValidateAndExecute({ type: "RUN_COMMAND", command: t.command, args: t.args, cwd: t.cwd });
-    results.push({ name: t.name, pass: res.ok });
-    if (!res.ok) {
-      log(`필수 테스트 실패(${t.name})`, { command: t.command, args: t.args, cwd: t.cwd, denyReason: res.denyReason });
+    if (res.ok) {
+      results.push({ name: t.name, pass: true });
+      continue;
+    }
+    log(`필수 테스트 실패(${t.name})`, { command: t.command, args: t.args, cwd: t.cwd, denyReason: res.denyReason });
+    const commandLabel = [t.command, ...t.args].join(" ");
+    // res.data는 실제로 명령이 spawn되어 실행됐을 때만 exitCode/stdout/stderr를 담는다(§
+    // safe-executor.ts executeRunCommand) — Command Safety Gate가 애초에 명령을 막았으면
+    // (denyReason만 있고 data는 없음) 그 사실 자체가 이미 인프라 원인이므로 없는 stdout/
+    // stderr를 지어내지 않는다.
+    const data = res.data as { exitCode?: number | null; stdout?: string; stderr?: string } | undefined;
+    if (data && (typeof data.exitCode === "number" || data.exitCode === null)) {
+      results.push({
+        name: t.name,
+        pass: false,
+        failureEvidence: {
+          command: commandLabel,
+          exitCode: data.exitCode,
+          stderrTail: tailChars(data.stderr, FAILURE_EVIDENCE_TAIL_CHARS),
+          stdoutTail: tailChars(data.stdout, FAILURE_EVIDENCE_TAIL_CHARS),
+        },
+      });
+    } else {
+      results.push({ name: t.name, pass: false });
     }
   }
   return results;

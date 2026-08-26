@@ -52,6 +52,39 @@ async function main(): Promise<void> {
   const clean = sanitizeForLog(dirtyRaw);
   check("secret sanitize: rawOutput 마스킹", !clean.includes("leak-if-not-masked-999") && clean.includes("[REDACTED]"));
 
+  // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 8 —
+  // password/generic secret/credential key와 key 없이 단독으로 등장하는 Bearer 토큰도
+  // 마스킹되는지 확인한다(§ logger.ts REDACT_KEYS/BEARER_TOKEN_PATTERN).
+  const dirtyPassword = '{"username":"svc","password":"do-not-leak-pw-777"}';
+  const cleanPassword = sanitizeForLog(dirtyPassword);
+  check(
+    "secret sanitize: password 필드 마스킹",
+    !cleanPassword.includes("do-not-leak-pw-777") && cleanPassword.includes("[REDACTED]")
+  );
+
+  const dirtySecret = '{"client":"jarvis","secret":"do-not-leak-secret-888"}';
+  const cleanSecret = sanitizeForLog(dirtySecret);
+  check(
+    "secret sanitize: 일반 secret 필드 마스킹",
+    !cleanSecret.includes("do-not-leak-secret-888") && cleanSecret.includes("[REDACTED]")
+  );
+
+  const dirtyBearerHeader = "curl -H \"Authorization: Bearer do-not-leak-bearer-token-999abcXYZ\" https://api.example.com";
+  const cleanBearerHeader = sanitizeForLog(dirtyBearerHeader);
+  check(
+    "secret sanitize: 'Authorization: Bearer <token>' 형태(key 매칭)도 마스킹됨",
+    !cleanBearerHeader.includes("do-not-leak-bearer-token-999abcXYZ")
+  );
+
+  // key:value 형태가 전혀 아니라 "Bearer <token>"만 문자열 안에 단독으로 등장하는 경우
+  // (예: 다른 프로세스의 curl 커맨드 로그를 그대로 남기는 경우)까지 방어한다.
+  const dirtyBearerBare = "요청 헤더 복사: Bearer do-not-leak-bare-bearer-token-1234567890";
+  const cleanBearerBare = sanitizeForLog(dirtyBearerBare);
+  check(
+    "secret sanitize: key 없이 단독으로 등장하는 'Bearer <token>'도 마스킹됨",
+    !cleanBearerBare.includes("do-not-leak-bare-bearer-token-1234567890") && cleanBearerBare.includes("Bearer [REDACTED]")
+  );
+
   // CLI_NOT_FOUND — 실제 존재하지 않는 커맨드로 진짜 spawn ENOENT 경로를 검증한다
   // (claude CLI는 호출하지 않음 — 완전히 별개의 안전한 커맨드명).
   const notFound = await execAndClassify("movan-automation-nonexistent-binary-xyz123", [], 5000);

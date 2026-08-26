@@ -32,7 +32,14 @@ import type { RequiredTestCommand } from "./task-registry";
 const TEST_EXECUTION_POLICY: ProjectExecutionPolicy = {
   allowedReadPrefixes: ["automation/"],
   allowedWritePrefixes: ["automation/"],
-  allowedCommands: [{ cwd: "root", command: "git", args: ["status", "--short"] }],
+  allowedCommands: [
+    { cwd: "root", command: "git", args: ["status", "--short"] },
+    // Phase 5 회귀(scenarioT) 전용 — read-only("show")로 허용되면서도 존재하지 않는 ref를
+    // 가리켜 실제로 spawn된 뒤 nonzero exit로 실패하는 명령. 이 exact-match 항목이 없으면
+    // Command Safety Gate 이전 단계(project policy.allowedCommands)에서 거부되어 애초에
+    // spawn되지 않는다(§ 이 경우 res.data 자체가 없다 — H 시나리오와 동일한 이유).
+    { cwd: "root", command: "git", args: ["show", "refs/does-not-exist-xyz-autodev-test"] },
+  ],
 };
 
 function makeIsolatedTestRoot(): string {
@@ -357,6 +364,33 @@ async function scenarioH_requiredTestFailureReflectedForReal(): Promise<void> {
   check("H: success=true(TASK_COMPLETE 자체는 성공)", result.success === true);
   check("H: 정상 명령은 pass=true", result.tests.find((t) => t.name === "root:git-status")?.pass === true);
   check("H: allow-list 밖 명령은 pass=false로 실제 반영됨", result.tests.find((t) => t.name === "misconfigured:not-allowed")?.pass === false);
+}
+
+async function scenarioT_requiredTestFailureEvidencePropagated(): Promise<void> {
+  // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+  // required test가 실제로 spawn되어 실패하면 "pass=false"만 남기지 않고 실제 exitCode/
+  // stderr 꼬리를 보존해야 한다(§ 요구사항 — Reviewer/다음 Developer 라운드가 원인을
+  // 추측하지 않도록). "git show <존재하지 않는 ref>"는 read-only로 허용되면서도(Core
+  // Command Safety Gate 통과) 실제로 spawn되어 실패하는 명령이다.
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "성공했다고 주장", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([taskComplete]);
+  const requiredTests: RequiredTestCommand[] = [
+    { name: "root:git-show-missing-ref", command: "git", args: ["show", "refs/does-not-exist-xyz-autodev-test"], cwd: "root" },
+  ];
+
+  const result = await runDeveloperTaskViaSafeExecutor("필수 테스트 실행 시나리오(실패 근거 보존)", 1, {
+    claudeCaller: scripted.call,
+    requiredTests,
+  });
+
+  const t = result.tests.find((x) => x.name === "root:git-show-missing-ref");
+  check("T: 실제 exitCode 기준으로 pass=false", t?.pass === false);
+  check("T: failureEvidence.command에 실제 실행한 명령이 그대로 담김", t?.failureEvidence?.command === "git show refs/does-not-exist-xyz-autodev-test");
+  check(
+    "S: failureEvidence.exitCode가 0이 아닌 실제 값으로 보존됨(추측/생략 아님)",
+    typeof t?.failureEvidence?.exitCode === "number" && t.failureEvidence.exitCode !== 0
+  );
+  check("T: failureEvidence.stderrTail에 실제 git 에러 메시지가 보존됨", (t?.failureEvidence?.stderrTail ?? "").length > 0);
 }
 
 async function scenarioI_lockBlocksReadThenWriteSucceeds(): Promise<void> {
@@ -761,6 +795,7 @@ async function main(): Promise<void> {
     await scenarioF_planThenWriteSucceeds();
     await scenarioG_requiredTestsExecutedForReal();
     await scenarioH_requiredTestFailureReflectedForReal();
+    await scenarioT_requiredTestFailureEvidencePropagated();
     await scenarioI_lockBlocksReadThenWriteSucceeds();
     await scenarioJ_lockBlocksContinuedReadUntilStagnation();
     await scenarioK_lockPlanOnceThenWriteSucceeds();

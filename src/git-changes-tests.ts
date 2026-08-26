@@ -189,6 +189,13 @@ function scenarioBoundedFileSnapshotTruncation(): void {
     "Case3) 훨씬 큰 파일도 omitted_chars가 truncated 상태를 명시적으로 나타냄(0이 아님)",
     /omitted_chars=([1-9]\d*)/.test(hugeResult.content)
   );
+
+  // Case 4 — AutoDev / JARVIS Unattended Continuous Development Reliability Hardening
+  // Phase 7 요구사항 7 — 결정론적(no LLM) 순수 함수이므로 동일 입력에는 항상 동일 출력을
+  // 내야 한다(reviewer가 매 round 다른 snapshot을 받아 불필요하게 REVISE를 반복하지 않도록).
+  const repeat1 = buildBoundedFileSnapshot(oversized, cap);
+  const repeat2 = buildBoundedFileSnapshot(oversized, cap);
+  check("Case4) 동일 입력을 두 번 호출해도 완전히 동일한 snapshot을 생성함(결정론적)", repeat1.content === repeat2.content && repeat1.truncated === repeat2.truncated);
 }
 
 function main(): void {

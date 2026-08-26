@@ -490,7 +490,22 @@ export function buildReviewInput(
   consistencySnapshot: Record<string, ReviewFileState>;
 } {
   const access = resolveFileAccess(executor);
-  const testsSummary = result.tests.map((t) => `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`).join("\n") || "(없음)";
+  // Phase 5 — 실패한 required test의 실제 근거(exitCode/stdout·stderr 꼬리)가 있으면 함께
+  // 전달한다. "pass=false"만 보고 REVISE를 반복하지 않고, Developer/Reviewer 모두 실제
+  // 원인(CONFIGURATION_ERROR/TEST_LOGIC_ERROR/IMPLEMENTATION_ERROR)을 추측 없이 판단할 수
+  // 있게 한다(§ claude-developer.ts runRequiredTests).
+  const testsSummary =
+    result.tests
+      .map((t) => {
+        const header = `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`;
+        if (t.pass || !t.failureEvidence) return header;
+        const ev = t.failureEvidence;
+        const parts = [`  command: ${ev.command}`, `  exitCode: ${ev.exitCode ?? "(none)"}`];
+        if (ev.stderrTail) parts.push(`  stderr(tail):\n${ev.stderrTail}`);
+        if (ev.stdoutTail) parts.push(`  stdout(tail):\n${ev.stdoutTail}`);
+        return [header, ...parts].join("\n");
+      })
+      .join("\n") || "(없음)";
   const { text: changeSection, scopeViolations, mode, newBaseline, consistencySnapshot } = buildReviewPayload(
     task,
     reviewCycle,
