@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
-import { PROJECT_ROOT, configureSafeExecutor } from "./safe-executor";
+import { PROJECT_ROOT, configureSafeExecutor, createSafeExecutorContext } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { RealClaudeResult, ClaudeErrorCode } from "./claude-runner";
 import type { RequiredTestCommand } from "./task-registry";
@@ -391,6 +391,78 @@ async function scenarioT_requiredTestFailureEvidencePropagated(): Promise<void> 
     typeof t?.failureEvidence?.exitCode === "number" && t.failureEvidence.exitCode !== 0
   );
   check("T: failureEvidence.stderrTail에 실제 git 에러 메시지가 보존됨", (t?.failureEvidence?.stderrTail ?? "").length > 0);
+}
+
+async function scenarioAB_selfRepairsMissingRequiredTestScriptAtTaskComplete(): Promise<void> {
+  // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+  // 이 task의 required test npm script가 아직 package.json에 등록돼 있지 않은 채로
+  // attempt가 시작돼도(§ 새 task를 막 시작하는 정상 상태 — 구현 전에는 그 npm script가
+  // 가리킬 실제 테스트 파일 자체가 아직 없다), Claude가 이 attempt 안에서 그 파일을 실제로
+  // 만들면 TASK_COMPLETE 시점에 required-test-preflight.ts의 기존 판정/복구 함수(§
+  // checkRequiredTestScriptRegistration/attemptSafeRequiredTestScriptRepair/
+  // commitRequiredTestScriptRepair — 새로 만들지 않고 그대로 재사용)가 package.json에
+  // 그 스크립트를 자동으로 등록하고 별도 git commit으로 확정한 뒤, 곧바로 실행되는 required
+  // test도 실제로 통과해야 한다 — 이 전체 과정이 추가 REVISE 라운드 없이 같은 attempt(정확히
+  // 2라운드: WRITE_FILE → TASK_COMPLETE) 안에서 끝나야 한다. task 이름/npm script 이름을
+  // 임의로 하드코딩한 특정 task 전용 처리가 아님을 보이기 위해 "proj-feature"라는, 이
+  // 저장소의 어떤 실제 task와도 무관한 이름을 쓴다.
+  const root = mkdtempSync(join(tmpdir(), "claude-developer-self-repair-"));
+  try {
+    spawnSync("git", ["init", "-q"], { cwd: root });
+    spawnSync("git", ["config", "user.email", "claude-developer-tests@example.com"], { cwd: root });
+    spawnSync("git", ["config", "user.name", "Claude Developer Tests"], { cwd: root });
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "self-repair-fixture", scripts: {} }, null, 2) + "\n", "utf-8");
+    spawnSync("git", ["add", "--", "package.json"], { cwd: root });
+    spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: root });
+
+    const policy: ProjectExecutionPolicy = {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: [{ cwd: "root", command: "npm", args: ["run", "test:proj-feature"] }],
+    };
+    const executor = createSafeExecutorContext(root, policy);
+
+    const writeTestFile = JSON.stringify({
+      type: "ACTION_REQUEST",
+      actions: [{ type: "WRITE_FILE", path: "proj/proj-feature.test.mjs", content: "process.exit(0);\n" }],
+    });
+    const taskComplete = JSON.stringify({
+      type: "TASK_COMPLETE",
+      summary: "proj-feature 구현 및 테스트 파일 생성 완료",
+      changedFiles: ["proj/proj-feature.test.mjs"],
+      testsRequested: [],
+    });
+    const scripted = makeScriptedClaudeCaller([writeTestFile, taskComplete]);
+
+    const requiredTests: RequiredTestCommand[] = [
+      { name: "proj-feature-tests", command: "npm", args: ["run", "test:proj-feature"], cwd: "root" },
+    ];
+
+    const result = await runDeveloperTaskViaSafeExecutor("자체 복구 시나리오(required test script 자동 등록, 향후 임의 task에 공통 적용)", 1, {
+      claudeCaller: scripted.call,
+      requiredTests,
+      allowedPathPrefixes: ["proj/"],
+      executor,
+    });
+
+    check("AB: 추가 REVISE 라운드 없이 정확히 2라운드(WRITE_FILE → TASK_COMPLETE)만 소모", scripted.callCount() === 2);
+    check("AB: TASK_COMPLETE 자체는 성공", result.success === true);
+    check(
+      "AB: required test(npm run test:proj-feature)가 실제로 pass=true로 반영됨(자동 등록 후 실제 실행)",
+      result.tests.find((t) => t.name === "proj-feature-tests")?.pass === true
+    );
+
+    const pkgAfter = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    check(
+      "AB: package.json에 test:proj-feature 스크립트가 실제로 등록됨(node proj/proj-feature.test.mjs)",
+      pkgAfter.scripts["test:proj-feature"] === "node proj/proj-feature.test.mjs"
+    );
+
+    const log = (spawnSync("git", ["log", "--oneline"], { cwd: root, encoding: "utf-8" }).stdout || "").trim();
+    check("AB: package.json 등록이 별도 git commit으로 확정됨(init 포함 2건)", log.split("\n").length === 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function scenarioI_lockBlocksReadThenWriteSucceeds(): Promise<void> {
@@ -919,6 +991,7 @@ async function main(): Promise<void> {
     await scenarioG_requiredTestsExecutedForReal();
     await scenarioH_requiredTestFailureReflectedForReal();
     await scenarioT_requiredTestFailureEvidencePropagated();
+    await scenarioAB_selfRepairsMissingRequiredTestScriptAtTaskComplete();
     await scenarioI_lockBlocksReadThenWriteSucceeds();
     await scenarioJ_lockBlocksContinuedReadUntilStagnation();
     await scenarioK_lockPlanOnceThenWriteSucceeds();

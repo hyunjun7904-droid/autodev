@@ -51,7 +51,7 @@ type PackageJsonScriptsResult =
   | { ok: true; scripts: Record<string, unknown> }
   | { ok: false; reason: string };
 
-function readPackageJsonScripts(projectRoot: string): PackageJsonScriptsResult {
+export function readPackageJsonScripts(projectRoot: string): PackageJsonScriptsResult {
   const pkgPath = join(projectRoot, "package.json");
   let raw: string;
   try {
@@ -115,6 +115,46 @@ export function checkRequiredTestScriptRegistration(
     }
   }
   return { ok: issues.length === 0, issues, skippedUnsupportedCwd };
+}
+
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+// Stale REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN Reconciliation.
+//
+// checkRequiredTestScriptRegistration()이 예전(이 Phase 5 이전) 실행에서 "npm script
+// 미등록"을 이유로 state.deferredHumanTasks에 남긴 고정 템플릿 문자열을 다시 파싱해, 그
+// 사유가 *지금도* 유효한지 재확인한다. 사람의 판단이 필요한 다른 어떤 사유(SECURITY_BLOCKED/
+// REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED/CHECKPOINT_SCOPE_VIOLATION/HUMAN_FINAL_REVIEW_PENDING/
+// AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT/REMOTE_GIT_CHANGED_DURING_RUN 등)는 이 정규식과
+// 전혀 다른 문자열이므로 매칭되지 않는다 — 배열 안에 이 형태가 아닌 항목이 단 하나라도 섞여
+// 있으면 fail-closed로 전체를 "해소되지 않음"으로 취급한다(어떤 실제 사람 판단 필요 상태도
+// 이 재검사로 조용히 해제되지 않는다).
+const REQUIRED_TEST_CONFIG_ERROR_ENTRY_PATTERN = /^REQUIRED_TEST_CONFIGURATION_ERROR: task=\S+ requiredTest=\S+ missingScript=(\S+)$/;
+
+export interface StaleRequiredTestConfigReconciliation {
+  /** true면 deferredHumanTasks 전체가 REQUIRED_TEST_CONFIGURATION_ERROR 형태였고, 그
+   *  각각이 가리키는 npm script가 지금은 전부 package.json에 등록돼 있다 — 호출부가
+   *  안전하게 WAITING_HUMAN을 해제하고 이 배열을 비울 수 있다. */
+  resolved: boolean;
+}
+
+/** state.status==="WAITING_HUMAN"이고 state.humanFinalReview가 없을 때만 호출한다(그 gate는
+ *  이 함수가 전혀 모르는 별도의, 사람의 명시적 승인이 필요한 상태다 — 호출부가 그 조건을
+ *  먼저 확인해야 한다). npm/claude 어떤 프로세스도 spawn하지 않는 순수 fs 판정이다. */
+export function reconcileStaleRequiredTestConfigurationTasks(
+  deferredHumanTasks: readonly string[],
+  projectRoot: string
+): StaleRequiredTestConfigReconciliation {
+  if (deferredHumanTasks.length === 0) return { resolved: false };
+  const scripts: string[] = [];
+  for (const entry of deferredHumanTasks) {
+    const m = REQUIRED_TEST_CONFIG_ERROR_ENTRY_PATTERN.exec(entry);
+    if (!m) return { resolved: false };
+    scripts.push(m[1]);
+  }
+  const pkg = readPackageJsonScripts(projectRoot);
+  if (!pkg.ok) return { resolved: false };
+  const allRegistered = scripts.every((s) => Object.prototype.hasOwnProperty.call(pkg.scripts, s));
+  return { resolved: allRegistered };
 }
 
 const IGNORED_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build"]);

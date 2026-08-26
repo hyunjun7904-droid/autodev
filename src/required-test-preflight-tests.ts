@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import {
   checkRequiredTestScriptRegistration,
   attemptSafeRequiredTestScriptRepair,
+  reconcileStaleRequiredTestConfigurationTasks,
 } from "./required-test-preflight";
 import type { RequiredTestCommand } from "./task-registry";
 
@@ -198,6 +199,71 @@ function scenarioSymlinkedDirectoryIsNotFollowed(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// C) reconcileStaleRequiredTestConfigurationTasks — 오래된 REQUIRED_TEST_CONFIGURATION_ERROR
+//    WAITING_HUMAN 재검사(Phase 5).
+// ---------------------------------------------------------------------------
+function scenarioReconcileResolvedWhenAllScriptsNowRegistered(): void {
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs", "test:device-trust-revocation": "node backend/device-trust/device-trust-revocation.test.mjs" });
+  try {
+    const result = reconcileStaleRequiredTestConfigurationTasks(
+      [
+        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
+        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-revocation-tests missingScript=test:device-trust-revocation",
+      ],
+      root
+    );
+    check("C) 전부 REQUIRED_TEST_CONFIGURATION_ERROR 형태 + 전부 등록됨 → resolved=true", result.resolved === true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileNotResolvedWhenStillMissing(): void {
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const result = reconcileStaleRequiredTestConfigurationTasks(
+      [
+        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
+        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-revocation-tests missingScript=test:device-trust-revocation",
+      ],
+      root
+    );
+    check("C) 일부만 등록됨 → resolved=false(전부 해소돼야만 안전하게 복구)", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileFailClosedOnUnrelatedReason(): void {
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const result = reconcileStaleRequiredTestConfigurationTasks(
+      [
+        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
+        "HUMAN_FINAL_REVIEW_PENDING(2.1): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다.",
+      ],
+      root
+    );
+    check(
+      "C) 실제 사람 판단이 필요한 다른 사유가 섞여 있으면 fail-closed로 resolved=false(자동 해제 안 함)",
+      result.resolved === false
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileEmptyIsNotResolved(): void {
+  const root = makeProjectRoot({});
+  try {
+    const result = reconcileStaleRequiredTestConfigurationTasks([], root);
+    check("C) deferredHumanTasks가 비어 있으면 resolved=false(재검사할 대상 자체가 없음)", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function main(): void {
   scenarioRegisteredScriptPasses();
   scenarioMissingScriptFlagged();
@@ -209,6 +275,10 @@ function main(): void {
   scenarioAmbiguousCandidatesAreUnresolved();
   scenarioNeverOverwritesExistingConflictingEntry();
   scenarioSymlinkedDirectoryIsNotFollowed();
+  scenarioReconcileResolvedWhenAllScriptsNowRegistered();
+  scenarioReconcileNotResolvedWhenStillMissing();
+  scenarioReconcileFailClosedOnUnrelatedReason();
+  scenarioReconcileEmptyIsNotResolved();
 
   console.log("\n=== required-test-preflight 테스트 결과 ===");
   for (const r of results) console.log(r);

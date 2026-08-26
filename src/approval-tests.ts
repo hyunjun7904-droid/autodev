@@ -68,6 +68,23 @@ function scenarioClassifyUnknownReason(): void {
   const type = classifyApprovalType(ev({ reason: "전혀 다른 새로운 사유 문구" }));
   check("HUMAN_APPROVAL_REQUIRED + 매칭 안 되는 reason -> UNKNOWN(추측 안 함)", type === "UNKNOWN");
 }
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 — 이
+// 사유(REQUIRED_TEST_CONFIGURATION_ERROR)는 이 함수에 특별한 case가 없어 UNKNOWN으로
+// 분류된다(§ scenarioClassifyUnknownReason과 동일한 fail-closed 원칙). 이 값 자체는 여기서
+// 바뀌지 않는다 — 대신 autodev.ts는 Phase 5부터 이 사유로는 애초에 HUMAN_APPROVAL_REQUIRED
+// event를 만들지 않으므로(§ required-test-preflight.ts 위임 경로), classifyApprovalType()이
+// UNKNOWN을 반환하는 것 자체가 "사람 대기로 이어진다"는 뜻이 되지 않는다는 것을 문서화한다.
+function scenarioClassifyRequiredTestConfigurationErrorIsUnknownButHarmless(): void {
+  const type = classifyApprovalType(
+    ev({ reason: "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration" })
+  );
+  check(
+    "REQUIRED_TEST_CONFIGURATION_ERROR reason -> UNKNOWN(하지만 Phase 5부터 이 사유로는 이 event 자체가 만들어지지 않음 — autodev.ts 참고)",
+    type === "UNKNOWN"
+  );
+  check("UNKNOWN은 remotelyApprovable=false(Telegram 자동 재개 대상 아님 — 승인 보안 계약 유지)", isRemotelyApprovable(type) === false);
+}
+
 function scenarioClassifyNoReason(): void {
   const type = classifyApprovalType(ev({ reason: undefined }));
   check("HUMAN_APPROVAL_REQUIRED + reason 없음 -> UNKNOWN", type === "UNKNOWN");
@@ -201,6 +218,7 @@ async function main(): Promise<void> {
   scenarioClassifyCheckpointScopeViolation();
   scenarioClassifyOrchestratorGeneric();
   scenarioClassifyUnknownReason();
+  scenarioClassifyRequiredTestConfigurationErrorIsUnknownButHarmless();
   scenarioClassifyNoReason();
   scenarioClassifyOtherEventType();
   scenarioClassifyDeterministic();

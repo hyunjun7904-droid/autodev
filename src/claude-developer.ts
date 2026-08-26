@@ -7,6 +7,11 @@ import type { ExecutorAction, SafeExecutorContext } from "./safe-executor";
 import { getWorkingTreeChanges } from "./git-changes";
 import type { RequiredTestCommand } from "./task-registry";
 import { log, sanitizeForLog } from "./logger";
+import {
+  checkRequiredTestScriptRegistration,
+  attemptSafeRequiredTestScriptRepair,
+  commitRequiredTestScriptRepair,
+} from "./required-test-preflight";
 
 // Claude Developer — built-in Read/Edit/Write/Bash를 전혀 주지 않는다(항상 --tools "").
 // 대신 Claude는 JSON ACTION_REQUEST로 무엇을 읽고/검색하고/수정하고 싶은지 "요청"만 하고,
@@ -821,6 +826,38 @@ export async function runDeveloperTaskViaSafeExecutor(
 
     if (parsed.type === "TASK_COMPLETE") {
       const summary = typeof parsed.summary === "string" ? parsed.summary : "(summary 없음)";
+      // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+      // required test npm script가 아직 package.json에 등록돼 있지 않더라도, 방금 이
+      // attempt에서 Claude가 만든(§ opts.allowedPathPrefixes 범위) *.test.mjs 후보가 정확히
+      // 하나로 확정되면 여기서 즉시 등록하고 별도 commit으로 확정한다(§
+      // required-test-preflight.ts checkRequiredTestScriptRegistration/
+      // attemptSafeRequiredTestScriptRepair/commitRequiredTestScriptRepair — 판정/복구
+      // 로직을 복제하지 않고 그대로 재사용한다). 이 자체 복구는 TASK_COMPLETE를 선언한 이
+      // 라운드 안에서 조용히 일어나므로 새로운 REVISE 라운드를 소비하지 않는다. 후보가
+      // 아직 없거나(파일을 만들지 않음) 모호하면(여러 개) 여기서는 아무것도 등록하지 않고
+      // 그대로 넘어간다 — 아래 runRequiredTests()가 실제 npm 실행 결과(예: "Missing
+      // script")를 그대로 tests[].failureEvidence에 남기고, 그 실패는 기존 GPT Reviewer
+      // REVISE 루프가 일반 구현 미완료와 동일하게 처리한다(§ 새 사람 대기 경로를 만들지
+      // 않는다 — autodev.ts REQUIRED_TEST_CONFIGURATION_ERROR 처리와 동일한 원칙).
+      if (executor?.projectRoot && opts.allowedPathPrefixes && opts.allowedPathPrefixes.length > 0) {
+        const requiredTestPreflight = checkRequiredTestScriptRegistration(opts.requiredTests, executor.projectRoot);
+        if (!requiredTestPreflight.ok) {
+          const repair = attemptSafeRequiredTestScriptRepair(requiredTestPreflight.issues, executor.projectRoot, opts.allowedPathPrefixes);
+          if (repair.repaired.length > 0) {
+            const commit = commitRequiredTestScriptRepair(executor.projectRoot, repair.repaired);
+            if (commit.ok) {
+              log("developer TASK_COMPLETE — required test npm script 자체 복구", {
+                repaired: repair.repaired.map((r) => ({ npmScript: r.npmScript, expectedScript: r.expectedScript })),
+                commitHash: commit.commitHash,
+              });
+            } else {
+              log("developer TASK_COMPLETE — required test npm script 자체 복구 commit 실패(package.json은 등록된 채로 남음, 다음 attempt가 재시도할 수 있음)", {
+                reason: commit.reason,
+              });
+            }
+          }
+        }
+      }
       // Claude의 자체 보고를 신뢰하지 않는다 — task-registry에 지정된 필수 테스트만
       // AutoDev(Safe Executor)가 직접 실행해 실제 exitCode로 결과를 만든다(§ 요구사항 6).
       const tests = await runRequiredTests(opts.requiredTests, executor);

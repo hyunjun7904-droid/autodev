@@ -919,13 +919,13 @@ const REQUIRED_TEST_PREFLIGHT_REGISTRY: TaskDefinition[] = [
   },
 ];
 
-function buildRequiredTestPreflightManifest(root: string, statePath: string): ProjectManifest {
+function buildRequiredTestPreflightManifestFor(root: string, statePath: string, registry: TaskDefinition[]): ProjectManifest {
   return {
     projectId: "required-test-preflight-fixture-project",
     projectName: "Required Test Preflight Fixture Project",
     targetProjectRoot: root,
     statePath,
-    taskRegistry: REQUIRED_TEST_PREFLIGHT_REGISTRY,
+    taskRegistry: registry,
     developerInstructions: "허용 범위: proj/**.",
     reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
     reviewScopeDirs: ["proj/"],
@@ -933,38 +933,189 @@ function buildRequiredTestPreflightManifest(root: string, statePath: string): Pr
   };
 }
 
-async function scenarioRunAutodevOnceBlockedByMissingRequiredTestScript(): Promise<void> {
+function buildRequiredTestPreflightManifest(root: string, statePath: string): ProjectManifest {
+  return buildRequiredTestPreflightManifestFor(root, statePath, REQUIRED_TEST_PREFLIGHT_REGISTRY);
+}
+
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+// "required test npm script 미등록 + 후보 파일 0개"는 새 task를 막 시작하는 정상 상태다
+// (그 npm script가 가리킬 실제 테스트 파일은 이 task의 Developer가 구현 과정에서 만든다).
+// 사람의 판단이 필요한 문제가 아니므로 더 이상 WAITING_HUMAN으로 전이하지 않고 Developer를
+// 그대로 호출해야 한다. taskId/npm script 이름에 하드코딩된 특정 task 전용 처리가 아님을
+// 증명하기 위해, 서로 다른 taskId/스크립트 이름을 쓰는 두 개의 독립된 registry로 각각
+// 검증한다(scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScript는 P1.2/
+// test:rtp-check를, ...ForArbitraryFutureTask는 이 저장소의 어떤 실제 task와도 무관한
+// "F9"/test:future-feature를 쓴다).
+async function runProceedsDespiteMissingRequiredTestScriptScenario(
+  registry: TaskDefinition[],
+  expectedTaskId: string,
+  requiredTestName: string,
+  expectedNpmScript: string,
+  labelPrefix: string
+): Promise<void> {
   const repo = makeTempGitRepo();
-  const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → 다음은 P1.2
+  const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → registry의 두 번째 task
   writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "fixture", scripts: {} }, null, 2) + "\n", "utf-8");
+  // package.json은 실제 JARVIS처럼 이미 커밋된(tracked) 파일이어야 한다 — 여기서 커밋하지
+  // 않으면 checkpoint의 기존 "allowedPathPrefixes 밖 예상치 못한 변경" 감지가 이 fixture
+  // 파일 자체를 untracked 변경으로 오인해 매번 CHECKPOINT_SCOPE_VIOLATION으로 BLOCK한다 —
+  // 이 required-test 재검사 로직과 무관한 실제 checkpoint 동작이므로 fixture를 실제와
+  // 맞춘다.
+  spawnSync("git", ["add", "--", "package.json"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "package.json"], { cwd: repo });
+  const manifest = buildRequiredTestPreflightManifestFor(repo, statePath, registry);
+
+  let claudeCalls = 0;
+  const markerRel = `proj/marker-${expectedTaskId}.txt`;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, markerRel, "marker\n");
+    return {
+      success: true,
+      summary: "테스트: 후보 파일 없어도 정상 호출됨",
+      changedFiles: [markerRel],
+      tests: [{ name: requiredTestName, pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check(`${labelPrefix}: Claude Developer가 정상적으로 1회 호출됨(더 이상 사전 차단하지 않음)`, claudeCalls === 1);
+  check(
+    `${labelPrefix}: outcome이 BLOCKED_REQUIRED_TEST_CONFIGURATION이 아님(checkpoint까지 정상 진행)`,
+    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(`${labelPrefix}: status가 WAITING_HUMAN이 아님`, (finalState.status as unknown as string) !== "WAITING_HUMAN");
+  check(
+    `${labelPrefix}: deferredHumanTasks에 REQUIRED_TEST_CONFIGURATION_ERROR가 기록되지 않음`,
+    !finalState.deferredHumanTasks.some((t) => t.includes("REQUIRED_TEST_CONFIGURATION_ERROR"))
+  );
+
+  const pkgAfter = JSON.parse(readFileSync(join(repo, "package.json"), "utf-8"));
+  check(
+    `${labelPrefix}: 후보 파일이 없었으므로 package.json은 여전히 미등록 상태로 남음(추측으로 등록하지 않음)`,
+    !Object.prototype.hasOwnProperty.call(pkgAfter.scripts, expectedNpmScript)
+  );
+}
+
+async function scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScript(): Promise<void> {
+  await runProceedsDespiteMissingRequiredTestScriptScenario(
+    REQUIRED_TEST_PREFLIGHT_REGISTRY,
+    "P1.2",
+    "rtp-check",
+    "test:rtp-check",
+    "required-test preflight(P1.2)"
+  );
+}
+
+// 향후 완전히 다른 task/script 이름으로도 동일하게 동작함을 증명한다 — P1.2/test:rtp-check에
+// 대한 하드코딩이 아니라 공통 규칙임을 보인다(§ 요구사항 5 — task 2.1 전용 수정 금지).
+const FUTURE_TASK_REQUIRED_TEST_REGISTRY: TaskDefinition[] = [
+  { id: "P1.1", phase: 1, taskNumber: 1, title: "Phase1 Task1", prompt: "Phase1 Task1 prompt", requiredTests: [], allowedPathPrefixes: ["proj/"], prohibitedOperations: [] },
+  {
+    id: "F9",
+    phase: 1,
+    taskNumber: 2,
+    title: "향후 임의 작업(F9)",
+    prompt: "F9 prompt",
+    requiredTests: [{ name: "future-feature-tests", command: "npm", args: ["run", "test:future-feature"], cwd: "root" }],
+    allowedPathPrefixes: ["proj/"],
+    prohibitedOperations: [],
+  },
+];
+
+async function scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScriptForArbitraryFutureTask(): Promise<void> {
+  await runProceedsDespiteMissingRequiredTestScriptScenario(
+    FUTURE_TASK_REQUIRED_TEST_REGISTRY,
+    "F9",
+    "future-feature-tests",
+    "test:future-feature",
+    "required-test preflight(임의 향후 task F9)"
+  );
+}
+
+// 필수 검증 2 — 오래된 WAITING_HUMAN(REQUIRED_TEST_CONFIGURATION_ERROR) 자동 복구. 과거
+// 실행이 "npm script 미등록"을 이유로 WAITING_HUMAN을 남긴 뒤(§ Phase 3/4 시절 동작), 그
+// 사이 package.json에 해당 script가 등록됐다면(원인 해소) 다음 실행이 project-state.json을
+// 직접 손대지 않고도 스스로 정상 상태로 복구되어 같은 task를 계속 진행해야 한다.
+async function scenarioRunAutodevOnceReconcilesStaleRequiredTestConfigWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    deferredHumanTasks: ["REQUIRED_TEST_CONFIGURATION_ERROR: task=P1.2 requiredTest=rtp-check missingScript=test:rtp-check"],
+  });
+  // 원인 해소: package.json에 필요한 npm script가 이미 등록돼 있다(예: 620992e 같은 별도
+  // 커밋으로) — 다만 project-state.json은 아직 그 사실을 반영하지 못한 채 WAITING_HUMAN에
+  // 머물러 있는 상태를 재현한다.
+  writeFileSync(
+    join(repo, "package.json"),
+    JSON.stringify({ name: "fixture", scripts: { "test:rtp-check": "node proj/rtp-check.test.mjs" } }, null, 2) + "\n",
+    "utf-8"
+  );
+  spawnSync("git", ["add", "--", "package.json"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "package.json"], { cwd: repo });
   const manifest = buildRequiredTestPreflightManifest(repo, statePath);
 
   let claudeCalls = 0;
-  let gptCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
     claudeCalls += 1;
-    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
-  };
-  const gptReviewer = async (): Promise<GptReviewerReturn> => {
-    gptCalls += 1;
-    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨", nextTask: null };
+    writeRepoFile(repo, "proj/marker-stale-recovery.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: 오래된 WAITING_HUMAN 자동복구 이후 정상 진행",
+      changedFiles: ["proj/marker-stale-recovery.txt"],
+      tests: [{ name: "rtp-check", pass: true }],
+      rawOutput: "",
+    };
   };
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
   check(
-    "required-test preflight: 미등록 npm script(후보 파일 없음) → outcome=BLOCKED_REQUIRED_TEST_CONFIGURATION",
-    result.outcome === "BLOCKED_REQUIRED_TEST_CONFIGURATION"
+    "오래된 WAITING_HUMAN 자동복구: project-state.json을 사람이 직접 고치지 않아도 같은 task가 자동으로 재개됨(checkpoint까지 도달)",
+    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
   );
-  check("required-test preflight: Claude Developer가 전혀 호출되지 않음", claudeCalls === 0);
-  check("required-test preflight: GPT Reviewer가 전혀 호출되지 않음", gptCalls === 0);
+  check("오래된 WAITING_HUMAN 자동복구: Claude Developer가 정상적으로 1회 호출됨", claudeCalls === 1);
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("required-test preflight: reviewCycle이 증가하지 않음(0 유지)", finalState.reviewCycle === 0);
-  check("required-test preflight: status='WAITING_HUMAN'", finalState.status === "WAITING_HUMAN");
+  check("오래된 WAITING_HUMAN 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
   check(
-    "required-test preflight: deferredHumanTasks에 REQUIRED_TEST_CONFIGURATION_ERROR 기록됨",
-    finalState.deferredHumanTasks.some((t) => t.includes("REQUIRED_TEST_CONFIGURATION_ERROR") && t.includes("test:rtp-check"))
+    "오래된 WAITING_HUMAN 자동복구: 예전 REQUIRED_TEST_CONFIGURATION_ERROR deferredHumanTasks가 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.includes("REQUIRED_TEST_CONFIGURATION_ERROR"))
+  );
+}
+
+// 실제 사람 판단이 필요한 WAITING_HUMAN(예: Human Final Review PENDING)은 이 재검사로 절대
+// 자동 해제되지 않아야 한다 — deferredHumanTasks 문자열이 REQUIRED_TEST_CONFIGURATION_ERROR
+// 형태가 아니므로 애초에 매칭되지 않는다는 것을 직접 증명한다.
+async function scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    humanFinalReview: { taskId: "P1.2", reviewCycle: 0, status: "PENDING", requestedAt: new Date().toISOString() },
+    deferredHumanTasks: ["HUMAN_FINAL_REVIEW_PENDING(P1.2): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다."],
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트", nextTask: null },
+  });
+  writeFileSync(
+    join(repo, "package.json"),
+    JSON.stringify({ name: "fixture", scripts: { "test:rtp-check": "node proj/rtp-check.test.mjs" } }, null, 2) + "\n",
+    "utf-8"
+  );
+  spawnSync("git", ["add", "--", "package.json"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "package.json"], { cwd: repo });
+  const manifest = buildRequiredTestPreflightManifest(repo, statePath);
+
+  const result = await runAutodevOnce({ manifest });
+
+  check("실제 사람 판단 필요 상태 보호: Human Final Review PENDING은 자동 해제되지 않고 STOPPED 유지", result.outcome === "STOPPED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("실제 사람 판단 필요 상태 보호: status가 여전히 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "실제 사람 판단 필요 상태 보호: humanFinalReview gate가 여전히 PENDING(위조/자동승인 없음)",
+    finalState.humanFinalReview?.status === "PENDING"
   );
 }
 
@@ -1264,7 +1415,10 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceFinalNonGateTaskEmitsProjectCompleted();
     await scenarioRunAutodevOnceBlockedByRemoteGitAtStart();
     await scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint();
-    await scenarioRunAutodevOnceBlockedByMissingRequiredTestScript();
+    await scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScript();
+    await scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScriptForArbitraryFutureTask();
+    await scenarioRunAutodevOnceReconcilesStaleRequiredTestConfigWaitingHuman();
+    await scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();

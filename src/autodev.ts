@@ -23,6 +23,7 @@ import {
   checkRequiredTestScriptRegistration,
   attemptSafeRequiredTestScriptRepair,
   commitRequiredTestScriptRepair,
+  reconcileStaleRequiredTestConfigurationTasks,
 } from "./required-test-preflight";
 import { hasFailedRequiredTest } from "./review-policy";
 import {
@@ -362,14 +363,16 @@ export type AutodevRunOutcome =
    *  어느 쪽도 건드리지 않는다(loadState조차 호출하지 않는다) — reason에 remote-git-safety.ts의
    *  RemoteGitBlockedCode가 남는다. */
   | "BLOCKED_REMOTE_GIT"
-  /** AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 3 —
-   *  taskDef.requiredTests 중 "npm run X" 형태가 package.json에 등록돼 있지 않은 경우.
-   *  Safe deterministic self-recovery(§ required-test-preflight.ts
-   *  attemptSafeRequiredTestScriptRepair)로 고칠 수 있는 항목은 이미 여기서 고쳐지고 실행이
-   *  계속된다 — 이 outcome은 그렇게도 해결할 수 없는(파일이 아직 없거나 후보가 모호한)
-   *  항목이 하나라도 남았을 때만 반환된다. Claude Developer/GPT Reviewer 어느 쪽도 호출되지
-   *  않고, state.reviewCycle도 전혀 증가하지 않는다(구현 실패가 아니라 인프라 설정 문제이기
-   *  때문 — § REQUIRED_TEST_CONFIGURATION_ERROR). */
+  /** AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 3, 이후
+   *  Phase 5에서 재정의됨 — taskDef.requiredTests 중 "npm run X" 형태가 package.json에
+   *  등록돼 있지 않은 경우. Safe deterministic self-recovery(§ required-test-preflight.ts
+   *  attemptSafeRequiredTestScriptRepair)로 고칠 수 있는 항목은 여기서 고쳐지고 실행이
+   *  계속된다. Phase 5부터는 그렇게도 해결할 수 없는 항목(파일이 아직 없는 정상적인
+   *  "구현 전" 상태, 또는 후보가 모호함)이 남아도 이 outcome을 반환하지 않는다 —
+   *  REQUIRED_TEST_CONFIGURATION_ERROR는 사람의 판단이 필요한 문제가 아니므로(§
+   *  CLAUDE.md WAITING_HUMAN 정책) Developer/Reviewer 호출을 막지 않고 그대로 진행한다.
+   *  이 union member는 타입 호환성을 위해 남겨두지만 현재 production 코드 경로에서는
+   *  반환되지 않는다. */
   | "BLOCKED_REQUIRED_TEST_CONFIGURATION";
 
 export interface AutodevRunResult {
@@ -705,6 +708,34 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
 
     const state = loadState(statePath);
+
+    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
+    // Stale REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN Reconciliation. decideNextAction()
+    // 은 순수 함수로 유지한다(§ 그 함수 상단 주석 — state만 보고 부수효과 없이 판단, 독립
+    // 테스트 대상) — 그래서 fs를 읽는 이 재검사는 decideNextAction() 호출 "전에" 여기서
+    // 별도로 수행하고, 필요하면 이 state 객체만 갱신한다. state.humanFinalReview가 있으면
+    // (사람이 이미 이 정확한 checkpoint에 명시적으로 APPROVE해야만 넘어갈 수 있는 별도
+    // gate — § decideNextAction의 RESUME_APPROVED_CHECKPOINT) 이 재검사는 절대 개입하지
+    // 않는다. deferredHumanTasks 전체가 REQUIRED_TEST_CONFIGURATION_ERROR 고정 템플릿
+    // 문자열이 아니면(다른 실제 사람 판단 필요 사유가 하나라도 섞여 있으면)
+    // reconcileStaleRequiredTestConfigurationTasks()가 fail-closed로 resolved=false를
+    // 반환하므로 이 블록은 아무것도 하지 않는다.
+    if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
+      const reconciliation = reconcileStaleRequiredTestConfigurationTasks(state.deferredHumanTasks, executorContext.projectRoot);
+      if (reconciliation.resolved) {
+        console.log(
+          `[autodev] 오래된 WAITING_HUMAN(REQUIRED_TEST_CONFIGURATION_ERROR)을 재검사했습니다 — package.json에 필요한 npm script가 이미 등록되어 원인이 해소됨을 확인, 정상 실행 상태로 자동 복구합니다.`
+        );
+        log("오래된 REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN 자동 복구", {
+          projectId: manifest.projectId,
+          previousDeferredHumanTasks: state.deferredHumanTasks,
+        });
+        state.status = "READY";
+        state.deferredHumanTasks = [];
+        saveState(state, statePath);
+      }
+    }
+
     const decision = decideNextAction(state, manifest.taskRegistry);
 
     if (decision.kind === "STOP") {
@@ -764,14 +795,23 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     });
     finalState = state;
   } else {
-    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 3/4 —
-    // Claude Developer/GPT Reviewer를 부르기 전에, 그리고 state.reviewCycle을 증가시키기
-    // 전에 required-test 등록 상태를 먼저 확인한다(§ required-test-preflight.ts). 이 검사는
-    // npm/claude 어떤 프로세스도 spawn하지 않는 순수 fs 판정이다. 안전하게 증명 가능한 경우
-    // (task의 allowedPathPrefixes 안에 후보 *.test.mjs가 정확히 하나만 있는 경우)에만
-    // package.json.scripts를 보강하고 그대로 진행한다 — 그렇게도 해결할 수 없으면(파일이
-    // 아직 없거나 후보가 여럿이라 모호함) Developer/Reviewer를 전혀 부르지 않고 즉시
-    // WAITING_HUMAN으로 보고한다(§ Tasks 1.2/1.3/1.4가 반복한 5회 REVISE 낭비를 막는다).
+    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 3/4/5 —
+    // Claude Developer/GPT Reviewer를 부르기 전에 required-test 등록 상태를 먼저 확인한다
+    // (§ required-test-preflight.ts). 이 검사는 npm/claude 어떤 프로세스도 spawn하지 않는
+    // 순수 fs 판정이다. 안전하게 증명 가능한 경우(task의 allowedPathPrefixes 안에 후보
+    // *.test.mjs가 정확히 하나만 있는 경우 — 이전 시도가 이미 파일을 만들어둔 채 중단된
+    // 경우)에는 여기서 즉시 package.json.scripts를 보강해 Developer가 헛되이 같은 npm
+    // 오류를 다시 겪지 않게 한다. 후보가 아직 없다면(§ 새 task를 지금 막 시작하는 정상
+    // 상태 — task의 requiredTests가 가리키는 실제 테스트 파일은 이 task의 Developer가
+    // 구현 과정에서 만들 파일이다, 구현 전에는 존재하지 않는 것이 정상이다) 더 이상
+    // Developer/Reviewer 호출을 막지 않는다(Phase 5) — REQUIRED_TEST_CONFIGURATION_ERROR는
+    // "사람의 판단"이 필요한 문제가 아니라 순수 기술/설정 문제이기 때문이다(§ CLAUDE.md
+    // WAITING_HUMAN 정책). Developer가 그 test 파일을 만들면, claude-developer.ts의
+    // TASK_COMPLETE 처리 시점(같은 attempt 안, 새 REVISE 라운드 소비 없음)에 바로 이
+    // 후보가 정확히 하나로 확정되어 같은 자동 등록이 다시 시도된다. Developer가 그래도 그
+    // 파일을 만들지 않으면 npm run이 "Missing script"로 실패하고, 그 실패는 일반 required
+    // test 실패와 동일하게 기존 GPT Reviewer REVISE 루프가 처리한다 — 이 preflight는 그
+    // 흐름을 대신하지 않는다.
     const requiredTestPreflight = checkRequiredTestScriptRegistration(taskDef.requiredTests, executorContext.projectRoot);
     if (!requiredTestPreflight.ok) {
       const repair = attemptSafeRequiredTestScriptRepair(
@@ -779,7 +819,6 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         executorContext.projectRoot,
         taskDef.allowedPathPrefixes
       );
-      let unresolvedAfterRepair = repair.unresolved;
       if (repair.repaired.length > 0) {
         console.log(
           `[autodev] task ${taskDef.id} — REQUIRED_TEST_CONFIGURATION 자동 복구: ${repair.repaired
@@ -787,45 +826,28 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
             .join(", ")}`
         );
         // 이 write를 즉시 별도 commit으로 확정한다(§ Phase 11 — Task 자신의 checkpoint와
-        // 절대 섞지 않는다). commit에 실패하면 package.json은 uncommitted로 남아 이어지는
-        // Task의 checkpoint를 "범위 밖 예상치 못한 변경"으로 BLOCK시킬 뿐이므로, 그 낭비를
-        // 피하기 위해 이번 실행에서는 해결되지 않은 것으로 취급하고 사람에게 넘긴다.
+        // 절대 섞지 않는다). commit이 실패해도(예: 동시성으로 index에 다른 변경이 함께
+        // staged됨) package.json 내용 자체는 working tree에 이미 등록된 채로 남아 있어
+        // 아래 Developer 호출을 막을 이유가 되지 않는다 — 그 uncommitted 변경은 이 task
+        // 자신의 checkpoint(performTaskCheckpoint)가 범위 밖 예상치 못한 변경으로 이미
+        // 다루는 기존 CHECKPOINT_SCOPE_VIOLATION 경로로 자연히 수렴한다(새 사람 대기
+        // 경로를 여기서 만들지 않는다).
         const commit = commitRequiredTestScriptRepair(executorContext.projectRoot, repair.repaired);
         if (commit.ok) {
           console.log(`[autodev] task ${taskDef.id} — REQUIRED_TEST_CONFIGURATION 자동 복구 commit 완료(${commit.commitHash ?? "no-op"})`);
         } else {
-          console.log(`[autodev] task ${taskDef.id} — REQUIRED_TEST_CONFIGURATION 자동 복구 commit 실패: ${commit.reason}`);
-          unresolvedAfterRepair = [
-            ...unresolvedAfterRepair,
-            ...repair.repaired.map((r) => ({ requiredTestName: r.requiredTestName, npmScript: r.npmScript })),
-          ];
+          console.log(`[autodev] task ${taskDef.id} — REQUIRED_TEST_CONFIGURATION 자동 복구 commit 실패(uncommitted로 남음): ${commit.reason}`);
         }
       }
-      if (unresolvedAfterRepair.length > 0) {
-        const detail = unresolvedAfterRepair.map((i) => `requiredTest=${i.requiredTestName} missingScript=${i.npmScript}`);
-        console.log(`[autodev] task ${taskDef.id} — REQUIRED_TEST_CONFIGURATION_ERROR(해결 불가): ${detail.join("; ")}`);
-        emitEvent(events, {
-          eventType: "HUMAN_APPROVAL_REQUIRED",
-          runId,
-          projectId: manifest.projectId,
-          taskId: taskDef.id,
-          executionPhase: "task_selection",
-          outcome: "BLOCKED",
-          humanInterventionRequired: true,
-          reason: `REQUIRED_TEST_CONFIGURATION_ERROR: task=${taskDef.id} ${detail.join("; ")}`,
-        });
-        // Claude Developer/GPT Reviewer는 전혀 호출되지 않았고 state.reviewCycle도 증가하지
-        // 않았다 — 이 실행은 구현 실패가 아니라 인프라 설정 문제로 사람에게 넘긴다.
-        if ((state.status as unknown as string) !== "WAITING_HUMAN") {
-          state.status = "WAITING_HUMAN";
-        }
-        state.deferredHumanTasks.push(
-          ...unresolvedAfterRepair.map(
-            (i) => `REQUIRED_TEST_CONFIGURATION_ERROR: task=${taskDef.id} requiredTest=${i.requiredTestName} missingScript=${i.npmScript}`
-          )
+      if (repair.unresolved.length > 0) {
+        // 후보가 아직 없거나(정상적인 "구현 전" 상태) 모호함(여러 후보) — 사람 판단이 필요한
+        // 문제가 아니므로 WAITING_HUMAN으로 전환하지 않고, HUMAN_APPROVAL_REQUIRED event도
+        // 만들지 않는다(Telegram은 실제 사람 판단이 필요한 상태에서만 쓴다는 정책과 일치).
+        // Developer/Reviewer 호출을 막지 않고 그대로 진행한다 — § 위 주석.
+        const detail = repair.unresolved.map((i) => `requiredTest=${i.requiredTestName} missingScript=${i.npmScript}`);
+        console.log(
+          `[autodev] task ${taskDef.id} — required test npm script 아직 미등록(${detail.join("; ")}) — 사람 판단이 필요한 문제가 아니므로 차단하지 않고 Developer를 그대로 호출합니다(구현 과정에서 파일이 생기면 TASK_COMPLETE 시점에 자동 등록됩니다).`
         );
-        saveState(state, statePath);
-        return { outcome: "BLOCKED_REQUIRED_TEST_CONFIGURATION", taskId: taskDef.id, reason: `REQUIRED_TEST_CONFIGURATION_ERROR: ${detail.join("; ")}` };
       }
     }
 
