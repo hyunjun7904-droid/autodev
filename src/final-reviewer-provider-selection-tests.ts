@@ -19,17 +19,28 @@ import type { ChatCompletionHttpFetch, ChatCompletionHttpRequest } from "./chat-
 import { reviewClaudeResultOnce, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ClaudeResult } from "./types";
 
-// Final Reviewer Routing(Fireworks Primary / Groq Escalation) — production wiring 검증.
+// Final Reviewer Routing(Fireworks-only — Primary/Escalation 둘 다 Fireworks) — production
+// wiring 검증.
+//
+// Fireworks-only Final Reviewer Routing(2026-08-26) — escalation provider가 Groq에서
+// Fireworks로 바뀌었다(§ final-reviewer-provider-selection.ts FINAL_REVIEWER_ESCALATION_MODEL
+// 주석 — 실제 production Task 1.2 escalation payload가 Groq Free Tier의 8,000 TPM을 실제로
+// 초과함을 증명한 뒤의 결정). Primary/Escalation은 여전히 논리적으로 분리된 두 번째 독립 호출이다
+// — provider/model이 같을 뿐 escalation 판정/호출 자체를 생략하지 않는다.
 //
 // 이 파일이 증명하는 것: gpt-reviewer.ts의 production default(override 없음)가 실제로
-// final-reviewer-provider-selection.ts(Fireworks primary, accounts/fireworks/models/gpt-oss-120b)를
-// 쓰고, FIREWORKS_API_KEY/AUTODEV_FIREWORKS_ZDR_VERIFIED 둘 중 하나라도 미충족이면
-// fail-closed로 중단하며, 어떤 시나리오도 OpenAI/Ollama/OpenRouter/NVIDIA로 자동 전환하지
-// 않는다는 것. 실제 escalation(Groq) trigger 판정 로직 자체(content keyword/severity/
-// transport-anomaly 기반 escalation, rate-limit 진단 표시, "AutoDev 설정 오류를 escalation으로
-// 숨기지 않는다")는 final-reviewer-routing-tests.ts가 fake provider로 독립적으로 검증한다 — 이
-// 파일은 그 routing이 실제 Fireworks/Groq provider와 올바르게 배선됐는지만 확인한다. 실제
-// Fireworks/Groq API는 이 파일 어디서도 호출하지 않는다.
+// final-reviewer-provider-selection.ts(Primary/Escalation 모두 Fireworks,
+// accounts/fireworks/models/gpt-oss-120b)를 쓰고, FIREWORKS_API_KEY/
+// AUTODEV_FIREWORKS_ZDR_VERIFIED 둘 중 하나라도 미충족이면 fail-closed로 중단하며, 어떤
+// 시나리오도 OpenAI/Ollama/OpenRouter/NVIDIA/Groq로 자동 전환하지 않는다는 것. escalation
+// trigger 판정 로직 자체(content keyword/severity/transport-anomaly 기반 escalation,
+// rate-limit 진단 표시, "AutoDev 설정 오류를 escalation으로 숨기지 않는다")는
+// final-reviewer-routing-tests.ts가 fake provider로 독립적으로 검증한다(이 provider selection
+// 변경과 무관하게 그대로 유지됨) — 이 파일은 그 routing이 실제 Fireworks provider 두 인스턴스와
+// 올바르게 배선됐는지, 그리고 Groq가 더 이상 production escalation으로 선택되지 않는지만
+// 확인한다. 실제 Fireworks/Groq API는 이 파일 어디서도 호출하지 않는다. Groq adapter/413→
+// RATE_LIMIT classifier 자체는 review-provider-adapters-tests.ts가 이 파일과 무관하게 계속
+// 검증한다 — Groq 지원을 삭제하지 않았다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -65,8 +76,15 @@ function makeFakeHttpFetch(
 function scenarioA_staticIdentity(): void {
   check("A) FINAL_REVIEWER_PRIMARY_MODEL === Fireworks qualification 통과 모델", FINAL_REVIEWER_PRIMARY_MODEL === "accounts/fireworks/models/gpt-oss-120b");
   check("A) FINAL_REVIEWER_PRIMARY_PROVIDER_ID === 'fireworks'", FINAL_REVIEWER_PRIMARY_PROVIDER_ID === "fireworks");
-  check("A) FINAL_REVIEWER_ESCALATION_MODEL === Groq qualification 통과 모델", FINAL_REVIEWER_ESCALATION_MODEL === "openai/gpt-oss-120b");
-  check("A) FINAL_REVIEWER_ESCALATION_PROVIDER_ID === 'groq'", FINAL_REVIEWER_ESCALATION_PROVIDER_ID === "groq");
+  check(
+    "A) FINAL_REVIEWER_ESCALATION_MODEL === Fireworks qualification 통과 모델(Fireworks-only routing)",
+    FINAL_REVIEWER_ESCALATION_MODEL === "accounts/fireworks/models/gpt-oss-120b"
+  );
+  check("A) FINAL_REVIEWER_ESCALATION_PROVIDER_ID === 'fireworks'(더 이상 'groq'가 아님)", FINAL_REVIEWER_ESCALATION_PROVIDER_ID === "fireworks");
+  check(
+    "A) ESCALATION_MODEL/PROVIDER_ID가 PRIMARY와 값이 같음(같은 provider/model을 의도적으로 재사용)",
+    FINAL_REVIEWER_ESCALATION_MODEL === FINAL_REVIEWER_PRIMARY_MODEL && FINAL_REVIEWER_ESCALATION_PROVIDER_ID === FINAL_REVIEWER_PRIMARY_PROVIDER_ID
+  );
   check("A) PRODUCTION_MODEL/PROVIDER_ID 하위호환 alias가 PRIMARY와 동일", FINAL_REVIEWER_PRODUCTION_MODEL === FINAL_REVIEWER_PRIMARY_MODEL && FINAL_REVIEWER_PRODUCTION_PROVIDER_ID === FINAL_REVIEWER_PRIMARY_PROVIDER_ID);
   check("A) finalReviewerProductionProvider.id === 'fireworks'(routing provider가 primary의 id를 그대로 씀)", finalReviewerProductionProvider.id === "fireworks");
   check("A) finalReviewerProductionProvider.model === FINAL_REVIEWER_PRIMARY_MODEL", finalReviewerProductionProvider.model === FINAL_REVIEWER_PRIMARY_MODEL);
@@ -95,8 +113,16 @@ function scenarioB_sourceRegressionNoOtherProviderReferenced(): void {
     !/from ["']\.\/(openrouter-review-provider|nvidia-nim-review-provider)["']/.test(selectionSource)
   );
   check(
-    "B) final-reviewer-provider-selection.ts가 Fireworks/Groq 두 provider factory를 모두 import함(routing 조립 대상)",
-    /from ["']\.\/fireworks-review-provider["']/.test(selectionSource) && /from ["']\.\/groq-review-provider["']/.test(selectionSource)
+    "B) final-reviewer-provider-selection.ts가 fireworks-review-provider factory를 import함(primary+escalation 둘 다 조립 대상)",
+    /from ["']\.\/fireworks-review-provider["']/.test(selectionSource)
+  );
+  check(
+    "B) final-reviewer-provider-selection.ts는 더 이상 groq-review-provider.ts를 import하지 않음(production escalation이 Groq provider 인스턴스를 만들지 않음 — Fireworks-only routing)",
+    !/from ["']\.\/groq-review-provider["']/.test(selectionSource)
+  );
+  check(
+    "B) createGroqReviewProvider(가 소스 어디에서도 호출되지 않음(Groq가 production Final Reviewer escalation으로 선택되지 않음을 소스 레벨에서 증명)",
+    !/createGroqReviewProvider\(/.test(selectionSource)
   );
   check(
     "B) gpt-reviewer.ts의 provider 기본값이 finalReviewerProductionProvider임(소스 회귀)",
@@ -245,38 +271,43 @@ async function scenarioF_realDefaultProviderFailsClosedWithoutApiKey(): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// G) Fireworks transport failure(5xx) → escalation이 시도되지만(§ final-reviewer-routing.ts
-//    PRIMARY_TRANSPORT_FAILURE) Groq도 미구성이면 그 실제 설정 오류(AUTH_ERROR)를 그대로 노출한다
-//    — 어느 경우에도 PASS로 오판하지 않는다.
+// G) Fireworks primary transport failure(5xx) → escalation이 실제로 시도되고(Fireworks-only
+//    routing이므로 escalation도 같은 Fireworks endpoint를 다시 호출함) 그것도 실패하면(§
+//    final-reviewer-routing.ts, transient 실패는 ESCALATION_REVIEWER_UNAVAILABLE로 HOLD —
+//    자동 승인 금지) — 어느 경우에도 PASS로 오판하지 않고, escalation이 실제 두 번째 호출임을
+//    증명한다.
 // ---------------------------------------------------------------------------
 async function scenarioG_transportFailureEscalatesAndNeverMisreadAsPass(): Promise<void> {
-  const env = { FIREWORKS_API_KEY: "fake-key", AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" }; // GROQ_API_KEY 의도적으로 없음.
-  const fake = makeFakeHttpFetch(async (req) =>
-    req.url === FIREWORKS_CHAT_COMPLETIONS_URL ? { ok: false, reason: "HTTP 503", transient: true, status: 503 } : { ok: true, response: { status: 200, bodyText: "{}" } }
-  );
+  const env = { FIREWORKS_API_KEY: "fake-key", AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" };
+  // Fireworks-only routing에서는 primary/escalation이 같은 endpoint를 호출하므로 req.url로
+  // 구분할 수 없다 — 두 호출 모두 503을 반환해 "primary도 escalation도 진짜로 실패했다"를
+  // 재현한다(하나만 실패시키는 시나리오는 이제 J의 provider 구분 목적과 겹치지 않는다).
+  const fake = makeFakeHttpFetch(async () => ({ ok: false, reason: "HTTP 503", transient: true, status: 503 }));
   const provider = createFinalReviewerProductionProvider(env, fake.fetch);
   const registry = resolveFinalReviewerProductionSecurityRegistry(env);
 
   const result = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK, undefined, undefined, undefined, undefined, undefined, undefined, provider, {
     registry,
   });
-  check("G) Fireworks transport failure(503) → decision !== PASS", result.decision !== "PASS");
+  check("G) Fireworks primary transport failure(503) → decision !== PASS", result.decision !== "PASS");
   check("G) decision=HUMAN_REQUIRED", result.decision === "HUMAN_REQUIRED");
-  check("G) Fireworks 실패 후 escalation이 시도되어(Groq 미구성) 최종 errorCode=AUTH_ERROR로 노출됨(숨겨지지 않음)", result.errorCode === "AUTH_ERROR");
-  check("G) Fireworks endpoint가 실제로 1회 호출됨(escalation 판정 이전에 primary는 항상 호출됨)", fake.requests().some((r) => r.url === FIREWORKS_CHAT_COMPLETIONS_URL));
+  check(
+    "G) escalation(Fireworks 재호출)도 transient 실패 → errorCode=ESCALATION_REVIEWER_UNAVAILABLE로 HOLD(자동 승인되지 않음, 숨겨지지 않음)",
+    result.errorCode === "ESCALATION_REVIEWER_UNAVAILABLE"
+  );
+  check("G) Fireworks endpoint가 정확히 2회 호출됨(primary 1회 + escalation 1회 — 단일 호출로 합쳐지지 않음)", fake.callCount() === 2);
+  check("G) 두 호출 모두 Fireworks chat completions endpoint를 향함", fake.requests().every((r) => r.url === FIREWORKS_CHAT_COMPLETIONS_URL));
 }
 
 // ---------------------------------------------------------------------------
-// H) malformed response(envelope 자체가 기대한 형태가 아님) → escalation 시도, Groq 미구성이면
-//    그 오류를 그대로 노출 → PASS로 오판하지 않음.
+// H) malformed response(envelope 자체가 기대한 형태가 아님, non-transient) → escalation이
+//    Fireworks로 실제로 다시 시도되고, 그것도 malformed면(non-transient이므로
+//    ESCALATION_REVIEWER_UNAVAILABLE로 재분류되지 않음 — § G의 transient=true 경우와 대조)
+//    그 실제 오류(API_ERROR)를 그대로 노출한다 → PASS로 오판하지 않음.
 // ---------------------------------------------------------------------------
 async function scenarioH_malformedEnvelopeEscalatesAndNeverMisreadAsPass(): Promise<void> {
   const env = { FIREWORKS_API_KEY: "fake-key", AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" };
-  const fake = makeFakeHttpFetch(async (req) =>
-    req.url === FIREWORKS_CHAT_COMPLETIONS_URL
-      ? { ok: true, response: { status: 200, bodyText: JSON.stringify({ no_choices_field: true }) } }
-      : { ok: true, response: { status: 200, bodyText: "{}" } }
-  );
+  const fake = makeFakeHttpFetch(async () => ({ ok: true, response: { status: 200, bodyText: JSON.stringify({ no_choices_field: true }) } }));
   const provider = createFinalReviewerProductionProvider(env, fake.fetch);
   const registry = resolveFinalReviewerProductionSecurityRegistry(env);
 
@@ -284,18 +315,27 @@ async function scenarioH_malformedEnvelopeEscalatesAndNeverMisreadAsPass(): Prom
     registry,
   });
   check("H) malformed Fireworks envelope → decision !== PASS", result.decision !== "PASS");
-  check("H) escalation 시도(Groq 미구성) → errorCode=AUTH_ERROR로 노출됨", result.errorCode === "AUTH_ERROR");
+  check("H) escalation(Fireworks 재호출)도 malformed(non-transient) → errorCode=API_ERROR로 그대로 노출됨(숨겨지지 않음)", result.errorCode === "API_ERROR");
+  check("H) Fireworks endpoint가 정확히 2회 호출됨(primary 1회 + escalation 1회)", fake.callCount() === 2);
 }
 
 // ---------------------------------------------------------------------------
-// I) 두 provider 모두 정상 구성 + Fireworks가 non-PASS(REVISE) → Groq escalation이 실제로
-//    호출되고, Groq의 PASS 결과가 최종 판정을 우선한다.
+// I) Fireworks-only routing — primary가 non-PASS(REVISE)를 반환하면 escalation이 실제로
+//    Fireworks를 "두 번째로 다시" 호출하고(같은 endpoint/provider지만 별개의 review() 호출 —
+//    primary와 escalation이 하나로 합쳐지지 않음을 호출 순서로 직접 증명한다), escalation의
+//    PASS 결과가 최종 판정을 우선한다.
 // ---------------------------------------------------------------------------
-async function scenarioI_fireworksRevisesGroqEscalatesAndWins(): Promise<void> {
-  const env = { FIREWORKS_API_KEY: "fake-fw-key", AUTODEV_FIREWORKS_ZDR_VERIFIED: "true", GROQ_API_KEY: "fake-groq-key", AUTODEV_GROQ_ZDR_VERIFIED: "true" };
-  const reviseOutputText = JSON.stringify({ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "fireworks flagged an issue", nextTask: null });
+async function scenarioI_fireworksRevisesFireworksEscalatesAndWins(): Promise<void> {
+  const env = { FIREWORKS_API_KEY: "fake-fw-key", AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" };
+  const reviseOutputText = JSON.stringify({ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "fireworks primary flagged an issue", nextTask: null });
+  let callIndex = 0;
   const fake = makeFakeHttpFetch(async (req) => {
-    if (req.url === FIREWORKS_CHAT_COMPLETIONS_URL) {
+    callIndex += 1;
+    // 1번째 호출 = primary(REVISE), 2번째 호출 = escalation(PASS) — 호출 순서로만 구분한다.
+    // Fireworks-only routing에서는 두 호출이 같은 url/model을 향하므로 req.url로는 구분할 수
+    // 없다(§ 위 주석) — req는 그 사실을 그대로 보여주기 위해 인자로만 받아둔다.
+    void req;
+    if (callIndex === 1) {
       return { ok: true, response: { status: 200, bodyText: JSON.stringify({ model: FINAL_REVIEWER_PRIMARY_MODEL, choices: [{ message: { content: reviseOutputText } }] }) } };
     }
     return { ok: true, response: { status: 200, bodyText: JSON.stringify({ model: FINAL_REVIEWER_ESCALATION_MODEL, choices: [{ message: { content: passOutputText() } }] }) } };
@@ -306,10 +346,14 @@ async function scenarioI_fireworksRevisesGroqEscalatesAndWins(): Promise<void> {
   const result = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK, undefined, undefined, undefined, undefined, undefined, undefined, provider, {
     registry,
   });
-  check("I) Fireworks REVISE → escalation 발생 → Groq PASS가 최종 판정", result.decision === "PASS");
-  check("I) Fireworks endpoint 1회 호출됨", fake.requests().filter((r) => r.url === FIREWORKS_CHAT_COMPLETIONS_URL).length === 1);
-  check("I) Groq endpoint 1회 호출됨(escalation)", fake.requests().filter((r) => r.url === GROQ_CHAT_COMPLETIONS_URL).length === 1);
-  check("I) 최종 응답 model.provider === 'groq'(escalation 응답이 그대로 반영됨)", result.model?.provider === "groq");
+  check("I) Fireworks primary REVISE → escalation 발생 → escalation(Fireworks) PASS가 최종 판정", result.decision === "PASS");
+  check("I) Fireworks endpoint가 정확히 2회 호출됨(primary 1회 + escalation 1회 — 단일 호출로 합쳐지지 않음)", fake.callCount() === 2);
+  check("I) 두 호출 모두 Fireworks chat completions endpoint를 향함", fake.requests().every((r) => r.url === FIREWORKS_CHAT_COMPLETIONS_URL));
+  check(
+    "I) Groq endpoint(GROQ_CHAT_COMPLETIONS_URL)는 단 한 번도 호출되지 않음 — Groq가 production escalation으로 선택되지 않음을 실제 호출 URL로 직접 증명",
+    !fake.requests().some((r) => r.url === GROQ_CHAT_COMPLETIONS_URL)
+  );
+  check("I) 최종 응답 model.provider === 'fireworks'(escalation 응답이 그대로 반영됨, Groq 아님)", result.model?.provider === "fireworks");
 }
 
 // ---------------------------------------------------------------------------
@@ -353,10 +397,10 @@ async function main(): Promise<void> {
   await scenarioF_realDefaultProviderFailsClosedWithoutApiKey();
   await scenarioG_transportFailureEscalatesAndNeverMisreadAsPass();
   await scenarioH_malformedEnvelopeEscalatesAndNeverMisreadAsPass();
-  await scenarioI_fireworksRevisesGroqEscalatesAndWins();
+  await scenarioI_fireworksRevisesFireworksEscalatesAndWins();
   await scenarioJ_apiKeysNeverExposedInObservability();
 
-  console.log("\n=== Final Reviewer Routing(Fireworks Primary / Groq Escalation) Production Wiring 테스트 결과 ===");
+  console.log("\n=== Final Reviewer Routing(Fireworks-only — Primary/Escalation 둘 다 Fireworks) Production Wiring 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
   console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);

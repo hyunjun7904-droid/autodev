@@ -2,14 +2,11 @@ import type { ReviewProvider, ReviewProviderRequest, ReviewProviderResult } from
 import type { ProviderSecurityRegistry, ProviderSecurityMetadata, DataClassification } from "./provider-security-gate";
 import { evaluateProviderSecurity } from "./provider-security-gate";
 import type { ChatCompletionHttpFetch } from "./chat-completion-review-provider";
-import { createGroqReviewProvider } from "./groq-review-provider";
 import { createFireworksReviewProvider } from "./fireworks-review-provider";
 import {
-  GROQ_PROVIDER_ID,
   FIREWORKS_PROVIDER_ID,
   buildGroqProviderSecurityMetadata,
   buildFireworksProviderSecurityMetadata,
-  resolveGroqZdrVerification,
   resolveFireworksZdrVerification,
 } from "./provider-pool-security-metadata";
 import { OPENAI_REVIEW_RESULT_SCHEMA } from "./openai-review-provider";
@@ -76,10 +73,19 @@ import { createFinalReviewerRoutingProvider } from "./final-reviewer-routing";
 export const FINAL_REVIEWER_PRIMARY_MODEL = "accounts/fireworks/models/gpt-oss-120b";
 export const FINAL_REVIEWER_PRIMARY_PROVIDER_ID = FIREWORKS_PROVIDER_ID;
 
-/** qualification을 통과한 escalation(Groq) 모델 — final-reviewer-benchmark-groq.ts의
- *  QUALIFIED_MODEL 기본값과 정확히 동일한 문자열이다. */
-export const FINAL_REVIEWER_ESCALATION_MODEL = "openai/gpt-oss-120b";
-export const FINAL_REVIEWER_ESCALATION_PROVIDER_ID = GROQ_PROVIDER_ID;
+/** Fireworks-only Final Reviewer Routing(2026-08-26) — escalation provider도 Fireworks로
+ *  바뀌었다. 이전에는 Groq(openai/gpt-oss-120b)였으나, 실제 production Task 1.2 escalation
+ *  payload(~9,349 tokens)가 Groq Free Tier의 8,000 TPM 상한을 실제로 초과해(HTTP 413,
+ *  code:"rate_limit_exceeded" — 실제 replay로 직접 확인함, 재시도/대기로 해결 불가) escalation
+ *  이 구조적으로 성립할 수 없음이 production에서 증명됐고, Groq 계정 upgrade는 이 시점에
+ *  선택지가 아니다. Primary/Escalation는 여전히 논리적으로 분리된 두 번째 독립 리뷰 패스다
+ *  (§ createFinalReviewerRoutingProvider, escalation은 여전히 실제 두 번째 호출이다) — provider/
+ *  model이 우연히 같을 뿐, escalation 판정/호출 자체를 생략하거나 primary 결과에 자동 승인하지
+ *  않는다. FINAL_REVIEWER_PRIMARY_MODEL과 값을 공유해 두 상수가 우연히 어긋나지 않게 한다.
+ *  Groq adapter/413→RATE_LIMIT classifier 자체는 전혀 삭제/약화하지 않았다 — 이 provider
+ *  selection만 더 이상 Groq를 escalation으로 고르지 않을 뿐이다. */
+export const FINAL_REVIEWER_ESCALATION_MODEL = FINAL_REVIEWER_PRIMARY_MODEL;
+export const FINAL_REVIEWER_ESCALATION_PROVIDER_ID = FIREWORKS_PROVIDER_ID;
 
 // 하위 호환 — 기존 호출부(gpt-smoke-test.ts 등)가 "production에서 응답할 것으로 기대되는
 // provider/model"이라는 의미로 이 이름을 참조한다. 일반 review는 escalation 없이 Fireworks가
@@ -156,7 +162,11 @@ export function createFinalReviewerProductionProvider(
   httpFetch?: ChatCompletionHttpFetch
 ): ReviewProvider {
   const primaryProvider = withJsonOutputFormatDirective(createFireworksReviewProvider(FINAL_REVIEWER_PRIMARY_MODEL, httpFetch, env));
-  const escalationProvider = withJsonOutputFormatDirective(createGroqReviewProvider(FINAL_REVIEWER_ESCALATION_MODEL, httpFetch, env));
+  // Fireworks-only Final Reviewer Routing(2026-08-26, § 위 FINAL_REVIEWER_ESCALATION_MODEL 주석)
+  // — escalation도 Fireworks를 그대로 다시 호출한다(같은 provider/model이지만 여전히 primary와
+  // 분리된 두 번째 review() 호출이다 — routing 판정/호출 자체는 createFinalReviewerRoutingProvider가
+  // 그대로 수행한다).
+  const escalationProvider = withJsonOutputFormatDirective(createFireworksReviewProvider(FINAL_REVIEWER_ESCALATION_MODEL, httpFetch, env));
 
   // finalReviewerProductionProvider는 module import 시점에 한 번만 만들어지는 singleton이다 —
   // 이 함수(createFinalReviewerProductionProvider) 자체는 한 번만 호출되므로, registry/
@@ -167,9 +177,12 @@ export function createFinalReviewerProductionProvider(
   const routingProvider = createFinalReviewerRoutingProvider({
     primaryProvider,
     escalationProvider,
+    // escalation provider가 Fireworks로 바뀌었으므로(§ 위 FINAL_REVIEWER_ESCALATION_MODEL 주석)
+    // ZDR 검증 여부도 Fireworks 기준으로 확인한다 — Groq 기준을 그대로 두면 escalation provider
+    // 자신의 실제 상태와 무관한 값으로 classification이 잘못 계산된다.
     escalationSecurityCheck: () =>
       evaluateProviderSecurity(
-        { classification: reviewerClassificationFor(resolveGroqZdrVerification(env).verified), providerId: FINAL_REVIEWER_ESCALATION_PROVIDER_ID },
+        { classification: reviewerClassificationFor(resolveFireworksZdrVerification(env).verified), providerId: FINAL_REVIEWER_ESCALATION_PROVIDER_ID },
         resolveFinalReviewerProductionSecurityRegistry(env)
       ),
   });
