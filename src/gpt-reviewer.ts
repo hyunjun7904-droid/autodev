@@ -351,6 +351,23 @@ export interface ReviewPayloadResult {
   scopeViolations: string[];
   mode: ReviewPayloadMode;
   newBaseline: ReviewBaseline;
+  /**
+   * Final Consistency Cross-check 전용 — Task 1.3 JARVIS 실전 false positive(2026-08-26) 수정.
+   * newBaseline.fileHashes(REVIEW COVERAGE baseline)는 의도적으로 fullyIncludedPaths만 담는다
+   * (예산 초과로 완전히 전달되지 못한 파일은 "다음 round에도 계속 검토 대상"으로 남기기 위해
+   * 제외 — 이 semantics는 INCREMENTAL 재사용에 필수이므로 건드리지 않는다). 하지만 그 필터링된
+   * 집합을 "review 요청이 진행되는 동안 working tree가 실제로 안 바뀌었는가"를 확인하는 데
+   * 그대로 재사용하면, truncated(budget 초과) 파일 하나만 있어도 파일 개수가 always mismatch돼
+   * 실제로는 아무것도 바뀌지 않았는데도 항상 false positive로 REVIEW_CONSISTENCY_CHECK_FAILED가
+   * 난다(실제로 JARVIS Task 1.3에서 재현/확인됨 — baseline 1개 파일 vs 재검사 시점 2개 파일).
+   *
+   * consistencySnapshot은 그 별개의 목적을 위한 별도 스냅샷이다 — currentSnapshot(이 함수가
+   * 이미 한 번만 계산하는, truncation과 무관하게 changes.all 전체에 대한 full-content hash)을
+   * 필터링 없이 그대로 담는다. full/truncated(head+tail)/전혀 review에 포함되지 못한 파일 모두
+   * 동일하게 "이 경로가 payload를 만든 시점에 이 hash였다"만 기록한다 — "review에 완전히
+   * 포함됐는가"라는 다른 질문(newBaseline.fileHashes의 책임)과 섞지 않는다.
+   */
+  consistencySnapshot: Record<string, ReviewFileState>;
 }
 
 /**
@@ -403,20 +420,26 @@ function buildReviewPayload(
 
   if (!baseline) {
     const { text, scopeViolations, fullyIncludedPaths } = buildChangeSection(allowedPathPrefixes, scopeDirs, changes, access);
-    return { text, scopeViolations, mode: "FULL", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL") };
+    return { text, scopeViolations, mode: "FULL", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL"), consistencySnapshot: currentSnapshot };
   }
 
   const validation = validateReviewBaseline(baseline, { taskIdentity, scopeKey, allowedPathPrefixesKey, reviewCycle });
   if (!validation.ok) {
     log(`GPT Reviewer baseline을 신뢰할 수 없음(${validation.reason}) — SAFE_FULL_FALLBACK으로 전환합니다.`, { reviewCycle });
     const { text, scopeViolations, fullyIncludedPaths } = buildChangeSection(allowedPathPrefixes, scopeDirs, changes, access);
-    return { text, scopeViolations, mode: "SAFE_FULL_FALLBACK", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL") };
+    return { text, scopeViolations, mode: "SAFE_FULL_FALLBACK", newBaseline: buildReviewedBaseline(fullyIncludedPaths, "ALL"), consistencySnapshot: currentSnapshot };
   }
 
   const scopeViolations = changes.all.map((c) => c.path).filter((p) => !isPathInScope(p, allowedPathPrefixes));
   const { changedPaths, unchangedPaths, removedPaths } = diffAgainstBaseline(currentSnapshot, baseline);
   const { text, fullyIncludedPaths } = buildIncrementalText(changedPaths, unchangedPaths, removedPaths, changes, access, scopeViolations);
-  return { text, scopeViolations, mode: "INCREMENTAL", newBaseline: buildReviewedBaseline(fullyIncludedPaths, new Set(changedPaths)) };
+  return {
+    text,
+    scopeViolations,
+    mode: "INCREMENTAL",
+    newBaseline: buildReviewedBaseline(fullyIncludedPaths, new Set(changedPaths)),
+    consistencySnapshot: currentSnapshot,
+  };
 }
 
 // Final Consistency Cross-check(§ 요구사항 9)의 핵심 판정 — reviewClaudeResultOnce()가
@@ -424,15 +447,27 @@ function buildReviewPayload(
 // round-trip 없이도(git-changes.ts/review-baseline.ts만으로) 결정적으로 재현/검증할 수 있어,
 // 이 Task의 테스트가 실제 API를 호출하지 않고도 "review payload를 만든 시점 이후 working
 // tree가 실제로 달라졌는가"를 직접 증명할 수 있게 한다(review-baseline-tests.ts).
+//
+// JARVIS Task 1.3 false positive 수정(2026-08-26) — 이 함수는 이제 ReviewBaseline(REVIEW
+// COVERAGE 개념, fullyIncludedPaths로 필터링된 newBaseline.fileHashes)이 아니라
+// ReviewPayloadResult.consistencySnapshot(필터링 없는 전체 hash snapshot)을 받는다.
+// 이전에는 newBaseline.fileHashes를 그대로 재사용했는데, 그건 "예산 초과로 완전히 전달되지
+// 못한 파일은 제외"하는 REVIEW COVERAGE 규칙을 따르므로, truncated(20,000자 초과) 파일이
+// 하나만 있어도 payload 시점 스냅샷(파일 제외됨)과 재검사 시점 스냅샷(파일 포함됨)의 키 개수가
+// 항상 달라져 실제 내용 변경이 전혀 없어도 매번 false positive로 drift가 보고됐다(실제
+// JARVIS Task 1.3 production에서 재현·확인됨 — baseline 1개 파일 vs 재검사 2개 파일). 두
+// snapshot 모두 동일한 포함 규칙(scopeDirs 안의 changes.all 전체, truncation 여부 무관)을
+// 쓰도록 통일해 이 비대칭을 제거한다 — REVIEW COVERAGE(fullyIncludedPaths) semantics 자체는
+// 전혀 건드리지 않는다(여전히 그대로 별도 baseline으로 존재).
 export function hasWorkingTreeDriftedSincePayload(
   scopeDirs: string[],
-  payloadBaseline: ReviewBaseline,
+  payloadConsistencySnapshot: Record<string, ReviewFileState>,
   executor?: SafeExecutorContext
 ): boolean {
   const access = resolveFileAccess(executor);
   const currentChanges = getWorkingTreeChanges(scopeDirs, access.projectRoot);
   const currentSnapshot = buildFileStateSnapshot(currentChanges, makeFileStateReader(access));
-  return !snapshotsAreIdentical(currentSnapshot, payloadBaseline.fileHashes);
+  return !snapshotsAreIdentical(currentSnapshot, payloadConsistencySnapshot);
 }
 
 // export: developer-reviewer-context-tests.ts가 실제 OpenAI API를 호출하지 않고도 review
@@ -447,10 +482,16 @@ export function buildReviewInput(
   projectContext: ReviewProjectContext,
   executor?: SafeExecutorContext,
   baseline?: ReviewBaseline
-): { input: string; scopeViolations: string[]; reviewMode: ReviewPayloadMode; newBaseline: ReviewBaseline } {
+): {
+  input: string;
+  scopeViolations: string[];
+  reviewMode: ReviewPayloadMode;
+  newBaseline: ReviewBaseline;
+  consistencySnapshot: Record<string, ReviewFileState>;
+} {
   const access = resolveFileAccess(executor);
   const testsSummary = result.tests.map((t) => `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`).join("\n") || "(없음)";
-  const { text: changeSection, scopeViolations, mode, newBaseline } = buildReviewPayload(
+  const { text: changeSection, scopeViolations, mode, newBaseline, consistencySnapshot } = buildReviewPayload(
     task,
     reviewCycle,
     allowedPathPrefixes,
@@ -469,7 +510,7 @@ export function buildReviewInput(
     `# 테스트 결과(AutoDev가 실제로 실행해 확인한 exitCode 기준)\n${testsSummary}`,
     `# 실제 변경 내역(git status 기준, tracked+untracked 전부)\n${changeSection}`,
   ].join("\n\n");
-  return { input, scopeViolations, reviewMode: mode, newBaseline };
+  return { input, scopeViolations, reviewMode: mode, newBaseline, consistencySnapshot };
 }
 
 export function buildSystemInstructions(ctx: ReviewProjectContext): string {
@@ -522,7 +563,7 @@ export async function reviewClaudeResultOnce(
   securityGateOverrides?: { classification?: DataClassification; registry?: ProviderSecurityRegistry }
 ): Promise<GptReviewApiResult> {
   const effectiveAllowedPathPrefixes = allowedPathPrefixes ?? projectContext.scopeDirs;
-  const { input, scopeViolations, reviewMode, newBaseline } = buildReviewInput(
+  const { input, scopeViolations, reviewMode, newBaseline, consistencySnapshot } = buildReviewInput(
     task,
     result,
     reviewCycle,
@@ -700,7 +741,7 @@ export async function reviewClaudeResultOnce(
   // 그대로 반환하지 않고 HUMAN_REQUIRED로 강제 전환한다 — "previous PASS를 단순히 신뢰하지
   // 않는다"는 원칙을 APPROVED 후보 시점에도 동일하게 적용한다.
   if (parsed.decision === "PASS") {
-    if (hasWorkingTreeDriftedSincePayload(projectContext.scopeDirs, newBaseline, executor)) {
+    if (hasWorkingTreeDriftedSincePayload(projectContext.scopeDirs, consistencySnapshot, executor)) {
       log("GPT 리뷰 Final Consistency Cross-check 실패 — working tree가 review 도중 변경됨, PASS를 신뢰하지 않음", {
         reviewCycle,
         reviewMode,

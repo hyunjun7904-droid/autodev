@@ -261,11 +261,14 @@ function scenarioH_finalConsistencyDetectsDrift(): void {
   const executor = makeExecutor(repo);
 
   const round1 = buildReviewInput("task H", FAKE_RESULT, 1, ["src/"], CONTEXT, executor, undefined);
-  check("H) drift 없이 재확인하면 drifted=false", !hasWorkingTreeDriftedSincePayload(["src/"], round1.newBaseline, executor));
+  check("H) drift 없이 재확인하면 drifted=false", !hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor));
 
   // review payload를 만든 "이후" 파일이 다시 바뀌었다고 가정(예: 동시 write, race).
   writeFile(repo, "src/fileL.ts", "export const l = 'L_V2_DRIFTED';\n");
-  check("H) payload 이후 실제로 내용이 바뀌면 drifted=true로 감지됨(이전 PASS 영역 변경 감지, #16)", hasWorkingTreeDriftedSincePayload(["src/"], round1.newBaseline, executor));
+  check(
+    "H) payload 이후 실제로 내용이 바뀌면 drifted=true로 감지됨(이전 PASS 영역 변경 감지, #16)",
+    hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +500,72 @@ function scenarioP_incrementalSurfacesExcludedSecretPaths(): void {
   check("P) 실제 secret 파일 내용은 노출되지 않음", !round2.input.includes("should-not-appear"));
 }
 
+// ---------------------------------------------------------------------------
+// Q) Final Consistency Cross-check false positive 수정(2026-08-26, JARVIS Task 1.3 실전 사고).
+//    REVIEW COVERAGE baseline(newBaseline.fileHashes, fullyIncludedPaths로 필터링됨)과
+//    CONSISTENCY snapshot(consistencySnapshot, truncation과 무관하게 scope 전체)이 서로 다른
+//    개념으로 완전히 분리됐는지 직접 증명한다. 실제 사고: truncated된 파일 하나가 baseline에서는
+//    빠지고 재검사 시점 스냅샷에는 있어(키 개수 1 vs 2) 아무 내용도 안 바뀌었는데
+//    REVIEW_CONSISTENCY_CHECK_FAILED가 발생했다.
+// ---------------------------------------------------------------------------
+function scenarioQ_finalConsistencyUsesUnfilteredSnapshotNotCoverageBaseline(): void {
+  const repo = makeTempGitRepo("incr-review-q-");
+  writeFile(repo, "src/fileSmallQ.ts", "export const smallQ = 'SMALLQ_V0';\n");
+  commitAll(repo, "init");
+  const executor = makeExecutor(repo);
+
+  // perFileMaxChars=20_000 — 이 파일은 truncate된다(실제 JARVIS Task 1.3의 20,235자 파일과 동일한
+  // 모양의 재현).
+  const hugeContent = "HUGE_Q_MARKER_START\n" + "x".repeat(25_000) + "\nHUGE_Q_MARKER_END\n";
+  writeFile(repo, "src/fileHugeQ.ts", hugeContent); // untracked, 첫 round부터 truncate 대상.
+  writeFile(repo, "src/fileSmallQ.ts", "export const smallQ = 'SMALLQ_V1';\n");
+
+  const round1 = buildReviewInput("task Q", FAKE_RESULT, 1, ["src/"], CONTEXT, executor, undefined);
+
+  // Case 6 — REVIEW COVERAGE semantics는 전혀 바뀌지 않았다: truncated 파일은 여전히 baseline
+  // (newBaseline.fileHashes)에서 제외된다 — "fully included로 잘못 취급되지 않음"을 직접 증명.
+  check(
+    "Q6) truncated fileHugeQ는 여전히 REVIEW COVERAGE baseline(newBaseline.fileHashes)에서 제외됨(semantics 보존)",
+    !("src/fileHugeQ.ts" in round1.newBaseline.fileHashes)
+  );
+  check("Q6) 반면 CONSISTENCY snapshot에는 truncated 파일도 포함됨(별개 목적)", "src/fileHugeQ.ts" in round1.consistencySnapshot);
+  check(
+    "Q) fully included 파일(fileSmallQ)은 newBaseline과 consistencySnapshot 양쪽 모두에 포함됨",
+    "src/fileSmallQ.ts" in round1.newBaseline.fileHashes && "src/fileSmallQ.ts" in round1.consistencySnapshot
+  );
+
+  // Case 1 + Case 2 — fully-included 파일도, truncated 파일도 실제로는 아무것도 안 바뀌면
+  // drift=false여야 한다(이게 바로 JARVIS Task 1.3 production false positive의 직접 회귀 테스트).
+  check(
+    "Q1+Q2) 아무 파일도 review 도중 바뀌지 않으면(truncated 파일 포함) drift=false — 실제 프로덕션 false positive 직접 재현/수정 확인",
+    !hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor)
+  );
+
+  // Case 3 — truncated 파일이 review 도중 "진짜로" 바뀌면 여전히 drift=true여야 한다(안전장치가
+  // 약해지지 않았음을 증명 — 이 케이스가 없으면 그냥 truncated 파일을 통째로 무시하는 것과
+  // 구분이 안 된다).
+  writeFile(repo, "src/fileHugeQ.ts", "HUGE_Q_MARKER_START\n" + "z".repeat(25_000) + "\nHUGE_Q_MARKER_END_MODIFIED\n");
+  check(
+    "Q3) truncated 파일이 review 도중 실제로 변경되면 drift=true(안전장치 유지 확인)",
+    hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor)
+  );
+  writeFile(repo, "src/fileHugeQ.ts", hugeContent); // 원상복구.
+  check(
+    "Q3 복원 확인) 원상복구 후 다시 drift=false로 돌아옴(hash 비교가 실제 내용 기준임을 확인)",
+    !hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor)
+  );
+
+  // Case 4 — review 도중 관련 있는 새 파일이 나타나면 drift=true.
+  writeFile(repo, "src/fileNewQ.ts", "export const newQ = 'NEW_DURING_REVIEW';\n");
+  check("Q4) review 도중 새 관련 파일이 나타나면 drift=true", hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor));
+  unlinkSync(join(repo, "src/fileNewQ.ts")); // 원상복구.
+  check("Q4 복원 확인) 새 파일을 지우면 다시 drift=false로 돌아옴", !hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor));
+
+  // Case 5 — review 도중 baseline에 있던(=payload 시점에 존재했던) 관련 파일이 사라지면 drift=true.
+  unlinkSync(join(repo, "src/fileSmallQ.ts"));
+  check("Q5) review 도중 관련 파일이 사라지면 drift=true", hasWorkingTreeDriftedSincePayload(["src/"], round1.consistencySnapshot, executor));
+}
+
 async function main(): Promise<void> {
   const originalApiKey = process.env.OPENAI_API_KEY;
   delete process.env.OPENAI_API_KEY; // § 요구사항 26 — 이 파일의 어떤 시나리오도 실제 API를 호출하지 않는다.
@@ -518,6 +587,7 @@ async function main(): Promise<void> {
     scenarioN_incrementalDoesNotLeakOutOfScopeUntrackedContent();
     scenarioO_untrackedFileRemovedBetweenRoundsIsSurfaced();
     scenarioP_incrementalSurfacesExcludedSecretPaths();
+    scenarioQ_finalConsistencyUsesUnfilteredSnapshotNotCoverageBaseline();
   } finally {
     if (originalApiKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = originalApiKey;
