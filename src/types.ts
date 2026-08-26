@@ -50,7 +50,17 @@ export type GptErrorCode =
   // 호출되기 전에 결정되므로 실제 API 오류(API_ERROR 등)로 오분류되지 않으며, Budget Guard의
   // BUDGET_EXCEEDED와도 구분된다(둘 다 provider 호출 0회를 보장하지만 사유가 다르다). 재시도로
   // 해결되지 않으므로 항상 transient=false다.
-  | "PROVIDER_SECURITY_BLOCKED";
+  | "PROVIDER_SECURITY_BLOCKED"
+  // Final Reviewer Routing(Fireworks Primary / Groq Escalation) — escalation이 필요하다고
+  // 판정됐지만(§ final-reviewer-routing.ts) escalation reviewer(Groq) 호출이 transient하게
+  // 실패했을 때(rate limit/quota/timeout/일시적 provider 장애 — errorCode 자체는 RATE_LIMIT/
+  // TIMEOUT/API_ERROR 중 하나였고 transient===true였음)만 쓰인다. Core의 5회 자동 재시도 루프에
+  // 맡기지 않고 즉시(transient=false) HUMAN_REQUIRED로 수렴시켜, "escalation이 필요한데
+  // 사용할 수 없다"는 사실을 재시도에 묻히지 않고 즉시 드러낸다(자동 승인 금지 — HOLD와
+  // 동일한 의미). AUTH_ERROR(예: GROQ_API_KEY 누락)처럼 AutoDev 자체의 설정 오류인 경우는 이
+  // 코드로 재분류하지 않고 원래 errorCode를 그대로 노출한다(§ 요구사항 "missing required API
+  // key를 fallback으로 숨기지 않는다").
+  | "ESCALATION_REVIEWER_UNAVAILABLE";
 
 // SI-3.8A — GPT Reviewer API Budget Guard가 OpenAI API 호출을 막았을 때 별도의
 // "WAITING_API_BUDGET" enum 값을 추가하는 대신 기존 WAITING_HUMAN을 그대로 재사용하기로

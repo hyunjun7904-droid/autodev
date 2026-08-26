@@ -1,123 +1,185 @@
 import type { ReviewProvider, ReviewProviderRequest, ReviewProviderResult } from "./review-provider";
-import type { ProviderSecurityRegistry } from "./provider-security-gate";
+import type { ProviderSecurityRegistry, ProviderSecurityMetadata, DataClassification } from "./provider-security-gate";
+import { evaluateProviderSecurity } from "./provider-security-gate";
 import type { ChatCompletionHttpFetch } from "./chat-completion-review-provider";
 import { createGroqReviewProvider } from "./groq-review-provider";
-import { GROQ_PROVIDER_ID, buildGroqProviderSecurityMetadata } from "./provider-pool-security-metadata";
+import { createFireworksReviewProvider } from "./fireworks-review-provider";
+import {
+  GROQ_PROVIDER_ID,
+  FIREWORKS_PROVIDER_ID,
+  buildGroqProviderSecurityMetadata,
+  buildFireworksProviderSecurityMetadata,
+  resolveGroqZdrVerification,
+  resolveFireworksZdrVerification,
+} from "./provider-pool-security-metadata";
 import { OPENAI_REVIEW_RESULT_SCHEMA } from "./openai-review-provider";
+import { createFinalReviewerRoutingProvider } from "./final-reviewer-routing";
 
-// Production Final Reviewer Provider Selection — AutoDev Production Final Reviewer Wiring
-// Task.
+// Production Final Reviewer Provider Selection — Final Reviewer Routing(Fireworks Primary /
+// Groq Escalation), 실용형 보안 정책(§ .claude/CLAUDE.md).
 //
 // gpt-reviewer.ts(Reviewer Core)의 reviewClaudeResultOnce()가 provider/securityGateOverrides
-// 인자를 생략했을 때(production 경로 — orchestrator.ts/agent-orchestrator.ts는 항상 생략한다,
-// § 그 두 파일의 selectDefaultGptReviewer/selectDefaultReviewerRunner) 쓰는 production 기본값
-// 하나만 이 파일이 결정한다. 실제 provider transport(chat-completion-review-provider.ts 공용
-// factory)/Security Gate 판정(provider-security-gate.ts)/qualification corpus/evaluator는 전혀
-// 새로 만들지 않는다 — final-reviewer-benchmark-groq.ts(Groq openai/gpt-oss-120b, 4/4
-// QUALIFIED, CRITICAL_MISSED=0, HIGH_MISSED=0)가 검증한 것과 정확히 동일한 provider factory
-// (groq-review-provider.ts createGroqReviewProvider)와 동일한 Security metadata 함수
-// (provider-pool-security-metadata.ts buildGroqProviderSecurityMetadata)를 그대로 재사용한다.
+// 인자를 생략했을 때(production 경로) 쓰는 production 기본값을 이 파일이 결정한다. 일반 Final
+// Review는 Fireworks(accounts/fireworks/models/gpt-oss-120b, qualification 12/13 PASS,
+// Critical miss=0, High miss=1 — D8_insecure_fallback_downgrade)가 담당하고, 위험도가 높은
+// 변경/Fireworks의 불확실한 결과에서만 Groq(openai/gpt-oss-120b, qualification 13/13 PASS)가
+// 2차 검증한다(final-reviewer-routing.ts) — 목적은 Fireworks 유료 credit을 실제 workload에
+// 쓰면서 Groq quota를 escalation 전용으로 보존하는 것이다.
 //
-// Fail-closed는 이 파일이 새로 구현하지 않는다 — 기존 두 Core 게이트를 그대로 통과시킬 뿐이다:
-//   - GROQ_API_KEY 누락 → createChatCompletionReviewProvider()의 review()가 실제 HTTP 요청을
-//     보내기 전에 즉시 { ok:false, errorCode:"AUTH_ERROR", requestAttempted:false }를 반환한다
-//     (chat-completion-review-provider.ts, 이 파일과 무관하게 이미 존재하는 동작).
-//   - AUTODEV_GROQ_ZDR_VERIFIED !== "true" → buildGroqProviderSecurityMetadata()가
-//     retentionPolicy="bounded"(30일)를 반환하고, provider-security-gate.ts의 기존 Core hard
-//     rule(CONFIDENTIAL 이상은 zero retention만 인정)이 provider.review()를 호출하기 전에
-//     PROVIDER_SECURITY_BLOCKED로 BLOCK한다.
-// 두 조건 중 하나라도 미충족이면 Reviewer Core는 HUMAN_REQUIRED를 반환할 뿐 다른 provider(OpenAI/
-// Ollama/OpenRouter/NVIDIA)로 자동 전환하지 않는다 — 이 파일은 그 provider들의 ReviewProvider
-// factory(createOpenAIReviewProvider/openAIReviewProvider, ollama-review-provider.ts 등)를 아예
-// import하지 않는다(참조 자체가 없으므로 silent fallback 경로가 구조적으로 없다). 유일한 예외는
-// openai-review-provider.ts가 export하는 OPENAI_REVIEW_RESULT_SCHEMA 상수 하나뿐이다(아래 §
-// GROQ_OUTPUT_FORMAT_DIRECTIVE) — 이 값은 그 파일 자신의 주석이 "다른 provider가 동일한 구조화
-// 출력 schema를 강제할 때도 그대로 가져다 쓴다"고 명시한 순수 데이터 상수이지 OpenAI provider
-// 자체가 아니다.
+// 실제 provider transport(chat-completion-review-provider.ts 공용 factory)/Security Gate
+// 판정 로직(provider-security-gate.ts)/escalation 판정 로직(final-reviewer-routing.ts)은 이
+// 파일이 새로 만들지 않는다.
 //
-// Qualification(final-reviewer-benchmark-groq.ts)과 production 경로는 서로를 import하지 않는다
-// — benchmark 스크립트는 이 파일을 쓰지 않고 createGroqReviewProvider를 직접 호출하며, 이 파일도
-// benchmark corpus/evaluator를 전혀 참조하지 않는다.
-
-/** qualification을 통과한 모델 — final-reviewer-benchmark-groq.ts의 QUALIFIED_MODEL 기본값과
- *  정확히 동일한 문자열이다(값 복제이지 로직 복제가 아니다 — 두 파일이 이 상수를 공유하는
- *  import를 두지 않는 이유는 qualification 스크립트가 production 코드에 의존해서는 안 되기
- *  때문이다, § gpt-reviewer.ts 상단 "runtime production path가 benchmark 코드를 실행하면
- *  안 된다"). 이 값을 바꾸는 것은 곧 "어떤 모델을 production Final Reviewer로 쓸지" 자체를
- *  바꾸는 것이므로, 새 qualification 없이 이 값을 바꾸지 않는다. */
-export const FINAL_REVIEWER_PRODUCTION_MODEL = "openai/gpt-oss-120b";
-
-/** production Final Reviewer provider id — Groq(direct-external)와 동일하다. */
-export const FINAL_REVIEWER_PRODUCTION_PROVIDER_ID = GROQ_PROVIDER_ID;
-
-// STEP 5(REAL GROQ END-TO-END SMOKE) 실행 중 실제로 발견된 문제 — chat-completion-review-provider.ts
-// (Groq/OpenRouter/NVIDIA 공용)는 OpenAI Responses API의 구조화 출력(json_schema strict 모드)과
-// 달리 response_format을 전송하지 않는다(§ 그 파일 상단 주석 — 이 Task가 그 공용 factory를
-// 수정하지 않는다). gpt-reviewer.ts의 production system instructions(buildSystemInstructions())는
-// 어떤 provider에도 동일하게 중립적이라 명시적 JSON 출력 지시를 포함하지 않는데, 이 지시 없이
-// production instructions만으로 실제 호출해보면 gpt-oss-120b는 markdown 산문 리뷰를 반환해
-// Core의 JSON.parse(outputText)가 INVALID_OUTPUT으로 실패한다(직접 확인함). qualification
-// (final-reviewer-benchmark-groq.ts buildGroqInstructions())은 정확히 이 문제를 "출력 형식(필수)"
-// 지시 + OPENAI_REVIEW_RESULT_SCHEMA를 system instructions 끝에 추가해서 우회했고, 그 결과
-// PARSE_FAILURES=0으로 qualification을 통과했다 — 즉 "qualification을 통과한 설정"은 모델
-// 하나가 아니라 [모델 + 이 출력 형식 지시]의 조합이다. 이 파일도 production에 그 조합을 그대로
-// 옮긴다(모델만 옮기고 지시를 빠뜨리면 qualification이 실제로 검증한 조건과 달라진다).
+// =========================================================
+// 실용형 보안 정책 — ZDR verification은 provider 사용의 필수 자격조건이 아니라 신뢰도
+// 가산점이다.
+// =========================================================
 //
-// 이 지시는 Core의 JSON 파싱/검증 책임을 침범하지 않는다 — review-provider.ts의 원칙("invalid
-// structured output 판정은 Core의 단일 책임")을 그대로 지킨다: 이 wrapper는 request.instructions
-// 문자열에 고정 텍스트를 추가해 그대로 전달할 뿐, provider가 반환한 outputText를 스스로
-// JSON.parse하거나 그 유효성을 판단하지 않는다(성공/실패 결과를 그대로 통과시킨다) — 어떤 것이
-// "유효한 review"인지 판단하는 것은 여전히 gpt-reviewer.ts뿐이다. benchmark 스크립트의
-// 텍스트/스키마 상수를 import하지 않는다(qualification과 production은 서로를 참조하지 않는다,
-// § 파일 상단 주석) — 대신 두 파일이 이미 공유하도록 export된 OPENAI_REVIEW_RESULT_SCHEMA(§
-// openai-review-provider.ts, "다른 provider가 동일한 구조화 출력 schema를 강제할 때도 이 값을
-// 그대로 가져다 쓴다"고 명시된 값)만 재사용하고, 지시 문구 자체는 qualification이 검증한 것과
-// 동일한 문구를 이 파일에 직접 유지한다(qualification 스크립트를 production이 import하지 않기
-// 위한 값 복제 — § FINAL_REVIEWER_PRODUCTION_MODEL과 동일한 원칙).
-const GROQ_OUTPUT_FORMAT_DIRECTIVE = `
+// provider-security-gate.ts의 Core hard rule(CONFIDENTIAL 이상 등급은 zero retention만
+// 인정)은 이 파일이 전혀 수정하지 않는다 — 다른 모든 provider 경로(OpenAI 기본값 등)는 여전히
+// 그 규칙 그대로 적용된다. 대신 이 파일은 review-provider.ts가 제공하는 선택적 seam
+// (ReviewProvider.reviewerDataClassification)을 이용해 Fireworks/Groq에 한해 "이 요청에 어떤
+// classification을 물어볼지"를 ZDR 검증 여부에 따라 동적으로 정한다:
+//   - ZDR verified(AUTODEV_FIREWORKS_ZDR_VERIFIED/AUTODEV_GROQ_ZDR_VERIFIED === "true") →
+//     CONFIDENTIAL을 그대로 요청한다 — retentionPolicy도 "zero"이므로 Core Gate가 기존과
+//     동일하게 PASS한다(가산점 — 검증되면 기존과 동일한 최고 수준 보증을 받는다).
+//   - ZDR unverified → INTERNAL을 요청한다. Core의 CONFIDENTIAL 이상 전용 zero-retention
+//     요구사항은 INTERNAL에는 적용되지 않으므로(§ provider-security-gate.ts
+//     CLASSIFICATION_LEVEL), ZDR 미검증만을 이유로 BLOCK되지 않는다 — "그것만으로 provider를
+//     탈락시키지 않는다"는 정책을 그 Core 로직을 바꾸지 않고 구현한다.
+// 이 하향은 안전하다 — Review payload(§ gpt-reviewer.ts buildChangeSection) 자체가 이미
+// git-changes.ts의 secret/env 파일 패턴 제외를 거친 뒤에만 어떤 provider(OpenAI 포함)로도
+// 전달된다(이 Task가 새로 추가한 보호가 아니라 기존에 이미 존재하는, provider에 무관한
+// 공용 경로다). 호출부가 명시적으로 securityGateOverrides.classification을 지정하면(예:
+// CONFIDENTIAL/RESTRICTED가 실제로 필요하다고 판단한 경우) 그 값이 항상 이 provider의 자기
+// 선언보다 우선한다(§ gpt-reviewer.ts dataClassification 우선순위 주석) — 이 provider는 그
+// 값을 낮출 방법이 없다.
+//
+// retentionPolicy가 "unknown"(정보 자체가 없음, Fireworks 미검증 기본값)인 경우만 문서로 이미
+// 확인된 기본 동작에 맞춰 "bounded"로 완화해 표시한다(아래 toReviewerRegistryMetadata) —
+// buildFireworksProviderSecurityMetadata()/buildGroqProviderSecurityMetadata() 자신(다른
+// 소비처와 공유되는 shape/security metadata 빌더)은 전혀 수정하지 않는다. "unbounded"(보존기간
+// 제한 없음으로 실제 확인된 경우 — 지금은 둘 중 어느 provider도 이 값을 갖지 않는다)는 완화하지
+// 않는다 — 그것이 "완전히 불명확하거나 위험하다고 판단되는 경우 별도 검토"에 해당하는
+// 케이스다.
+//
+// Fireworks 자신의 fail-closed ZDR self-check(fireworks-review-provider.ts)도 이 정책에 맞춰
+// 완화됐다 — ZDR 미검증이어도 실제 HTTP 요청은 진행하고, 검증 여부는 이제 이 파일이 결정하는
+// classification에만 반영된다. API key 자체가 없으면(전혀 다른 문제) 그 provider는 여전히
+// fail-closed로 즉시 거부한다 — 그 검사는 이번 정책 변경과 무관하게 그대로 유지된다.
+
+/** qualification을 통과한 primary(Fireworks) 모델 — final-reviewer-benchmark-fireworks.ts의
+ *  기본값과 동일한 문자열이다(qualification 스크립트를 production이 import하지 않기 위한 값
+ *  복제 — § 아래 FINAL_REVIEWER_ESCALATION_MODEL과 동일한 원칙). 이 값을 바꾸는 것은 곧 "어떤
+ *  모델을 production primary Final Reviewer로 쓸지"를 바꾸는 것이므로, 새 qualification 없이
+ *  바꾸지 않는다. */
+export const FINAL_REVIEWER_PRIMARY_MODEL = "accounts/fireworks/models/gpt-oss-120b";
+export const FINAL_REVIEWER_PRIMARY_PROVIDER_ID = FIREWORKS_PROVIDER_ID;
+
+/** qualification을 통과한 escalation(Groq) 모델 — final-reviewer-benchmark-groq.ts의
+ *  QUALIFIED_MODEL 기본값과 정확히 동일한 문자열이다. */
+export const FINAL_REVIEWER_ESCALATION_MODEL = "openai/gpt-oss-120b";
+export const FINAL_REVIEWER_ESCALATION_PROVIDER_ID = GROQ_PROVIDER_ID;
+
+// 하위 호환 — 기존 호출부(gpt-smoke-test.ts 등)가 "production에서 응답할 것으로 기대되는
+// provider/model"이라는 의미로 이 이름을 참조한다. 일반 review는 escalation 없이 Fireworks가
+// 응답하므로 primary와 동일한 값을 가리킨다.
+export const FINAL_REVIEWER_PRODUCTION_MODEL = FINAL_REVIEWER_PRIMARY_MODEL;
+export const FINAL_REVIEWER_PRODUCTION_PROVIDER_ID = FINAL_REVIEWER_PRIMARY_PROVIDER_ID;
+
+// STEP 5(REAL GROQ END-TO-END SMOKE, Production Final Reviewer Wiring Task) 실행 중 실제로
+// 발견된 문제 — chat-completion-review-provider.ts(Fireworks/Groq/OpenRouter/NVIDIA 공용)는
+// OpenAI Responses API의 구조화 출력(json_schema strict 모드)과 달리 response_format을 전송하지
+// 않는다(§ 그 파일 상단 주석). gpt-reviewer.ts의 production system instructions
+// (buildSystemInstructions())는 어떤 provider에도 동일하게 중립적이라 명시적 JSON 출력 지시를
+// 포함하지 않는데, 이 지시 없이는 gpt-oss-120b가 markdown 산문 리뷰를 반환해 Core의
+// JSON.parse(outputText)가 INVALID_OUTPUT으로 실패한다(Groq 실제 호출로 직접 확인됨).
+// final-reviewer-benchmark-groq.ts/final-reviewer-benchmark-fireworks.ts 둘 다 동일하게 이
+// 문제를 "출력 형식(필수)" 지시 + OPENAI_REVIEW_RESULT_SCHEMA를 system instructions 끝에
+// 추가해서 우회했다 — 즉 "qualification을 통과한 설정"은 모델 하나가 아니라 [모델 + 이 출력
+// 형식 지시]의 조합이다. 이 지시 텍스트 자체는 provider에 무관하므로(모델 이름을 언급하지
+// 않는다) Fireworks/Groq 양쪽에 동일하게 적용한다.
+const JSON_OUTPUT_FORMAT_DIRECTIVE = `
 
 # 출력 형식(필수)
 설명, 서론, markdown 코드펜스 없이 아래 JSON Schema를 정확히 만족하는 JSON 객체 "하나만"
 출력하세요:
 ${JSON.stringify(OPENAI_REVIEW_RESULT_SCHEMA)}`;
 
-function withGroqOutputFormatDirective(inner: ReviewProvider): ReviewProvider {
+function withJsonOutputFormatDirective(inner: ReviewProvider): ReviewProvider {
   return {
     id: inner.id,
     model: inner.model,
     async review(request: ReviewProviderRequest): Promise<ReviewProviderResult> {
-      return inner.review({ instructions: request.instructions + GROQ_OUTPUT_FORMAT_DIRECTIVE, input: request.input });
+      return inner.review({ instructions: request.instructions + JSON_OUTPUT_FORMAT_DIRECTIVE, input: request.input });
     },
   };
 }
 
+/** ZDR verified → CONFIDENTIAL(기존과 동일한 최고 수준 요구), unverified → INTERNAL(zero
+ *  retention 요구사항이 적용되지 않는 Core의 기존 하위 등급) — provider-security-gate.ts의
+ *  등급 서열/판정 로직은 전혀 바꾸지 않는다. */
+function reviewerClassificationFor(zdrVerified: boolean): DataClassification {
+  return zdrVerified ? "CONFIDENTIAL" : "INTERNAL";
+}
+
+/** retentionPolicy가 "unknown"(정보 자체가 없음)일 때만 문서로 이미 확인된 기본 동작에 맞춰
+ *  "bounded"로 완화해 표시한다 — provider-pool-security-metadata.ts의 빌더 함수 자체는 전혀
+ *  수정하지 않으므로 real-provider-pool.ts 등 다른 소비처는 영향받지 않는다. "zero"/"bounded"/
+ *  "unbounded"는 이미 확인/판단된 값이므로 그대로 둔다(특히 "unbounded"는 완화하지 않는다 —
+ *  이것이 "완전히 불명확하거나 위험한" 경우다). */
+function toReviewerRegistryMetadata(metadata: ProviderSecurityMetadata): ProviderSecurityMetadata {
+  if (metadata.retentionPolicy !== "unknown") return metadata;
+  return { ...metadata, retentionPolicy: "bounded", maxRetentionDays: 30 };
+}
+
+/** gpt-reviewer.ts의 Provider Security Gate 호출(primary=Fireworks 판정)과
+ *  final-reviewer-routing.ts의 escalationSecurityCheck(escalation=Groq 판정)가 공유하는 단일
+ *  registry — 두 곳 모두 이 함수 하나로 metadata를 조립해, 같은 provider에 대해 서로 다른
+ *  metadata가 쓰이는 drift를 구조적으로 막는다. 등록되지 않은 provider는 이 registry에 없으므로
+ *  evaluateProviderSecurity()가 PROVIDER_UNKNOWN으로 BLOCK한다. */
+export function resolveFinalReviewerProductionSecurityRegistry(env: NodeJS.ProcessEnv = process.env): ProviderSecurityRegistry {
+  const fireworksMetadata = toReviewerRegistryMetadata(buildFireworksProviderSecurityMetadata(env));
+  const groqMetadata = toReviewerRegistryMetadata(buildGroqProviderSecurityMetadata(env));
+  return { [fireworksMetadata.providerId]: fireworksMetadata, [groqMetadata.providerId]: groqMetadata };
+}
+
 /**
- * production Final Reviewer ReviewProvider를 만든다. httpFetch를 지정하지 않으면
- * createGroqReviewProvider()의 기본값(nodeChatCompletionHttpFetch, 실제 네트워크)을 그대로
- * 쓴다 — 이 파라미터는 오직 테스트가 실제 네트워크 없이 이 selection 자체(모델/provider id가
- * 정확한지, GROQ_API_KEY/ZDR 조건이 그대로 적용되는지, 출력 형식 지시가 실제로 요청에
- * 포함되는지)를 검증하기 위한 주입 지점이다(§ chat-completion-review-provider.ts
- * ChatCompletionHttpFetch와 동일한 설계 원칙 — 실제 운용 기본값을 바꾸지 않는다).
+ * production Final Reviewer ReviewProvider(routing 포함)를 만든다. httpFetch를 지정하지
+ * 않으면 각 provider factory의 기본값(nodeChatCompletionHttpFetch, 실제 네트워크)을 그대로
+ * 쓴다 — 이 파라미터는 오직 테스트가 실제 네트워크 없이 이 selection/routing 자체를 검증하기
+ * 위한 주입 지점이다(§ chat-completion-review-provider.ts ChatCompletionHttpFetch와 동일한
+ * 설계 원칙 — 실제 운용 기본값을 바꾸지 않는다).
  */
 export function createFinalReviewerProductionProvider(
   env: NodeJS.ProcessEnv = process.env,
   httpFetch?: ChatCompletionHttpFetch
 ): ReviewProvider {
-  return withGroqOutputFormatDirective(createGroqReviewProvider(FINAL_REVIEWER_PRODUCTION_MODEL, httpFetch, env));
-}
+  const primaryProvider = withJsonOutputFormatDirective(createFireworksReviewProvider(FINAL_REVIEWER_PRIMARY_MODEL, httpFetch, env));
+  const escalationProvider = withJsonOutputFormatDirective(createGroqReviewProvider(FINAL_REVIEWER_ESCALATION_MODEL, httpFetch, env));
 
-/** gpt-reviewer.ts의 Provider Security Gate 호출에 그대로 쓰이는 registry — Groq 하나만 안다
- *  (openai-provider-security-metadata.ts resolveOpenAiProviderSecurityRegistry와 동일한 패턴).
- *  등록되지 않은 provider(예: 테스트 fake provider)는 이 registry에 없으므로
- *  evaluateProviderSecurity()가 PROVIDER_UNKNOWN으로 BLOCK한다 — 알 수 없는 provider를 자동
- *  allow하지 않는다. */
-export function resolveFinalReviewerProductionSecurityRegistry(env: NodeJS.ProcessEnv = process.env): ProviderSecurityRegistry {
-  const metadata = buildGroqProviderSecurityMetadata(env);
-  return { [metadata.providerId]: metadata };
+  // finalReviewerProductionProvider는 module import 시점에 한 번만 만들어지는 singleton이다 —
+  // 이 함수(createFinalReviewerProductionProvider) 자체는 한 번만 호출되므로, registry/
+  // classification을 여기서 즉시 계산해 값으로 고정하면 이후 env가 바뀌어도(테스트의 env
+  // 조작 등) 반영되지 않는다. 그래서 아래 두 closure는 실제로 호출되는 시점(escalation 판정
+  // 직전/매 review() 직전)에 매번 다시 계산한다 — API key를 review() 호출 시점에만 읽는 기존
+  // lazy 원칙과 동일하다.
+  const routingProvider = createFinalReviewerRoutingProvider({
+    primaryProvider,
+    escalationProvider,
+    escalationSecurityCheck: () =>
+      evaluateProviderSecurity(
+        { classification: reviewerClassificationFor(resolveGroqZdrVerification(env).verified), providerId: FINAL_REVIEWER_ESCALATION_PROVIDER_ID },
+        resolveFinalReviewerProductionSecurityRegistry(env)
+      ),
+  });
+
+  // gpt-reviewer.ts의 outer Provider Security Gate 호출이 이 값을 읽는다(§ review-provider.ts
+  // ReviewProvider.reviewerDataClassification, gpt-reviewer.ts dataClassification 우선순위).
+  return { ...routingProvider, reviewerDataClassification: () => reviewerClassificationFor(resolveFireworksZdrVerification(env).verified) };
 }
 
 // production default — 이 파일을 import하는 시점에 실제 네트워크 요청/자격증명 읽기를 하지
-// 않는다(createGroqReviewProvider()도 { id, model, review } 객체만 만들 뿐, 실제 GROQ_API_KEY는
-// review() 호출이 실제로 필요한 시점에만 env에서 읽는다 — § openai-review-provider.ts
-// openAIReviewProvider와 동일한 lazy 보장).
+// 않는다(각 provider factory도 { id, model, review } 객체만 만들 뿐, 실제 API key는 review()
+// 호출이 실제로 필요한 시점에만 env에서 읽는다).
 export const finalReviewerProductionProvider: ReviewProvider = createFinalReviewerProductionProvider();

@@ -233,7 +233,7 @@ function buildChangeSection(
     `## tracked 변경 diff (최대 ${MAX_DIFF_CHARS}자)\n${trackedDiffText}`,
     `## 신규(untracked) 파일 전체 내용\n${untrackedText}`,
     `## 예산 초과로 review에서 생략된 파일(어떤 파일이 잘렸는지)\n${skipped.length ? skipped.join("\n") : "(없음)"}`,
-    `## secret/빌드산출물/로그/temp 등으로 제외된 경로\n${changes.excluded.length ? changes.excluded.join("\n") : "(없음)"}`,
+    `## 민감정보/빌드산출물/로그/temp 등으로 제외된 경로\n${changes.excluded.length ? changes.excluded.join("\n") : "(없음)"}`,
     `## 이 task의 허용 경로(allowedPathPrefixes) 밖에서 발견된 변경 — 정책 위반, 반드시 BLOCK 또는 REVISE 판단에 반영\n${scopeViolations.length ? scopeViolations.join("\n") : "(없음)"}`,
   ].join("\n\n");
 
@@ -339,7 +339,7 @@ function buildIncrementalText(
     `## 예산 초과로 이번 payload에서 생략된 파일\n${skipped.length ? skipped.join("\n") : "(없음)"}`,
     `## 이전 review 이후 내용이 전혀 변경되지 않아 이번 payload에서 생략된 파일(${unchangedPaths.length}개, 이미 이전 round에서 검토됨)\n${unchangedPaths.length ? unchangedPaths.join("\n") : "(없음)"}`,
     `## 이전에 감지되었으나 이번 review에서는 더 이상 나타나지 않는 파일(예: untracked 신규 파일이 삭제됨 — git status가 더 이상 추적하지 않음)\n${removedPaths.length ? removedPaths.join("\n") : "(없음)"}`,
-    `## secret/빌드산출물/로그/temp 등으로 제외된 경로\n${changes.excluded.length ? changes.excluded.join("\n") : "(없음)"}`,
+    `## 민감정보/빌드산출물/로그/temp 등으로 제외된 경로\n${changes.excluded.length ? changes.excluded.join("\n") : "(없음)"}`,
     `## 이 task의 허용 경로(allowedPathPrefixes) 밖에서 발견된 변경 — 정책 위반, 반드시 BLOCK 또는 REVISE 판단에 반영\n${scopeViolations.length ? scopeViolations.join("\n") : "(없음)"}`,
   ].join("\n\n");
 
@@ -573,11 +573,16 @@ export async function reviewClaudeResultOnce(
   // 불완전하면 evaluateProviderSecurity()가 PROVIDER_UNKNOWN/PROVIDER_METADATA_INCOMPLETE로
   // BLOCK한다 — 어떤 provider도 이 registry에 없다는 이유만으로 자동 allow되지 않는다(§
   // 요구사항 5 Provider identity). classification 판정 자체는 이 함수가 임의로 하지 않는다 —
-  // 지정하지 않으면 review-provider.ts의 DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL)을
-  // 그대로 쓴다. production default registry는 Groq만 아는
-  // resolveFinalReviewerProductionSecurityRegistry()다(§ final-reviewer-provider-selection.ts) —
-  // AUTODEV_GROQ_ZDR_VERIFIED가 "true"로 명시 검증되지 않으면 이 Gate가 항상 BLOCK한다(fail-closed).
-  const dataClassification = securityGateOverrides?.classification ?? DEFAULT_REVIEWER_DATA_CLASSIFICATION;
+  // 우선순위는 (1) 호출부가 명시적으로 지정한 securityGateOverrides.classification(항상 최우선
+  // — 어떤 caller가 실제로 CONFIDENTIAL/RESTRICTED를 명시하면 provider의 자기 선언으로 절대
+  // 낮출 수 없다), (2) provider.reviewerDataClassification(review-provider.ts, Final Reviewer
+  // Routing 실용형 보안 정책 — provider가 스스로 선언하는 선택적 값, 지정하지 않는 provider는
+  // 이 단계가 그냥 없는 것과 동일), (3) DEFAULT_REVIEWER_DATA_CLASSIFICATION(CONFIDENTIAL, 기존
+  // 동작과 완전히 동일한 최종 fallback). provider-security-gate.ts의 판정 로직 자체는 전혀
+  // 바뀌지 않는다 — 이 3단계는 그 로직에 "어떤 classification을 물어볼지"만 결정할 뿐이다.
+  // production default registry는 resolveFinalReviewerProductionSecurityRegistry()다(§
+  // final-reviewer-provider-selection.ts).
+  const dataClassification = securityGateOverrides?.classification ?? provider.reviewerDataClassification?.() ?? DEFAULT_REVIEWER_DATA_CLASSIFICATION;
   const securityRegistry = securityGateOverrides?.registry ?? resolveFinalReviewerProductionSecurityRegistry();
   const securityResult = evaluateProviderSecurity({ classification: dataClassification, providerId: provider.id }, securityRegistry);
   if (securityResult.verdict === "BLOCK") {

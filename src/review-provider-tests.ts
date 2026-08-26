@@ -8,6 +8,7 @@ import {
   buildOpenAiProviderSecurityMetadata,
   resolveOpenAiProviderSecurityRegistry,
 } from "./openai-provider-security-metadata";
+import { resolveFinalReviewerProductionSecurityRegistry } from "./final-reviewer-provider-selection";
 import { runOrchestrator } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
 import { executeRoutingPlan } from "./agent-orchestrator";
@@ -137,12 +138,16 @@ async function scenarioA_openaiProviderParity(): Promise<void> {
     check("A) 직접 호출 requestAttempted=false(실제 네트워크 요청 미발생)", direct.requestAttempted === false);
   }
 
-  // Reviewer Core 기본 경로(provider/securityGateOverrides 모두 생략) — production default
-  // registry가 ZDR 미검증이라 CONFIDENTIAL을 zero-only 정책으로 BLOCK한다. 즉 OpenAI client는
-  // 아예 시도되지 않는다(§ Security Ordering Correction — 이는 오탐이 아니라 의도된 fail-closed
-  // 기본값이다).
+  // Reviewer Core 기본 경로(provider/securityGateOverrides 모두 생략) — production default는
+  // 이제 Fireworks Primary/Groq Escalation routing이다(§ final-reviewer-provider-selection.ts).
+  // 실용형 보안 정책(§ .claude/CLAUDE.md) 이후 ZDR 미검증만으로는 Security Gate가 더 이상
+  // BLOCK하지 않는다(classification이 INTERNAL로 하향돼 zero-retention 요구사항이 적용되지
+  // 않음) — 이 파일 main()이 FIREWORKS_API_KEY도 제거해두므로, 실제로 도달하는 지점은
+  // Fireworks provider 자신의 API key 누락 fail-closed다(client/요청 시도 자체가 없음은
+  // 여전히 동일하게 보장된다 — 이는 오탐이 아니라 의도된 fail-closed 기본값이다).
   const viaCoreDefault = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK);
-  check("A) Reviewer Core 기본 경로(override 없음)는 Security Gate에서 먼저 BLOCK됨(client 시도 자체 없음)", viaCoreDefault.errorCode === "PROVIDER_SECURITY_BLOCKED");
+  check("A) Reviewer Core 기본 경로(override 없음)는 FIREWORKS_API_KEY 누락으로 fail-closed(client 시도 자체 없음)", viaCoreDefault.errorCode === "AUTH_ERROR");
+  check("A) requestAttempted=false(실제 요청 미전송)", viaCoreDefault.requestAttempted === false);
 
   // Security Gate를 컴플라이언트 override로 통과시키면, 그제서야 직접 호출과 동일한 결과가
   // 나와야 production default provider가 실제로 OpenAIReviewProvider임을 증명한다(#13/#23/#24
@@ -393,24 +398,25 @@ async function scenarioJ_providerThrowConvertedToSafeFailure(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// K) production reviewer path: Security Gate가 실제로 실행되며 BLOCK 시 provider.review
-//    call count가 0임을 override 없이(진짜 production 기본값으로) 증명한다(§ 요구사항 1 —
-//    production-path 검증, seam-only 아님).
+// K) production reviewer path: 아무 자격증명도 구성되지 않은 진짜 production 기본값(override
+//    없음)으로도 provider.review()가 실제 네트워크를 시도하지 않고 fail-closed됨을 증명한다
+//    (§ 요구사항 1 — production-path 검증, seam-only 아님). 실용형 보안 정책 이후 이 fail-closed
+//    는 Security Gate(ZDR)가 아니라 Fireworks provider 자신의 API key 누락 검사가 담당한다.
 // ---------------------------------------------------------------------------
-async function scenarioK_productionPathSecurityGateBlocksBeforeProviderCall(): Promise<void> {
+async function scenarioK_productionPathFailsClosedBeforeProviderCall(): Promise<void> {
   const result = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK); // 완전히 기본값 — provider/securityGateOverrides 모두 생략.
-  check("K) production default(override 없음) → PROVIDER_SECURITY_BLOCKED", result.errorCode === "PROVIDER_SECURITY_BLOCKED");
+  check("K) production default(override 없음) → AUTH_ERROR(FIREWORKS_API_KEY 누락)", result.errorCode === "AUTH_ERROR");
   check("K) decision=HUMAN_REQUIRED", result.decision === "HUMAN_REQUIRED");
   check("K) transient=false(재시도 대상 아님)", result.transient === false);
   check(
-    "K) model/tokenUsage 없음(OpenAI 응답을 받은 적이 없다는 뜻 — client가 아예 시도되지 않았음의 간접 증거)",
+    "K) model/tokenUsage 없음(실제 응답을 받은 적이 없다는 뜻 — client가 아예 시도되지 않았음의 간접 증거)",
     result.model === undefined && result.tokenUsage === undefined
   );
 
-  // Ledger 매핑 — Security BLOCK이 provider API error로 잘못 기록되지 않음(#9).
+  // Ledger 매핑 — 로컬 preflight 실패가 provider API error로 뭉뚱그려지지 않음(#9).
   const entry = buildGptReviewLedgerEntryInput(result, { projectId: "p", taskId: "t" });
   check("K) Ledger requestCount=0(실제 API 호출로 기록되지 않음)", entry.requestCount === 0);
-  check("K) Ledger status=PROVIDER_SECURITY_BLOCKED(API_ERROR로 뭉뚱그려지지 않음)", entry.status === "PROVIDER_SECURITY_BLOCKED");
+  check("K) Ledger status=AUTH_ERROR", entry.status === "AUTH_ERROR");
   check("K) Ledger에 token/비용 없음", entry.inputTokens === undefined && entry.estimatedCostUsd === undefined);
 }
 
@@ -587,23 +593,25 @@ async function scenarioP_allThreeModesApplySecurityGate(): Promise<void> {
   writeRepoFile(repo, "src/fileA.ts", "export const a = 'A_V1';\n");
   const executor = makeExecutor(repo);
 
-  // FULL(첫 review, baseline 없음) — override 없음, production 기본 registry.
+  // FULL(첫 review, baseline 없음) — override 없음, production 기본값. 실용형 보안 정책 이후
+  // 세 모드 모두 실제로 도달하는 fail-closed 지점은 Fireworks provider의 API key 누락이다(§
+  // 이 파일 main()이 FIREWORKS_API_KEY를 제거해둠) — 어느 모드든 실제 네트워크를 시도하지
+  // 않는다는 것 자체가 이 시나리오의 핵심 증명이다.
   const full = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK, ["src/"], CONTEXT, executor, undefined, undefined, undefined);
-  check("P) FULL round도 Security Gate가 적용됨(PROVIDER_SECURITY_BLOCKED)", full.errorCode === "PROVIDER_SECURITY_BLOCKED");
+  check("P) FULL round도 fail-closed 적용됨(AUTH_ERROR)", full.errorCode === "AUTH_ERROR");
   check("P) FULL round의 reviewMode=FULL", full.reviewMode === "FULL");
 
-  // INCREMENTAL(유효한 이전 baseline) — 하지만 그 baseline도 이전 round가 Security Gate에
-  // BLOCK되며 만든 것이므로, 여기서는 buildReviewInput()으로 유효한 baseline을 직접 만들어
-  // INCREMENTAL round를 인위적으로 구성한다.
+  // INCREMENTAL(유효한 이전 baseline) — 여기서는 buildReviewInput()으로 유효한 baseline을 직접
+  // 만들어 INCREMENTAL round를 인위적으로 구성한다.
   writeRepoFile(repo, "src/fileA.ts", "export const a = 'A_V2';\n");
   const incremental = await reviewClaudeResultOnce(FAKE_RESULT, 2, SMALL_TASK, ["src/"], CONTEXT, executor, undefined, undefined, full.reviewBaseline);
-  check("P) INCREMENTAL round도 Security Gate가 적용됨(PROVIDER_SECURITY_BLOCKED)", incremental.errorCode === "PROVIDER_SECURITY_BLOCKED");
+  check("P) INCREMENTAL round도 fail-closed 적용됨(AUTH_ERROR)", incremental.errorCode === "AUTH_ERROR");
   check("P) INCREMENTAL round의 reviewMode=INCREMENTAL", incremental.reviewMode === "INCREMENTAL");
 
   // SAFE_FULL_FALLBACK(baseline이 tampered) — validateReviewBaseline이 거부하도록 baselineHash를 깨뜨린다.
   const tamperedBaseline = incremental.reviewBaseline ? { ...incremental.reviewBaseline, fileHashes: {}, baselineHash: "will-not-match" } : undefined;
   const fallback = await reviewClaudeResultOnce(FAKE_RESULT, 3, SMALL_TASK, ["src/"], CONTEXT, executor, undefined, undefined, tamperedBaseline);
-  check("P) SAFE_FULL_FALLBACK round도 Security Gate가 적용됨(PROVIDER_SECURITY_BLOCKED)", fallback.errorCode === "PROVIDER_SECURITY_BLOCKED");
+  check("P) SAFE_FULL_FALLBACK round도 fail-closed 적용됨(AUTH_ERROR)", fallback.errorCode === "AUTH_ERROR");
   check("P) fallback round의 reviewMode=SAFE_FULL_FALLBACK", fallback.reviewMode === "SAFE_FULL_FALLBACK");
 
   check(
@@ -614,10 +622,28 @@ async function scenarioP_allThreeModesApplySecurityGate(): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // Q) Usage Ledger/observability — Security Gate 판정 결과 어디에도 secret 유사 값이 없음(§
-//    요구사항 12).
+//    요구사항 12). 실용형 보안 정책 이후 production 기본값(override 없음)은 더 이상 Security
+//    Gate에서 BLOCK되지 않으므로(§ scenarioA/K/P), 여기서는 호출부가 명시적으로 CONFIDENTIAL을
+//    요구해 provider의 INTERNAL 자기 선언으로 낮출 수 없는 실제 BLOCK 경로를 직접 구성한다(§
+//    final-reviewer-provider-selection-tests.ts D와 동일한 원칙 — explicit override가 항상
+//    우선한다).
 // ---------------------------------------------------------------------------
 async function scenarioQ_noSecretInSecurityBlockedObservability(): Promise<void> {
-  const result = await reviewClaudeResultOnce(FAKE_RESULT, 1, SMALL_TASK);
+  const registry = resolveFinalReviewerProductionSecurityRegistry({}); // FIREWORKS_API_KEY/AUTODEV_FIREWORKS_ZDR_VERIFIED 모두 없음 → unverified.
+  const result = await reviewClaudeResultOnce(
+    FAKE_RESULT,
+    1,
+    SMALL_TASK,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { classification: "CONFIDENTIAL", registry }
+  );
+  check("Q) 명시적 CONFIDENTIAL 요구 + ZDR 미검증 → 실제로 BLOCK됨(이 시나리오의 전제 조건)", result.errorCode === "PROVIDER_SECURITY_BLOCKED");
   const entry = buildGptReviewLedgerEntryInput(result, { projectId: "p", taskId: "t" });
   const SECRET_MARKER = "sk-should-never-appear-anywhere";
   check("Q) GptReviewApiResult에 secret marker 없음(주입한 적 없으므로 당연히 없어야 함)", !JSON.stringify(result).includes(SECRET_MARKER));
@@ -656,11 +682,15 @@ async function scenarioH_orchestratorUsesSameProviderAbstractionAndSecurityGate(
   const originalZdr = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
   const originalGroqApiKey = process.env.GROQ_API_KEY;
   const originalGroqZdr = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  const originalFireworksApiKey = process.env.FIREWORKS_API_KEY;
+  const originalFireworksZdr = process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
   process.env.AUTOMATION_DRY_RUN = "false"; // 실제 gpt-reviewer.ts 경로(realReviewClaudeResult) 선택
   delete process.env.OPENAI_API_KEY;
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED; // ZDR 미검증 기본값 고정.
-  delete process.env.GROQ_API_KEY; // production default provider(Groq)도 동일하게 미구성 고정.
+  delete process.env.GROQ_API_KEY;
   delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  delete process.env.FIREWORKS_API_KEY; // production default provider(Fireworks)도 동일하게 미구성 고정.
+  delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
 
   try {
     let claudeCalls = 0;
@@ -670,14 +700,17 @@ async function scenarioH_orchestratorUsesSameProviderAbstractionAndSecurityGate(
     };
     const { finalState } = await runOrchestrator(SMALL_TASK, { claudeRunner, statePath });
 
+    // 실용형 보안 정책 이후 production 기본값은 FIREWORKS_API_KEY 누락으로 fail-closed된다
+    // (§ scenarioA/K/P와 동일한 이유 — ZDR 미검증만으로는 더 이상 Security Gate가 BLOCK하지
+    // 않는다).
     check(
-      "H) orchestrator 기본 gptReviewer(realReviewClaudeResult)도 Security Gate가 실행되어 PROVIDER_SECURITY_BLOCKED",
-      (finalState.lastGptDecision as GptReviewApiResult | null)?.errorCode === "PROVIDER_SECURITY_BLOCKED"
+      "H) orchestrator 기본 gptReviewer(realReviewClaudeResult)도 fail-closed(AUTH_ERROR)",
+      (finalState.lastGptDecision as GptReviewApiResult | null)?.errorCode === "AUTH_ERROR"
     );
     check("H) 최종 상태 WAITING_HUMAN(별도 reviewer 구현이 아님을 확인)", finalState.status === "WAITING_HUMAN");
     check(
-      "H) deferredHumanTasks에 PROVIDER_SECURITY_BLOCKED가 기록됨",
-      finalState.deferredHumanTasks.some((t) => t.startsWith("PROVIDER_SECURITY_BLOCKED"))
+      "H) deferredHumanTasks에 AUTH_ERROR가 기록됨",
+      finalState.deferredHumanTasks.some((t) => t.startsWith("AUTH_ERROR"))
     );
     check("H) Claude worker는 1회만 호출됨", claudeCalls === 1);
   } finally {
@@ -691,6 +724,10 @@ async function scenarioH_orchestratorUsesSameProviderAbstractionAndSecurityGate(
     else process.env.GROQ_API_KEY = originalGroqApiKey;
     if (originalGroqZdr === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
     else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdr;
+    if (originalFireworksApiKey === undefined) delete process.env.FIREWORKS_API_KEY;
+    else process.env.FIREWORKS_API_KEY = originalFireworksApiKey;
+    if (originalFireworksZdr === undefined) delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
+    else process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED = originalFireworksZdr;
   }
 }
 
@@ -707,11 +744,15 @@ async function scenarioI_agentOrchestratorUsesSameProviderAbstractionAndSecurity
   const originalZdr = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
   const originalGroqApiKey = process.env.GROQ_API_KEY;
   const originalGroqZdr = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  const originalFireworksApiKey = process.env.FIREWORKS_API_KEY;
+  const originalFireworksZdr = process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
   process.env.AUTOMATION_DRY_RUN = "false"; // 실제 reviewerRunner(realReviewClaudeResult) 선택
   delete process.env.OPENAI_API_KEY;
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
-  delete process.env.GROQ_API_KEY; // production default provider(Groq)도 동일하게 미구성 고정.
+  delete process.env.GROQ_API_KEY;
   delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
+  delete process.env.FIREWORKS_API_KEY; // production default provider(Fireworks)도 동일하게 미구성 고정.
+  delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
 
   try {
     let developerCalls = 0;
@@ -727,8 +768,8 @@ async function scenarioI_agentOrchestratorUsesSameProviderAbstractionAndSecurity
     const reviewerStep = result.stepResults.find((r) => r.role === "reviewer");
     check("I) developer는 정확히 1회 호출됨", developerCalls === 1);
     check(
-      "I) agent-orchestrator의 기본 reviewerRunner도 Security Gate가 실행되어 PROVIDER_SECURITY_BLOCKED",
-      (reviewerStep?.data as GptReviewApiResult | undefined)?.errorCode === "PROVIDER_SECURITY_BLOCKED"
+      "I) agent-orchestrator의 기본 reviewerRunner도 fail-closed(AUTH_ERROR — FIREWORKS_API_KEY 누락)",
+      (reviewerStep?.data as GptReviewApiResult | undefined)?.errorCode === "AUTH_ERROR"
     );
     check("I) overallStatus=HUMAN_APPROVAL_REQUIRED(HUMAN_REQUIRED decision 매핑)", result.overallStatus === "HUMAN_APPROVAL_REQUIRED");
   } finally {
@@ -742,6 +783,10 @@ async function scenarioI_agentOrchestratorUsesSameProviderAbstractionAndSecurity
     else process.env.GROQ_API_KEY = originalGroqApiKey;
     if (originalGroqZdr === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
     else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdr;
+    if (originalFireworksApiKey === undefined) delete process.env.FIREWORKS_API_KEY;
+    else process.env.FIREWORKS_API_KEY = originalFireworksApiKey;
+    if (originalFireworksZdr === undefined) delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
+    else process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED = originalFireworksZdr;
   }
 }
 
@@ -749,22 +794,31 @@ async function main(): Promise<void> {
   const originalApiKeyOuter = process.env.OPENAI_API_KEY;
   const originalZdrOuter = process.env.AUTODEV_OPENAI_ZDR_VERIFIED;
   const originalZdrAtOuter = process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT;
-  // Production Final Reviewer Wiring — reviewClaudeResultOnce()의 production default
-  // provider/registry가 이제 Groq(§ final-reviewer-provider-selection.ts)이므로, "override
-  // 없음" 시나리오(K/O/P/Q/H/I 등)가 정말로 fail-closed로 BLOCK되는지는 이 프로세스의 실제
-  // Groq 자격증명/ZDR 상태와 무관해야 한다 — OPENAI_API_KEY/ZDR와 동일하게 GROQ_API_KEY/
-  // AUTODEV_GROQ_ZDR_VERIFIED도 이 파일 실행 동안 일시적으로 제거한다(그렇지 않으면 이
-  // 배포처럼 GROQ_API_KEY+ZDR이 실제로 구성된 환경에서는 default 경로가 실제 Groq 네트워크
-  // 요청을 시도하게 된다 — § 요구사항 15와 동일한 이유).
+  // Final Reviewer Routing(Fireworks Primary / Groq Escalation) — reviewClaudeResultOnce()의
+  // production default provider/registry가 이제 Fireworks/Groq(§
+  // final-reviewer-provider-selection.ts)이므로, "override 없음" 시나리오(K/P/Q/H/I 등)가
+  // 정말로 fail-closed되는지는 이 프로세스의 실제 자격증명/ZDR 상태와 무관해야 한다 —
+  // OPENAI_API_KEY/ZDR와 동일하게 GROQ_API_KEY/FIREWORKS_API_KEY/AUTODEV_*_ZDR_VERIFIED도 이
+  // 파일 실행 동안 일시적으로 제거한다(그렇지 않으면 이 배포처럼 자격증명이 실제로 구성된
+  // 환경에서는 default 경로가 실제 네트워크 요청을 시도하게 된다 — § 요구사항 15와 동일한
+  // 이유). 실용형 보안 정책(§ .claude/CLAUDE.md) 이후 ZDR 미검증만으로는 더 이상 Security
+  // Gate가 BLOCK하지 않으므로, "override 없음" 시나리오가 실제로 도달하는 fail-closed 지점은
+  // Fireworks provider의 API key 누락이다(§ scenarioA/K/P/H/I 주석).
   const originalGroqApiKeyOuter = process.env.GROQ_API_KEY;
   const originalGroqZdrOuter = process.env.AUTODEV_GROQ_ZDR_VERIFIED;
   const originalGroqZdrAtOuter = process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
+  const originalFireworksApiKeyOuter = process.env.FIREWORKS_API_KEY;
+  const originalFireworksZdrOuter = process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
+  const originalFireworksZdrAtOuter = process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED_AT;
   delete process.env.OPENAI_API_KEY; // 이 파일 전체가 실제 네트워크 요청을 만들 수 없게 한다(§ 요구사항 15).
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED; // 기본은 항상 ZDR 미검증 상태에서 시작.
   delete process.env.AUTODEV_OPENAI_ZDR_VERIFIED_AT;
   delete process.env.GROQ_API_KEY;
   delete process.env.AUTODEV_GROQ_ZDR_VERIFIED;
   delete process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
+  delete process.env.FIREWORKS_API_KEY;
+  delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
+  delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED_AT;
 
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -777,7 +831,7 @@ async function main(): Promise<void> {
     await scenarioF_budgetGuardBlocksBeforeSecurityAndProviderCall();
     await scenarioG_noHiddenProviderFallback();
     await scenarioJ_providerThrowConvertedToSafeFailure();
-    await scenarioK_productionPathSecurityGateBlocksBeforeProviderCall();
+    await scenarioK_productionPathFailsClosedBeforeProviderCall();
     await scenarioL_confidentialBoundedRetentionBlocks();
     await scenarioM_confidentialVerifiedZdrPasses();
     scenarioZdrConfigRules();
@@ -800,6 +854,12 @@ async function main(): Promise<void> {
     else process.env.AUTODEV_GROQ_ZDR_VERIFIED = originalGroqZdrOuter;
     if (originalGroqZdrAtOuter === undefined) delete process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT;
     else process.env.AUTODEV_GROQ_ZDR_VERIFIED_AT = originalGroqZdrAtOuter;
+    if (originalFireworksApiKeyOuter === undefined) delete process.env.FIREWORKS_API_KEY;
+    else process.env.FIREWORKS_API_KEY = originalFireworksApiKeyOuter;
+    if (originalFireworksZdrOuter === undefined) delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED;
+    else process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED = originalFireworksZdrOuter;
+    if (originalFireworksZdrAtOuter === undefined) delete process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED_AT;
+    else process.env.AUTODEV_FIREWORKS_ZDR_VERIFIED_AT = originalFireworksZdrAtOuter;
     for (const dir of tempDirs) {
       try {
         rmSync(dir, { recursive: true, force: true });

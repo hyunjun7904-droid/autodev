@@ -23,6 +23,7 @@ export const OLLAMA_PROVIDER_ID = "ollama";
 export const GROQ_PROVIDER_ID = "groq";
 export const OPENROUTER_PROVIDER_ID = "openrouter";
 export const NVIDIA_NIM_PROVIDER_ID = "nvidia-nim";
+export const FIREWORKS_PROVIDER_ID = "fireworks";
 
 const POLICY_VERIFIED_AT = "2026-08-25T00:00:00.000Z";
 
@@ -194,5 +195,69 @@ export function buildNvidiaNimProviderSecurityMetadata(): ProviderSecurityMetada
     allowedDataClassifications: ["PUBLIC"],
     policyVerifiedAt: POLICY_VERIFIED_AT,
     costTier: "free",
+  };
+}
+
+// =========================================================
+// Fireworks(Fireworks Direct) — direct-external provider. Final Reviewer Qualification
+// (Fireworks GPT-OSS-120B Final Reviewer Qualification, 2026-08-26, 12/13 PASS, Critical
+// miss=0, High miss=1 — D8_insecure_fallback_downgrade) 이후 Final Reviewer Routing(Fireworks
+// Primary / Groq Escalation, § final-reviewer-provider-selection.ts/final-reviewer-routing.ts)
+// production wiring의 primary provider로 쓰인다. 이 metadata는 여전히
+// real-provider-pool.ts의 승인된 pool에는 등록하지 않는다 — 그 pool은 이 Task와 무관한 별도
+// candidate catalog다(§ real-provider-pool.ts 상단 주석).
+//
+// 공식 https://docs.fireworks.ai/guides/security_compliance/data_handling(2026-08-26 확인):
+// "Fireworks does not use your prompts, training data, or API inputs to train or improve its AI
+// models without your explicit opt-in." → trainingPolicy: "no-training"(확정).
+//
+// 같은 문서: "Fireworks does not log or store prompt or generation data for any open models,
+// without explicit user opt-in." / "Prompt and generation data exist only in volatile memory
+// for the duration of the request." — Groq(self-serve로 별도 활성화해야 하는 조건부 정책)와
+// 달리 Fireworks의 Chat Completions API(Response API 별개 — 그 API는 store=True가 기본이라
+// 30일 보존, 이 provider는 Response API를 전혀 호출하지 않는다)는 기본값 자체가 이미
+// zero-retention이다. 다만 FireOptimizer(opt-in prompt logging)나 prompt caching으로 인한 수 분
+// 단위 volatile 잔존처럼 "이 AutoDev 배포가 그런 opt-in 기능을 실제로 켜지 않았다"는 것은
+// 배포별로 사람이 확인해야 하는 사실이므로, Groq/OpenRouter/Cloudflare와 동일한 env 기반
+// verification seam으로 그 확인을 요구한다 — 검증되지 않으면 retentionPolicy를 "unknown"으로
+// fail-closed한다(provider-security-gate.ts의 기존 Core hard rule이 모든 classification을
+// BLOCK으로 강제, PUBLIC 포함). fireworks-review-provider.ts는 이 검증을 provider 생성 시점에도
+// 다시 확인해 미검증 상태면 실제 HTTP 요청 자체를 만들지 않는다(이 metadata 함수와는 별개의
+// 방어선).
+const FIREWORKS_ZDR_VERIFIED_ENV = "AUTODEV_FIREWORKS_ZDR_VERIFIED";
+const FIREWORKS_ZDR_VERIFIED_AT_ENV = "AUTODEV_FIREWORKS_ZDR_VERIFIED_AT";
+
+export interface FireworksZdrVerification {
+  verified: boolean;
+  verifiedAt?: string;
+}
+
+/** AUTODEV_FIREWORKS_ZDR_VERIFIED — 이 AutoDev 배포가 Fireworks Chat Completions API만 쓰고
+ *  FireOptimizer/Response API store=true 같은 opt-in 로깅 기능을 켜지 않았다는 것을 사람이 직접
+ *  확인했을 때만 "true"로 설정하는 local config seam이다(Fireworks API/Dashboard를 호출해 자동
+ *  검증하지 않음 — resolveGroqZdrVerification/resolveOpenRouterZdrVerification과 동일한 규칙:
+ *  정확히 "true" 문자열만 인정, 그 외 전부 false). */
+export function resolveFireworksZdrVerification(env: NodeJS.ProcessEnv = process.env): FireworksZdrVerification {
+  const raw = env[FIREWORKS_ZDR_VERIFIED_ENV];
+  if (raw !== "true") return { verified: false };
+  const rawAt = env[FIREWORKS_ZDR_VERIFIED_AT_ENV];
+  const verifiedAt = typeof rawAt === "string" && rawAt.trim().length > 0 && !Number.isNaN(Date.parse(rawAt)) ? rawAt : undefined;
+  return { verified: true, verifiedAt };
+}
+
+export function buildFireworksProviderSecurityMetadata(env: NodeJS.ProcessEnv = process.env): ProviderSecurityMetadata {
+  const zdr = resolveFireworksZdrVerification(env);
+  return {
+    providerId: FIREWORKS_PROVIDER_ID,
+    trainingPolicy: "no-training",
+    retentionPolicy: zdr.verified ? "zero" : "unknown",
+    supportsZeroDataRetention: true,
+    dataLocation: "unknown",
+    // 독립 감사/계약 증거가 없어 "high"로 상향하지 않는다(Groq/Cloudflare metadata와 동일한
+    // 보수적 원칙).
+    trustLevel: "medium",
+    allowedDataClassifications: ["PUBLIC", "INTERNAL", "CONFIDENTIAL"],
+    policyVerifiedAt: "2026-08-26T00:00:00.000Z",
+    costTier: "paid",
   };
 }

@@ -70,6 +70,13 @@ export interface ReviewProviderFailure {
    *  기준으로 실제 API 사용량과 로컬 preflight 실패를 구분한다(§ gpt-reviewer.ts
    *  buildGptReviewLedgerEntryInput, 변경 없음). */
   requestAttempted: boolean;
+  /** Final Reviewer Routing(Fireworks Primary / Groq Escalation) — errorCode==="RATE_LIMIT"일
+   *  때만 채워질 수 있다. 고정 allow-list(retry-after/x-ratelimit-*)에 있는 응답 header만 담는다
+   *  (§ chat-completion-review-provider.ts nodeChatCompletionHttpFetch) — Authorization 등
+   *  credential이 담긴 header는 이 allow-list에 없으므로 구조적으로 절대 포함되지 않는다. 다른
+   *  provider(Groq/OpenRouter/NVIDIA/Fireworks 단독 호출 등)는 이 필드를 읽지 않으므로 기존
+   *  동작에 영향이 없다. */
+  rateLimitHeaders?: Record<string, string>;
 }
 
 export type ReviewProviderResult = ReviewProviderSuccess | ReviewProviderFailure;
@@ -89,4 +96,18 @@ export interface ReviewProvider {
    *  ReviewProviderSuccess.model에 별도로 담긴다(둘이 다를 수 있음을 구분하기 위함). */
   readonly model: string;
   review(request: ReviewProviderRequest): Promise<ReviewProviderResult>;
+  /** Final Reviewer Routing 실용형 보안 정책 — provider가 이 요청에 대해 Provider Security
+   *  Gate가 판정에 쓸 데이터 등급을 스스로 선언할 수 있는 선택적 seam이다. 지정하지 않으면
+   *  gpt-reviewer.ts는 기존과 완전히 동일하게 DEFAULT_REVIEWER_DATA_CLASSIFICATION
+   *  (CONFIDENTIAL)을 쓴다 — 기존 provider(OpenAI 등)와 fake test provider는 이 필드를 선언하지
+   *  않으므로 동작 변화가 없다. provider-security-gate.ts의 판정 로직 자체는 이 필드로 전혀
+   *  바뀌지 않는다 — 이 필드는 그 Core 로직에 어떤 classification을 물어볼지만 provider마다
+   *  다르게 정할 뿐이다(§ final-reviewer-provider-selection.ts — ZDR verified 여부에 따라
+   *  CONFIDENTIAL/INTERNAL을 동적으로 선언). 함수(값이 아님)인 이유 — provider 객체는 보통
+   *  module import 시점에 한 번만 생성되는 singleton이다(§ finalReviewerProductionProvider);
+   *  ZDR verified 여부(env 기반)를 그 생성 시점의 값으로 고정해버리면 이후 env가 바뀌어도(예:
+   *  테스트가 env를 조작하는 경우) 반영되지 않는다 — apiKeyEnv를 review() 호출 시점에만 읽는
+   *  기존 lazy 원칙(§ chat-completion-review-provider.ts)과 동일하게, 이 값도 매 호출 직전에
+   *  다시 평가한다. */
+  reviewerDataClassification?: () => DataClassification;
 }

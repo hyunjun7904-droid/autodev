@@ -3,12 +3,15 @@ import {
   buildGroqProviderSecurityMetadata,
   buildOpenRouterProviderSecurityMetadata,
   buildNvidiaNimProviderSecurityMetadata,
+  buildFireworksProviderSecurityMetadata,
   resolveGroqZdrVerification,
   resolveOpenRouterZdrVerification,
+  resolveFireworksZdrVerification,
   OLLAMA_PROVIDER_ID,
   GROQ_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
   NVIDIA_NIM_PROVIDER_ID,
+  FIREWORKS_PROVIDER_ID,
 } from "./provider-pool-security-metadata";
 import { evaluateProviderSecurity } from "./provider-security-gate";
 
@@ -137,6 +140,44 @@ function scenarioNvidiaNim(): void {
 }
 
 // =========================================================
+// Fireworks — 기본(미검증) unknown retention → 항상 BLOCK(PUBLIC 포함), ZDR verification 시
+// zero. AUTODEV_FIREWORKS_ZDR_VERIFIED로 단정하지 않는다는 요구사항을 코드 레벨로 검증한다.
+// =========================================================
+function scenarioFireworksZdrConfig(): void {
+  check("Fireworks-ZDR) 미설정 → false", resolveFireworksZdrVerification({}).verified === false);
+  check("Fireworks-ZDR) 'false' 문자열 → false", resolveFireworksZdrVerification({ AUTODEV_FIREWORKS_ZDR_VERIFIED: "false" }).verified === false);
+  check("Fireworks-ZDR) 임의 truthy('1') → false(fail-closed, 정확히 'true'만 인정)", resolveFireworksZdrVerification({ AUTODEV_FIREWORKS_ZDR_VERIFIED: "1" }).verified === false);
+  check("Fireworks-ZDR) 정확히 'true' → verified=true", resolveFireworksZdrVerification({ AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" }).verified === true);
+}
+
+function scenarioFireworksMetadata(): void {
+  const defaultMeta = buildFireworksProviderSecurityMetadata({});
+  check("Fireworks) providerId 일치", defaultMeta.providerId === FIREWORKS_PROVIDER_ID);
+  check("Fireworks) trainingPolicy=no-training(공식 data handling 문서 확인)", defaultMeta.trainingPolicy === "no-training");
+  check("Fireworks) 기본(미검증) retentionPolicy=unknown(배포별 opt-in 로깅 미사용 확인 필요)", defaultMeta.retentionPolicy === "unknown");
+  check("Fireworks) RESTRICTED는 승인 목록에 없음(고신뢰 근거 없음)", !defaultMeta.allowedDataClassifications.includes("RESTRICTED"));
+
+  const registryDefault = { [FIREWORKS_PROVIDER_ID]: defaultMeta };
+  const publicBlocked = evaluateProviderSecurity({ classification: "PUBLIC", providerId: FIREWORKS_PROVIDER_ID }, registryDefault);
+  check(
+    "Fireworks) 기본(미검증) → retentionPolicy=unknown이라 PUBLIC조차 BLOCK(fail-closed, provider-security-gate.ts 기존 규칙)",
+    publicBlocked.verdict === "BLOCK" && publicBlocked.blockCode === "RETENTION_POLICY_UNKNOWN"
+  );
+
+  const verifiedMeta = buildFireworksProviderSecurityMetadata({ AUTODEV_FIREWORKS_ZDR_VERIFIED: "true" });
+  check("Fireworks) ZDR 검증됨 → retentionPolicy=zero", verifiedMeta.retentionPolicy === "zero");
+  const registryVerified = { [FIREWORKS_PROVIDER_ID]: verifiedMeta };
+  const confidentialPassed = evaluateProviderSecurity({ classification: "CONFIDENTIAL", providerId: FIREWORKS_PROVIDER_ID }, registryVerified);
+  check("Fireworks) ZDR 검증됨 + CONFIDENTIAL → PASS", confidentialPassed.verdict === "PASS");
+
+  const secretResult = evaluateProviderSecurity({ classification: "SECRET", providerId: FIREWORKS_PROVIDER_ID }, registryVerified);
+  check(
+    "Fireworks) SECRET은 ZDR 검증 여부와 무관하게 항상 BLOCK(Core Secret Gate와 충돌하지 않음)",
+    secretResult.verdict === "BLOCK" && secretResult.blockCode === "SECRET_CLASS_BLOCKED"
+  );
+}
+
+// =========================================================
 // Secret 비노출(#23) — 이 파일의 metadata 객체 어디에도 API key "값" 필드가 없다(구조적 보장 —
 // ProviderSecurityMetadata 타입 자체에 그런 필드가 없음을 직렬화로 재확인한다).
 // =========================================================
@@ -146,6 +187,7 @@ function scenarioNoSecretFields(): void {
     buildGroqProviderSecurityMetadata({ GROQ_API_KEY: "sk-should-never-appear-anywhere" }),
     buildOpenRouterProviderSecurityMetadata({ OPENROUTER_API_KEY: "or-should-never-appear-anywhere" }),
     buildNvidiaNimProviderSecurityMetadata(),
+    buildFireworksProviderSecurityMetadata({ FIREWORKS_API_KEY: "fw-should-never-appear-anywhere" }),
   ];
   const serialized = JSON.stringify(all);
   check("Secret) 어떤 metadata에도 주입한 API key 값이 나타나지 않음(#23)", !serialized.includes("should-never-appear-anywhere"));
@@ -159,6 +201,8 @@ function main(): void {
   scenarioOpenRouterZdrConfig();
   scenarioOpenRouterMetadata();
   scenarioNvidiaNim();
+  scenarioFireworksZdrConfig();
+  scenarioFireworksMetadata();
   scenarioNoSecretFields();
 
   console.log("\n=== Approved Free/Low-cost Reviewer Provider Pool(SI-3.8F) — Security Metadata 테스트 결과 ===");

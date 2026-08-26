@@ -33,8 +33,13 @@ export interface ChatCompletionHttpSuccess {
 }
 
 /** transient: 재시도로 해결될 가능성이 있는 실패(429/5xx/timeout/네트워크 오류)인지 — Reviewer
- *  Core의 재시도 판단(review-provider.ts ReviewProviderFailure.transient)에 그대로 쓰인다. */
-export type ChatCompletionHttpOutcome = { ok: true; response: ChatCompletionHttpSuccess } | { ok: false; reason: string; transient: boolean; status?: number };
+ *  Core의 재시도 판단(review-provider.ts ReviewProviderFailure.transient)에 그대로 쓰인다.
+ *  rateLimitHeaders: Final Reviewer Routing(Fireworks Primary / Groq Escalation)이 429 진단
+ *  표시(GROQ_STATUS=RATE_LIMITED 등)를 만들 때만 쓴다 — RATE_LIMIT_RESPONSE_HEADER_ALLOWLIST에
+ *  있는 header만 담기므로 Authorization 등 credential이 섞일 경로가 구조적으로 없다. */
+export type ChatCompletionHttpOutcome =
+  | { ok: true; response: ChatCompletionHttpSuccess }
+  | { ok: false; reason: string; transient: boolean; status?: number; rateLimitHeaders?: Record<string, string> };
 
 /** 실제 네트워크 호출은 이 함수 타입 뒤로 격리된다 — 모든 테스트는 이 함수를 fake로 주입해
  *  네트워크 없이 deterministic하게 검증한다(§ 요구사항 "실제 network request test 금지",
@@ -43,6 +48,28 @@ export type ChatCompletionHttpOutcome = { ok: true; response: ChatCompletionHttp
 export type ChatCompletionHttpFetch = (req: ChatCompletionHttpRequest) => Promise<ChatCompletionHttpOutcome>;
 
 const CHAT_COMPLETION_MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+// Final Reviewer Routing(Fireworks Primary / Groq Escalation) — Groq 429/quota 진단 표시(§
+// GROQ_STATUS/GROQ_REASON) 요구사항. secret이 담긴 header(authorization 등)는 이 목록에 절대
+// 추가하지 않는다 — 이 고정 allow-list 밖 header는 어떤 이유로도 읽어서 옮기지 않는다.
+const RATE_LIMIT_RESPONSE_HEADER_ALLOWLIST = [
+  "retry-after",
+  "x-ratelimit-limit-requests",
+  "x-ratelimit-remaining-requests",
+  "x-ratelimit-reset-requests",
+  "x-ratelimit-limit-tokens",
+  "x-ratelimit-remaining-tokens",
+  "x-ratelimit-reset-tokens",
+];
+
+function captureRateLimitHeaders(headers: Headers): Record<string, string> | undefined {
+  const captured: Record<string, string> = {};
+  for (const name of RATE_LIMIT_RESPONSE_HEADER_ALLOWLIST) {
+    const value = headers.get(name);
+    if (typeof value === "string" && value.length > 0) captured[name] = value;
+  }
+  return Object.keys(captured).length > 0 ? captured : undefined;
+}
 
 /** 실제 운용 기본 구현 — Node 전역 fetch. Authorization 헤더에만 apiKey를 실어 보내고, 그 값을
  *  어떤 로그/에러 메시지에도 포함하지 않는다(에러 사유는 상태 코드/일반 문구로만 구성한다).
@@ -93,7 +120,7 @@ export const nodeChatCompletionHttpFetch: ChatCompletionHttpFetch = async (req) 
     const bodyText = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf-8");
     if (!res.ok) {
       const transient = res.status === 429 || res.status >= 500;
-      return { ok: false, reason: `HTTP ${res.status}`, transient, status: res.status };
+      return { ok: false, reason: `HTTP ${res.status}`, transient, status: res.status, rateLimitHeaders: captureRateLimitHeaders(res.headers) };
     }
     return { ok: true, response: { status: res.status, bodyText } };
   } catch (err) {
@@ -117,6 +144,11 @@ export interface ChatCompletionProviderConfig {
   /** 실제 API key "값"이 아니라 그 값을 담은 환경변수의 "이름"만 담는다. */
   apiKeyEnv: string;
   timeoutMs?: number;
+  /** 선택적 추가 request body 필드(예: max_tokens) — 지정하지 않으면(undefined) 기존 요청
+   *  body(model/messages만)와 완전히 동일하다(Groq/OpenRouter/NVIDIA는 이 필드를 쓰지 않으므로
+   *  동작이 전혀 바뀌지 않는다). model/messages는 항상 이 필드보다 뒤에 조립되어 절대 덮어써지지
+   *  않는다. */
+  extraBody?: Record<string, unknown>;
 }
 
 function classifyHttpFailure(outcome: Extract<ChatCompletionHttpOutcome, { ok: false }>): { code: GptErrorCode; transient: boolean } {
@@ -191,6 +223,7 @@ export function createChatCompletionReviewProvider(
       }
 
       const body = {
+        ...config.extraBody,
         model: config.model,
         messages: [
           { role: "system", content: request.instructions },
@@ -201,7 +234,7 @@ export function createChatCompletionReviewProvider(
       const outcome = await httpFetch({ url: config.baseUrl, apiKey, body, timeoutMs: config.timeoutMs ?? 120_000 });
       if (!outcome.ok) {
         const { code, transient } = classifyHttpFailure(outcome);
-        return { ok: false, errorCode: code, transient, requestAttempted: true };
+        return { ok: false, errorCode: code, transient, requestAttempted: true, rateLimitHeaders: outcome.rateLimitHeaders };
       }
 
       const parsed = parseChatCompletionEnvelope(config.id, outcome.response.bodyText);
