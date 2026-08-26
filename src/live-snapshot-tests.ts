@@ -61,7 +61,7 @@ function scenarioRunningTask(): void {
   check("RUNNING: runStatus=RUNNING", snap.runStatus === "RUNNING");
   check("RUNNING: taskStatus=RUNNING", snap.taskStatus === "RUNNING");
   check("RUNNING: taskId=T1(자동 감지)", snap.taskId === "T1");
-  check("RUNNING: currentAction=Task 시작", snap.currentOperation.currentAction === "Task 시작");
+  check("RUNNING: currentAction=작업 분석 중", snap.currentOperation.currentAction === "작업 분석 중");
   check("RUNNING: startedAt 실제 값", typeof snap.currentOperation.startedAt === "string");
 }
 

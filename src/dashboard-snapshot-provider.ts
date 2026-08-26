@@ -3,6 +3,14 @@ import { createFileEventStore, RUNTIME_EVENT_LOG_PATH } from "./event-store";
 import type { QueryResult } from "./event-store";
 import { buildAutoDevLiveSnapshot } from "./live-snapshot";
 import type { AutoDevLiveSnapshot } from "./live-snapshot";
+import { computeActiveWorkMs, computeActiveWorkMsAcrossTasks } from "./work-time";
+import { aggregateProviderModelUsage, sumProviderModelUsage, buildRecentCalls } from "./dashboard-usage";
+import type { ProviderModelUsage, UsageTotals, RecentCallEntry } from "./dashboard-usage";
+import { loadProjectProgress } from "./dashboard-project-progress";
+import type { ProjectProgress } from "./dashboard-project-progress";
+import { buildProblemSolvingSnapshot } from "./dashboard-problem-solving";
+import type { ProblemSolvingSnapshot } from "./dashboard-problem-solving";
+import { createFileUsageLedger, resolveUsageLedgerFilePath, RUNTIME_USAGE_LEDGER_DIR } from "./usage-ledger";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -57,11 +65,90 @@ function latestRunId(result: QueryResult): string | undefined {
 
 export type DashboardSnapshotStatus = "OK" | "NO_RUN_YET";
 
+export interface UsageOverview {
+  allTime: { totals: UsageTotals; byService: ProviderModelUsage[] };
+  currentTask?: { totals: UsageTotals; byService: ProviderModelUsage[] };
+  /** § 요구사항 5 "실제 사용량 원장과 연결" — usage-ledger.ts(현재는 GPT Reviewer 호출만
+   *  기록한다, § usage-ledger.ts 상단 주석)를 실제로 읽었다는 사실 자체를 정직하게
+   *  드러낸다. byService/totals의 주된 근거는 EventStore다(Claude Developer 호출까지
+   *  포함하는 유일하게 완전한 소스이기 때문 — 상세 근거는 아래 buildUsageOverview 주석). */
+  usageLedgerEntryCount: number;
+}
+
+export interface ActualWorkTime {
+  /** 현재 task의 실제 작업시간(ms) — currentTaskId가 없으면 undefined. */
+  currentTaskMs?: number;
+  /** 이 project 전체(모든 run/task 합산)의 실제 작업시간(ms) — projectId가 없으면 undefined. */
+  projectTotalMs?: number;
+}
+
 export interface DashboardSnapshot {
   status: DashboardSnapshotStatus;
   generatedAt: string;
   /** status가 "OK"일 때만 채워진다 — G4의 데이터 계약을 그대로 통과시킨다. */
   snapshot?: AutoDevLiveSnapshot;
+  /** AUTODEV_PROJECT_ADAPTER가 설정돼 있지 않거나 읽기에 실패하면 undefined — 추측하지
+   *  않는다(§ 요구사항 3). */
+  projectProgress?: ProjectProgress;
+  actualWorkTime?: ActualWorkTime;
+  usageOverview?: UsageOverview;
+  recentCalls?: RecentCallEntry[];
+  /** problem-memory.ts(지능형 오류 복구 하드닝)에 이 project의 기록이 전혀 없으면
+   *  undefined(§ 요구사항 11 — 새 문제 해결 엔진을 만들지 않고 기존 자료만 읽는다). */
+  problemSolving?: ProblemSolvingSnapshot;
+}
+
+const RECENT_CALLS_LIMIT = 20;
+
+/**
+ * "서비스별 사용량"(§ 요구사항 5)의 주된 근거로 EventStore를 쓴다 — usage-ledger.ts는
+ * 현재 GPT Reviewer 호출(operation="gpt_review")만 기록하고 Claude Developer 호출은 전혀
+ * 기록하지 않는다(이 대시보드 작업 중 직접 소스를 확인해 알게 된 사실). usage-ledger만
+ * 단독으로 쓰면 Claude가 실제로 계속 호출되고 있어도 화면에서 완전히 누락된다 — 그래서
+ * TEST_COMPLETED(Developer)/REVIEW_APPROVED·REVISE·BLOCKED(Reviewer) event가 이미 담고
+ * 있는 model/tokenUsage(§ observability-event.ts, claude-developer.ts/gpt-reviewer.ts가
+ * 이미 정확히 채워 넣는다)를 유일한 소스로 쓴다 — Claude/GPT 양쪽을 실제로 빠짐없이 보여줄
+ * 수 있는 것이 이 소스뿐이기 때문이다. usage-ledger는 별도로 읽어 "연결은 됐다"는 사실과
+ * 실제 기록 건수만 정직하게 보여준다(§ 위 UsageOverview.usageLedgerEntryCount) — 두 소스를
+ * 억지로 하나의 숫자로 합쳐서 이중 계산하지 않는다.
+ */
+function buildUsageOverview(allEvents: QueryResult["events"], projectId: string | undefined, currentTaskId: string | undefined): UsageOverview {
+  const scopedToProject = projectId ? allEvents.filter((e) => e.projectId === projectId) : allEvents;
+  const allTimeByService = aggregateProviderModelUsage(scopedToProject);
+  const allTime = { totals: sumProviderModelUsage(allTimeByService), byService: allTimeByService };
+
+  let currentTask: UsageOverview["currentTask"];
+  if (currentTaskId) {
+    const taskEvents = scopedToProject.filter((e) => e.taskId === currentTaskId);
+    const byService = aggregateProviderModelUsage(taskEvents);
+    currentTask = { totals: sumProviderModelUsage(byService), byService };
+  }
+
+  let usageLedgerEntryCount = 0;
+  try {
+    const resolved = resolveUsageLedgerFilePath(RUNTIME_USAGE_LEDGER_DIR, projectId);
+    if (resolved.ok) {
+      usageLedgerEntryCount = createFileUsageLedger(resolved.path).query().entries.length;
+    }
+  } catch {
+    // 사용량 원장을 읽지 못해도(예: 파일 없음) 대시보드 전체를 무너뜨리지 않는다 — 0으로
+    // 남긴다(추측 금지).
+  }
+
+  return { allTime, currentTask, usageLedgerEntryCount };
+}
+
+function buildActualWorkTime(allEvents: QueryResult["events"], projectId: string | undefined, currentTaskId: string | undefined, now: number): ActualWorkTime {
+  const result: ActualWorkTime = {};
+  if (currentTaskId) {
+    const taskEvents = allEvents.filter((e) => e.taskId === currentTaskId).sort((a, b) => a.sequence - b.sequence);
+    result.currentTaskMs = computeActiveWorkMs(taskEvents, now);
+  }
+  if (projectId) {
+    const projectEvents = allEvents.filter((e) => e.projectId === projectId).sort((a, b) => a.sequence - b.sequence);
+    result.projectTotalMs = computeActiveWorkMsAcrossTasks(projectEvents, now);
+  }
+  return result;
 }
 
 /**
@@ -78,5 +165,20 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH):
   }
   const lastEvent = result.events[result.events.length - 1];
   const snapshot = buildAutoDevLiveSnapshot(result, { runId, projectId: lastEvent.projectId, now });
-  return { status: "OK", generatedAt: snapshot.generatedAt, snapshot };
+
+  // run.ts가 이미 쓰는 것과 완전히 동일한 project config 경로(§ project-adapter-loader.ts) —
+  // 새 설정 방식을 만들지 않는다. 설정돼 있지 않으면 projectProgress는 undefined로 남는다.
+  const adapterPath = process.env.AUTODEV_PROJECT_ADAPTER;
+  const projectProgressResult = loadProjectProgress(adapterPath);
+
+  return {
+    status: "OK",
+    generatedAt: snapshot.generatedAt,
+    snapshot,
+    projectProgress: projectProgressResult.ok ? projectProgressResult.progress : undefined,
+    actualWorkTime: buildActualWorkTime(result.events, snapshot.projectId, snapshot.taskId, now),
+    usageOverview: buildUsageOverview(result.events, snapshot.projectId, snapshot.taskId),
+    recentCalls: buildRecentCalls(result.events, RECENT_CALLS_LIMIT),
+    problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId),
+  };
 }

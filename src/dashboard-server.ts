@@ -19,7 +19,11 @@ import { DASHBOARD_HTML } from "./dashboard-html";
 // 받는다.
 
 const LOCALHOST = "127.0.0.1";
-const DEFAULT_PORT = 4590;
+// 오토데브 대시보드 후속 개선(윈도우 자동 실행) — dashboard.ts가 실제 서버를 시작하기 전에
+// "이미 이 포트에서 정상 대시보드가 떠 있는지"를 미리 확인해야 하므로(§ 요구사항 19 중복
+// 실행 방지) 이 상수를 export한다(단일 출처 유지 — 다른 파일에 4590을 다시 하드코딩하지
+// 않는다).
+export const DEFAULT_PORT = 4590;
 
 export interface DashboardServerOptions {
   /** 기본값 4590. 테스트에서는 0을 넘겨 OS가 빈 포트를 골라주게 한다. */

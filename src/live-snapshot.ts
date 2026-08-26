@@ -75,30 +75,33 @@ const STATUS_TRANSITIONS: Partial<Record<AutoDevEventType, LiveStatus>> = {
 
 // currentOperation.currentAction의 단일 출처 — 항상 이 고정 라벨만 쓴다(event.reason 같은
 // 자유 텍스트를 절대 그대로 노출하지 않는다).
+// 오토데브 대시보드 후속 개선 § 요구사항 2/4 — 이 라벨들은 순수 표시 문자열이라(판정
+// 로직은 STATUS_TRANSITIONS/이 파일의 나머지가 그대로 담당) 자연스러운 한글로 다듬는다.
+// 어떤 event → 상태 매핑도 바뀌지 않는다(문자열 값만 교체).
 const CURRENT_ACTION_LABELS: Partial<Record<AutoDevEventType, string>> = {
   RUN_STARTED: "실행 시작",
-  TASK_STARTED: "Task 시작",
-  AGENT_SELECTED: "Agent 선택됨",
-  AGENT_STARTED: "Agent 실행 중",
-  AGENT_COMPLETED: "Agent 완료",
-  AGENT_FAILED: "Agent 실패",
-  DEVELOPER_RETRY_STARTED: "Developer 재작업 시작",
-  TEST_STARTED: "Test 실행 중",
-  TEST_COMPLETED: "Test 완료",
-  REVIEW_STARTED: "GPT 리뷰 진행 중",
-  REVIEW_APPROVED: "리뷰 승인됨",
-  REVIEW_REVISE: "REVISE 요청됨",
-  REVIEW_BLOCKED: "리뷰 차단됨",
-  SECURITY_BLOCKED: "보안 게이트 차단됨",
-  CHECKPOINT_CREATED: "Checkpoint 생성됨",
+  TASK_STARTED: "작업 분석 중",
+  AGENT_SELECTED: "보조 담당 선택됨",
+  AGENT_STARTED: "보조 담당 작업 중",
+  AGENT_COMPLETED: "보조 담당 완료",
+  AGENT_FAILED: "보조 담당 실패",
+  DEVELOPER_RETRY_STARTED: "수정 중",
+  TEST_STARTED: "관련 검사 중",
+  TEST_COMPLETED: "검사 완료",
+  REVIEW_STARTED: "독립 검토 중",
+  REVIEW_APPROVED: "검토 승인됨",
+  REVIEW_REVISE: "수정 요청됨",
+  REVIEW_BLOCKED: "검토 차단됨",
+  SECURITY_BLOCKED: "보안 검사 차단됨",
+  CHECKPOINT_CREATED: "저장 지점 생성됨",
   HUMAN_APPROVAL_REQUIRED: "사람 승인 대기 중",
-  REVIEW_CYCLE_EXHAUSTED: "Review Cycle 소진",
-  TASK_COMPLETED: "Task 완료",
-  RUN_COMPLETED: "Run 완료",
-  RUN_BLOCKED: "Run 차단됨",
+  REVIEW_CYCLE_EXHAUSTED: "검토 반복 한도 소진",
+  TASK_COMPLETED: "작업 완료",
+  RUN_COMPLETED: "실행 완료",
+  RUN_BLOCKED: "실행 차단됨",
 };
 
-interface EventWalkResult {
+export interface EventWalkResult {
   status: LiveStatus;
   phase?: ExecutionPhase;
   currentAction?: string;
@@ -121,7 +124,12 @@ interface EventWalkResult {
  *     오면 다시 비활성화한다 — "지금 실행 중인 agent"만 담는다(끝난 agent는 advisory
  *     집계(§ aggregateAgentMetrics)로만 확인한다).
  */
-function walkEvents(events: AutoDevEvent[]): EventWalkResult {
+/**
+ * 대시보드 후속 작업(work-time.ts) — 이 함수의 가시성만 넓힌다(구현/동작은 한 글자도
+ * 바뀌지 않는다). "지금 상태가 무엇인가"의 단일 출처를 그대로 재사용해 "실제 작업 구간"을
+ * 판정하기 위함이다 — 상태 판정 규칙을 새로 만들거나 복제하지 않는다.
+ */
+export function walkEvents(events: AutoDevEvent[]): EventWalkResult {
   if (events.length === 0) return { status: "UNKNOWN" };
 
   let status: LiveStatus = "IDLE";

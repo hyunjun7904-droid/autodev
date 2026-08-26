@@ -110,6 +110,18 @@ function createInMemoryStore(): ProblemMemoryStore {
   };
 }
 
+/**
+ * 대시보드 후속 작업 — 항상 실제 파일을 읽는(§ isProductionRuntime() 게이트를 거치지 않는)
+ * 직접 생성자. event-store.ts의 createFileEventStore()/usage-ledger.ts의
+ * createFileUsageLedger()와 동일한 기존 관례를 그대로 따른다 — 대시보드는 AutoDev
+ * 개발 실행 자체가 아니라 "이미 디스크에 있는 기록을 읽기만 하는 별도 프로세스"이므로,
+ * 그 실행의 production 여부와 무관하게 항상 실제 파일을 봐야 한다. 판정/기록 로직은 전혀
+ * 바뀌지 않는다(순수 가시성 확장).
+ */
+export function createFileProblemMemoryStore(tier: MemoryTier, projectId: string | undefined, baseDir: string = RUNTIME_PROBLEM_MEMORY_DIR): ProblemMemoryStore {
+  return createFileStore(memoryFilePath(baseDir, tier, projectId));
+}
+
 function createFileStore(filePath: string): ProblemMemoryStore {
   return {
     load(): ProblemMemoryEntry[] {
