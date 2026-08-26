@@ -352,12 +352,13 @@ async function scenarioFullTickWiring(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 구성돼 있으면 Telegram보다
-// 우선한다(Telegram getUpdates/승인 처리 자체는 botToken이 있으면 그대로 동작 — ntfy는
-// 발신 알림 채널만 대체한다).
+// AutoDev production notification policy(2026-08-27) — ntfy는 production에서 쓰지
+// 않는다. AUTODEV_NTFY_TOPIC 등 ntfy 관련 옵션 자체가 TelegramControllerOptions에서
+// 제거됐으므로(§ telegram-controller.ts), ntfy.sh로 향하는 호출이 정말 0건인지 실제
+// fetch 라우팅으로 재확인한다(§ 요구사항 "ntfy provider 호출 = 0").
 // ---------------------------------------------------------------------------
-async function scenarioNtfyPreferredOverTelegramWhenBothConfigured(): Promise<void> {
-  const root = makeGitRepo("controller-ntfy-preferred-");
+async function scenarioNtfyNeverCalledInProduction(): Promise<void> {
+  const root = makeGitRepo("controller-ntfy-unused-");
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath);
@@ -375,14 +376,13 @@ async function scenarioNtfyPreferredOverTelegramWhenBothConfigured(): Promise<vo
     fetchImpl: routable.fetch,
     botToken: "tok",
     chatId: "777",
-    ntfyTopic: "autodev-test-topic",
     allowlist: { chatId: "777" },
     tickDelayMs: 5,
   });
 
-  await waitUntil(() => routable.ntfyCalls.length > 0);
-  check("ntfy가 구성돼 있으면 실제로 ntfy로 알림이 전달됨", routable.ntfyCalls.length >= 1);
-  check("ntfy가 우선하면 Telegram sendMessage는 호출되지 않음", routable.sendMessageCalls.length === 0);
+  await waitUntil(() => routable.sendMessageCalls.length > 0);
+  check("ntfy 호출 자체가 없음(provider가 생성/호출되지 않음)", routable.ntfyCalls.length === 0);
+  check("Telegram sendMessage로 정상 전달됨(유일한 provider)", routable.sendMessageCalls.length >= 1);
 
   await handle.stop();
 }
@@ -453,14 +453,141 @@ async function scenarioControllerRestartPreservesState(): Promise<void> {
   check("재시작 후에도 이미 소비된 approval은 여전히 DEFERRED로 남아있음(재시작으로 되살아나지 않음)", approvalStore.get(created.approvalId)?.status === "DEFERRED");
 }
 
+// ---------------------------------------------------------------------------
+// AutoDev production notification policy(2026-08-27) — Telegram은 "실제 사용자
+// APPROVE/REJECT 입력이 필요한 상태"에만 쓴다(§ 요구사항 1~15). APPROVE/REJECT/EXPIRED/
+// STALE callback 처리 자체는 approval-service.ts를 전혀 건드리지 않았으므로
+// approval-service-tests.ts가 이미 검증한다(요구사항 3/5/6) — 여기서 중복 검증하지
+// 않는다. REJECT callback + getUpdates polling 유지(요구사항 4/14)는 기존
+// scenarioFullTickWiring이 이미 검증한다. 이 두 시나리오는 나머지 "Telegram 발신 여부"
+// 판정(요구사항 1/2/7/8/9/10/11/12/13/15)만 검증한다 — 각 event는 dedupeKey 충돌을
+// 피하려고 서로 다른 runId를 쓴다(§ notification.ts buildDedupeKey는 runId+taskId+type
+// 기준이라, 같은 runId/taskId에 같은 notificationType이 두 번 오면 두 번째는 dedupe로
+// 걸러진다 — 이 테스트의 의도가 아니다).
+async function scenarioApprovalRequiredNotificationsSentToTelegram(): Promise<void> {
+  const root = makeGitRepo("controller-policy-allow-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {});
+  const manifest = buildManifest(root, statePath);
+
+  const eventStore: EventStore = createInMemoryEventStore();
+  // 1) HUMAN_FINAL_REVIEW — autodev.ts가 실제로 남기는 고정 reason 그대로 재현(§ autodev.ts).
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "hfr-1", taskId: "C1", reason: "HUMAN_FINAL_REVIEW_PENDING(C1)" });
+  // 2) 기존 canonical approval request(고위험 작업 사전 게이트) — classifyApprovalType()의
+  //    HIGH_RISK_PREGATE_PREFIX와 정확히 일치하는 고정 접두사(§ approval.ts).
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "highrisk-1", taskId: "C1", reason: "고위험 작업 감지(prod-db-write)" });
+  // 13) approval-required WAITING_HUMAN — GPT reviewer가 최종적으로 차단한 경우.
+  eventStore.append({ eventType: "REVIEW_BLOCKED", runId: "reviewblocked-1", taskId: "C1" });
+  // (참고) 일반적인 Claude 구조적 실패(재시도가 실제로 의미 있는 경우)도 여전히 알려야
+  // 한다는 기존 계약(§ scenarioFullTickWiring, remotelyApprovable=true) — NO_PROGRESS_
+  // STAGNATION만 예외로 제외된다는 것을 아래 scenarioNonApprovalNotificationsNotSentToTelegram과
+  // 대조해서 함께 증명한다.
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "generic-1", taskId: "C1", reason: "orchestrator status=WAITING_HUMAN" });
+
+  const notificationStore: NotificationStore = createInMemoryNotificationStore();
+  const routable = createRoutableFakeFetch();
+
+  const handle = await startTelegramController({
+    manifest,
+    eventStore,
+    notificationStore,
+    fetchImpl: routable.fetch,
+    botToken: "tok",
+    chatId: "777",
+    allowlist: { chatId: "777" },
+    tickDelayMs: 5,
+  });
+
+  await waitUntil(() => routable.sendMessageCalls.length >= 4);
+  await new Promise((resolve) => setTimeout(resolve, 30)); // 추가 tick에서 중복 전송되지 않는지 여유를 둔다.
+  await handle.stop();
+
+  function textOf(call: CapturedCall): string {
+    return String((call.body as { text?: string })?.text ?? "");
+  }
+  const texts = routable.sendMessageCalls.map(textOf);
+  check("1) HUMAN_FINAL_REVIEW → Telegram send=1", texts.filter((t) => t.includes("C1")).length >= 1 && routable.sendMessageCalls.length === 4);
+  check("2) 기존 canonical approval request(고위험 사전 게이트) → Telegram send 포함됨", routable.sendMessageCalls.length === 4);
+  check("13) approval-required WAITING_HUMAN(REVIEW_BLOCKED) → Telegram send 포함됨", routable.sendMessageCalls.length === 4);
+  check("일반 Claude 구조적 실패(재시도가 의미 있는 경우)도 여전히 Telegram send 포함됨", routable.sendMessageCalls.length === 4);
+  check("정확히 4건만 전송됨(중복/누락 없음)", routable.sendMessageCalls.length === 4);
+}
+
+async function scenarioNonApprovalNotificationsNotSentToTelegram(): Promise<void> {
+  const root = makeGitRepo("controller-policy-deny-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {});
+  const manifest = buildManifest(root, statePath);
+
+  const eventStore: EventStore = createInMemoryEventStore();
+  // 7) task completion(하위 Task 🟡) — requiresHumanAction=false.
+  eventStore.append({ eventType: "TASK_COMPLETED", runId: "taskdone-1", taskId: "C1", outcome: "SUCCESS" });
+  // 8) final completion(✅) — requiresHumanAction=false.
+  eventStore.append({ eventType: "PROJECT_COMPLETED", runId: "finaldone-1", taskId: "C1", outcome: "SUCCESS" });
+  // 9) routine failure(self-dev 완료 재검증 실패, ❌) — requiresHumanAction=false.
+  eventStore.append({ eventType: "SELF_DEV_TASK_FAILED", runId: "routinefail-1", taskId: "C1", reason: "typecheck 실패" });
+  // 10) reviewer REVISE — EVENT_TO_NOTIFICATION_TYPE에 아예 없음(알림 자체가 안 만들어짐).
+  eventStore.append({ eventType: "REVIEW_REVISE", runId: "revise-1", taskId: "C1", reviseCycle: 1 });
+  // 11) NO_PROGRESS_STAGNATION — 같은 reason이라도 metadata.claudeErrorCode로 구분해
+  //     제외된다(§ telegram-controller.ts isTelegramAlertWorthyEvent, autodev.ts가 실어보냄).
+  eventStore.append({
+    eventType: "HUMAN_APPROVAL_REQUIRED",
+    runId: "stagnation-1",
+    taskId: "C1",
+    reason: "orchestrator status=WAITING_HUMAN",
+    metadata: { claudeErrorCode: "NO_PROGRESS_STAGNATION" },
+  });
+  // 12) 일반 WAITING_HUMAN이지만 approval action 없음(RUN_BLOCKED — approval-service.ts가
+  //     이미 ApprovalRequest 자체를 만들지 않는 것과 동일한 판단).
+  eventStore.append({ eventType: "RUN_BLOCKED", runId: "runblocked-1", taskId: "C1", reason: "checkpoint 실패" });
+  // self-dev/deployment informational-only WAITING_HUMAN도 동일하게 제외되는지 함께 확인.
+  eventStore.append({ eventType: "SELF_DEV_WAITING_HUMAN", runId: "selfdevwait-1", taskId: "C1", reason: "사용자 확인 필요" });
+  eventStore.append({ eventType: "DEPLOYMENT_WAITING_HUMAN", runId: "deploywait-1", taskId: "C1" });
+
+  // "control" event — 이 batch에서 실제로 알림 판정이 동작했다는 것을 증명하는 대조군
+  // (tick 자체가 안 돌아서 0건인 것과, 정책상 걸러져서 0건인 것을 구분하기 위함).
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "control-1", taskId: "C1", reason: "orchestrator status=WAITING_HUMAN" });
+
+  const notificationStore: NotificationStore = createInMemoryNotificationStore();
+  const routable = createRoutableFakeFetch();
+
+  const handle = await startTelegramController({
+    manifest,
+    eventStore,
+    notificationStore,
+    fetchImpl: routable.fetch,
+    botToken: "tok",
+    chatId: "777",
+    allowlist: { chatId: "777" },
+    tickDelayMs: 5,
+  });
+
+  await waitUntil(() => routable.sendMessageCalls.length >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  await handle.stop();
+
+  check("control event(일반 승인 요청)는 정상 전송됨(필터가 실제로 동작했다는 증거)", routable.sendMessageCalls.length === 1);
+  check("7) task completion → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("8) final completion → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("9) routine failure(self-dev 최종 미완료) → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("10) reviewer REVISE → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("11) NO_PROGRESS_STAGNATION → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("12) 일반 WAITING_HUMAN(RUN_BLOCKED, approval action 없음) → Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("SELF_DEV_WAITING_HUMAN도 Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("DEPLOYMENT_WAITING_HUMAN도 Telegram send=0", routable.sendMessageCalls.length === 1);
+  check("ntfy 호출 없음(15)", routable.ntfyCalls.length === 0);
+}
+
 async function main(): Promise<void> {
   await scenarioInvalidManifestThrowsAndDoesNotStartLoop();
   await scenarioStartStopLifecycle();
   await scenarioNotConfiguredMakesNoNetworkCalls();
   await scenarioProductionCredentialsInEnvNeverAutoAdoptedOutsideProductionRuntime();
   await scenarioFullTickWiring();
-  await scenarioNtfyPreferredOverTelegramWhenBothConfigured();
+  await scenarioNtfyNeverCalledInProduction();
   await scenarioControllerRestartPreservesState();
+  await scenarioApprovalRequiredNotificationsSentToTelegram();
+  await scenarioNonApprovalNotificationsNotSentToTelegram();
 
   console.log("\n=== telegram-controller.ts(G6) 테스트 결과 ===");
   for (const r of results) console.log(r);

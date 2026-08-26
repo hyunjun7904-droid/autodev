@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
+import type { AutoDevEvent } from "./observability-event";
 import { selectDefaultNotificationStore } from "./notification-store";
 import type { NotificationStore } from "./notification-store";
 import { selectDefaultApprovalStore, selectDefaultTelegramOffsetStore } from "./approval-store";
@@ -11,26 +12,68 @@ import { getTelegramUpdates, resolveTelegramAllowlist } from "./telegram-callbac
 import type { TelegramAllowlistConfig } from "./telegram-callback-client";
 import { createApprovalRequestsFromEvents, handleTelegramCallbackUpdate } from "./approval-service";
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
+import { classifyEventForNotification } from "./notification";
 import { processNotifications } from "./notification-service";
 import { createTelegramApprovalAwareProvider } from "./telegram-approval-provider";
-import { createNtfyNotificationProvider } from "./notification-provider-ntfy";
 import type { NotificationProvider } from "./notification-provider";
 import { isProductionRuntime } from "./runtime-origin";
+
+// AutoDev production notification policy(2026-08-27) — Telegram은 더 이상 일반 알림
+// 채널이 아니다. ntfy는 production에서 쓰지 않는다(provider 파일 자체(notification-
+// provider-ntfy.ts)는 그대로 두되, 이 controller가 더 이상 그 provider를 생성/호출하지
+// 않는다 — § 요구사항). Telegram은 오직 "실제 사용자 APPROVE/REJECT 입력이 필요한 상태"
+// 에만 쓴다 — 아래 isTelegramAlertWorthyEvent()가 그 판정이다. approval-service.ts의
+// ApprovalRequest 생성/remotelyApprovable/CAS/expiry/replay 판정은 전혀 건드리지 않는다
+// (이 함수는 "이미 만들어진 알림을 Telegram으로 push할지"만 결정하는 routing/filter
+// 계층이다 — 새 판정 엔진이 아니라 notification.ts/observability-event.ts가 이미 아는
+// 사실만 재사용한다).
+function isTelegramAlertWorthyEvent(event: AutoDevEvent): boolean {
+  const notification = classifyEventForNotification(event);
+  if (!notification || !notification.requiresHumanAction) return false;
+  // TASK_COMPLETED/FINAL_COMPLETED/SELF_DEV_TASK_FAILED는 이미 requiresHumanAction=false라
+  // 위에서 걸러진다(§ notification.ts) — task 진행/완료/self-dev 완료는 여기 도달하지 않는다.
+  // RUN_BLOCKED/SELF_DEV_WAITING_HUMAN/DEPLOYMENT_WAITING_HUMAN은 approval-service.ts가
+  // 이미 "실제 resumable action이 없다"고 판단해 ApprovalRequest 자체를 만들지 않는 것과
+  // 동일한 세 타입이다 — Telegram push 판단도 그 사실과 일치시킨다(새 판정이 아니라 기존
+  // 판단의 재확인).
+  if (
+    notification.notificationType === "RUN_BLOCKED" ||
+    notification.notificationType === "SELF_DEV_WAITING_HUMAN" ||
+    notification.notificationType === "DEPLOYMENT_WAITING_HUMAN"
+  ) {
+    return false;
+  }
+  // NO_PROGRESS_STAGNATION(§ claude-developer.ts) — 같은 접근을 반복하다 무진척으로
+  // 조기 종료된 것이라, "다시 한번 자동 재시도"가 실제로 도움이 될 가능성이 낮다(TIMEOUT/
+  // PROTOCOL_ERROR 소진 등 다른 원인과 다르다 — 그 원인들은 재시도가 실제로 의미 있어
+  // 그대로 알린다). classifyApprovalType()/remotelyApprovable 판정 자체는 바꾸지 않는다 —
+  // ApprovalRequest는 그대로 생성되고 승인 보안 계약도 그대로다, 이 필터는 오직 "Telegram
+  // push 여부"만 좁힌다(§ autodev.ts가 실어보내는 metadata.claudeErrorCode).
+  if (event.eventType === "HUMAN_APPROVAL_REQUIRED" && event.metadata?.claudeErrorCode === "NO_PROGRESS_STAGNATION") {
+    return false;
+  }
+  return true;
+}
 
 // Local Telegram Controller — Phase G Task G6.
 //
 // public webhook/public server를 두지 않는다(§ telegram-callback-client.ts) — 이 파일은
 // 사람의 PC에서 직접 실행되는 단일 local process로서, getUpdates long polling과 알림 자동
-// 전달을 하나의 순환(tick)으로 반복한다. 이 파일 자신은 어떤 새 판정/정책도 만들지 않는다 —
-// 이미 존재하는 조각들을 정해진 순서로 호출할 뿐이다:
+// 전달을 하나의 순환(tick)으로 반복한다. approval 생성/전달/재시도/승인 판정 자체는 이미
+// 존재하는 조각들을 정해진 순서로 호출할 뿐이다 — 이 파일이 직접 추가하는 유일한 판정은
+// "이미 만들어진 알림 중 어떤 것을 실제로 Telegram push로 보낼지"(§ isTelegramAlertWorthyEvent,
+// production notification policy) 하나뿐이다:
 //
 //   매 tick마다:
 //     1) EventStore의 전체 event를 다시 읽어 approval-service.ts의
 //        createApprovalRequestsFromEvents()로 새 ApprovalRequest를 만든다(dedupeKey 기준
-//        idempotent — 매 tick 전체를 다시 훑어도 안전하다, § approval-store.ts).
-//     2) notification-service.ts의 processNotifications()로 미전달 알림을 Telegram에
-//        전달한다(§ G5 dedupe/재시도/우선순위 배선을 그대로 재사용 — provider만
-//        telegram-approval-provider.ts의 approval-aware provider로 바꿔 끼운다).
+//        idempotent — 매 tick 전체를 다시 훑어도 안전하다, § approval-store.ts). 이 목록은
+//        isTelegramAlertWorthyEvent()로 걸러지지 않은 전체 events를 그대로 쓴다 — "무엇을
+//        push하는가"와 "무엇이 승인 대상인가"는 서로 다른 질문이다.
+//     2) events를 isTelegramAlertWorthyEvent()로 좁힌 뒤에만 notification-service.ts의
+//        processNotifications()로 Telegram에 전달한다(§ G5 dedupe/재시도/우선순위 배선을
+//        그대로 재사용 — provider는 telegram-approval-provider.ts의 approval-aware
+//        provider 하나뿐이다, ntfy는 production에서 쓰지 않는다).
 //     3) Telegram Bot Token이 설정돼 있을 때만 getUpdates를 1회 호출하고, 반환된 각
 //        update를 approval-service.ts의 handleTelegramCallbackUpdate()에 그대로 넘긴다 —
 //        처리한 update_id는 즉시 offset store에 반영한다(중간에 process가 죽어도 이미
@@ -63,16 +106,6 @@ export interface TelegramControllerOptions {
   botToken?: string;
   /** 지정하지 않으면 AUTODEV_TELEGRAM_CHAT_ID 환경변수를 쓴다. */
   chatId?: string;
-  /**
-   * AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 이제 AutoDev 상태 알림의
-   * 기준이다(Telegram보다 우선). 지정하지 않으면 AUTODEV_NTFY_TOPIC 환경변수를 쓴다
-   * (isProductionRuntime()일 때만, botToken/chatId와 동일한 fail-closed 원칙).
-   */
-  ntfyTopic?: string;
-  /** 지정하지 않으면 AUTODEV_NTFY_BASE_URL 환경변수, 그것도 없으면 공식 https://ntfy.sh. */
-  ntfyBaseUrl?: string;
-  /** self-host 인증 서버용 — 지정하지 않으면 AUTODEV_NTFY_TOKEN 환경변수를 쓴다. */
-  ntfyAccessToken?: string;
   /** 테스트 전용 override — 지정하지 않으면 전역 fetch를 쓴다. */
   fetchImpl?: typeof fetch;
   statePath?: string;
@@ -119,9 +152,6 @@ interface ControllerDeps {
   allowlist: TelegramAllowlistConfig;
   botToken?: string;
   chatId?: string;
-  ntfyTopic?: string;
-  ntfyBaseUrl?: string;
-  ntfyAccessToken?: string;
   fetchImpl: typeof fetch;
   statePath: string;
   cwd: string;
@@ -149,27 +179,20 @@ async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSumm
     eventStore: deps.eventStore,
   });
 
-  // AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 Telegram보다 우선하는 알림
-  // 채널이다. ntfy는 발신 전용(§ notification-provider-ntfy.ts)이라 승인 응답 콜백을
-  // 대체하지 않는다 — 아래 getUpdates/handleTelegramCallbackUpdate(승인 처리)는 botToken이
-  // 있으면 이 선택과 무관하게 그대로 동작한다.
-  const ntfyProvider = createNtfyNotificationProvider({
-    topic: deps.ntfyTopic,
-    baseUrl: deps.ntfyBaseUrl,
-    accessToken: deps.ntfyAccessToken,
-    fetchImpl: deps.fetchImpl,
-  });
+  // AutoDev production notification policy(2026-08-27) — ntfy는 production에서 쓰지 않는다
+  // (§ 파일 상단 주석). Telegram이 유일한 provider이고, 그마저도 실제 approval이 필요한
+  // event만 골라 보낸다(§ isTelegramAlertWorthyEvent) — task 진행/완료/self-dev
+  // 완료/routine failure/reviewer REVISE 같은 일반 상태는 여기 도달하지 않는다.
   const notificationProvider: NotificationProvider | undefined =
-    ntfyProvider.configStatus === "CONFIGURED"
-      ? ntfyProvider
-      : deps.botToken && deps.chatId
-        ? createTelegramApprovalAwareProvider({ botToken: deps.botToken, chatId: deps.chatId, fetchImpl: deps.fetchImpl }, deps.approvalStore)
-        : undefined;
+    deps.botToken && deps.chatId
+      ? createTelegramApprovalAwareProvider({ botToken: deps.botToken, chatId: deps.chatId, fetchImpl: deps.fetchImpl }, deps.approvalStore)
+      : undefined;
+  const telegramAlertEvents = events.filter(isTelegramAlertWorthyEvent);
 
   let notificationsDelivered = 0;
   let notificationsFailed = 0;
   if (notificationProvider) {
-    const notifResult = await processNotifications(events, deps.notificationStore, notificationProvider, {
+    const notifResult = await processNotifications(telegramAlertEvents, deps.notificationStore, notificationProvider, {
       now: () => deps.now().toISOString(),
       eventStore: deps.eventStore,
       ...(deps.maxDeliveryAttempts !== undefined ? { maxAttempts: deps.maxDeliveryAttempts } : {}),
@@ -180,7 +203,7 @@ async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSumm
     // provider 없이도 dedupe/PENDING 기록 같은 bookkeeping은 그대로 수행한다(§
     // notification-service.ts) — Bot Token이 아직 없다는 이유로 이 event batch를 건너뛰면
     // 나중에 설정된 뒤에도 그 사이 발생한 event가 알림으로 승격되지 않는다.
-    await processNotifications(events, deps.notificationStore, undefined, {
+    await processNotifications(telegramAlertEvents, deps.notificationStore, undefined, {
       now: () => deps.now().toISOString(),
       eventStore: deps.eventStore,
     });
@@ -248,9 +271,6 @@ export async function startTelegramController(opts: TelegramControllerOptions): 
     // 읽히지 않는다(fail-closed).
     botToken: opts.botToken ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_BOT_TOKEN : undefined),
     chatId: opts.chatId ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_CHAT_ID : undefined),
-    ntfyTopic: opts.ntfyTopic ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_TOPIC : undefined),
-    ntfyBaseUrl: opts.ntfyBaseUrl ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_BASE_URL : undefined),
-    ntfyAccessToken: opts.ntfyAccessToken ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_TOKEN : undefined),
     fetchImpl: opts.fetchImpl ?? fetch,
     statePath: opts.statePath ?? opts.manifest.statePath,
     cwd: opts.cwd ?? opts.manifest.targetProjectRoot,

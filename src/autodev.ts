@@ -1055,7 +1055,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // § 요구사항 "호출 효율 지표" — developer가 구조적으로 실패한 cycle은 orchestrator.ts의
     // TEST_COMPLETED를 거치지 않으므로(§ 위) callStats를 실어보낼 다른 event가 없다 — 이미
     // 존재하는 이 event의 metadata(원시 타입만 허용)에 그대로 얹는다(새 event type을 만들지
-    // 않는다).
+    // 않는다). § AutoDev production notification policy(2026-08-27) — claudeErrorCode도
+    // 함께 싣는다: approval.ts의 classifyApprovalType()은 이 reason(고정 접두사
+    // "orchestrator status=")만으로는 NO_PROGRESS_STAGNATION(같은 접근을 반복하다 무진척으로
+    // 조기 종료 — 재시도해도 다시 같은 결과일 가능성이 높다)과 TIMEOUT/PROTOCOL_ERROR 소진
+    // 같은 "다시 시도하면 실제로 도움이 될 수 있는" 원인을 구분하지 못한다 —
+    // classifyApprovalType()/remotelyApprovable 판정 자체(승인 보안 계약)는 전혀 건드리지
+    // 않고, telegram-controller.ts의 routing 필터가 이 metadata만 보고 NO_PROGRESS_STAGNATION
+    // 하나만 Telegram push 대상에서 제외한다.
+    const metadataFields: Record<string, string | number | boolean | null> = {};
+    if (failedClaudeResult?.callStats) {
+      metadataFields.devTotalRounds = failedClaudeResult.callStats.totalRounds;
+      metadataFields.devValidResponseRounds = failedClaudeResult.callStats.validResponseRounds;
+      metadataFields.devLocalRecoveryRounds = failedClaudeResult.callStats.localRecoverySuccessRounds;
+      metadataFields.devProtocolFailureRounds = failedClaudeResult.callStats.protocolFailureRounds;
+    }
+    if (failedClaudeResult?.errorCode) metadataFields.claudeErrorCode = failedClaudeResult.errorCode;
     emitEvent(
       events,
       {
@@ -1067,16 +1082,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         outcome: "BLOCKED",
         humanInterventionRequired: true,
         reason: `orchestrator status=${finalState.status}`,
-        ...(failedClaudeResult?.callStats
-          ? {
-              metadata: {
-                devTotalRounds: failedClaudeResult.callStats.totalRounds,
-                devValidResponseRounds: failedClaudeResult.callStats.validResponseRounds,
-                devLocalRecoveryRounds: failedClaudeResult.callStats.localRecoverySuccessRounds,
-                devProtocolFailureRounds: failedClaudeResult.callStats.protocolFailureRounds,
-              },
-            }
-          : {}),
+        ...(Object.keys(metadataFields).length > 0 ? { metadata: metadataFields } : {}),
       },
       auditFailures
     );
