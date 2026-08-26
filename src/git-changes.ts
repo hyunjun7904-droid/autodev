@@ -162,6 +162,38 @@ export interface UntrackedFileContent {
   truncated: boolean;
 }
 
+// AutoDev Reviewer Snapshot Truncation Fix(2026-08-26, JARVIS Task 1.3 — Fireworks가 20,235자
+// 테스트 파일을 head-only truncation 때문에 "물리적으로 잘린/미완성 파일"로 오판해 반복 REVISE함).
+// 이전에는 예산 초과 시 raw.slice(0, cap)만 반환했다 — 파일 끝(닫는 함수 호출/export/summary
+// 등)이 통째로 사라지고, 그 사실을 알려주는 표시는 호출부(gpt-reviewer.ts)가 붙이는 헤더 한 줄
+// ("(내용 일부 truncated)")뿐이라 실제 잘린 지점 자체는 아무 경계 표시 없이 그냥 끊겼다 —
+// reviewer 입장에서는 "물리적으로 손상된 파일"과 "AutoDev가 예산 때문에 자른 파일"을 구분할
+// 방법이 없었다.
+//
+// 요구사항: per-file 예산은 그대로 bounded(임의로 늘리지 않음) — 대신 그 예산 안에서 HEAD +
+// 명시적 truncation marker + TAIL(파일의 실제 물리적 끝) 세 부분으로 재분배한다. tail을 항상
+// 일정 길이 확보해두면(TRUNCATION_TAIL_CHARS) "닫는 syntax/마지막 함수 호출/summary"가 예산
+// 크기와 무관하게 항상 보이게 된다. marker 자체의 길이만큼만 총 출력이 cap을 살짝 넘을 수 있다
+// (명시적으로 계산해 로그/코드에 남기는 것이지 조용히 예산을 어기는 게 아니다).
+const TRUNCATION_TAIL_CHARS = 2_000;
+
+/** 결정적(no LLM) 순수 함수 — 동일 입력엔 항상 동일 출력. cap 이하 파일은 완전히 그대로
+ *  반환한다(truncated:false, marker 없음 — 기존 동작 100% 보존). cap을 넘으면 head(cap의 앞
+ *  대부분) + explicit marker + tail(파일의 실제 마지막 부분)을 이어붙인다 — marker에는
+ *  reviewer가 "물리적으로 잘린 게 아니라 AutoDev가 잘랐다"를 판단할 수 있는 정보
+ *  (원본 길이/생략된 글자 수/tail 보존 여부)를 그대로 담는다. */
+export function buildBoundedFileSnapshot(raw: string, cap: number): { content: string; truncated: boolean } {
+  if (raw.length <= cap) return { content: raw, truncated: false };
+
+  const tailChars = Math.max(0, Math.min(TRUNCATION_TAIL_CHARS, Math.floor(cap / 4)));
+  const headChars = Math.max(0, cap - tailChars);
+  const head = raw.slice(0, headChars);
+  const tail = tailChars > 0 ? raw.slice(raw.length - tailChars) : "";
+  const omittedChars = raw.length - head.length - tail.length;
+  const marker = `\n[AUTODEV REVIEW SNAPSHOT TRUNCATED original_chars=${raw.length} omitted_chars=${omittedChars} tail_preserved=${tail.length > 0}]\n`;
+  return { content: `${head}${marker}${tail}`, truncated: true };
+}
+
 /**
  * untracked 파일들의 내용을 안전하게 읽는다 — Safe Executor의 validateReadPath()를 그대로
  * 재사용해 읽기 허용 범위(web/**, automation/**, supabase/migrations/**) 밖이거나
@@ -205,8 +237,7 @@ export function readUntrackedFiles(
     }
     const remaining = totalBudgetChars - used;
     const cap = Math.min(perFileMaxChars, remaining);
-    const truncated = raw.length > cap;
-    const content = truncated ? raw.slice(0, cap) : raw;
+    const { content, truncated } = buildBoundedFileSnapshot(raw, cap);
     used += content.length;
     files.push({ path: change.path, content, truncated });
   }

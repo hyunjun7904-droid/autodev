@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, unlinkSync }
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles } from "./git-changes";
+import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, buildBoundedFileSnapshot } from "./git-changes";
 import { PROJECT_ROOT, configureSafeExecutor } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 
@@ -140,7 +140,61 @@ function scenarioReadUntrackedFilesContentAndTruncation(): void {
   }
 }
 
+// AutoDev Reviewer Snapshot Truncation Fix(2026-08-26, JARVIS Task 1.3) — buildBoundedFileSnapshot()는
+// 순수 함수라 git/Safe Executor 없이 직접 검증한다. 실제 사고 재현: 20,235자 test 파일이
+// perFileMaxChars=20_000 head-only truncation으로 잘려 Fireworks가 "파일이 물리적으로 손상/
+// 미완성"이라고 오판, 5회 연속 REVISE로 WAITING_HUMAN까지 갔다.
+function scenarioBoundedFileSnapshotTruncation(): void {
+  // Case 1 — 예산 이하 파일은 완전히 그대로, truncated 표시 없음(기존 동작 100% 보존).
+  const small = "small file content, well under any budget\n";
+  const smallResult = buildBoundedFileSnapshot(small, 20_000);
+  check("Case1) cap 이하 파일은 원본과 완전히 동일한 content", smallResult.content === small);
+  check("Case1) cap 이하 파일은 truncated=false", smallResult.truncated === false);
+
+  // Case 2 — 실제 사고와 같은 모양: 20,000자 초과 + 파일 맨 끝에 유일한 sentinel(닫는 함수
+  // 호출 등을 대표).
+  const cap = 20_000;
+  const tailSentinel = "run();\nTAIL_SENTINEL_UNIQUE_MARKER\n";
+  const headFiller = "x".repeat(cap + 500 - tailSentinel.length);
+  const oversized = headFiller + tailSentinel;
+  check("Case2) 시나리오 전제 — 합성 파일이 실제로 cap을 초과함", oversized.length > cap);
+  const oversizedResult = buildBoundedFileSnapshot(oversized, cap);
+  check("Case2) truncated=true", oversizedResult.truncated === true);
+  check("Case2) head 내용이 남아있음(앞부분 filler 포함)", oversizedResult.content.startsWith("x"));
+  check(
+    "Case2) explicit truncation marker 포함(원본 길이/생략 글자 수/tail 보존 여부를 기계가 읽을 수 있는 형태로)",
+    /\[AUTODEV REVIEW SNAPSHOT TRUNCATED original_chars=\d+ omitted_chars=\d+ tail_preserved=true\]/.test(oversizedResult.content)
+  );
+  check(
+    "Case2) marker에 기록된 original_chars가 실제 원본 길이와 정확히 일치",
+    oversizedResult.content.includes(`original_chars=${oversized.length}`)
+  );
+  check("Case2) 실제 파일의 물리적 마지막 부분(tail sentinel)이 스냅샷에 그대로 보존됨", oversizedResult.content.includes(tailSentinel.trim()));
+  check("Case2) 스냅샷이 tail sentinel로 끝남(marker 뒤에 tail이 옴 — head-only truncation처럼 마커 앞에서 끊기지 않음)", oversizedResult.content.trimEnd().endsWith("TAIL_SENTINEL_UNIQUE_MARKER"));
+  check(
+    "Case2) 출력이 bounded — cap + marker 같은 작은 고정 오버헤드 안에서만 커짐(임의로 크게 늘어나지 않음)",
+    oversizedResult.content.length <= cap + 200
+  );
+
+  // Case 3 — 훨씬 더 큰 파일(수십 배)에서도 동일하게 bounded/head/tail/명시적 표시가 유지됨을
+  // 증명한다(단순히 "20,000을 30,000으로 늘려서 우연히 통과"하는 게 아님을 확인).
+  const hugeTailSentinel = "export default HUGE_FILE_END;\nHUGE_TAIL_SENTINEL\n";
+  const huge = "y".repeat(500_000) + hugeTailSentinel;
+  const hugeResult = buildBoundedFileSnapshot(huge, cap);
+  check("Case3) 훨씬 큰 파일도 truncated=true", hugeResult.truncated === true);
+  check("Case3) 훨씬 큰 파일도 출력이 bounded(원본 500KB+ vs 스냅샷은 cap 근처)", hugeResult.content.length <= cap + 200);
+  check("Case3) 훨씬 큰 파일도 head가 살아남음", hugeResult.content.startsWith("y"));
+  check("Case3) 훨씬 큰 파일도 실제 물리적 tail이 살아남음", hugeResult.content.includes(hugeTailSentinel.trim()));
+  check(
+    "Case3) 훨씬 큰 파일도 omitted_chars가 truncated 상태를 명시적으로 나타냄(0이 아님)",
+    /omitted_chars=([1-9]\d*)/.test(hugeResult.content)
+  );
+}
+
 function main(): void {
+  // 순수 함수 시나리오 — git/Safe Executor 불필요, 격리된 root 설정 이전에 바로 실행한다.
+  scenarioBoundedFileSnapshotTruncation();
+
   // scenarioReadUntrackedFilesContentAndTruncation()이 readUntrackedFiles()를 통해 실제
   // Safe Executor(validateReadPath)를 호출한다 — configureSafeExecutor()로 명시적으로
   // 주입되기 전까지 어떤 프로젝트로도 조용히 fallback하지 않으므로 먼저 이 파일 전용 격리된
