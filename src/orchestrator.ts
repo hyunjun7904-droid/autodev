@@ -289,6 +289,10 @@ export async function runOrchestrator(
       // tokenUsage를 이 cycle의 유일한 terminal event(TEST_COMPLETED)에만 붙인다 — 같은
       // reviewCycle 안에서 DEVELOPER_RETRY_STARTED(호출 전) 등 다른 event에는 중복 기록하지
       // 않는다(§ 요구사항 6 double-counting 방지).
+      // AutoDev 신뢰성 보완(2026-08-27, "호출 효율 지표") — claude-developer.ts가 이미 계산한
+      // DeveloperCallStats를 이 cycle의 유일한 terminal event에 그대로 실어보낸다(원시 타입만
+      // 허용하는 기존 metadata 필드 재사용 — 새 event type을 만들지 않는다).
+      const callStats = (claudeResult as ClaudeResult & { callStats?: { totalRounds: number; validResponseRounds: number; localRecoverySuccessRounds: number; protocolFailureRounds: number } }).callStats;
       emitEvent({
         eventType: "TEST_COMPLETED",
         executionPhase: "test",
@@ -297,6 +301,16 @@ export async function runOrchestrator(
         testSummary: buildTestSummary(claudeResult.tests),
         model: claudeResult.model,
         tokenUsage: claudeResult.tokenUsage,
+        ...(callStats
+          ? {
+              metadata: {
+                devTotalRounds: callStats.totalRounds,
+                devValidResponseRounds: callStats.validResponseRounds,
+                devLocalRecoveryRounds: callStats.localRecoverySuccessRounds,
+                devProtocolFailureRounds: callStats.protocolFailureRounds,
+              },
+            }
+          : {}),
       });
     }
 

@@ -40,6 +40,7 @@ import {
   promoteToCommonIfGeneric,
 } from "./problem-memory";
 import type { ProblemMemoryStore } from "./problem-memory";
+import { selectDefaultRoundStatusReporter } from "./round-status";
 import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 import { selectDefaultUsageLedgerForProject } from "./usage-ledger";
@@ -740,6 +741,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     opts.problemMemoryStores?.project ?? selectDefaultProblemMemoryStore("PROJECT", manifest.projectId);
   const problemCommonStore: ProblemMemoryStore =
     opts.problemMemoryStores?.common ?? selectDefaultProblemMemoryStore("COMMON", undefined);
+  // AutoDev 신뢰성 보완(2026-08-27, "현재 개발 라운드 대시보드 실시간 표시") — production이
+  // 아니면 no-op이라(§ round-status.ts) 테스트가 실제 파일을 건드리지 않는다.
+  const roundStatusReporter = selectDefaultRoundStatusReporter();
 
   if (isResumingApprovedCheckpoint) {
     // 이미 디스크에 저장된 승인된 상태(state, 이 함수 상단에서 loadState()로 읽은 값 —
@@ -865,6 +869,21 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     const memoryStagnationTracker = createStagnationTracker();
     let previousAttemptResult: ClaudeResult | undefined;
 
+    // AutoDev 신뢰성 보완(2026-08-27, "응답 형식 오류도 기존 문제 해결 흐름에 포함") — 이
+    // 정확한 task가 과거에 PROTOCOL_ERROR(§ claude-developer.ts PROTOCOL_FAILURE_HARD_STOP)로
+    // 중단된 적이 있으면, 매번 3라운드를 소진한 뒤에야(2회차 실패 시점) 나오는
+    // RESPONSE_CONTRACT_REINFORCEMENT_MESSAGE를 기다리지 않고 최초 라운드부터 JSON 계약을
+    // 미리 상기시킨다(§ 요구사항 "동일 문제 재발 시 더 빠른 해결"). 정확히 같은 fingerprint가
+    // 재현된다는 보장은 없으므로 구체적 해결책을 단정하지 않고, 일반 계약 재안내만 앞당긴다 —
+    // problemProjectStore.load()는 이 run에서 한 번만 호출한다.
+    const hadPriorProtocolFailureForThisTask = problemProjectStore
+      .load()
+      .some((e) => e.projectId === manifest.projectId && e.taskId === taskDef.id && e.errorCode === "PROTOCOL_ERROR");
+    const PRIOR_PROTOCOL_FAILURE_HINT =
+      "# AutoDev 안내(과거 응답 형식 문제 이력)\n" +
+      "이 작업은 과거에 Claude 응답을 AutoDev 프로토콜(TASK_COMPLETE/PLAN/ACTION_REQUEST)로 해석하지 못해 중단된 적이 있습니다. " +
+      "다른 텍스트나 코드펜스 없이 세 형태 중 정확히 하나의 순수 JSON 객체만 출력하세요(ACTION_REQUEST의 actions는 항상 배열).";
+
     // AutoDev 신뢰성 수정(2026-08-26) — runDeveloperTaskViaSafeExecutor를 직접 부르지 않고
     // runDeveloperTaskWithRetry로 감싼다. TIMEOUT/CLI_NOT_FOUND처럼 명확히 일시적인 실패는
     // 최대 2회까지 자동 재시도(총 3회 시도)한 뒤에도 계속되면 그때 실패로 반환한다(§
@@ -876,7 +895,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // (Developer 호출 자체가 "무엇을 시도할지"를 만든다), 대신 직전 시도가 required test에
       // 실패했다면 그 프롬프트에 과거 해결 사례/반복 실패 전략 전환 안내를 덧붙여, 같은
       // 실수를 맹목적으로 반복하지 않게 한다(§ claude-developer.ts opts.memoryHint).
-      let memoryHint: string | undefined;
+      let memoryHint: string | undefined = !previousAttemptResult && hadPriorProtocolFailureForThisTask ? PRIOR_PROTOCOL_FAILURE_HINT : undefined;
       let lookupEntryIdThisCycle: string | undefined;
       if (previousAttemptResult && hasFailedRequiredTest(previousAttemptResult.tests)) {
         const fingerprint = computeProblemFingerprint(previousAttemptResult.tests);
@@ -927,6 +946,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // 테스트 전용(§ AutodevRunOptions.developerClaudeCaller) — 지정하지 않으면 undefined라
         // runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)이 그대로 쓰인다.
         claudeCaller: opts.developerClaudeCaller,
+        onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
       });
 
       // Section 2/6/9 — 이 cycle의 결과를 problem-memory에 기록한다. GPT 리뷰 판단이 아니라
@@ -1000,8 +1020,42 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   // 전에 이미 gate.status==="APPROVED" && lastGptDecision.decision==="PASS"를 확인했다.
   if (!isResumingApprovedCheckpoint && finalState.status !== "APPROVED") {
     console.log(`[autodev] task ${taskDef.id} — orchestrator가 APPROVED로 끝나지 않음(status=${finalState.status}). checkpoint 생략.`);
+
+    // AutoDev 신뢰성 보완(2026-08-27) — orchestrator.ts는 developer 응답이 구조적으로
+    // 실패(claudeResult.success===false)하면 GPT 리뷰 없이 즉시 WAITING_HUMAN으로 넘어간다
+    // (§ orchestrator.ts). 이 cycle은 defaultClaudeRunner의 `if (result.success)` 기록 분기를
+    // 거치지 않으므로(§ 위) PROTOCOL_ERROR가 problem-memory에 전혀 남지 않았다 — 여기서
+    // FAILURE로 한 번 기록해, 이 task가 다시 시도될 때(§ hadPriorProtocolFailureForThisTask)
+    // 그리고 대시보드(§ Section 15) 양쪽에서 이 이력을 확인할 수 있게 한다. 원문 응답은
+    // 포함하지 않고 claude-developer.ts가 이미 계산한 non-secret fingerprint만 쓴다.
+    const failedClaudeResult = finalState.lastClaudeResult as
+      | (ClaudeResult & { errorCode?: string; protocolFailureFingerprint?: string; callStats?: { totalRounds: number; validResponseRounds: number; localRecoverySuccessRounds: number; protocolFailureRounds: number } })
+      | null;
+    if (failedClaudeResult && failedClaudeResult.success === false && failedClaudeResult.errorCode === "PROTOCOL_ERROR") {
+      recordAttempt(problemProjectStore, {
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        tests: [
+          {
+            name: `claude-response-protocol:${failedClaudeResult.protocolFailureFingerprint ?? "unknown"}`,
+            pass: false,
+            failureEvidence: { command: "developer-response-protocol-parse" },
+          },
+        ],
+        errorType: "UNKNOWN",
+        claudeErrorCode: "PROTOCOL_ERROR",
+        changedFiles: failedClaudeResult.changedFiles,
+        attemptDescription: failedClaudeResult.summary,
+        outcome: "FAILURE",
+      });
+    }
+
     // claude 구조적 실패/GPT 호출 상한 초과처럼 orchestrator.ts에서 cycle 단위 event 이름이
     // 따로 없는 나머지 WAITING_HUMAN 사유까지 이 HUMAN_APPROVAL_REQUIRED 하나로 포괄한다.
+    // § 요구사항 "호출 효율 지표" — developer가 구조적으로 실패한 cycle은 orchestrator.ts의
+    // TEST_COMPLETED를 거치지 않으므로(§ 위) callStats를 실어보낼 다른 event가 없다 — 이미
+    // 존재하는 이 event의 metadata(원시 타입만 허용)에 그대로 얹는다(새 event type을 만들지
+    // 않는다).
     emitEvent(
       events,
       {
@@ -1013,6 +1067,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         outcome: "BLOCKED",
         humanInterventionRequired: true,
         reason: `orchestrator status=${finalState.status}`,
+        ...(failedClaudeResult?.callStats
+          ? {
+              metadata: {
+                devTotalRounds: failedClaudeResult.callStats.totalRounds,
+                devValidResponseRounds: failedClaudeResult.callStats.validResponseRounds,
+                devLocalRecoveryRounds: failedClaudeResult.callStats.localRecoverySuccessRounds,
+                devProtocolFailureRounds: failedClaudeResult.callStats.protocolFailureRounds,
+              },
+            }
+          : {}),
       },
       auditFailures
     );

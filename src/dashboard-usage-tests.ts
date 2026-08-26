@@ -1,6 +1,6 @@
 import { createInMemoryEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
-import { aggregateProviderModelUsage, sumProviderModelUsage, buildRecentCalls, providerDisplayName } from "./dashboard-usage";
+import { aggregateProviderModelUsage, sumProviderModelUsage, buildRecentCalls, providerDisplayName, aggregateCallEfficiency } from "./dashboard-usage";
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -198,6 +198,44 @@ function scenarioEventsWithoutModelAreIgnored(): void {
   check("model이 없는 event는 최근 호출 기록에서 제외됨", buildRecentCalls(events, 10).length === 0);
 }
 
+// 오토데브 대시보드 후속 개선 § 요구사항 16(호출 효율) — claude-developer.ts가 실제로
+// 계산한 DeveloperCallStats를 TEST_COMPLETED/HUMAN_APPROVAL_REQUIRED의 metadata에서
+// 다시 읽어 합산하는지만 검증한다(§ dashboard-usage.ts CALL_STATS_EVENT_TYPES).
+function scenarioCallEfficiencySumsAcrossCycles(): void {
+  const store = createInMemoryEventStore();
+  append(store, 0, {
+    eventType: "TEST_COMPLETED",
+    runId: "r1",
+    taskId: "T1",
+    executionPhase: "test",
+    outcome: "SUCCESS",
+    reviseCycle: 1,
+    metadata: { devTotalRounds: 3, devValidResponseRounds: 2, devLocalRecoveryRounds: 1, devProtocolFailureRounds: 1 },
+  });
+  append(store, 1_000, {
+    eventType: "HUMAN_APPROVAL_REQUIRED",
+    runId: "r1",
+    taskId: "T1",
+    executionPhase: "review",
+    outcome: "BLOCKED",
+    humanInterventionRequired: true,
+    reason: "orchestrator status=WAITING_HUMAN",
+    metadata: { devTotalRounds: 3, devValidResponseRounds: 0, devLocalRecoveryRounds: 0, devProtocolFailureRounds: 3 },
+  });
+  const summary = aggregateCallEfficiency(store.query().events);
+  check("호출 효율: totalRounds 합산(3+3=6)", summary?.totalRounds === 6);
+  check("호출 효율: validResponseRounds 합산(2+0=2)", summary?.validResponseRounds === 2);
+  check("호출 효율: localRecoverySuccessRounds 합산(1+0=1)", summary?.localRecoverySuccessRounds === 1);
+  check("호출 효율: protocolFailureRounds 합산(1+3=4)", summary?.protocolFailureRounds === 4);
+}
+
+function scenarioCallEfficiencyUndefinedWhenNoMetadata(): void {
+  const store = createInMemoryEventStore();
+  append(store, 0, { eventType: "TASK_STARTED", runId: "r1", taskId: "T1", executionPhase: "task_selection", outcome: "PENDING" });
+  const summary = aggregateCallEfficiency(store.query().events);
+  check("호출 효율: metadata가 없으면 0으로 채우지 않고 undefined(추측 금지)", summary === undefined);
+}
+
 function main(): void {
   scenarioProviderNamesMappedCorrectly();
   scenarioOnlyActuallyCalledServicesAppear();
@@ -207,6 +245,8 @@ function main(): void {
   scenarioDeveloperCallWithoutModelStillCountedAsClaude();
   scenarioReviewCallWithoutModelIsNotGuessed();
   scenarioEventsWithoutModelAreIgnored();
+  scenarioCallEfficiencySumsAcrossCycles();
+  scenarioCallEfficiencyUndefinedWhenNoMetadata();
 
   console.log("\n=== dashboard-usage 테스트 결과 ===");
   for (const r of results) console.log(r);

@@ -271,10 +271,12 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("프로젝트 진행 상황", rows + bars);
   }
 
-  function renderCurrentStatus(snap) {
+  function renderCurrentStatus(data) {
+    var snap = data.snapshot;
     var agent = snap.currentOperation.activeAgentRole
       ? snap.currentOperation.activeAgentRole + " (" + orDash(snap.currentOperation.activeAgentId) + ")"
       : "없음";
+    var rs = data.roundStatus;
     var rows =
       row("오토데브 상태", esc(STATUS_LABEL_KO[snap.runStatus] || snap.runStatus), STATUS_TONE[snap.runStatus]) +
       row("프로젝트", orDash(snap.projectId)) +
@@ -282,7 +284,8 @@ export const DASHBOARD_HTML = `<!doctype html>
       row("현재 작업", orDash(snap.taskId)) +
       row("현재 수행 중", orDash(snap.currentOperation.currentAction)) +
       row("현재 개발/검토 담당", esc(agent)) +
-      row("대기시간(참고)", fmtDuration(snap.currentOperation.elapsedMs)) +
+      row("개발 진행(현재 라운드/최대)", rs ? rs.round + " / 최대 " + rs.maxRounds : NOT_AVAILABLE) +
+      row("마지막 활동 후 경과", rs ? fmtDuration(Date.now() - Date.parse(rs.updatedAt)) : fmtDuration(snap.currentOperation.elapsedMs)) +
       row("감사 기록 상태", snap.integrity === "CLEAN" ? "정상" : "손상", snap.integrity === "CLEAN" ? "GREEN" : "RED");
     return card("현재 작업 상태", rows);
   }
@@ -399,7 +402,8 @@ export const DASHBOARD_HTML = `<!doctype html>
     } else {
       rows += row("과거 해결 사례 재사용 횟수", NO_DATA);
     }
-    rows += row("자동 복구 횟수", NOT_AVAILABLE);
+    var ce = data.callEfficiency;
+    rows += row("자동 복구 횟수(현재 작업)", ce ? fmtNum(ce.localRecoverySuccessRounds) : NOT_AVAILABLE);
     return card("개발 품질", rows);
   }
 
@@ -409,16 +413,32 @@ export const DASHBOARD_HTML = `<!doctype html>
       return card("현재 문제 해결 상황", '<div class="empty">현재 진행 중인 문제 없음</div>');
     }
     var cp = ps.currentProblem;
+    var ce = data.callEfficiency;
+    var localRecoveryLabel = ce ? (ce.localRecoverySuccessRounds > 0 ? "로컬 복구 " + ce.localRecoverySuccessRounds + "회" : "로컬 복구 없음") : NOT_AVAILABLE;
     var rows =
       row("문제 유형", ERROR_TYPE_LABEL_KO[cp.errorType] || cp.errorType) +
       row("실패한 검사", orDash(cp.failedCheck)) +
       row("같은 오류 반복 횟수", String(cp.repeatedFailureCount)) +
       row("과거 유사 사례 수", String(ps.similarPastCasesCount)) +
       row("과거 해결책 재사용 여부", ps.similarPastCasesCount > 0 ? "재사용 가능한 사례 있음" : "없음") +
-      row("자동 복구 상태", NOT_AVAILABLE) +
+      row("자동 복구 상태(현재 작업)", localRecoveryLabel) +
       row("해결 상태", cp.resolved ? "해결됨" : "진행 중", cp.resolved ? "GREEN" : "YELLOW") +
       row("마지막 관측 시각", esc(fmtDateTime(cp.lastSeenAt)));
     return card("현재 문제 해결 상황", rows);
+  }
+
+  function renderCallEfficiency(data) {
+    var ce = data.callEfficiency;
+    if (!ce) {
+      return card("호출 효율", '<div class="empty">현재 작업에 대한 개발 담당 호출 기록이 아직 없습니다.</div>');
+    }
+    var wastedTone = ce.protocolFailureRounds > 0 ? "YELLOW" : "GREEN";
+    var rows =
+      row("현재 작업 개발 담당 호출(내부 라운드) 총합", fmtNum(ce.totalRounds)) +
+      row("유효한 개발 응답 라운드", fmtNum(ce.validResponseRounds), "GREEN") +
+      row("로컬 복구 성공 라운드(추가 호출 없음)", fmtNum(ce.localRecoverySuccessRounds)) +
+      row("응답 형식 실패 라운드", fmtNum(ce.protocolFailureRounds), wastedTone);
+    return card("호출 효율", rows);
   }
 
   function renderAdvisory(snap) {
@@ -452,7 +472,7 @@ export const DASHBOARD_HTML = `<!doctype html>
     html += '<div class="grid">' +
       renderQuickGlance(snap) +
       renderProjectProgress(data) +
-      renderCurrentStatus(snap) +
+      renderCurrentStatus(data) +
       renderActualWorkTime(data) +
       renderLiveOperations(snap) +
       renderUsage(data) +
@@ -462,6 +482,7 @@ export const DASHBOARD_HTML = `<!doctype html>
       renderSubscription(snap) +
       renderQuality(data) +
       renderProblemSolving(data) +
+      renderCallEfficiency(data) +
       renderAdvisory(snap) +
       "</div>";
     document.getElementById("content").innerHTML = html;

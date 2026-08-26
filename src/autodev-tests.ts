@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { decideNextAction, runAutodevOnce, approveHumanFinalReview, rejectHumanFinalReview } from "./autodev";
-import { DEFAULT_STATE_PATH } from "./state";
+import { DEFAULT_STATE_PATH, loadState, saveState } from "./state";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -1176,6 +1176,75 @@ async function scenarioSameTaskDoesNotRepeatFailedStrategy(): Promise<void> {
   check("I) 3번째 attempt 이후 transcript에 반복 전략 금지 안내가 실제로 주입됨", receivedInputs.some((inp) => inp.includes("전략 재사용 금지")));
 }
 
+/** 매번 완전히 동일한(claude-developer.ts 프로토콜에 없는) 응답 shape만 반환한다 — 실제
+ *  production 장애(§ autodev.ts hadPriorProtocolFailureForThisTask 상단 주석)를 재현하기
+ *  위해 claude-developer-tests.ts scenario Y와 동일한 패턴을 이 autodev.ts 통합 레벨에서
+ *  다시 스크립트한다. */
+function makeAlwaysUnrecognizedProtocolCaller(): ScriptedDeveloperCaller {
+  const receivedInputs: string[] = [];
+  return {
+    receivedInputs,
+    call: async (input: string) => {
+      receivedInputs.push(input);
+      const badJson = JSON.stringify({ type: "SOMETHING_ELSE", foo: "bar" });
+      return { success: true, summary: badJson, changedFiles: [], tests: [], rawOutput: badJson };
+    },
+  };
+}
+
+async function scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt(): Promise<void> {
+  // AutoDev 신뢰성 보완(2026-08-27, "응답 형식 오류도 기존 문제 해결 흐름에 포함") —
+  // PROTOCOL_ERROR(§ claude-developer.ts PROTOCOL_FAILURE_HARD_STOP)로 developer가
+  // 구조적으로 실패하면 orchestrator.ts가 GPT 리뷰 없이 즉시 WAITING_HUMAN으로 넘어간다
+  // (§ defaultClaudeRunner의 `if (result.success)` 기록 분기를 거치지 않음) — 그래도
+  // problem-memory에 FAILURE로 기록되고, 이 task가 다시 시도될 때 최초 라운드부터(2회차
+  // 실패를 기다리지 않고) 응답 형식 안내가 미리 주입되는지 검증한다(§ 요구사항 "동일 문제
+  // 재발 시 더 빠른 해결").
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] }); // 다음 task = M1
+  writeCheckScript(repo);
+  const manifest = buildMemoryReuseManifest(repo, statePath);
+  const problemMemoryStores = { project: makeInMemoryProblemMemoryStore(), common: makeInMemoryProblemMemoryStore() };
+
+  const firstCaller = makeAlwaysUnrecognizedProtocolCaller();
+  const firstResult = await runAutodevOnce({
+    manifest,
+    problemMemoryStores,
+    developerClaudeCaller: firstCaller.call,
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+  });
+
+  check("J) 1차 시도: PROTOCOL_ERROR로 checkpoint 없이 종료(RAN_TASK_NOT_APPROVED)", firstResult.outcome === "RAN_TASK_NOT_APPROVED");
+  check("J) 1차 시도: 정확히 3회 내부 호출 후 중단(claude-developer.ts 하드 상한, 20라운드까지 낭비되지 않음)", firstCaller.receivedInputs.length === 3);
+
+  const recordedEntry = problemMemoryStores.project.load().find((e) => e.taskId === "M1" && e.errorCode === "PROTOCOL_ERROR");
+  check("J) PROTOCOL_ERROR가 problem-memory에 FAILURE로 기록됨", !!recordedEntry);
+  check("J) 기록된 attemptedSolutions에 FAILURE 결과가 포함됨", !!recordedEntry?.attemptedSolutions.some((s) => s.outcome === "FAILURE"));
+
+  // decideNextAction()은 WAITING_HUMAN을 절대 자동으로 재시도하지 않는다(§ 요구사항 —
+  // 모호하면 승인으로 간주하지 않음). 실제 재시도는 사람이 승인한 뒤 auto-resume.ts가
+  // state.status를 안전하게 재확인하고 "READY"로 되돌린 뒤에만 일어난다(§ auto-resume.ts
+  // 상단 주석) — 그 지점만 흉내낸다(그 파일의 git/lock/remote 재확인 로직 자체를 다시
+  // 구현하지 않는다, 이 테스트가 검증하려는 것은 problem-memory 연결이지 auto-resume 자체가
+  // 아니다).
+  const resumedState = loadState(statePath);
+  resumedState.status = "READY";
+  saveState(resumedState, statePath);
+
+  const secondCaller = makeAlwaysUnrecognizedProtocolCaller();
+  await runAutodevOnce({
+    manifest,
+    problemMemoryStores,
+    developerClaudeCaller: secondCaller.call,
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+  });
+
+  check(
+    "J) 2차 시도: 최초 라운드 입력에 과거 응답 형식 문제 이력 안내가 이미 포함됨(2회차 실패를 기다리지 않음)",
+    secondCaller.receivedInputs[0]?.includes("과거 응답 형식 문제 이력") ?? false
+  );
+}
+
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -1199,6 +1268,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();
+    await scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt();
 
     await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();
     await scenarioHumanFinalReviewRerunWithoutApprovalStaysBlocked();

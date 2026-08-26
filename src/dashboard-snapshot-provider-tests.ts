@@ -5,6 +5,7 @@ import { createFileEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 import type { AutoDevEventInput } from "./observability-event";
 import { getDashboardSnapshot, resetDashboardSnapshotCacheForTests } from "./dashboard-snapshot-provider";
+import { createRoundStatusReporterForTests } from "./round-status";
 
 // Local Operations Dashboard — Read Service / Cache Seam 테스트(Phase G Task G4.1). 실제
 // Claude/GPT 유료 API를 호출하지 않는다 — 이 파일은 파일 기반 EventStore에 직접 event를
@@ -164,9 +165,51 @@ function scenarioProblemSolvingUndefinedWithoutMemoryData(): void {
   check("problem-memory 기록이 전혀 없는 project는 problemSolving이 undefined", snapshot.problemSolving === undefined);
 }
 
+// § 요구사항 13(현재 개발 라운드) — round-status.json이 지금 보여줄 run/task와 실제로
+// 일치할 때만 노출되고, 다른 run/task 또는 파일이 없으면 절대 추측해서 채우지 않는지 검증.
+function makeRoundStatusFilePath(): string {
+  const dir = mkdtempSync(join(tmpdir(), "autodev-dashboard-round-status-"));
+  tempDirs.push(dir);
+  return join(dir, "round-status.json");
+}
+
+function scenarioRoundStatusShownWhenMatchesCurrentRunAndTask(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const roundStatusFilePath = makeRoundStatusFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [ev({ eventType: "TASK_STARTED", runId: "run-round", taskId: "T1", projectId: "proj-a" })]);
+  createRoundStatusReporterForTests(roundStatusFilePath).report({ runId: "run-round", taskId: "T1", round: 4, maxRounds: 20, stage: "DISCOVERY" });
+
+  const snapshot = getDashboardSnapshot(filePath, roundStatusFilePath);
+  check("현재 run/task와 일치하면 roundStatus가 채워짐", snapshot.roundStatus?.round === 4 && snapshot.roundStatus?.maxRounds === 20);
+}
+
+function scenarioRoundStatusHiddenWhenTaskDiffersOrMissing(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const roundStatusFilePath = makeRoundStatusFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [ev({ eventType: "TASK_STARTED", runId: "run-round-2", taskId: "T2", projectId: "proj-a" })]);
+  // 다른(이미 끝난) task의 낡은 round 값 — 지금 보여줄 task(T2)와 다르다.
+  createRoundStatusReporterForTests(roundStatusFilePath).report({ runId: "run-round-2", taskId: "T1-old", round: 9, maxRounds: 20, stage: "LOCKED" });
+
+  const snapshot = getDashboardSnapshot(filePath, roundStatusFilePath);
+  check("다른 task의 값이면 roundStatus가 undefined(추측 금지)", snapshot.roundStatus === undefined);
+
+  resetDashboardSnapshotCacheForTests();
+  const filePath2 = makeEventFilePath();
+  const store2 = createFileEventStore(filePath2);
+  appendAll(store2, [ev({ eventType: "TASK_STARTED", runId: "run-round-3", taskId: "T3", projectId: "proj-a" })]);
+  const snapshotNoFile = getDashboardSnapshot(filePath2, makeRoundStatusFilePath()); // 파일 자체를 만들지 않음
+  check("round-status 파일이 없으면 roundStatus가 undefined", snapshotNoFile.roundStatus === undefined);
+}
+
 function main(): void {
   try {
     scenarioNoRunYet();
+    scenarioRoundStatusShownWhenMatchesCurrentRunAndTask();
+    scenarioRoundStatusHiddenWhenTaskDiffersOrMissing();
     scenarioLatestRunSelected();
     scenarioCacheHitWithoutFileChange();
     scenarioDegradedIntegrityPropagates();

@@ -743,6 +743,106 @@ async function scenarioV_noMemoryHintMeansNoExtraSection(): Promise<void> {
   check("V: memoryHint 미지정 시 '과거 해결 사례' 섹션이 생기지 않음", !scripted.receivedInputs[0].includes("과거 해결 사례"));
 }
 
+// AutoDev 신뢰성 수정(2026-08-27, "CLI 프로세스 성공 vs 개발 응답 유효성 미구분") — 실제
+// production 로그(logs/automation.log, JARVIS 2026-08-26 17:37~17:56)에서 claude CLI
+// subprocess가 exitCode=0으로 정상 종료했음에도 "developer 라운드 N 알 수 없는 응답
+// 형식"이 반복 관측된 패턴을 아래 W~AA 시나리오로 직접 재현/검증한다(§ claude-developer.ts
+// PROTOCOL_FAILURE_HARD_STOP 상단 주석).
+
+async function scenarioW_locallyRecoverableSingleActionObjectCostsZeroExtraCalls(): Promise<void> {
+  // W: actions가 배열이 아니라 "그 자체로 유효한 단일 action 객체"인 흔한 실수는 추가
+  // Claude 호출 없이 로컬에서 즉시 복구되어 정상 ACTION_REQUEST처럼 처리돼야 한다.
+  const singleActionNotArray = JSON.stringify({
+    type: "ACTION_REQUEST",
+    actions: { type: "READ_FILES", paths: ["automation/src/logger.ts"] },
+  });
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-after-local-recovery", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([singleActionNotArray, taskComplete]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("로컬 복구 시나리오(actions가 배열 아님)", 1, {
+    claudeCaller: scripted.call,
+  });
+
+  check("W: 로컬 복구 후 정상 성공", result.success === true);
+  check("W: summary가 TASK_COMPLETE 값과 일치", result.summary === "done-after-local-recovery");
+  check("W: 정확히 2회 호출(복구에 추가 Claude 호출이 들지 않음 — READ 1회 + TASK_COMPLETE 1회)", scripted.callCount() === 2);
+  check("W: callStats.localRecoverySuccessRounds=1(§ 호출 효율 지표)", result.callStats?.localRecoverySuccessRounds === 1);
+  check("W: callStats.totalRounds=2, validResponseRounds=2, protocolFailureRounds=0", result.callStats?.totalRounds === 2 && result.callStats?.validResponseRounds === 2 && result.callStats?.protocolFailureRounds === 0);
+}
+
+async function scenarioX_variedUnrecognizedResponsesDoNotFalselyTriggerHardStop(): Promise<void> {
+  // X: 매번 다른(서로 다른 fingerprint) 알 수 없는 형식이 오면 "동일 패턴 반복"이 아니므로
+  // PROTOCOL_ERROR로 조기 중단되지 않고, 기존처럼 안내 후 계속 진행되다가 정상 응답이 오면
+  // 성공해야 한다 — 반복 차단이 "다른 실패"까지 성급하게 죽이지 않는다는 것을 증명한다.
+  const variedUnknown = ["WEIRD_1", "WEIRD_2", "WEIRD_3"].map((t) => JSON.stringify({ type: t }));
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-after-varied-unknown", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([...variedUnknown, taskComplete]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("서로 다른 알 수 없는 형식 시나리오", 1, { claudeCaller: scripted.call });
+
+  check("X: PROTOCOL_ERROR로 조기 중단되지 않음(서로 다른 실패라 반복으로 취급되지 않음)", result.errorCode !== "PROTOCOL_ERROR");
+  check("X: 결국 정상 성공", result.success === true);
+  check("X: 정확히 4회 호출(서로 다른 알 수 없는 형식 3회 + TASK_COMPLETE 1회)", scripted.callCount() === 4);
+}
+
+async function scenarioY_identicalUnrecognizedResponseRepeatedStopsAfterThreeCalls(): Promise<void> {
+  // Y(핵심 회귀 — 실제 JARVIS 장애 재현): 완전히 동일한 알 수 없는 형식이 계속 반복되면,
+  // 옛 코드처럼 MAX_INTERNAL_ROUNDS(20)까지 그대로 흘러가지 않고 정확히 3회(하드 상한) 만에
+  // PROTOCOL_ERROR로 종료돼야 한다 — 뒤 17회분의 낭비된 Claude 호출/토큰을 막는다.
+  const sameUnknown = JSON.stringify({ type: "SOMETHING_ELSE", foo: "bar" });
+  const scripted = makeScriptedClaudeCaller([sameUnknown]); // 계속 같은 응답을 반환
+
+  const result = await runDeveloperTaskViaSafeExecutor("동일 알 수 없는 형식 반복 시나리오", 1, { claudeCaller: scripted.call });
+
+  check("Y: success=false", result.success === false);
+  check("Y: errorCode=PROTOCOL_ERROR", result.errorCode === "PROTOCOL_ERROR");
+  check("Y: MAX_INTERNAL_ROUNDS(20)이 아니라 정확히 3회 만에 중단(무의미한 재호출 방지의 직접 증거)", scripted.callCount() === 3);
+  check(
+    "Y: deferredHumanTasks에 PROTOCOL_ERROR 반복 사유가 기록됨",
+    (result.deferredHumanTasks ?? []).some((t) => t.startsWith("PROTOCOL_ERROR:"))
+  );
+  check("Y: callStats.protocolFailureRounds=3, validResponseRounds=0(§ 호출 효율 지표)", result.callStats?.protocolFailureRounds === 3 && result.callStats?.validResponseRounds === 0);
+}
+
+async function scenarioZ_secondRepeatSendsReinforcementThenRecoversOnThird(): Promise<void> {
+  // Z: 동일 실패가 2회째일 때 응답 계약 재안내 메시지가 정확히 한 번 transcript에 실려
+  // 다음 호출로 전달되고, 3회째에 정상 응답이 오면(하드 상한에 도달하기 전) 그대로
+  // 성공해야 한다 — "보정 요청 최대 1회 후 정상 복귀 가능"을 증명한다.
+  const sameUnknown = JSON.stringify({ type: "SOMETHING_ELSE", foo: "bar" });
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-after-reinforcement", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([sameUnknown, sameUnknown, taskComplete]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("2회 반복 후 정상 복귀 시나리오", 1, { claudeCaller: scripted.call });
+
+  check("Z: PROTOCOL_ERROR 없이 정상 성공(3회째에 하드 상한 도달 전 복귀)", result.success === true && result.errorCode !== "PROTOCOL_ERROR");
+  check("Z: 정확히 3회 호출", scripted.callCount() === 3);
+  check(
+    "Z: 세 번째 호출 입력에 응답 계약 재안내 메시지가 포함됨(2회째 이후 전송)",
+    scripted.receivedInputs[2].includes("AutoDev 응답 형식 재안내")
+  );
+  check(
+    "Z: 재안내 메시지가 두 번 중복 전송되지 않음(3회째 입력에 정확히 1회만 등장)",
+    (scripted.receivedInputs[2].match(/AutoDev 응답 형식 재안내/g) ?? []).length === 1
+  );
+  check(
+    "Z: callStats.totalRounds=3, validResponseRounds=1, protocolFailureRounds=2(§ 호출 효율 지표)",
+    result.callStats?.totalRounds === 3 && result.callStats?.validResponseRounds === 1 && result.callStats?.protocolFailureRounds === 2
+  );
+}
+
+async function scenarioAA_plainTextNonJsonRepeatedAlsoStopsAfterThreeCalls(): Promise<void> {
+  // AA: JSON 파싱 자체가 실패하는 완전한 자유 텍스트가 반복되는 경우도(로컬 복구 대상이
+  // 아님 — 애초에 JSON이 아니므로 shape 복구 불가) 동일한 하드 상한(3회)이 적용돼야 한다.
+  const plainText = "이것은 JSON이 아닌 일반 텍스트 응답입니다.";
+  const scripted = makeScriptedClaudeCaller([plainText]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("JSON이 아닌 응답 반복 시나리오", 1, { claudeCaller: scripted.call });
+
+  check("AA: success=false", result.success === false);
+  check("AA: errorCode=PROTOCOL_ERROR", result.errorCode === "PROTOCOL_ERROR");
+  check("AA: NOT_JSON도 정확히 3회 만에 중단", scripted.callCount() === 3);
+}
+
 // Phase C Task C4.1(Read-only Git Command Hardening) — 요구된 source regression: "AutoDev
 // Claude Worker의 production 경로가 직접 Bash/tool 실행으로 Safe Executor를 우회할 수
 // 없는 현재 구조"를 확인한다. 이 파일의 나머지 시나리오는 fake claudeCaller로 라운드
@@ -831,6 +931,11 @@ async function main(): Promise<void> {
     await scenarioR_resumeContextDetectedForExistingInScopeChanges();
     await scenarioU_memoryHintInjectedIntoInitialTranscript();
     await scenarioV_noMemoryHintMeansNoExtraSection();
+    await scenarioW_locallyRecoverableSingleActionObjectCostsZeroExtraCalls();
+    await scenarioX_variedUnrecognizedResponsesDoNotFalselyTriggerHardStop();
+    await scenarioY_identicalUnrecognizedResponseRepeatedStopsAfterThreeCalls();
+    await scenarioZ_secondRepeatSendsReinforcementThenRecoversOnThird();
+    await scenarioAA_plainTextNonJsonRepeatedAlsoStopsAfterThreeCalls();
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

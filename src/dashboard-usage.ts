@@ -150,3 +150,46 @@ export function buildRecentCalls(events: readonly AutoDevEvent[], limit: number)
   calls.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
   return calls.slice(0, limit);
 }
+
+// 오토데브 대시보드 후속 개선 § 요구사항 16(호출 효율) — claude-developer.ts의
+// DeveloperCallStats(§ claude-developer.ts)를 TEST_COMPLETED/HUMAN_APPROVAL_REQUIRED
+// event의 metadata(원시 타입만 허용하는 기존 필드)에서 그대로 다시 읽어 합산한다. 새
+// 판정/집계 엔진이 아니다 — 이미 claude-developer.ts가 계산해 event에 실어보낸 값만 더한다.
+export interface CallEfficiencySummary {
+  /** 실제로 성공한 claude CLI 호출(내부 round) 총합 — USAGE_LIMIT 재시도는 세지 않는다
+   *  (§ claude-developer.ts DeveloperCallStats 상단 주석). */
+  totalRounds: number;
+  /** 유효한 AutoDev 프로토콜(TASK_COMPLETE/PLAN/ACTION_REQUEST)로 해석된 round 수 —
+   *  로컬 복구로 유효해진 round도 포함한다(중복 집계 없음, § claude-developer.ts). */
+  validResponseRounds: number;
+  /** 응답 형식이 이상했지만 추가 Claude 호출 없이 로컬에서 즉시 복구된 round 수. */
+  localRecoverySuccessRounds: number;
+  /** 로컬 복구도 실패해 응답 형식 자체를 해석하지 못한 round 수(§ 요구사항 "응답 형식
+   *  실패 횟수"). */
+  protocolFailureRounds: number;
+}
+
+const CALL_STATS_EVENT_TYPES: ReadonlySet<AutoDevEventType> = new Set(["TEST_COMPLETED", "HUMAN_APPROVAL_REQUIRED"]);
+
+/** events가 이미 원하는 scope(현재 작업/전체 누적 등)로 좁혀졌다고 가정하고 그 안의
+ *  metadata.devTotalRounds가 있는 event만 합산한다 — 이 metadata가 없는(§ claude-developer.ts
+ *  callStats가 계산되지 않은 매우 이른 실패 경로) event는 조용히 건너뛴다. 이 scope 안에
+ *  callStats를 실은 event가 하나도 없으면 undefined(0으로 채우지 않는다 — 추측 금지). */
+export function aggregateCallEfficiency(events: readonly AutoDevEvent[]): CallEfficiencySummary | undefined {
+  let totalRounds = 0;
+  let validResponseRounds = 0;
+  let localRecoverySuccessRounds = 0;
+  let protocolFailureRounds = 0;
+  let any = false;
+  for (const e of events) {
+    if (!CALL_STATS_EVENT_TYPES.has(e.eventType)) continue;
+    const m = e.metadata;
+    if (!m || typeof m.devTotalRounds !== "number") continue;
+    any = true;
+    totalRounds += m.devTotalRounds;
+    if (typeof m.devValidResponseRounds === "number") validResponseRounds += m.devValidResponseRounds;
+    if (typeof m.devLocalRecoveryRounds === "number") localRecoverySuccessRounds += m.devLocalRecoveryRounds;
+    if (typeof m.devProtocolFailureRounds === "number") protocolFailureRounds += m.devProtocolFailureRounds;
+  }
+  return any ? { totalRounds, validResponseRounds, localRecoverySuccessRounds, protocolFailureRounds } : undefined;
+}

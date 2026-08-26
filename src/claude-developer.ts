@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { resolveTrustedClaudeCommand, classifySubprocessOutcome } from "./claude-runner";
 import type { ClaudeErrorCode } from "./claude-runner";
 import { runSubprocessWithTimeout } from "./subprocess-runner";
@@ -67,6 +68,17 @@ export function isTransientDeveloperFailure(result: Pick<DeveloperResult, "succe
   return !result.success && result.errorCode !== undefined && DEVELOPER_TRANSIENT_ERROR_CODES.has(result.errorCode);
 }
 
+/** AutoDev 신뢰성 보완(2026-08-27, "호출 효율 지표") — Section 16 요구사항("전체 Claude
+ *  호출 횟수/유효 응답 횟수/응답 형식 실패 횟수/로컬 복구 성공 횟수")을 위한 최소 요약값.
+ *  validResponseRounds + protocolFailureRounds(로컬 복구로 유효해진 라운드는
+ *  validResponseRounds에만 센다 — 중복 집계 없음)가 항상 totalRounds 이하다. */
+export interface DeveloperCallStats {
+  totalRounds: number;
+  validResponseRounds: number;
+  localRecoverySuccessRounds: number;
+  protocolFailureRounds: number;
+}
+
 export interface DeveloperResult {
   success: boolean;
   summary: string;
@@ -81,6 +93,15 @@ export interface DeveloperResult {
   rawOutput: string;
   errorCode?: DeveloperErrorCode;
   deferredHumanTasks?: string[];
+  /** errorCode==="PROTOCOL_ERROR"일 때만 채워진다 — computeProtocolFailureFingerprint()의
+   *  결과를 그대로 노출해, 호출부(autodev.ts)가 problem-memory.ts에 이 정확한 실패 패턴을
+   *  기록/재사용할 수 있게 한다(원문 응답 내용은 포함하지 않는다). */
+  protocolFailureFingerprint?: string;
+  /** AutoDev 신뢰성 보완(2026-08-27, "호출 효율 지표") — 이 attempt(1회의
+   *  runDeveloperTaskViaSafeExecutor 호출) 안에서 실제로 성공한 모든 내부 round(claude CLI
+   *  호출) 하나하나가 어떤 결과였는지 요약한다. USAGE_LIMIT 재시도(같은 round를 다시
+   *  요청)는 세지 않는다 — 이 값은 "응답 형식 낭비"만 관측하기 위한 지표다. */
+  callStats?: DeveloperCallStats;
   /** Phase G Task G3.1 — 이 developer attempt(1회의 runDeveloperTaskViaSafeExecutor 호출)
    *  안에서 실제로 성공한 모든 내부 round(claude CLI 호출)의 tokenUsage를 합산하고, model은
    *  가장 최근 round에서 관측된 값을 담는다(같은 세션이라 round마다 달라지지 않는다). CLI가
@@ -125,6 +146,12 @@ export interface DeveloperTaskOptions {
   usageLimitMaxRetries?: number;
   /** 테스트 전용 override — 기본은 실제 setTimeout 기반 대기. */
   sleep?: (ms: number) => Promise<void>;
+  /** AutoDev 신뢰성 보완(2026-08-27, "현재 개발 라운드 대시보드 실시간 표시") — 매 내부
+   *  round가 실제 claude CLI 호출을 시작하기 직전에 한 번씩 호출된다(순수 관측용, fire-and-
+   *  forget). 이 콜백이 무엇을 하든(파일 쓰기 등) 예외를 던지면 실제 개발 흐름에 영향을
+   *  주지 않도록 호출부(이 함수)가 항상 try/catch로 감싼다(§ 요구사항 "관측 기능이 실제
+   *  개발을 방해하면 안 됨") — 지정하지 않으면 아무 일도 일어나지 않는다(기존 동작과 동일). */
+  onRoundStart?: (round: number, maxRounds: number, stage: "DISCOVERY" | "LOCKED") => void;
   /** 이 task를 수행할 프로젝트의 맥락(system prompt에 삽입) — 지정하지 않으면
    *  DEFAULT_PROJECT_CONTEXT(범용 기본값)를 쓴다. 실제 운용은 autodev.ts가 ProjectManifest로
    *  부터 조립해 항상 명시적으로 넘긴다. */
@@ -200,6 +227,95 @@ const DISCOVERY_REJECTION_MESSAGE =
 const PLAN_LOCK_REPEAT_MESSAGE =
   "Discovery budget exhausted. The one-time post-lock PLAN has already been used. " +
   "Issue WRITE_FILE or APPLY_PATCH now instead of another PLAN.";
+
+// AutoDev 신뢰성 수정(2026-08-27, "CLI 프로세스 성공 vs 개발 응답 유효성 미구분") — 실제
+// production 로그(logs/automation.log, JARVIS 2026-08-26 17:37~17:56)에서 claude CLI
+// subprocess가 매번 exitCode=0으로 정상 종료(§ claude-runner.ts classifySubprocessOutcome의
+// "claude CLI 호출 완료" 로그 — 이 로그는 CLI 프로세스 성공 + 바깥쪽 CLI JSON envelope
+// 파싱 성공만 의미하며, Claude가 실제로 유효한 AutoDev 프로토콜(TASK_COMPLETE/PLAN/
+// ACTION_REQUEST+배열 actions)로 응답했는지는 별개다)한 직후 "developer 라운드 N 알 수
+// 없는 응답 형식"이 반복 관측됐다 — 매회 실제 Claude CLI 왕복(수십 초~2분)을 그대로
+// 소비하면서도 discoveryOnlyRoundCount/lockedNoProgressCount 어느 예산에도 잡히지 않고
+// MAX_INTERNAL_ROUNDS(20)까지 그대로 흘러갈 수 있었다(§ 코드 증거: 옛 "알 수 없는 응답
+// 형식" 분기는 로그+continue만 하고 어떤 카운터도 건드리지 않았다). 아래 메커니즘은 그
+// 간극만 닫는다 — MAX_INTERNAL_ROUNDS/DISCOVERY_BUDGET_ROUNDS/IMPLEMENTATION_LOCK_GRACE
+// 자체는 건드리지 않는다(다른 종류의 무진척 판정과 목적이 다르다).
+//
+// 1) 로컬 복구 우선(추가 Claude 호출 없이) — attemptLocalProtocolRecovery()가 "알려진 3개
+//    타입의 대소문자/공백 오차"와 "actions가 배열이 아니라 단일 action 객체인 흔한 실수"만
+//    보수적으로 복구한다. 내용을 추측하지 않는다 — 이 두 패턴이 아니면 복구를 포기한다.
+// 2) 그래도 실패하면 실패 지문(스테이지+실패 종류+구조적 shape+응답 길이 버킷 — 원문/비밀은
+//    전혀 포함하지 않음)을 만들어 "동일 지문이 연속되는지"만 추적한다(discoveryOnlyRoundCount와
+//    완전히 독립된 카운터). 같은 지문 1회째는 기존과 동일하게 안내 후 계속 진행, 2회째는
+//    응답 계약을 강하게 재안내(RESPONSE_CONTRACT_REINFORCEMENT_MESSAGE, 최대 1회), 3회째는
+//    같은 방식으로 더 호출하지 않고 PROTOCOL_ERROR로 즉시 종료한다(§ DeveloperErrorCode에
+//    이미 존재했지만 실제로 반환된 적은 없었다 — problem-memory.ts의
+//    COMMON_PROBLEM_PATTERNS가 이미 이 코드를 "Claude CLI 응답 형식 문제"로 인식하도록
+//    설계돼 있었다).
+const PROTOCOL_FAILURE_HARD_STOP = 3;
+const KNOWN_TOP_LEVEL_TYPES = new Set(["TASK_COMPLETE", "PLAN", "ACTION_REQUEST"]);
+const KNOWN_ACTION_TYPES = new Set(["READ_FILES", "SEARCH", "WRITE_FILE", "APPLY_PATCH", "RUN_COMMAND"]);
+const RESPONSE_CONTRACT_REINFORCEMENT_MESSAGE =
+  "# AutoDev 응답 형식 재안내(중요)\n" +
+  "방금 응답도 허용된 형식(TASK_COMPLETE / PLAN / ACTION_REQUEST)과 일치하지 않았습니다. " +
+  "다른 텍스트나 코드펜스 없이 다음 세 형태 중 정확히 하나의 순수 JSON 객체만 출력하세요:\n" +
+  '1) {"type":"ACTION_REQUEST","actions":[{"type":"READ_FILES","paths":[...]}, ...]} ' +
+  "(actions는 요청이 하나뿐이어도 항상 배열이어야 합니다)\n" +
+  '2) {"type":"PLAN","summary":"..."}\n' +
+  '3) {"type":"TASK_COMPLETE","summary":"...","changedFiles":[...],"testsRequested":[...]}\n' +
+  "이후에도 같은 방식으로 형식이 맞지 않으면 이 시도는 자동으로 중단되고 사람이 확인해야 합니다.";
+
+type ParsedProtocolMessage = { type?: string; actions?: unknown; [key: string]: unknown };
+
+/** 알려진 3개 타입의 대소문자/공백 오차, 그리고 ACTION_REQUEST의 actions가 배열이 아니라
+ *  "그 자체로 유효해 보이는 단일 action 객체"인 흔한 실수만 보수적으로 복구한다 — 그 외에는
+ *  절대 추측하지 않고 null을 반환한다(§ 요구사항: 지원되지 않는 형태를 추측해서 만들어내지
+ *  않는다). 복구에 성공하면 추가 Claude 호출 없이 기존 TASK_COMPLETE/PLAN/ACTION_REQUEST
+ *  분기를 그대로 재사용할 수 있는 정규화된 객체를 돌려준다. */
+function attemptLocalProtocolRecovery(parsed: ParsedProtocolMessage): ParsedProtocolMessage | null {
+  if (typeof parsed.type !== "string") return null;
+  const canonicalType = parsed.type.trim().toUpperCase();
+  if (!KNOWN_TOP_LEVEL_TYPES.has(canonicalType)) return null;
+
+  if (canonicalType === "ACTION_REQUEST") {
+    if (Array.isArray(parsed.actions)) {
+      return canonicalType === parsed.type ? null : { ...parsed, type: canonicalType };
+    }
+    const singleAction = parsed.actions;
+    if (
+      singleAction &&
+      typeof singleAction === "object" &&
+      typeof (singleAction as Record<string, unknown>).type === "string" &&
+      KNOWN_ACTION_TYPES.has(((singleAction as Record<string, unknown>).type as string).toUpperCase())
+    ) {
+      return { ...parsed, type: canonicalType, actions: [singleAction] };
+    }
+    return null;
+  }
+
+  return canonicalType === parsed.type ? null : { ...parsed, type: canonicalType };
+}
+
+/** 실패한 응답의 "구조"만 짧게 요약한다 — 원문 내용은 절대 포함하지 않는다(type 필드
+ *  값만 40자로 잘라 sanitizeForLog를 거쳐 담는다, § 관측성 요구사항). */
+function describeUnrecognizedShape(parsed: ParsedProtocolMessage | null): string {
+  if (!parsed) return "not-json";
+  const typeVal = typeof parsed.type === "string" ? sanitizeForLog(parsed.type.slice(0, 40)) : typeof parsed.type;
+  if (parsed.type === "ACTION_REQUEST") {
+    return `type=ACTION_REQUEST,actions=${Array.isArray(parsed.actions) ? "array" : typeof parsed.actions}`;
+  }
+  return `type=${typeVal}`;
+}
+
+/** stage(discovery/locked)+실패 종류+구조 요약+응답 길이 버킷만으로 만든 non-secret
+ *  지문 — 원문도, task 내용도 포함하지 않는다. 같은 실패가 반복되는지만 판정하면 되므로
+ *  암호학적 강도는 필요 없지만(sha256은 이미 이 저장소 다른 곳(project-lock.ts 등)에서도
+ *  이런 용도로 재사용되는 표준 선택이라 그대로 따른다), 짧게(16자) 자른다. */
+function computeProtocolFailureFingerprint(stageLabel: string, kind: string, shapeDescriptor: string, rawLength: number): string {
+  const lenBucket = Math.floor(rawLength / 200);
+  const composite = `${stageLabel}|${kind}|${shapeDescriptor}|len${lenBucket}`;
+  return createHash("sha256").update(composite).digest("hex").slice(0, 16);
+}
 
 // system prompt 자체는 신뢰 경계가 아니다(§ 상단 주석) — 여기 들어가는 프로젝트별 내용은
 // 순수 안내문이고, 실제 강제는 Safe Executor(safe-executor.ts)가 코드 레벨로 한다. 그래서
@@ -413,6 +529,14 @@ export async function runDeveloperTaskViaSafeExecutor(
     ((input: string, callTimeoutMs: number) =>
       callClaude(input, callTimeoutMs, systemPrompt, opts.executor?.projectRoot ?? PROJECT_ROOT));
   const sleepFn = opts.sleep ?? defaultDeveloperSleep;
+  function reportRoundStart(round: number, stage: "DISCOVERY" | "LOCKED"): void {
+    if (!opts.onRoundStart) return;
+    try {
+      opts.onRoundStart(round, MAX_INTERNAL_ROUNDS, stage);
+    } catch (e) {
+      log("developer onRoundStart 콜백 실패 — 관측용이므로 무시하고 개발을 계속합니다", { error: e instanceof Error ? e.message : undefined });
+    }
+  }
   const usageLimitWaitMs = opts.usageLimitWaitMs ?? DEVELOPER_USAGE_LIMIT_WAIT_MS;
   const usageLimitMaxRetries = opts.usageLimitMaxRetries ?? DEVELOPER_USAGE_LIMIT_MAX_RETRIES;
   // Phase C Task C2 — 이 run 전용 SafeExecutorContext(지정 안 되면 module-level singleton
@@ -466,6 +590,21 @@ export async function runDeveloperTaskViaSafeExecutor(
   // (두 번째부터는 PLAN_LOCK_REPEAT_MESSAGE로 거부).
   let planUsedInLock = false;
 
+  // discoveryOnlyRoundCount/lockedNoProgressCount와 완전히 독립된 카운터 — "응답을 아예
+  // 유효한 프로토콜로 해석하지 못한 라운드"만 추적한다(§ PROTOCOL_FAILURE_HARD_STOP 상단 주석).
+  let consecutiveProtocolFailureCount = 0;
+  let lastProtocolFailureFingerprint: string | undefined;
+  let reinforcementSentForFingerprint: string | undefined;
+
+  // AutoDev 신뢰성 보완(2026-08-27, "호출 효율 지표") — 대시보드(§ Section 16)가 "호출은
+  // 많은데 실제 개발은 안 되는 상황"을 새 사용량 체계 없이 이 attempt 하나의 요약값만으로
+  // 판단할 수 있게 한다. round 루프 밖에서 별도로 추정하지 않고, 이미 그 판정을 내리는
+  // 지점(dispatchable/recovered 계산부)에서 그대로 1씩만 더한다 — 새 판정 로직이 아니다.
+  let totalRounds = 0;
+  let validResponseRounds = 0;
+  let localRecoverySuccessRounds = 0;
+  let protocolFailureRounds = 0;
+
   // Phase G Task G3.1 — 이 developer attempt 안에서 실제로 성공한 모든 내부 round(claude CLI
   // 호출)의 tokenUsage를 합산한다. round마다 별도 event로 쪼개 기록하지 않고(canonical 위치는
   // 이 함수의 반환값 하나뿐이다) 이 attempt 전체를 대표하는 값 하나로만 반환한다 — 호출부
@@ -478,12 +617,13 @@ export async function runDeveloperTaskViaSafeExecutor(
     if (raw.tokenUsage?.inputTokens !== undefined) accInputTokens = (accInputTokens ?? 0) + raw.tokenUsage.inputTokens;
     if (raw.tokenUsage?.outputTokens !== undefined) accOutputTokens = (accOutputTokens ?? 0) + raw.tokenUsage.outputTokens;
   }
-  function usageFields(): Pick<DeveloperResult, "model" | "tokenUsage"> {
+  function usageFields(): Pick<DeveloperResult, "model" | "tokenUsage" | "callStats"> {
     return {
       ...(lastModel ? { model: lastModel } : {}),
       ...(accInputTokens !== undefined || accOutputTokens !== undefined
         ? { tokenUsage: { inputTokens: accInputTokens, outputTokens: accOutputTokens } }
         : {}),
+      callStats: { totalRounds, validResponseRounds, localRecoverySuccessRounds, protocolFailureRounds },
     };
   }
 
@@ -528,6 +668,7 @@ export async function runDeveloperTaskViaSafeExecutor(
   }
 
   for (let round = 1; round <= MAX_INTERNAL_ROUNDS; round++) {
+    reportRoundStart(round, implementationLocked ? "LOCKED" : "DISCOVERY");
     const input = capTranscript();
     let claudeRaw = await claudeCall(input, timeoutMs);
 
@@ -577,14 +718,106 @@ export async function runDeveloperTaskViaSafeExecutor(
       };
     }
 
-    const parsed = tryParseProtocolJson(claudeRaw.summary);
-    if (!parsed) {
-      log(`developer 라운드 ${round} 응답 JSON 파싱 실패`);
-      transcript.push(
-        `# Round ${round} 오류\n응답이 JSON이 아닙니다. 코드펜스나 설명 텍스트 없이 ACTION_REQUEST 또는 TASK_COMPLETE JSON 객체 하나만 출력하세요.`
+    let parsed = tryParseProtocolJson(claudeRaw.summary);
+    let recoveredThisRound = false;
+    if (parsed) {
+      // CLI 프로세스 성공(claudeRaw.success)과 개발 응답 유효성은 별개다 — JSON은 파싱됐지만
+      // 알려진 3개 타입/shape와 정확히 일치하지 않으면, 추가 Claude 호출 없이 로컬에서 먼저
+      // 복구를 시도한다(§ PROTOCOL_FAILURE_HARD_STOP 상단 주석).
+      const isRecognizedShape =
+        parsed.type === "TASK_COMPLETE" ||
+        parsed.type === "PLAN" ||
+        (parsed.type === "ACTION_REQUEST" && Array.isArray(parsed.actions));
+      if (!isRecognizedShape) {
+        const recovered = attemptLocalProtocolRecovery(parsed);
+        if (recovered) {
+          log(`developer 라운드 ${round} 응답 해석: 형식 이상 감지 → 로컬 복구 성공(추가 Claude 호출 없음)`);
+          parsed = recovered;
+          recoveredThisRound = true;
+        }
+      }
+    }
+
+    const dispatchable =
+      !!parsed &&
+      (parsed.type === "TASK_COMPLETE" ||
+        parsed.type === "PLAN" ||
+        (parsed.type === "ACTION_REQUEST" && Array.isArray(parsed.actions)));
+
+    // § DeveloperCallStats 상단 주석 — USAGE_LIMIT 재시도는 위에서 이미 별도로 처리되고
+    // 여기 도달하지 않으므로(같은 round를 다시 요청) 여기 도달한 시점이 곧 "실제로 한 번의
+    // 응답을 받아 해석을 시도한 라운드"다.
+    totalRounds += 1;
+    if (dispatchable) {
+      validResponseRounds += 1;
+      if (recoveredThisRound) localRecoverySuccessRounds += 1;
+    } else {
+      protocolFailureRounds += 1;
+    }
+
+    if (dispatchable) {
+      // 유효한 개발 응답을 실제로 받았다 — 이전에 이어지던 응답 해석 실패 연쇄를 끊는다.
+      consecutiveProtocolFailureCount = 0;
+      lastProtocolFailureFingerprint = undefined;
+    } else {
+      const kind = parsed ? "UNRECOGNIZED_SHAPE" : "NOT_JSON";
+      const shapeDescriptor = describeUnrecognizedShape(parsed);
+      const fingerprint = computeProtocolFailureFingerprint(
+        implementationLocked ? "LOCKED" : "DISCOVERY",
+        kind,
+        shapeDescriptor,
+        claudeRaw.summary.length
       );
+
+      if (fingerprint === lastProtocolFailureFingerprint) {
+        consecutiveProtocolFailureCount += 1;
+      } else {
+        consecutiveProtocolFailureCount = 1;
+        lastProtocolFailureFingerprint = fingerprint;
+        reinforcementSentForFingerprint = undefined;
+      }
+
+      log(
+        `developer 라운드 ${round} 응답 해석 실패 — CLI 프로세스: 정상, 응답 수신: 정상, 응답 해석: 실패` +
+          `(${kind}, shape=${shapeDescriptor}, 동일 지문 연속 ${consecutiveProtocolFailureCount}회, fingerprint=${fingerprint})`
+      );
+
+      if (consecutiveProtocolFailureCount >= PROTOCOL_FAILURE_HARD_STOP) {
+        log(
+          `developer 응답 해석 실패가 동일 패턴(fingerprint=${fingerprint})으로 ${consecutiveProtocolFailureCount}회 연속 반복 — ` +
+            `동일 방식 재호출을 중단하고 PROTOCOL_ERROR로 종료합니다(라운드 ${round}/${MAX_INTERNAL_ROUNDS})`
+        );
+        return {
+          success: false,
+          summary: `Claude 응답을 동일한 방식(${kind})으로 ${consecutiveProtocolFailureCount}회 연속 해석하지 못해 재호출을 중단했습니다.`,
+          changedFiles: getActualChangedFiles(changeScopeDirs, executor),
+          tests: [],
+          rawOutput: "",
+          errorCode: "PROTOCOL_ERROR",
+          protocolFailureFingerprint: fingerprint,
+          deferredHumanTasks: [
+            ...deferredHumanTasks,
+            `PROTOCOL_ERROR: 동일한 응답 해석 실패(${kind}, shape=${shapeDescriptor})가 ${consecutiveProtocolFailureCount}회 연속 반복되어 재호출을 중단했습니다.`,
+          ],
+          ...usageFields(),
+        };
+      }
+
+      if (consecutiveProtocolFailureCount === 2 && reinforcementSentForFingerprint !== fingerprint) {
+        reinforcementSentForFingerprint = fingerprint;
+        transcript.push(RESPONSE_CONTRACT_REINFORCEMENT_MESSAGE);
+      } else if (kind === "NOT_JSON") {
+        transcript.push(
+          `# Round ${round} 오류\n응답이 JSON이 아닙니다. 코드펜스나 설명 텍스트 없이 ACTION_REQUEST 또는 TASK_COMPLETE JSON 객체 하나만 출력하세요.`
+        );
+      } else {
+        transcript.push(`# Round ${round} 오류\n알 수 없는 응답 형식입니다. ACTION_REQUEST 또는 TASK_COMPLETE만 허용됩니다.`);
+      }
       continue;
     }
+
+    // dispatchable===true를 계산한 시점에 이미 !!parsed를 확인했다 — TypeScript narrowing용.
+    if (!parsed) continue;
 
     if (parsed.type === "TASK_COMPLETE") {
       const summary = typeof parsed.summary === "string" ? parsed.summary : "(summary 없음)";
@@ -677,8 +910,8 @@ export async function runDeveloperTaskViaSafeExecutor(
       continue;
     }
 
-    log(`developer 라운드 ${round} 알 수 없는 응답 형식`);
-    transcript.push(`# Round ${round} 오류\n알 수 없는 응답 형식입니다. ACTION_REQUEST 또는 TASK_COMPLETE만 허용됩니다.`);
+    // dispatchable 판정에서 TASK_COMPLETE/PLAN/ACTION_REQUEST(배열 actions) 중 하나가 이미
+    // 보장됐고 위 세 분기가 각각 return/continue로 끝나므로 이 지점에는 도달하지 않는다.
   }
 
   return {

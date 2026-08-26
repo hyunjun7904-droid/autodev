@@ -4,13 +4,15 @@ import type { QueryResult } from "./event-store";
 import { buildAutoDevLiveSnapshot } from "./live-snapshot";
 import type { AutoDevLiveSnapshot } from "./live-snapshot";
 import { computeActiveWorkMs, computeActiveWorkMsAcrossTasks } from "./work-time";
-import { aggregateProviderModelUsage, sumProviderModelUsage, buildRecentCalls } from "./dashboard-usage";
-import type { ProviderModelUsage, UsageTotals, RecentCallEntry } from "./dashboard-usage";
+import { aggregateProviderModelUsage, sumProviderModelUsage, buildRecentCalls, aggregateCallEfficiency } from "./dashboard-usage";
+import type { ProviderModelUsage, UsageTotals, RecentCallEntry, CallEfficiencySummary } from "./dashboard-usage";
 import { loadProjectProgress } from "./dashboard-project-progress";
 import type { ProjectProgress } from "./dashboard-project-progress";
 import { buildProblemSolvingSnapshot } from "./dashboard-problem-solving";
 import type { ProblemSolvingSnapshot } from "./dashboard-problem-solving";
 import { createFileUsageLedger, resolveUsageLedgerFilePath, RUNTIME_USAGE_LEDGER_DIR } from "./usage-ledger";
+import { readRoundStatus, isRoundStatusLive, RUNTIME_ROUND_STATUS_PATH } from "./round-status";
+import type { RoundStatusSnapshot } from "./round-status";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -96,7 +98,20 @@ export interface DashboardSnapshot {
   /** problem-memory.ts(지능형 오류 복구 하드닝)에 이 project의 기록이 전혀 없으면
    *  undefined(§ 요구사항 11 — 새 문제 해결 엔진을 만들지 않고 기존 자료만 읽는다). */
   problemSolving?: ProblemSolvingSnapshot;
+  /** 현재 작업 범위(§ 요구사항 16 "호출 효율") — 이 task의 event에 devTotalRounds
+   *  metadata가 전혀 없으면 undefined(추측 금지). */
+  callEfficiency?: CallEfficiencySummary;
+  /** § 요구사항 13 "현재 개발 라운드/최대 개발 라운드" — 지금 보여줄 run/task와 실제로
+   *  일치하고 충분히 최근(§ ROUND_STATUS_MAX_AGE_MS)인 round-status.json 값이 있을 때만
+   *  채워진다. 오래됐거나 다른 run/task의 값이면 undefined(추측해서 보여주지 않는다). */
+  roundStatus?: RoundStatusSnapshot;
 }
+
+// round-status.json은 claude CLI가 실제로 응답을 받은 round 시작 시점에만 갱신된다 — 그
+// 사이(USAGE_LIMIT 대기 등)에는 갱신되지 않을 수 있다. 너무 짧으면 정상적으로 오래 걸리는
+// round도 "자료 없음"으로 사라지고, 너무 길면 이미 끝난 run의 낡은 값을 진행 중으로
+// 오인시킬 수 있다 — 10분을 절충값으로 둔다(§ isRoundStatusLive).
+const ROUND_STATUS_MAX_AGE_MS = 10 * 60 * 1000;
 
 const RECENT_CALLS_LIMIT = 20;
 
@@ -156,7 +171,7 @@ function buildActualWorkTime(allEvents: QueryResult["events"], projectId: string
  * run이 한 번도 없었음) "NO_RUN_YET"을 반환한다 — UNKNOWN이나 임의 기본값으로 채우지
  * 않는다.
  */
-export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH): DashboardSnapshot {
+export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, roundStatusFilePath: string = RUNTIME_ROUND_STATUS_PATH): DashboardSnapshot {
   const result = readQueryResult(filePath);
   const runId = latestRunId(result);
   const now = Date.now();
@@ -171,6 +186,10 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH):
   const adapterPath = process.env.AUTODEV_PROJECT_ADAPTER;
   const projectProgressResult = loadProjectProgress(adapterPath);
 
+  const rawRoundStatus = readRoundStatus(roundStatusFilePath);
+  const roundStatus =
+    rawRoundStatus && snapshot.taskId && isRoundStatusLive(rawRoundStatus, runId, snapshot.taskId, now, ROUND_STATUS_MAX_AGE_MS) ? rawRoundStatus : undefined;
+
   return {
     status: "OK",
     generatedAt: snapshot.generatedAt,
@@ -180,5 +199,7 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH):
     usageOverview: buildUsageOverview(result.events, snapshot.projectId, snapshot.taskId),
     recentCalls: buildRecentCalls(result.events, RECENT_CALLS_LIMIT),
     problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId),
+    callEfficiency: aggregateCallEfficiency(snapshot.taskId ? result.events.filter((e) => e.taskId === snapshot.taskId) : result.events),
+    roundStatus,
   };
 }
