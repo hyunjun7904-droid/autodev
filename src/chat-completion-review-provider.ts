@@ -119,7 +119,13 @@ export const nodeChatCompletionHttpFetch: ChatCompletionHttpFetch = async (req) 
     }
     const bodyText = Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf-8");
     if (!res.ok) {
-      const transient = res.status === 429 || res.status >= 500;
+      // 413(Payload Too Large)도 429와 동일하게 transient로 취급한다 — Groq는 tokens-per-minute
+      // capacity 초과를 429가 아니라 413 + {"code":"rate_limit_exceeded"}로 반환한다(2026-08-26,
+      // JARVIS Task 1.2 Groq escalation 실제 실패를 재현해 직접 확인함: HTTP 413, "Request too
+      // large for model ... on tokens per minute (TPM): Limit 8000, Requested 9349"). 이 상태를
+      // 429/5xx와 다르게 취급하면(기존 버그) 재시도 가능한 capacity 초과가 영구적인 API_ERROR로
+      // 오분류되어 escalation 실패 원인이 GROQ_STATUS 진단 없이 불투명하게 보고된다.
+      const transient = res.status === 429 || res.status === 413 || res.status >= 500;
       return { ok: false, reason: `HTTP ${res.status}`, transient, status: res.status, rateLimitHeaders: captureRateLimitHeaders(res.headers) };
     }
     return { ok: true, response: { status: res.status, bodyText } };
@@ -154,7 +160,10 @@ export interface ChatCompletionProviderConfig {
 function classifyHttpFailure(outcome: Extract<ChatCompletionHttpOutcome, { ok: false }>): { code: GptErrorCode; transient: boolean } {
   if (outcome.reason === "timeout") return { code: "TIMEOUT", transient: true };
   if (outcome.status === 401 || outcome.status === 403) return { code: "AUTH_ERROR", transient: false };
-  if (outcome.status === 429) return { code: "RATE_LIMIT", transient: true };
+  // 413 — Groq의 tokens-per-minute capacity 초과 응답(§ 위 nodeChatCompletionHttpFetch 주석).
+  // 429와 동일하게 RATE_LIMIT/transient로 분류해 final-reviewer-routing.ts의 기존
+  // GROQ_STATUS=RATE_LIMITED 진단 경로로 흘러가게 한다 — 새 진단 경로를 만들지 않는다.
+  if (outcome.status === 429 || outcome.status === 413) return { code: "RATE_LIMIT", transient: true };
   return { code: "API_ERROR", transient: outcome.transient };
 }
 

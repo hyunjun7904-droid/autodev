@@ -90,10 +90,13 @@ async function scenarioA_factoryBasics(): Promise<void> {
     ])
   );
 
-  // A3) HTTP 오류 분류 — 401/429/500/timeout.
+  // A3) HTTP 오류 분류 — 401/413/429/500/timeout.
   const cases: { status?: number; reason: string; transient: boolean; expectedCode: string; expectedTransient: boolean }[] = [
     { status: 401, reason: "HTTP 401", transient: false, expectedCode: "AUTH_ERROR", expectedTransient: false },
     { status: 429, reason: "HTTP 429", transient: true, expectedCode: "RATE_LIMIT", expectedTransient: true },
+    // Groq의 tokens-per-minute capacity 초과는 429가 아니라 413로 온다(2026-08-26, JARVIS
+    // Task 1.2 Groq escalation 실제 실패 재현으로 확인 — HTTP 413, code:"rate_limit_exceeded").
+    { status: 413, reason: "HTTP 413", transient: true, expectedCode: "RATE_LIMIT", expectedTransient: true },
     { status: 500, reason: "HTTP 500", transient: true, expectedCode: "API_ERROR", expectedTransient: true },
     { reason: "timeout", transient: true, expectedCode: "TIMEOUT", expectedTransient: true },
   ];
