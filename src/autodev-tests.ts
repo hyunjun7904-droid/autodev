@@ -11,6 +11,7 @@ import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
+import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -1004,6 +1005,177 @@ async function scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues()
   );
 }
 
+// ---------------------------------------------------------------------------
+// H) AutoDev 지능형 오류 복구 하드닝 — Problem-Solving Knowledge Store가 실제
+//    runAutodevOnce() 파이프라인에 배선되어 cross-task 재사용이 동작하는지 검증한다.
+//    problem-memory.ts 자체의 세부 판정 로직 회귀는 problem-memory-tests.ts가 전담한다 —
+//    여기서는 "실제 developer 호출 흐름에 배선되어 있는지"만 확인한다.
+// ---------------------------------------------------------------------------
+function makeInMemoryProblemMemoryStore(): ProblemMemoryStore {
+  let entries: ProblemMemoryEntry[] = [];
+  return {
+    load: () => entries,
+    save: (next) => {
+      entries = next;
+    },
+  };
+}
+
+const MEMORY_REUSE_REGISTRY: TaskDefinition[] = [
+  {
+    id: "M1",
+    phase: 1,
+    taskNumber: 1,
+    title: "M1",
+    prompt: "M1 prompt",
+    requiredTests: [{ name: "check-fixed", command: "node", args: ["check.js"], cwd: "root" }],
+    allowedPathPrefixes: ["proj/"],
+    prohibitedOperations: [],
+  },
+  {
+    id: "M2",
+    phase: 1,
+    taskNumber: 2,
+    title: "M2",
+    prompt: "M2 prompt",
+    requiredTests: [{ name: "check-fixed", command: "node", args: ["check.js"], cwd: "root" }],
+    allowedPathPrefixes: ["proj/"],
+    prohibitedOperations: [],
+  },
+];
+
+function buildMemoryReuseManifest(root: string, statePath: string): ProjectManifest {
+  return {
+    projectId: "memory-reuse-fixture-project",
+    projectName: "Memory Reuse Fixture Project",
+    targetProjectRoot: root,
+    statePath,
+    taskRegistry: MEMORY_REUSE_REGISTRY,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: [{ cwd: "root", command: "node", args: ["check.js"] }],
+    },
+  };
+}
+
+function writeCheckScript(repo: string): void {
+  // proj/** 밖의 파일이라 checkpoint의 "allowedPathPrefixes 밖 예상치 못한 변경" 방어에
+  // 걸리지 않도록, 이미 존재하는 프로젝트 인프라 파일처럼 초기 커밋에 포함시킨다(이 Task
+  // 자신이 만든 변경이 아니다 — marker.txt만 Task의 실제 산출물이다).
+  // startsWith("FIXED")로 판정한다(정확히 "FIXED"가 아니어도 됨) — 여러 Task가 순차로 이
+  // 같은 required test를 통과시켜야 하는데, 매번 정확히 같은 문자열을 쓰면 이전 Task의
+  // commit과 diff가 전혀 없어 "commit할 변경 파일이 없습니다"로 checkpoint가 막힌다(git이
+  // 실제로 아무것도 안 바뀐 것으로 판단하는 것 자체는 정상 동작이다 — 이 fixture가 각 Task마다
+  // 구분되는 값을 쓰도록 설계해야 한다).
+  writeFileSync(
+    join(repo, "check.js"),
+    "const fs=require('fs');\ntry{const c=fs.readFileSync('proj/marker.txt','utf8').trim();process.exit(c.indexOf('FIXED')===0?0:1);}catch(e){process.exit(1);}\n",
+    "utf-8"
+  );
+  spawnSync("git", ["add", "--", "check.js"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "add check.js"], { cwd: repo });
+}
+
+interface ScriptedDeveloperCaller {
+  call: (input: string, timeoutMs: number) => Promise<{ success: boolean; summary: string; changedFiles: string[]; tests: never[]; rawOutput: string }>;
+  receivedInputs: string[];
+}
+
+/** WRITE_FILE(BROKEN) → TASK_COMPLETE → [REVISE] → WRITE_FILE(FIXED) → TASK_COMPLETE
+ *  순서를 스크립트한다 — 첫 attempt는 항상 문제를 해결하지 못하고, 두 번째 attempt에서만
+ *  고친다(memory hint가 두 번째 attempt의 transcript에 실제로 실리는지 검증하기 위함). */
+function makeTwoAttemptFixCaller(fixedValue: string = "FIXED"): ScriptedDeveloperCaller {
+  let call = 0;
+  const receivedInputs: string[] = [];
+  return {
+    receivedInputs,
+    call: async (input: string) => {
+      call += 1;
+      receivedInputs.push(input);
+      if (call === 1 || call === 3) {
+        const content = call === 1 ? "BROKEN\n" : `${fixedValue}\n`;
+        const protocolJson = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: "proj/marker.txt", content }] });
+        return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
+      }
+      const summary = call === 2 ? "1차 시도: marker.txt를 BROKEN으로 둔 채 완료(문제 미해결)" : "2차 시도: marker.txt 값을 FIXED로 바꿔 문제를 해결함";
+      const protocolJson = JSON.stringify({ type: "TASK_COMPLETE", summary, changedFiles: ["proj/marker.txt"], testsRequested: [] });
+      return { success: true, summary: protocolJson, changedFiles: ["proj/marker.txt"], tests: [], rawOutput: protocolJson };
+    },
+  };
+}
+
+async function scenarioCrossTaskMemoryReuseEndToEnd(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] }); // 다음 task = M1
+  writeCheckScript(repo);
+  const manifest = buildMemoryReuseManifest(repo, statePath);
+  const problemMemoryStores = { project: makeInMemoryProblemMemoryStore(), common: makeInMemoryProblemMemoryStore() };
+
+  const m1Caller = makeTwoAttemptFixCaller();
+  const m1Result = await runAutodevOnce({
+    manifest,
+    problemMemoryStores,
+    developerClaudeCaller: m1Caller.call,
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+  });
+
+  check("H) M1: 두 번째 attempt(과거 기록 없음)에서 정상적으로 checkpoint까지 도달", m1Result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("H) M1: memory에 확정된(pendingConfirmation=false) 해결책이 기록됨", problemMemoryStores.project.load().some((e) => e.taskId === "M1" && e.finalSuccessfulSolution && !e.pendingConfirmation));
+
+  const m2Caller = makeTwoAttemptFixCaller("FIXED-M2");
+  const m2Result = await runAutodevOnce({
+    manifest,
+    problemMemoryStores,
+    developerClaudeCaller: m2Caller.call,
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+  });
+
+  check("H) M2: 같은 프로젝트의 다른 Task도 정상적으로 checkpoint까지 도달", m2Result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check(
+    "H) M2: 두 번째 attempt의 초기 transcript에 M1의 과거 해결 사례 안내가 실제로 주입됨",
+    m2Caller.receivedInputs[2]?.includes("과거 해결 사례") && m2Caller.receivedInputs[2]?.includes("marker.txt 값을 FIXED로 바꿔 문제를 해결함")
+  );
+  check(
+    "H) M2: 재사용된 M1 항목의 reuseSuccessCount가 1 증가함",
+    problemMemoryStores.project.load().find((e) => e.taskId === "M1")?.reuseSuccessCount === 1
+  );
+}
+
+async function scenarioSameTaskDoesNotRepeatFailedStrategy(): Promise<void> {
+  // 같은 Task 안에서 반복 실패하면 이미 실패한 설명이 escalation guidance로 그대로
+  // 전달되는지 확인한다(§ 요구사항 6/10 — 같은 전략을 맹목적으로 반복하지 않게 안내).
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  writeCheckScript(repo);
+  const manifest = buildMemoryReuseManifest(repo, statePath);
+  const problemMemoryStores = { project: makeInMemoryProblemMemoryStore(), common: makeInMemoryProblemMemoryStore() };
+
+  let call = 0;
+  const receivedInputs: string[] = [];
+  const caller = async (input: string) => {
+    call += 1;
+    receivedInputs.push(input);
+    // 매 attempt마다 여전히 BROKEN으로 둔 채 다른 설명으로 완료 보고 — 3번째 attempt까지
+    // 계속 실패해야 3회차 escalation("금지") 안내를 관찰할 수 있다.
+    const summary = `시도 ${call}: 여전히 해결하지 못함`;
+    const protocolJson = JSON.stringify({ type: "TASK_COMPLETE", summary, changedFiles: [], testsRequested: [] });
+    return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
+  };
+
+  await runAutodevOnce({
+    manifest,
+    problemMemoryStores,
+    developerClaudeCaller: caller,
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+  });
+
+  check("I) 3번째 attempt 이후 transcript에 반복 전략 금지 안내가 실제로 주입됨", receivedInputs.some((inp) => inp.includes("전략 재사용 금지")));
+}
+
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -1025,6 +1197,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceRemoteChangedDuringRunBlocksCheckpoint();
     await scenarioRunAutodevOnceBlockedByMissingRequiredTestScript();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
+    await scenarioCrossTaskMemoryReuseEndToEnd();
+    await scenarioSameTaskDoesNotRepeatFailedStrategy();
 
     await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();
     await scenarioHumanFinalReviewRerunWithoutApprovalStaysBlocked();

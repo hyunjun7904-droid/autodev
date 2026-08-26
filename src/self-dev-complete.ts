@@ -120,6 +120,13 @@ const CHILD_PROCESS_ENV_DENYLIST: readonly string[] = [
   "AUTODEV_TELEGRAM_BOT_TOKEN",
   "AUTODEV_TELEGRAM_CHAT_ID",
   "AUTODEV_TELEGRAM_USER_ID",
+  // AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12/16 — ntfy가 이제 Telegram보다 우선하는
+  // 알림 채널이다(§ notification-provider-ntfy.ts) — 같은 이유(실제 알림 채널 credential이
+  // test/fixture 자식 프로세스로 새어 들어가 test event에 대해 진짜 알림이 트리거되는 것을
+  // 막는다)로 동일하게 방어한다.
+  "AUTODEV_NTFY_TOPIC",
+  "AUTODEV_NTFY_TOKEN",
+  "AUTODEV_NTFY_BASE_URL",
 ];
 
 function sanitizedChildEnv(): NodeJS.ProcessEnv {

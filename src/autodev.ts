@@ -3,7 +3,7 @@ import { loadState, saveState } from "./state";
 import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
 import { runDeveloperTaskWithRetry } from "./claude-developer";
-import type { DeveloperProjectContext } from "./claude-developer";
+import type { DeveloperProjectContext, DeveloperTaskOptions } from "./claude-developer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
@@ -24,6 +24,22 @@ import {
   attemptSafeRequiredTestScriptRepair,
   commitRequiredTestScriptRepair,
 } from "./required-test-preflight";
+import { hasFailedRequiredTest } from "./review-policy";
+import {
+  computeProblemFingerprint,
+  classifyFailureCategory,
+  createStagnationTracker,
+  buildEscalationGuidance,
+} from "./failure-stagnation";
+import {
+  selectDefaultProblemMemoryStore,
+  lookupSolution,
+  recordAttempt,
+  confirmResolution,
+  recordReuseOutcome,
+  promoteToCommonIfGeneric,
+} from "./problem-memory";
+import type { ProblemMemoryStore } from "./problem-memory";
 import { selectDefaultEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 import { selectDefaultUsageLedgerForProject } from "./usage-ledger";
@@ -295,6 +311,24 @@ export interface AutodevRunOptions {
    * 와 동일한 원칙).
    */
   ledger?: UsageLedger;
+  /**
+   * 테스트 전용 — defaultClaudeRunner(problem-memory 조회/기록, memoryHint 주입을 포함한
+   * 이 파일의 실제 wiring)는 그대로 실행하면서, 그 안에서 실제 Claude CLI를 부르는
+   * runDeveloperTaskViaSafeExecutor의 claudeCaller만 스크립트로 대체한다. 이 값이 없으면
+   * runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)을 그대로 쓴다.
+   * orchestratorDeps.claudeRunner(더 상위의 완전 대체 seam)를 지정하면 이 옵션은 무시된다
+   * (defaultClaudeRunner 자체가 호출되지 않으므로).
+   */
+  developerClaudeCaller?: DeveloperTaskOptions["claudeCaller"];
+  /**
+   * 테스트 전용 — problem-memory.ts의 project/common tier store를 명시적으로 주입한다.
+   * 지정하지 않으면 selectDefaultProblemMemoryStore()가 production 여부에 따라 file/
+   * in-memory를 자동 선택한다(§ 그 파일). 서로 다른 runAutodevOnce() 호출(예: Task A →
+   * Task B 순차 실행) 사이에 지식이 이어지는지 검증하려면, 테스트가 같은 store 인스턴스를
+   * 여러 호출에 걸쳐 명시적으로 재사용해야 한다(in-memory store는 호출마다 새로 만들면
+   * 매번 비워진다).
+   */
+  problemMemoryStores?: { project: ProblemMemoryStore; common: ProblemMemoryStore };
   /** 지정하지 않으면 이 실행마다 새 runId를 생성한다(node:crypto의 randomUUID). */
   runId?: string;
   /**
@@ -692,6 +726,20 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
   let finalState: CoreState;
   let preAdvisory: AgentStepResult[] | undefined;
+  // AutoDev 지능형 오류 복구 하드닝(Problem-Solving Knowledge Store) — defaultClaudeRunner
+  // (아래 else 분기)가 "이 task 안에서 required test 실패를 해결한 cycle"을 만나면 그 항목의
+  // id를 여기 남긴다. checkpoint가 실제로 성공한 뒤(§ 아래 CHECKPOINT_CREATED emitEvent
+  // 직후)에만 confirmResolution()으로 확정한다 — resume 경로(위 isResumingApprovedCheckpoint)는
+  // defaultClaudeRunner를 전혀 호출하지 않으므로 이 값은 undefined로 남고 확정 코드는
+  // 자연히 no-op이다.
+  let pendingMemoryEntryId: string | undefined;
+  // resume 경로도 checkpoint 확정 코드(아래)에서 이 두 store를 참조하므로 if/else 밖에서
+  // 한 번만 만든다(§ problem-memory.ts — production 여부에 따라 file/in-memory 자동 선택,
+  // 테스트는 opts.problemMemoryStores로 명시적으로 override할 수 있다).
+  const problemProjectStore: ProblemMemoryStore =
+    opts.problemMemoryStores?.project ?? selectDefaultProblemMemoryStore("PROJECT", manifest.projectId);
+  const problemCommonStore: ProblemMemoryStore =
+    opts.problemMemoryStores?.common ?? selectDefaultProblemMemoryStore("COMMON", undefined);
 
   if (isResumingApprovedCheckpoint) {
     // 이미 디스크에 저장된 승인된 상태(state, 이 함수 상단에서 loadState()로 읽은 값 —
@@ -809,14 +857,61 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       rulesPath: manifest.rulesPath,
     };
 
+    // AutoDev 지능형 오류 복구 하드닝(Problem-Solving Knowledge Store) — 이 run(runAutodevOnce
+    // 1회 호출) 동안만 유효한 loop-local 상태다(orchestrator.ts의 gptCallCount/
+    // stagnationTracker와 동일한 원칙 — project-state.json에 저장하지 않는다). store 자체는
+    // 위(if/else 밖)에서 이미 만들었다 — checkpoint 확정 코드도 같은 인스턴스를 참조해야
+    // 하기 때문이다.
+    const memoryStagnationTracker = createStagnationTracker();
+    let previousAttemptResult: ClaudeResult | undefined;
+
     // AutoDev 신뢰성 수정(2026-08-26) — runDeveloperTaskViaSafeExecutor를 직접 부르지 않고
     // runDeveloperTaskWithRetry로 감싼다. TIMEOUT/CLI_NOT_FOUND처럼 명확히 일시적인 실패는
     // 최대 2회까지 자동 재시도(총 3회 시도)한 뒤에도 계속되면 그때 실패로 반환한다(§
     // claude-developer.ts isTransientDeveloperFailure) — orchestrator.ts는 이 재시도를
     // 전혀 모른 채 최종 결과 하나만 받으므로 기존 REVISE/WAITING_HUMAN 상태 머신은 손대지
     // 않는다.
-    const defaultClaudeRunner = (task: string, attempt: number) =>
-      runDeveloperTaskWithRetry(task, attempt, {
+    const defaultClaudeRunner = async (task: string, attempt: number): Promise<ClaudeResult> => {
+      // Section 4/5/9/10 — 새 문제라고 바로 Claude를 다시 부르는 것 자체는 막을 수 없다
+      // (Developer 호출 자체가 "무엇을 시도할지"를 만든다), 대신 직전 시도가 required test에
+      // 실패했다면 그 프롬프트에 과거 해결 사례/반복 실패 전략 전환 안내를 덧붙여, 같은
+      // 실수를 맹목적으로 반복하지 않게 한다(§ claude-developer.ts opts.memoryHint).
+      let memoryHint: string | undefined;
+      let lookupEntryIdThisCycle: string | undefined;
+      if (previousAttemptResult && hasFailedRequiredTest(previousAttemptResult.tests)) {
+        const fingerprint = computeProblemFingerprint(previousAttemptResult.tests);
+        const repeatCount = memoryStagnationTracker.observe(fingerprint);
+        const priorFailedDescriptions = problemProjectStore
+          .load()
+          .filter((e) => e.projectId === manifest.projectId && e.taskId === taskDef.id && e.fingerprint === fingerprint)
+          .flatMap((e) => e.attemptedSolutions.filter((s) => s.outcome === "FAILURE").map((s) => s.description));
+
+        const lookup = lookupSolution({
+          projectId: manifest.projectId,
+          taskId: taskDef.id,
+          tests: previousAttemptResult.tests,
+          projectStore: problemProjectStore,
+          commonStore: problemCommonStore,
+          projectRootForAncestryCheck: executorContext.projectRoot,
+        });
+
+        const hintParts: string[] = [];
+        if (lookup) {
+          lookupEntryIdThisCycle = lookup.entry.id;
+          hintParts.push(
+            `# AutoDev 안내(과거 해결 사례 — ${lookup.tier === "PROJECT" ? "같은 프로젝트의 다른 Task" : "AutoDev 공통 지식"})\n` +
+              "이 문제와 동일한 조건(같은 required test 실패 신호)이 과거에 다음과 같이 해결된 적이 있습니다. " +
+              "이것은 검증된 정답이 아니라 우선적으로 검토할 후보입니다 — 현재 코드/조건에 실제로 적용 가능한지 " +
+              "먼저 판단하고, 적용할 수 없다면 다른 접근을 시도하세요:\n" +
+              lookup.entry.finalSuccessfulSolution
+          );
+        }
+        const escalation = buildEscalationGuidance(repeatCount, priorFailedDescriptions);
+        if (escalation) hintParts.push(escalation);
+        if (hintParts.length > 0) memoryHint = hintParts.join("\n\n");
+      }
+
+      const result = await runDeveloperTaskWithRetry(task, attempt, {
         requiredTests: taskDef.requiredTests,
         allowedPathPrefixes: taskDef.allowedPathPrefixes,
         projectContext: developerContext,
@@ -828,7 +923,47 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // module-level Safe Executor singleton을 전혀 거치지 않고 이 context의 root/policy로만
         // 파일/명령을 검증·실행한다.
         executor: executorContext,
+        memoryHint,
+        // 테스트 전용(§ AutodevRunOptions.developerClaudeCaller) — 지정하지 않으면 undefined라
+        // runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)이 그대로 쓰인다.
+        claudeCaller: opts.developerClaudeCaller,
       });
+
+      // Section 2/6/9 — 이 cycle의 결과를 problem-memory에 기록한다. GPT 리뷰 판단이 아니라
+      // required test 통과 여부라는 객관적 신호만 근거로 삼는다(§ agent-orchestrator.ts의
+      // "QA 의견이 아니라 실제 required test가 최종 판정을 결정"과 동일한 원칙).
+      if (result.success) {
+        const stillFailing = hasFailedRequiredTest(result.tests);
+        const priorWasFailing = previousAttemptResult ? hasFailedRequiredTest(previousAttemptResult.tests) : false;
+        if (stillFailing) {
+          recordAttempt(problemProjectStore, {
+            projectId: manifest.projectId,
+            taskId: taskDef.id,
+            tests: result.tests,
+            errorType: classifyFailureCategory(undefined, undefined, result.tests),
+            changedFiles: result.changedFiles,
+            attemptDescription: result.summary,
+            outcome: "FAILURE",
+          });
+          if (lookupEntryIdThisCycle) recordReuseOutcome(problemProjectStore, lookupEntryIdThisCycle, "FAILURE");
+        } else if (priorWasFailing && previousAttemptResult) {
+          const entry = recordAttempt(problemProjectStore, {
+            projectId: manifest.projectId,
+            taskId: taskDef.id,
+            tests: previousAttemptResult.tests,
+            errorType: classifyFailureCategory(undefined, undefined, previousAttemptResult.tests),
+            changedFiles: result.changedFiles,
+            attemptDescription: result.summary,
+            outcome: "SUCCESS",
+          });
+          pendingMemoryEntryId = entry.id;
+          if (lookupEntryIdThisCycle) recordReuseOutcome(problemProjectStore, lookupEntryIdThisCycle, "SUCCESS");
+        }
+      }
+
+      previousAttemptResult = result;
+      return result;
+    };
 
     const orchestratorResult = await runOrchestrator(taskDef.prompt, {
       statePath,
@@ -1198,6 +1333,17 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     },
     auditFailures
   );
+
+  // AutoDev 지능형 오류 복구 하드닝(Problem-Solving Knowledge Store) — checkpoint가 실제로
+  // 성공한 뒤에만 pending 해결책을 확정한다(§ 요구사항 5 — 검증 전 해결책을 정답으로
+  // 단정하지 않는다). checkpoint.commitHash가 없으면(이론상 발생하지 않지만 방어적으로)
+  // 확정하지 않는다 — "resolvedAtCommit 없는 확정 항목"을 만들지 않기 위함이다.
+  if (pendingMemoryEntryId && checkpoint.commitHash) {
+    confirmResolution(problemProjectStore, pendingMemoryEntryId, checkpoint.commitHash);
+    const confirmedEntry = problemProjectStore.load().find((e) => e.id === pendingMemoryEntryId);
+    if (confirmedEntry) promoteToCommonIfGeneric(problemCommonStore, confirmedEntry);
+  }
+
   // Phase G Task G7.5 — Telegram 알림 UX Hardening. 이 task 완료가 "하위 Task(🟡)"인지
   // "상위 task-registry 전체가 진짜 최종 완료될 예정(PENDING_FINAL)"인지 "모든 자동 task는
   // 끝났지만 이 task가 isHumanGate라 배포는 사람이 트리거해야 하는지(PENDING_DEPLOYMENT_

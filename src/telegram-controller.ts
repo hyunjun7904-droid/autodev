@@ -13,6 +13,8 @@ import { createApprovalRequestsFromEvents, handleTelegramCallbackUpdate } from "
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 import { processNotifications } from "./notification-service";
 import { createTelegramApprovalAwareProvider } from "./telegram-approval-provider";
+import { createNtfyNotificationProvider } from "./notification-provider-ntfy";
+import type { NotificationProvider } from "./notification-provider";
 import { isProductionRuntime } from "./runtime-origin";
 
 // Local Telegram Controller — Phase G Task G6.
@@ -61,6 +63,16 @@ export interface TelegramControllerOptions {
   botToken?: string;
   /** 지정하지 않으면 AUTODEV_TELEGRAM_CHAT_ID 환경변수를 쓴다. */
   chatId?: string;
+  /**
+   * AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 이제 AutoDev 상태 알림의
+   * 기준이다(Telegram보다 우선). 지정하지 않으면 AUTODEV_NTFY_TOPIC 환경변수를 쓴다
+   * (isProductionRuntime()일 때만, botToken/chatId와 동일한 fail-closed 원칙).
+   */
+  ntfyTopic?: string;
+  /** 지정하지 않으면 AUTODEV_NTFY_BASE_URL 환경변수, 그것도 없으면 공식 https://ntfy.sh. */
+  ntfyBaseUrl?: string;
+  /** self-host 인증 서버용 — 지정하지 않으면 AUTODEV_NTFY_TOKEN 환경변수를 쓴다. */
+  ntfyAccessToken?: string;
   /** 테스트 전용 override — 지정하지 않으면 전역 fetch를 쓴다. */
   fetchImpl?: typeof fetch;
   statePath?: string;
@@ -107,6 +119,9 @@ interface ControllerDeps {
   allowlist: TelegramAllowlistConfig;
   botToken?: string;
   chatId?: string;
+  ntfyTopic?: string;
+  ntfyBaseUrl?: string;
+  ntfyAccessToken?: string;
   fetchImpl: typeof fetch;
   statePath: string;
   cwd: string;
@@ -134,14 +149,27 @@ async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSumm
     eventStore: deps.eventStore,
   });
 
+  // AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 Telegram보다 우선하는 알림
+  // 채널이다. ntfy는 발신 전용(§ notification-provider-ntfy.ts)이라 승인 응답 콜백을
+  // 대체하지 않는다 — 아래 getUpdates/handleTelegramCallbackUpdate(승인 처리)는 botToken이
+  // 있으면 이 선택과 무관하게 그대로 동작한다.
+  const ntfyProvider = createNtfyNotificationProvider({
+    topic: deps.ntfyTopic,
+    baseUrl: deps.ntfyBaseUrl,
+    accessToken: deps.ntfyAccessToken,
+    fetchImpl: deps.fetchImpl,
+  });
+  const notificationProvider: NotificationProvider | undefined =
+    ntfyProvider.configStatus === "CONFIGURED"
+      ? ntfyProvider
+      : deps.botToken && deps.chatId
+        ? createTelegramApprovalAwareProvider({ botToken: deps.botToken, chatId: deps.chatId, fetchImpl: deps.fetchImpl }, deps.approvalStore)
+        : undefined;
+
   let notificationsDelivered = 0;
   let notificationsFailed = 0;
-  if (deps.botToken && deps.chatId) {
-    const provider = createTelegramApprovalAwareProvider(
-      { botToken: deps.botToken, chatId: deps.chatId, fetchImpl: deps.fetchImpl },
-      deps.approvalStore
-    );
-    const notifResult = await processNotifications(events, deps.notificationStore, provider, {
+  if (notificationProvider) {
+    const notifResult = await processNotifications(events, deps.notificationStore, notificationProvider, {
       now: () => deps.now().toISOString(),
       eventStore: deps.eventStore,
       ...(deps.maxDeliveryAttempts !== undefined ? { maxAttempts: deps.maxDeliveryAttempts } : {}),
@@ -220,6 +248,9 @@ export async function startTelegramController(opts: TelegramControllerOptions): 
     // 읽히지 않는다(fail-closed).
     botToken: opts.botToken ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_BOT_TOKEN : undefined),
     chatId: opts.chatId ?? (isProductionRuntime() ? process.env.AUTODEV_TELEGRAM_CHAT_ID : undefined),
+    ntfyTopic: opts.ntfyTopic ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_TOPIC : undefined),
+    ntfyBaseUrl: opts.ntfyBaseUrl ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_BASE_URL : undefined),
+    ntfyAccessToken: opts.ntfyAccessToken ?? (isProductionRuntime() ? process.env.AUTODEV_NTFY_TOKEN : undefined),
     fetchImpl: opts.fetchImpl ?? fetch,
     statePath: opts.statePath ?? opts.manifest.statePath,
     cwd: opts.cwd ?? opts.manifest.targetProjectRoot,

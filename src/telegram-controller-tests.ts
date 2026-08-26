@@ -103,18 +103,29 @@ interface RoutableFetch {
   getUpdatesCalls: CapturedCall[];
   sendMessageCalls: CapturedCall[];
   answerCalls: CapturedCall[];
+  ntfyCalls: CapturedCall[];
   /** 다음 getUpdates 응답에 이 update 하나를 1회만 실어 보낸다(그 이후는 빈 배열). */
   queueNextUpdate: (update: unknown) => void;
 }
 function createRoutableFakeFetch(): RoutableFetch {
   const getUpdatesCalls: CapturedCall[] = [];
   const sendMessageCalls: CapturedCall[] = [];
+  const ntfyCalls: CapturedCall[] = [];
   const answerCalls: CapturedCall[] = [];
   let queuedUpdate: unknown = null;
 
   const fetchImpl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input.toString();
-    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    // ntfy는 plain text body를 보낸다(§ notification-provider-ntfy.ts) — Telegram(JSON body)과
+    // 달리 JSON.parse가 실패하므로, 파싱 가능할 때만 파싱하고 아니면 원문 문자열을 그대로 쓴다.
+    let body: unknown;
+    if (init?.body) {
+      try {
+        body = JSON.parse(String(init.body));
+      } catch {
+        body = String(init.body);
+      }
+    }
     if (url.includes("/getUpdates")) {
       getUpdatesCalls.push({ url, body });
       const result = queuedUpdate ? [queuedUpdate] : [];
@@ -129,6 +140,10 @@ function createRoutableFakeFetch(): RoutableFetch {
       answerCalls.push({ url, body });
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }
+    if (url.includes("ntfy.sh") || url.includes("ntfy.example")) {
+      ntfyCalls.push({ url, body: init?.body });
+      return new Response("{}", { status: 200 });
+    }
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   }) as typeof fetch;
 
@@ -137,6 +152,7 @@ function createRoutableFakeFetch(): RoutableFetch {
     getUpdatesCalls,
     sendMessageCalls,
     answerCalls,
+    ntfyCalls,
     queueNextUpdate: (update: unknown) => {
       queuedUpdate = update;
     },
@@ -336,6 +352,42 @@ async function scenarioFullTickWiring(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12 — ntfy가 구성돼 있으면 Telegram보다
+// 우선한다(Telegram getUpdates/승인 처리 자체는 botToken이 있으면 그대로 동작 — ntfy는
+// 발신 알림 채널만 대체한다).
+// ---------------------------------------------------------------------------
+async function scenarioNtfyPreferredOverTelegramWhenBothConfigured(): Promise<void> {
+  const root = makeGitRepo("controller-ntfy-preferred-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {});
+  const manifest = buildManifest(root, statePath);
+
+  const eventStore: EventStore = createInMemoryEventStore();
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "r1", taskId: "C1", reason: "orchestrator status=WAITING_HUMAN(x)" });
+
+  const notificationStore: NotificationStore = createInMemoryNotificationStore();
+  const routable = createRoutableFakeFetch();
+
+  const handle = await startTelegramController({
+    manifest,
+    eventStore,
+    notificationStore,
+    fetchImpl: routable.fetch,
+    botToken: "tok",
+    chatId: "777",
+    ntfyTopic: "autodev-test-topic",
+    allowlist: { chatId: "777" },
+    tickDelayMs: 5,
+  });
+
+  await waitUntil(() => routable.ntfyCalls.length > 0);
+  check("ntfy가 구성돼 있으면 실제로 ntfy로 알림이 전달됨", routable.ntfyCalls.length >= 1);
+  check("ntfy가 우선하면 Telegram sendMessage는 호출되지 않음", routable.sendMessageCalls.length === 0);
+
+  await handle.stop();
+}
+
+// ---------------------------------------------------------------------------
 // controller 재시작 — offset/approval 상태가 그대로 이어짐(같은 store 인스턴스를 재사용해
 // "재시작"을 흉내낸다 — store 자체의 파일 재시작 persistence는 approval-store-tests.ts가
 // 이미 별도로 검증한다).
@@ -407,6 +459,7 @@ async function main(): Promise<void> {
   await scenarioNotConfiguredMakesNoNetworkCalls();
   await scenarioProductionCredentialsInEnvNeverAutoAdoptedOutsideProductionRuntime();
   await scenarioFullTickWiring();
+  await scenarioNtfyPreferredOverTelegramWhenBothConfigured();
   await scenarioControllerRestartPreservesState();
 
   console.log("\n=== telegram-controller.ts(G6) 테스트 결과 ===");

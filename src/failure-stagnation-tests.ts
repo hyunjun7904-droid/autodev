@@ -1,4 +1,10 @@
-import { computeFailureFingerprint, classifyFailureCategory, createStagnationTracker } from "./failure-stagnation";
+import {
+  computeFailureFingerprint,
+  computeProblemFingerprint,
+  classifyFailureCategory,
+  createStagnationTracker,
+  buildEscalationGuidance,
+} from "./failure-stagnation";
 import type { ClaudeResult } from "./types";
 
 const results: string[] = [];
@@ -95,6 +101,45 @@ function scenarioTrackerResetsOnDifferentFingerprint(): void {
   check("C) fp-b가 반복되면 2", tracker.observe("fp-b") === 2);
 }
 
+// ---------------------------------------------------------------------------
+// D) computeProblemFingerprint — cross-task/cross-project 재사용의 기반(taskId 미포함)
+// ---------------------------------------------------------------------------
+function scenarioProblemFingerprintExcludesTaskId(): void {
+  const a = tests([{ name: "x", pass: false, failureEvidence: { command: "npm run test:x", exitCode: 1, stderrTail: "boom" } }]);
+  check(
+    "D) computeProblemFingerprint는 taskId 없이도 동일 조건이면 항상 동일 값",
+    computeProblemFingerprint(a) === computeProblemFingerprint(a)
+  );
+  check(
+    "D) computeFailureFingerprint(taskId, tests) === `${taskId}::${computeProblemFingerprint(tests)}`",
+    computeFailureFingerprint("T1", a) === `T1::${computeProblemFingerprint(a)}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// E) buildEscalationGuidance
+// ---------------------------------------------------------------------------
+function scenarioNoGuidanceOnFirstFailure(): void {
+  check("E) 1회차(repeatCount=1)는 안내 없음", buildEscalationGuidance(1, []) === undefined);
+}
+
+function scenarioSecondFailureWarnsStrategyMayBeWrong(): void {
+  const guidance = buildEscalationGuidance(2, ["방법 A 시도"]);
+  check("E) 2회차 안내가 존재함", typeof guidance === "string");
+  check("E) 2회차 안내에 직전 시도 내용이 포함됨", (guidance ?? "").includes("방법 A 시도"));
+}
+
+function scenarioThirdFailureForbidsRepeatingStrategy(): void {
+  const guidance = buildEscalationGuidance(3, ["방법 A 시도", "방법 B 시도"]) ?? "";
+  check("E) 3회차 안내는 '금지'를 명시함", guidance.includes("금지"));
+  check("E) 3회차 안내에 이전 실패 목록(A, B) 포함", guidance.includes("방법 A 시도") && guidance.includes("방법 B 시도"));
+}
+
+function scenarioFourthFailureRequestsReconsideringApproach(): void {
+  const guidance = buildEscalationGuidance(4, ["A", "B", "C"]) ?? "";
+  check("E) 4회차 이상은 구현 접근 재검토를 요구함", guidance.includes("재검토"));
+}
+
 function main(): void {
   scenarioSameFailureProducesSameFingerprint();
   scenarioDifferentTaskProducesDifferentFingerprint();
@@ -107,6 +152,11 @@ function main(): void {
   scenarioUnknownWhenNoFailedTests();
   scenarioTrackerDetectsSecondConsecutiveRepeat();
   scenarioTrackerResetsOnDifferentFingerprint();
+  scenarioProblemFingerprintExcludesTaskId();
+  scenarioNoGuidanceOnFirstFailure();
+  scenarioSecondFailureWarnsStrategyMayBeWrong();
+  scenarioThirdFailureForbidsRepeatingStrategy();
+  scenarioFourthFailureRequestsReconsideringApproach();
 
   console.log("\n=== failure-stagnation 테스트 결과 ===");
   for (const r of results) console.log(r);

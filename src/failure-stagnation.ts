@@ -32,7 +32,7 @@ const PROVIDER_GPT_ERROR_CODES = new Set([
 
 /** stderr/stdout 꼬리의 "첫 유의미한 줄"만 취해 정규화한다 — 타임스탬프/임시 경로/PID 같은
  *  매 실행마다 달라지는 숫자는 '#'으로 치환해 같은 실패를 같은 fingerprint로 묶는다. */
-function normalizeErrorSignature(text: string | undefined): string {
+export function normalizeErrorSignature(text: string | undefined): string {
   if (!text) return "";
   const firstLine = text
     .split("\n")
@@ -42,9 +42,14 @@ function normalizeErrorSignature(text: string | undefined): string {
   return firstLine.replace(/\d+/g, "#").slice(0, 200);
 }
 
-/** taskId + 실패한 required test들(이름/명령/exitCode/정규화된 에러 첫 줄)만으로 결정론적
- *  fingerprint를 만든다 — 같은 원인의 실패는 재실행해도 항상 같은 fingerprint를 낸다. */
-export function computeFailureFingerprint(taskId: string, tests: ClaudeResult["tests"]): string {
+/**
+ * 실패한 required test들(이름/명령/exitCode/정규화된 에러 첫 줄)만으로 결정론적
+ * fingerprint를 만든다 — taskId/projectId를 포함하지 않는다. AutoDev / JARVIS 지능형 오류
+ * 복구 하드닝(문제 해결 지식 저장소) — 이 fingerprint가 Task/Project 경계를 넘어 재사용
+ * 가능해야 하므로(§ problem-memory.ts) 특정 task/project에 종속된 값을 절대 섞지 않는다.
+ * computeFailureFingerprint()는 이 값에 taskId만 덧붙여 "이 task 안에서의 반복"을 구분한다.
+ */
+export function computeProblemFingerprint(tests: ClaudeResult["tests"]): string {
   const failed = tests.filter((t) => !t.pass);
   const parts = failed
     .map((t) => {
@@ -52,7 +57,15 @@ export function computeFailureFingerprint(taskId: string, tests: ClaudeResult["t
       return [t.name, ev?.command ?? "", String(ev?.exitCode ?? ""), normalizeErrorSignature(ev?.stderrTail)].join("|");
     })
     .sort();
-  return `${taskId}::${parts.join(";;")}`;
+  return parts.join(";;");
+}
+
+/** taskId + computeProblemFingerprint()만으로 결정론적 fingerprint를 만든다 — 같은 원인의
+ *  실패는 재실행해도 항상 같은 fingerprint를 낸다. 이 값은 "이 task 안에서 반복되는지"를
+ *  감지하는 stagnation tracker 전용이다 — cross-task/cross-project 재사용 검색에는
+ *  computeProblemFingerprint()를 직접 써야 한다(§ problem-memory.ts). */
+export function computeFailureFingerprint(taskId: string, tests: ClaudeResult["tests"]): string {
+  return `${taskId}::${computeProblemFingerprint(tests)}`;
 }
 
 export function classifyFailureCategory(
@@ -96,4 +109,41 @@ export function createStagnationTracker(): StagnationTracker {
       return repeatCount;
     },
   };
+}
+
+// AutoDev 지능형 오류 복구 하드닝 — 반복 횟수가 늘어날수록 해결 전략 자체가 달라져야 한다
+// (§ 요구사항 10). 이 함수는 어떤 코드도 되돌리거나 실행하지 않는다 — Claude Developer의
+// 다음 라운드 프롬프트에 덧붙일 안내 문구만 결정론적으로 만든다(순수 함수, LLM 호출 없음).
+// 1회차는 안내 없음(일반적인 원인 분석), 2회차는 "이 전략이 틀렸을 가능성" 경고, 3회차는
+// 같은 전략 재사용을 명시적으로 금지, 4회차 이상은 구현 접근 자체의 재검토를 요구한다.
+// 실제 git revert 등 자동 되돌리기는 하지 않는다(§ 요구사항 19 — 새 기능/대규모 개편 금지,
+// 이 계층은 어디까지나 안내 텍스트만 바꾼다).
+export function buildEscalationGuidance(repeatCount: number, priorAttemptedDescriptions: string[]): string | undefined {
+  if (repeatCount <= 1) return undefined;
+  const priorList = priorAttemptedDescriptions
+    .slice(-repeatCount + 1)
+    .map((d, i) => `  ${i + 1}) ${d.length > 300 ? `${d.slice(0, 300)}…` : d}`)
+    .join("\n");
+  if (repeatCount === 2) {
+    return (
+      "# AutoDev 안내(반복 실패 2회차)\n" +
+      "직전 시도가 같은 required test 실패를 해결하지 못했습니다. 그 시도가 잘못된 접근이었을 가능성이 높습니다.\n" +
+      "직전 시도 내용:\n" +
+      priorList
+    );
+  }
+  if (repeatCount === 3) {
+    return (
+      "# AutoDev 안내(반복 실패 3회차 — 전략 재사용 금지)\n" +
+      "같은 required test 실패가 3회 연속 반복되었습니다. 아래에 나열된 이미 실패한 접근을 그대로 다시 시도하지 마세요 — 근본 원인을 처음부터 다시 분석하세요.\n" +
+      "이미 실패한 접근:\n" +
+      priorList
+    );
+  }
+  return (
+    "# AutoDev 안내(반복 실패 4회 이상 — 구현 접근 재검토)\n" +
+    "같은 required test 실패가 4회 이상 반복되었습니다. 지금까지의 개별 수정을 반복하지 말고, 이 기능을 구현하는 접근 자체가 올바른지부터 재검토하세요. 필요하면 지금까지의 변경 중 문제를 일으킨 부분을 되돌리고 다른 구현 방법을 선택하세요.\n" +
+    "이미 실패한 접근:\n" +
+    priorList
+  );
 }

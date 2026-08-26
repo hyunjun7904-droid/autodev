@@ -720,6 +720,29 @@ async function scenarioR_resumeContextDetectedForExistingInScopeChanges(): Promi
   }
 }
 
+async function scenarioU_memoryHintInjectedIntoInitialTranscript(): Promise<void> {
+  // AutoDev 지능형 오류 복구 하드닝 — problem-memory.ts가 찾은 과거 해결 사례 안내
+  // (opts.memoryHint)가 재개 안내와 마찬가지로 초기 transcript에 그대로 포함되는지 확인한다.
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-with-memory-hint", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([taskComplete]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("메모리 힌트 주입 시나리오", 1, {
+    claudeCaller: scripted.call,
+    memoryHint: "# AutoDev 안내(과거 해결 사례)\n이전에 UNIQUE_MEMORY_HINT_MARKER 방식으로 해결된 적이 있습니다.",
+  });
+
+  check("U: 정상 성공(메모리 힌트가 진행을 방해하지 않음)", result.success === true);
+  check("U: 초기 입력에 memoryHint 문구가 그대로 포함됨", scripted.receivedInputs[0].includes("UNIQUE_MEMORY_HINT_MARKER"));
+}
+
+async function scenarioV_noMemoryHintMeansNoExtraSection(): Promise<void> {
+  // memoryHint를 지정하지 않으면 기존 동작과 완전히 동일하다(추가 섹션 없음).
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-no-hint", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([taskComplete]);
+  await runDeveloperTaskViaSafeExecutor("메모리 힌트 없음 시나리오", 1, { claudeCaller: scripted.call });
+  check("V: memoryHint 미지정 시 '과거 해결 사례' 섹션이 생기지 않음", !scripted.receivedInputs[0].includes("과거 해결 사례"));
+}
+
 // Phase C Task C4.1(Read-only Git Command Hardening) — 요구된 source regression: "AutoDev
 // Claude Worker의 production 경로가 직접 Bash/tool 실행으로 Safe Executor를 우회할 수
 // 없는 현재 구조"를 확인한다. 이 파일의 나머지 시나리오는 fake claudeCaller로 라운드
@@ -806,6 +829,8 @@ async function main(): Promise<void> {
     await scenarioP_usageLimitRetryExhaustionReturnsFailureWithoutHanging();
     await scenarioQ_nonRetriableClaudeErrorFailsImmediatelyWithoutRetry();
     await scenarioR_resumeContextDetectedForExistingInScopeChanges();
+    await scenarioU_memoryHintInjectedIntoInitialTranscript();
+    await scenarioV_noMemoryHintMeansNoExtraSection();
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

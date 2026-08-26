@@ -102,7 +102,17 @@ function makeFakeRunner(cfg: FakeRunnerConfig, callLog?: { command: string; args
 //    node -e로 자신이 물려받은 env를 그대로 출력하게 해서 확인한다.
 // ---------------------------------------------------------------------------
 function scenarioRealCommandRunnerSanitizesChildEnv(): void {
-  const sensitiveKeys = ["AUTOMATION_DRY_RUN", "AUTODEV_PRODUCTION_RUNTIME", "AUTODEV_TELEGRAM_BOT_TOKEN", "AUTODEV_TELEGRAM_CHAT_ID", "AUTODEV_TELEGRAM_USER_ID"];
+  const sensitiveKeys = [
+    "AUTOMATION_DRY_RUN",
+    "AUTODEV_PRODUCTION_RUNTIME",
+    "AUTODEV_TELEGRAM_BOT_TOKEN",
+    "AUTODEV_TELEGRAM_CHAT_ID",
+    "AUTODEV_TELEGRAM_USER_ID",
+    // AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12/16 — ntfy 자격증명도 동일하게 제거돼야 한다.
+    "AUTODEV_NTFY_TOPIC",
+    "AUTODEV_NTFY_TOKEN",
+    "AUTODEV_NTFY_BASE_URL",
+  ];
   const saved: Record<string, string | undefined> = {};
   for (const k of sensitiveKeys) saved[k] = process.env[k];
   try {
@@ -111,6 +121,9 @@ function scenarioRealCommandRunnerSanitizesChildEnv(): void {
     process.env.AUTODEV_TELEGRAM_BOT_TOKEN = "123456:fake-looks-real-for-test";
     process.env.AUTODEV_TELEGRAM_CHAT_ID = "999999";
     process.env.AUTODEV_TELEGRAM_USER_ID = "111111";
+    process.env.AUTODEV_NTFY_TOPIC = "fake-topic-for-test";
+    process.env.AUTODEV_NTFY_TOKEN = "fake-ntfy-token-for-test";
+    process.env.AUTODEV_NTFY_BASE_URL = "https://ntfy.example.invalid";
 
     const printEnvScript = `console.log(JSON.stringify(${JSON.stringify(sensitiveKeys)}.map((k) => process.env[k] ?? null)))`;
     const result = realCommandRunner(process.execPath, ["-e", printEnvScript], process.cwd());

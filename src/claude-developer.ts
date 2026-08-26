@@ -108,6 +108,16 @@ export interface DeveloperTaskOptions {
    * 하기 위함). 지정하지 않으면 기존 동작과 동일(감지 안 함).
    */
   allowedPathPrefixes?: string[];
+  /**
+   * AutoDev 지능형 오류 복구 하드닝(Problem-Solving Knowledge Store) — 직전 attempt에서
+   * required test가 실패했고 problem-memory.ts가 과거 해결 사례(또는 반복 실패에 따른
+   * 전략 전환 안내)를 찾았을 때만 채워진다. 존재하면 opts.allowedPathPrefixes의 "재개 안내"와
+   * 동일한 방식으로 초기 transcript에 그대로 덧붙인다 — 이 문자열은 이미 호출부
+   * (autodev.ts)가 problem-memory.ts로 조립을 마친 값이라 이 함수는 그 내용을 해석하거나
+   * 검증하지 않는다(그 값 자체를 신뢰하는 것이 아니라, Claude에게 "검토해볼 후보"로만
+   * 전달한다는 점은 안내 문구 자체에 이미 담겨 있다).
+   */
+  memoryHint?: string;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   usageLimitWaitMs?: number;
   /** USAGE_LIMIT 재시도 최대 횟수 — 이 횟수 안에서는 round/discovery budget/lock grace를
@@ -413,6 +423,14 @@ export async function runDeveloperTaskViaSafeExecutor(
   const doValidateAndExecute = executor?.validateAndExecute ?? validateAndExecute;
 
   const transcript: string[] = [`# Task\n${task}`];
+
+  // AutoDev 지능형 오류 복구 하드닝 — problem-memory.ts가 찾은 과거 해결 사례/반복 실패
+  // 전략 전환 안내가 있으면 그대로 덧붙인다(§ opts.memoryHint 문서 참고). 이 값은 "정답"이
+  // 아니라 검토할 후보일 뿐이라는 점을 안내 문구 자체에 명시한다(§ 요구사항 5 — 과거
+  // 해결책을 무조건 적용하지 않는다).
+  if (opts.memoryHint) {
+    transcript.push(opts.memoryHint);
+  }
 
   // 이전 시도(새 프로세스로 재시작 등)의 in-scope 미완성 작업물이 이미 디스크에 있으면,
   // 버리라고 하지 않고 이어서 진행하라고 명시적으로 안내한다. scope 밖 변경 차단은 여기서
