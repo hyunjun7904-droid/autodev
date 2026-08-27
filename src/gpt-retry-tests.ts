@@ -131,35 +131,106 @@ async function scenarioB(statePath: string): Promise<void> {
   check("B: GPT attempt 정확히 2회", seq.callCount() === 2);
 }
 
+// AutoDev / JARVIS 신뢰성 보완(2026-08-28 정책 수정) — GPT Reviewer 자신의 provider 일시적
+// 장애(5회 attempt 소진 후 gpt-reviewer.ts가 반환하는 GPT_REVIEW_TEMPORARILY_UNAVAILABLE)는
+// 더 이상 즉시 genuine WAITING_HUMAN으로 승격하지 않는다 — 같은 diff로 재리뷰만 반복하다가
+// provider가 회복되면 자동으로 통과한다("검증 안 된 코드를 PASS 처리하지 않는다"는 원칙은
+// 그대로 유지된다 — 실제로 성공 응답을 받기 전까지는 절대 PASS로 진행하지 않는다는 뜻이지,
+// 재시도 자체를 막는다는 뜻이 아니었다). orchestrator.ts 레벨 gptReviewer를 직접 합성해
+// "몇 번째 outer 호출인지"를 정확히 제어한다(gpt-reviewer.ts의 내부 5-attempt 재시도 세부
+// 타이밍에 의존하지 않기 위함).
+function syntheticTemporarilyUnavailable() {
+  return {
+    decision: "HUMAN_REQUIRED" as const,
+    severity: { critical: 0, high: 0, medium: 0 },
+    feedback: "GPT reviewer가 5회 연속 일시적 오류로 응답하지 않았습니다.",
+    nextTask: null,
+    errorCode: "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" as const,
+  };
+}
+function syntheticPass() {
+  return { decision: "PASS" as const, severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null };
+}
+
 async function scenarioC(statePath: string): Promise<void> {
-  // GPT TIMEOUT 5회(전부) → state 보존, deferred 기록, 검증 안 된 코드 PASS 금지
+  // outer 호출 2회는 provider 일시적 장애, 3회째에 회복(PASS) — Human Gate를 거치지 않고
+  // 자동으로 재리뷰가 이어지다가 정상 완료돼야 한다.
   let claudeCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
     claudeCalls += 1;
     return FAKE_CLAUDE_RESULT;
   };
-  let sleepCalls = 0;
-  const alwaysTimeout = async (): Promise<GptReviewApiResult> => transientResult("TIMEOUT");
-  const gptReviewer = async (result: ClaudeResult, reviewCycle: number, task: string) =>
-    reviewClaudeResultWithRetry(result, reviewCycle, task, {
-      deps: {
-        attempt: alwaysTimeout,
-        sleep: async () => {
-          sleepCalls += 1;
-        },
-      },
-    });
+  let outerGptCalls = 0;
+  const gptReviewer = async () => {
+    outerGptCalls += 1;
+    return outerGptCalls <= 2 ? syntheticTemporarilyUnavailable() : syntheticPass();
+  };
+  const observedStatuses: string[] = [];
+  let orchestratorSleepCalls = 0;
 
-  const { finalState } = await runOrchestrator("C: GPT TIMEOUT x5", { claudeRunner, gptReviewer, statePath });
-  check("C: decision이 PASS가 아님(검증 안 된 코드 PASS 금지)", finalState.status !== "APPROVED");
-  check("C: 최종 상태 WAITING_HUMAN", finalState.status === "WAITING_HUMAN");
-  check(
-    "C: deferredHumanTasks에 GPT_REVIEW_TEMPORARILY_UNAVAILABLE 기록됨",
-    finalState.deferredHumanTasks.some((t) => t.includes("GPT_REVIEW_TEMPORARILY_UNAVAILABLE"))
-  );
-  check("C: sleep 4회(5회 시도 사이 대기)", sleepCalls === 4);
+  const { finalState } = await runOrchestrator("C: GPT reviewer provider 일시적 장애 후 회복", {
+    claudeRunner,
+    gptReviewer,
+    statePath,
+    onProgress: (info) => observedStatuses.push(info.status),
+    sleep: async () => {
+      orchestratorSleepCalls += 1;
+    },
+  });
+
+  check("C: WAITING_HUMAN이 전혀 관측되지 않음(genuine 승격 안 함)", !observedStatuses.includes("WAITING_HUMAN"));
+  check("C: WAITING_PROVIDER_RETRY(durable wait)가 관측됨", observedStatuses.includes("WAITING_PROVIDER_RETRY"));
+  check("C: 최종 상태 APPROVED(provider 회복 후 자동으로 통과)", finalState.status === "APPROVED");
+  check("C: outer gptReviewer가 정확히 3회 호출됨(2회 실패+3회째 성공)", outerGptCalls === 3);
+  check("C: durable wait는 정확히 2회(orchestrator sleep)", orchestratorSleepCalls === 2);
+  check("C: reviewerProviderWaitCount가 2로 기록됨", finalState.reviewerProviderWaitCount === 2);
   check("C: Claude worker는 1회만 호출됨(같은 diff 재사용, 재실행 없음)", claudeCalls === 1);
-  check("C: lastGptDecision.decision이 PASS가 아님", finalState.lastGptDecision?.decision !== "PASS");
+  check(
+    "C: deferredHumanTasks에 GPT_REVIEW_TEMPORARILY_UNAVAILABLE이 genuine 마커로 남지 않음(정상 완료됐으므로)",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_REVIEW_TEMPORARILY_UNAVAILABLE"))
+  );
+}
+
+// 2026-08-28 정책 수정 이후에도 "검증 안 된 코드를 PASS 처리하지 않는다"는 원칙과 실제 비용
+// 안전장치(MAX_GPT_RAW_CALLS)는 그대로 살아있다는 것을 증명한다 — provider가 전혀 회복되지
+// 않으면(매 outer 호출마다 계속 실패) 결국 GPT_RAW_CALL_LIMIT_EXCEEDED(기존의, 이 정책과
+// 무관한 실제 비용 genuine 사유)로 bounded하게 멈춘다.
+async function scenarioCNeverRecoversHitsRawCallCap(statePath: string): Promise<void> {
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return FAKE_CLAUDE_RESULT;
+  };
+  let outerGptCalls = 0;
+  // 실제 gpt-reviewer.ts 내부 재시도(MAX_ATTEMPTS=5)를 그대로 반영해 outer 호출 1회당
+  // gptRawCallTotal이 5씩 늘어나는 것과 동일하게 gptTransportRetry:4를 명시한다.
+  const gptReviewer = async () => {
+    outerGptCalls += 1;
+    return { ...syntheticTemporarilyUnavailable(), gptTransportRetry: 4 };
+  };
+  let orchestratorSleepCalls = 0;
+
+  const { finalState } = await runOrchestrator("C2: GPT reviewer provider 영구 장애(회복 없음)", {
+    claudeRunner,
+    gptReviewer,
+    statePath,
+    sleep: async () => {
+      orchestratorSleepCalls += 1;
+    },
+  });
+
+  check("C2: 결국 WAITING_HUMAN(실제 비용 안전장치)으로 멈춤", finalState.status === "WAITING_HUMAN");
+  check(
+    "C2: deferredHumanTasks에 GPT_RAW_CALL_LIMIT_EXCEEDED가 기록됨(GPT_REVIEW_TEMPORARILY_UNAVAILABLE이 아니라)",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_RAW_CALL_LIMIT_EXCEEDED"))
+  );
+  check(
+    "C2: GPT_REVIEW_TEMPORARILY_UNAVAILABLE 자체는 genuine 마커로 남지 않음",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_REVIEW_TEMPORARILY_UNAVAILABLE"))
+  );
+  check("C2: outer 호출 횟수가 유한함(무한 재시도 아님, 정확히 7회)", outerGptCalls === 7);
+  check("C2: durable wait도 유한함(정확히 6회)", orchestratorSleepCalls === 6);
+  check("C2: Claude worker는 1회만 호출됨(같은 diff 재사용, 재실행 없음)", claudeCalls === 1);
 }
 
 async function scenarioD(statePath: string): Promise<void> {
@@ -225,6 +296,7 @@ async function main(): Promise<void> {
     await scenarioA(makeTempStatePath());
     await scenarioB(makeTempStatePath());
     await scenarioC(makeTempStatePath());
+    await scenarioCNeverRecoversHitsRawCallCap(makeTempStatePath());
     await scenarioD(makeTempStatePath());
     await scenarioE(makeTempStatePath());
   } finally {

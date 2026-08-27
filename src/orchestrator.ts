@@ -269,6 +269,8 @@ export async function runOrchestrator(
   if (!resumingSameTask) {
     state.developerProviderWaitCount = 0;
     state.developerProviderNextRetryAt = null;
+    state.reviewerProviderWaitCount = 0;
+    state.reviewerProviderNextRetryAt = null;
   }
   state.lastClaudeResult = null;
   state.lastGptDecision = null;
@@ -419,7 +421,7 @@ export async function runOrchestrator(
     // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
     // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
     // SI-3.8D — reviewBaseline(직전 round의 결과, 첫 round는 undefined)도 그대로 전달한다.
-    const gptResult = await gptReviewer(
+    let gptResult = await gptReviewer(
       claudeResult,
       state.reviewCycle,
       task,
@@ -432,16 +434,46 @@ export async function runOrchestrator(
     // 이번 round가 만든 새 baseline을 다음 round를 위해 보존한다(BLOCK/HUMAN_REQUIRED로
     // 루프가 끝나도 무해하다 — 더 이상 쓰이지 않을 뿐).
     reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
-
     // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
     // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
     gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
-
-    // Phase SI-3.8B — 이 reviewCycle의 gptReviewer() 호출 1건(Budget Guard BLOCK/실제 API
-    // 성공/실패 전부 포함, 결과 branch 분기보다 먼저)을 정확히 한 번만 Ledger에 기록한다 —
-    // 아래 어떤 branch(BUDGET_EXCEEDED/AUTH_ERROR/PASS/BLOCK/REVISE)로 진행하든 중복 기록되지
-    // 않는다.
     recordGptReviewUsage(gptResult, state.reviewCycle);
+
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-28 정책 수정) — GPT Reviewer 자신의 순수 provider
+    // 일시적 장애(timeout/rate limit류, gpt-reviewer.ts reviewClaudeResultWithRetry가 자체
+    // MAX_ATTEMPTS(5)까지 소진한 뒤에만 이 errorCode를 반환)는 Developer provider durable
+    // wait과 정확히 같은 원칙을 적용한다 — 아무리 반복돼도 genuine WAITING_HUMAN으로 승격하지
+    // 않는다. 대신 같은 diff로 재리뷰만 반복한다(Developer를 다시 호출하지 않음 — claudeResult
+    // 는 이 while(true) 바깥 loop의 값 그대로다). gptCallCount("몇 번째 REVISE round인지")는
+    // 이 재시도로 소비하지 않는다(claudeLimitWaitCount/developerProviderWaitCount와 동일
+    // 관례) — 다만 gptRawCallTotal(실제 API 호출 총합, 비용 안전장치)은 재시도도 실제 호출이므로
+    // 계속 늘어나고, 그 hard cap(MAX_GPT_RAW_CALLS)은 그대로 유지된다 — "얼마나 반복되든 Human
+    // Gate 승격 없음"이 "실제 비용이 무한정 계속 나가도 된다"는 뜻은 아니다(그건 이미
+    // GPT_RAW_CALL_LIMIT_EXCEEDED라는 별도의, 이 정책과 무관한 genuine 비용 사유다).
+    // 참고: Developer provider wait(위)과 달리 이 retry는 재시작 후 "남은 시간만 대기"를
+    // 구현하지 않는다 — claudeResult 자체가 프로세스 재시작에도 살아남을 방법이 없어(디스크에
+    // 영속화하지 않음, 기존 설계 그대로), 재시작하면 어차피 Developer 호출부터 처음부터 다시
+    // 해야 한다(이 특성은 이번 변경으로 새로 생긴 게 아니라 기존 review 단계 전체가 이미 그랬다
+    // — claudeResult를 durable하게 만드는 것은 이번 정책 수정의 범위 밖이다). 따라서
+    // reviewerProviderNextRetryAt은 관측(대시보드/로그)용으로만 저장되고, 재시작 시 남은
+    // 시간만큼만 기다리는 로직은 없다.
+    while (gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" && gptRawCallTotal <= MAX_GPT_RAW_CALLS) {
+      state.reviewerProviderWaitCount = (state.reviewerProviderWaitCount ?? 0) + 1;
+      const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewerProviderWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
+      state.reviewerProviderNextRetryAt = new Date(now() + delayMs).toISOString();
+      setStatus("WAITING_PROVIDER_RETRY");
+      saveCurrentState(state);
+      log(
+        `GPT Reviewer provider 일시적 오류 감지 — ${delayMs}ms 대기 후 같은 diff로 재리뷰 (${state.reviewerProviderWaitCount}회째, gptCallCount 예산은 소비하지 않음, Human Gate로 승격하지 않고 계속 재시도합니다)`
+      );
+      await sleep(delayMs);
+      state.reviewerProviderNextRetryAt = null;
+      setStatus("WAITING_GPT_REVIEW");
+      gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal, reviewBaseline);
+      reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
+      gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
+      recordGptReviewUsage(gptResult, state.reviewCycle);
+    }
 
     if (gptRawCallTotal > MAX_GPT_RAW_CALLS) {
       log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — WAITING_HUMAN`, { gptRawCallTotal });
@@ -453,7 +485,6 @@ export async function runOrchestrator(
     if (
       gptResult.errorCode === "AUTH_ERROR" ||
       gptResult.errorCode === "QUOTA_EXCEEDED" ||
-      gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" ||
       gptResult.errorCode === "BUDGET_EXCEEDED" ||
       // SI-3.8E Security Ordering Correction — Provider Security Gate BLOCK도 Budget Guard
       // BLOCK과 동일한 성격(사람 개입이 필요한 preflight 차단)이므로 동일하게 기록한다.

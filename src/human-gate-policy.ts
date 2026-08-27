@@ -31,8 +31,11 @@ import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 //   - REMOTE_GIT_CHANGED_DURING_RUN — 다른 곳에서 remote가 앞서갔다는 뜻으로, 이 저장소의
 //     Remote Git Safety Gate가 보호하려는 "요구사항 충돌"에 해당한다.
 //   - GPT_RAW_CALL_LIMIT_EXCEEDED / BUDGET_EXCEEDED / AUTH_ERROR / QUOTA_EXCEEDED /
-//     PROVIDER_SECURITY_BLOCKED / GPT_REVIEW_TEMPORARILY_UNAVAILABLE — 실제 비용/인증/
-//     provider 보안 판단이 얽혀 있다("실제 비용 발생" 범주).
+//     PROVIDER_SECURITY_BLOCKED — 실제 비용/인증/provider 보안 판단이 얽혀 있다("실제 비용
+//     발생" 범주). GPT_REVIEW_TEMPORARILY_UNAVAILABLE은 2026-08-28 정책 수정으로 이 목록에서
+//     빠졌다 — orchestrator.ts가 이제 이 errorCode를 genuine 마커로 저장하지 않고(§ 아래
+//     "기술적 자동 복구 대상") 같은 diff로 재리뷰만 무한히 반복하기 때문에, 이 마커 자체가
+//     더 이상 생성되지 않는다.
 //   - CHECKPOINT_BLOCKED이지만 이유가 CHECKPOINT_SCOPE_VIOLATION_REASON이 아닌 경우(Secret/
 //     Dependency Scanner Gate — SECURITY_BLOCKED) — 민감 보안 판단.
 //
@@ -66,7 +69,6 @@ const GENUINE_MARKER_PREFIXES: readonly string[] = [
   "AUTH_ERROR:",
   "QUOTA_EXCEEDED:",
   "PROVIDER_SECURITY_BLOCKED:",
-  "GPT_REVIEW_TEMPORARILY_UNAVAILABLE:",
 ];
 
 function isCheckpointScopeViolationMarker(marker: string): boolean {

@@ -451,7 +451,15 @@ async function scenarioReviewerErrorNotFailOpen(): Promise<void> {
     errorCode: "GPT_REVIEW_TEMPORARILY_UNAVAILABLE",
   });
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+  // 2026-08-28 정책 수정 — GPT_REVIEW_TEMPORARILY_UNAVAILABLE은 이제 orchestrator.ts가
+  // 즉시 genuine WAITING_HUMAN으로 승격하지 않고 같은 diff로 durable하게 재리뷰를 반복한다
+  // (실제 비용 안전장치 MAX_GPT_RAW_CALLS에 걸릴 때까지) — 이 fake reviewer는 항상 같은
+  // 결과만 반환하므로 결국 그 안전장치로 멈추는 것은 동일하지만(아래 assertion 불변),
+  // 실제 5분/15분/... 대기를 기다리면 테스트가 멈추므로 sleep/schedule을 fake로 override한다.
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, developerProviderWaitScheduleMs: [1, 1, 1], developerProviderWaitCooldownMs: 1 },
+  });
 
   check("reviewer 오류: outcome이 APPROVED_AND_CHECKPOINTED가 아님(fail-open 아님)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check("reviewer 오류: checkpoint가 시도되지 않음", result.checkpoint === undefined);

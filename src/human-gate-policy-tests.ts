@@ -74,7 +74,6 @@ function scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal(): void {
     "AUTH_ERROR: 인증 실패",
     "QUOTA_EXCEEDED: 쿼터 소진",
     "PROVIDER_SECURITY_BLOCKED: provider 보안 정책",
-    "GPT_REVIEW_TEMPORARILY_UNAVAILABLE: 일시 장애",
   ];
   for (const marker of genuineMarkers) {
     // 기술적 신호(REVIEW_CYCLE_EXHAUSTED)가 함께 섞여 있어도 genuine 마커가 하나라도 있으면
@@ -96,6 +95,19 @@ function scenarioDeveloperTransientRetryExhaustedIsTechnical(): void {
     classifyWaitingHumanReason(s) === "TECHNICAL_AUTO_RECOVERABLE"
   );
   check("isTechnicalAutoRecoverableWaitingHuman()도 동일하게 true", isTechnicalAutoRecoverableWaitingHuman(s));
+}
+
+// GPT_REVIEW_TEMPORARILY_UNAVAILABLE은 2026-08-28 정책 수정으로 GENUINE_MARKER_PREFIXES에서
+// 빠졌다(orchestrator.ts가 이제 이 errorCode를 저장하지 않고 무한히 재시도만 하기 때문) — 그
+// 목록에서 빠졌다고 해서 auto-recoverable로 잘못 분류되지는 않는다는 것을 확인한다: 이
+// 마커는 어떤 auto-recoverable 조건과도 매칭되지 않으므로 fail-closed 기본값(GENUINE)으로
+// 그대로 남아야 한다(혹시 이 정책 이전에 만들어진 stale 상태가 있어도 안전).
+function scenarioStaleGptReviewUnavailableMarkerStaysGenuineByDefault(): void {
+  const s = state({ deferredHumanTasks: ["GPT_REVIEW_TEMPORARILY_UNAVAILABLE: 일시 장애"] });
+  check(
+    "GPT_REVIEW_TEMPORARILY_UNAVAILABLE 마커는 명시적 genuine 목록에서 빠져도 fail-closed 기본값으로 GENUINE 유지(auto-recoverable로 새지 않음)",
+    classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT"
+  );
 }
 
 function scenarioUnknownReasonDefaultsToGenuine(): void {
@@ -133,6 +145,7 @@ function main(): void {
   scenarioCheckpointBlockedOtherReasonIsGenuine();
   scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal();
   scenarioDeveloperTransientRetryExhaustedIsTechnical();
+  scenarioStaleGptReviewUnavailableMarkerStaysGenuineByDefault();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();
 

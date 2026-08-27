@@ -225,6 +225,23 @@ export interface CoreState {
    */
   developerProviderNextRetryAt?: string | null;
 
+  /**
+   * developerProviderWaitCount와 동일한 설계지만 GPT Reviewer 자신의 provider 일시적
+   * 장애(gpt-reviewer.ts reviewClaudeResultWithRetry가 MAX_ATTEMPTS까지 소진했을 때
+   * errorCode==="GPT_REVIEW_TEMPORARILY_UNAVAILABLE")를 위한 것이다 — 같은 diff로
+   * 재리뷰만 반복하고(Developer는 다시 호출하지 않음), 아무리 반복돼도 genuine
+   * WAITING_HUMAN으로 승격하지 않는다. 다른(새) task로 전환될 때만 리셋된다.
+   */
+  reviewerProviderWaitCount?: number;
+
+  /**
+   * 위 reviewerProviderWaitCount와 짝을 이루는 durable timestamp — 다만 developerProviderNextRetryAt
+   * 과 달리 프로세스 재시작 시 "남은 시간만 대기"하는 로직에는 쓰이지 않는다(claudeResult
+   * 자체가 재시작에도 살아남지 않으므로 재시작하면 Developer 호출부터 다시 해야 한다 — §
+   * orchestrator.ts 주석). 관측(대시보드/로그)용으로만 저장된다.
+   */
+  reviewerProviderNextRetryAt?: string | null;
+
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];
 
