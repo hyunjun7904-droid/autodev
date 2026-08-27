@@ -56,6 +56,7 @@ import { rmSync } from "node:fs";
 import { getWorkingTreeChanges } from "./git-changes";
 import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
+import { isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles } from "./human-gate-policy";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
 // manifest.taskRegistry 데이터) → Claude 실제 개발 → targeted tests(AutoDev가 직접
@@ -712,6 +713,17 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
     const state = loadState(statePath);
 
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 아래 canonical Human Gate 재검사가
+    // CHECKPOINT_SCOPE_VIOLATION 기술적 WAITING_HUMAN을 복구할 때, deferredHumanTasks를
+    // 비우기 "전에" 그 마커에 이미 담겨 있던 checkpoint.unexpectedFiles 목록을 여기 보존한다
+    // — 이 목록은 GPT Reviewer가 보고하지 않는(Core checkpoint 자체의 독립 판정) 범위 밖
+    // 파일이라 Phase 7 정리(§ 아래, state.lastGptDecision.scopeViolations 기준)가 원래
+    // 감지하지 못한다. 이 값이 비어 있으면(REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED 등 다른
+    // 기술적 복구였거나 애초에 CHECKPOINT_BLOCKED가 아니었으면) Phase 7 정리는 기존과 동일하게
+    // lastGptDecision.scopeViolations만 본다 — 이 변수는 그 기존 대상 목록을 넓히기만 할
+    // 뿐 대체하지 않는다.
+    let checkpointBlockedLeftoverFiles: string[] = [];
+
     // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
     // Stale REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN Reconciliation. decideNextAction()
     // 은 순수 함수로 유지한다(§ 그 함수 상단 주석 — state만 보고 부수효과 없이 판단, 독립
@@ -732,6 +744,33 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         log("오래된 REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN 자동 복구", {
           projectId: manifest.projectId,
           previousDeferredHumanTasks: state.deferredHumanTasks,
+        });
+        state.status = "READY";
+        state.deferredHumanTasks = [];
+        saveState(state, statePath);
+      }
+    }
+
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Canonical Human Gate Policy 기반 기술적
+    // WAITING_HUMAN 자동 복구. 위 REQUIRED_TEST_CONFIGURATION_ERROR 전용 재검사가 이미
+    // 해소했다면(reconciliation.resolved) state.status는 이미 "READY"이므로 이 블록은
+    // 자연히 아무 것도 하지 않는다(중복 판정 없음). humanFinalReview가 있으면
+    // classifyWaitingHumanReason() 자체가 항상 GENUINE_HUMAN_JUDGMENT를 반환하므로 그
+    // gate는 여기서도 절대 건드리지 않는다(§ human-gate-policy.ts). CHECKPOINT_SCOPE_VIOLATION/
+    // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED로 저장된 WAITING_HUMAN만 READY로 되돌린다 —
+    // state.lastGptDecision/lastClaudeResult는 그대로 보존하므로, 아래(§ Phase 6/7)
+    // previousAttemptResult 시딩과 scope-violation leftover 정리가 이어서 정상 동작한다
+    // (이 블록은 새 정리 로직을 추가하지 않는다 — 기존 Phase 6/7 로직을 그대로 재사용).
+    if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
+      if (isTechnicalAutoRecoverableWaitingHuman(state)) {
+        checkpointBlockedLeftoverFiles = extractCheckpointScopeViolationFiles(state.deferredHumanTasks);
+        console.log(
+          `[autodev] 기술적 WAITING_HUMAN을 재검사했습니다 — 실제 사람 판단이 필요한 사유가 아니므로 Telegram 승인 없이 자동 복구합니다.`
+        );
+        log("기술적 WAITING_HUMAN 자동 복구(Canonical Human Gate Policy)", {
+          projectId: manifest.projectId,
+          previousDeferredHumanTasks: state.deferredHumanTasks,
+          lastGptDecision: state.lastGptDecision?.decision ?? null,
         });
         state.status = "READY";
         state.deferredHumanTasks = [];
@@ -924,15 +963,23 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     //      — tracked 파일, 즉 이미 커밋된 사용자/과거 작업은 이 경로로 절대 건드리지 않는다)
     //   4) 이 task의 현재 allowedPathPrefixes 밖(범위 안 미완성 변경은 기존 "재개 감지"
     //      로직이 이어서 진행하도록 그대로 보존한다 — 이 정리 대상과 절대 겹치지 않는다)
+    //
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 정리 대상 후보는 두 출처를 합친다: (a)
+    // state.lastGptDecision.scopeViolations(GPT Reviewer 자신이 BLOCK과 함께 보고한 목록,
+    // 기존 Phase 7), (b) checkpointBlockedLeftoverFiles(위에서 canonical Human Gate가
+    // CHECKPOINT_SCOPE_VIOLATION을 복구할 때 보존해 둔, Core checkpoint 자신의 독립 판정
+    // 목록 — GPT는 PASS했지만 Core가 범위 밖 파일을 발견해 commit을 막은 경우). 두 목록 다
+    // "이미 어떤 판정 로직이 실제로 내린 결과"만 그대로 재사용할 뿐 이 블록이 새로 추측하지
+    // 않으며, 안전조건 1)~4)는 출처와 무관하게 동일하게 적용한다.
     const lastGptDecisionForCleanup = state.lastGptDecision as (typeof state.lastGptDecision & { scopeViolations?: string[] }) | null;
-    if (
-      lastGptDecisionForCleanup &&
-      lastGptDecisionForCleanup.decision !== "PASS" &&
-      lastGptDecisionForCleanup.scopeViolations &&
-      lastGptDecisionForCleanup.scopeViolations.length > 0
-    ) {
+    const gptReportedScopeViolations =
+      lastGptDecisionForCleanup && lastGptDecisionForCleanup.decision !== "PASS" && lastGptDecisionForCleanup.scopeViolations
+        ? lastGptDecisionForCleanup.scopeViolations
+        : [];
+    const cleanupCandidates = Array.from(new Set([...gptReportedScopeViolations, ...checkpointBlockedLeftoverFiles]));
+    if (cleanupCandidates.length > 0) {
       const currentUntracked = new Set(getWorkingTreeChanges([], executorContext.projectRoot).untracked.map((c) => c.path));
-      const removable = lastGptDecisionForCleanup.scopeViolations.filter(
+      const removable = cleanupCandidates.filter(
         (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes)
       );
       for (const relPath of removable) {
@@ -1183,21 +1230,35 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       metadataFields.devProtocolFailureRounds = failedClaudeResult.callStats.protocolFailureRounds;
     }
     if (failedClaudeResult?.errorCode) metadataFields.claudeErrorCode = failedClaudeResult.errorCode;
-    emitEvent(
-      events,
-      {
-        eventType: "HUMAN_APPROVAL_REQUIRED",
-        runId,
-        projectId: manifest.projectId,
-        taskId: taskDef.id,
-        executionPhase: "review",
-        outcome: "BLOCKED",
-        humanInterventionRequired: true,
-        reason: `orchestrator status=${finalState.status}`,
-        ...(Object.keys(metadataFields).length > 0 ? { metadata: metadataFields } : {}),
-      },
-      auditFailures
-    );
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 이 generic HUMAN_APPROVAL_REQUIRED("orchestrator
+    // status=...")는 approval.ts에서 ORCHESTRATOR_NOT_APPROVED_GENERIC으로 분류되어 실제
+    // Telegram APPROVE 버튼을 만든다(remotelyApprovable=true). REVIEW_CYCLE_EXHAUSTED/
+    // REVIEW_BLOCKED(및 CHECKPOINT_SCOPE_VIOLATION — 이 분기가 아니라 checkpoint 실패 분기에서
+    // 별도 처리됨)는 이미 canonical Human Gate Policy상 기술적 자동 복구 대상이므로(§
+    // human-gate-policy.ts), 이 경우까지 실제 사람에게 APPROVE 버튼을 보내면 자동 복구가 끝나기
+    // 전에 사람이 오래된 버튼을 눌러 혼란을 주거나(실제 재실행은 막히지만 — §
+    // performAutoResume의 STALE_APPROVAL_UNEXPECTED_STATE 재검사 — 불필요한 알림 자체가
+    // 문제다), "실제 사람 판단이 필요한 경우에만 Telegram을 쓴다"는 정책에 어긋난다. 기술적
+    // 자동 복구 대상이면 이 event를 아예 만들지 않는다 — RUN_BLOCKED(아래, 항상 기록됨)와
+    // orchestrator.ts 자신의 REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED event만으로 audit
+    // 기록/대시보드 집계는 이미 충분하다(둘 다 이 generic event에 의존하지 않는다).
+    if (!isTechnicalAutoRecoverableWaitingHuman(finalState)) {
+      emitEvent(
+        events,
+        {
+          eventType: "HUMAN_APPROVAL_REQUIRED",
+          runId,
+          projectId: manifest.projectId,
+          taskId: taskDef.id,
+          executionPhase: "review",
+          outcome: "BLOCKED",
+          humanInterventionRequired: true,
+          reason: `orchestrator status=${finalState.status}`,
+          ...(Object.keys(metadataFields).length > 0 ? { metadata: metadataFields } : {}),
+        },
+        auditFailures
+      );
+    }
     emitEvent(
       events,
       {

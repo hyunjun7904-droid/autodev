@@ -132,7 +132,9 @@ async function main(): Promise<void> {
           ? `outcome=${continuousResult.stop.outcome}${continuousResult.stop.reason ? `, reason=${continuousResult.stop.reason}` : ""}`
           : continuousResult.stop.kind === "LIVELOCK_NO_PROGRESS"
             ? `taskId=${continuousResult.stop.taskId}`
-            : `maxIterations=${continuousResult.stop.maxIterations}`;
+            : continuousResult.stop.kind === "MAX_ITERATIONS_REACHED"
+              ? `maxIterations=${continuousResult.stop.maxIterations}`
+              : `maxTechnicalRecoveryAttempts=${continuousResult.stop.maxTechnicalRecoveryAttempts}, taskId=${continuousResult.stop.taskId ?? "(unknown)"}`;
       console.log(
         `[run] continuous 종료: ${continuousResult.iterations.length}회 실행, stop=${continuousResult.stop.kind}(${stopDetail})`
       );

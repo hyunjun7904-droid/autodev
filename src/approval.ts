@@ -45,7 +45,9 @@ export type ApprovalType =
 
 const HIGH_RISK_PREGATE_PREFIX = "고위험 작업 감지(";
 const AUDIT_STORE_UNAVAILABLE_PREFIX = "AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT";
-const CHECKPOINT_SCOPE_VIOLATION_REASON = "예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다.";
+// human-gate-policy.ts가 checkpoint.ts의 실제 scope-violation 실패 사유와 이 값을
+// 정확히 대조해 "기술적 자동 복구 대상"을 판정한다(단일 출처 — 값을 복제하지 않는다).
+export const CHECKPOINT_SCOPE_VIOLATION_REASON = "예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다.";
 const ORCHESTRATOR_STATUS_PREFIX = "orchestrator status=";
 
 /** event.eventType + 고정 템플릿 reason만으로 approvalType을 판정한다(LLM 재분류 없음,

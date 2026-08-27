@@ -1,5 +1,7 @@
 import { runAutodevOnce } from "./autodev";
 import type { AutodevRunOptions, AutodevRunResult, AutodevRunOutcome } from "./autodev";
+import { loadState } from "./state";
+import { isTechnicalAutoRecoverableWaitingHuman } from "./human-gate-policy";
 
 // AutoDev Generic Continuous Runner.
 //
@@ -27,15 +29,34 @@ import type { AutodevRunOptions, AutodevRunResult, AutodevRunOutcome } from "./a
 //   - "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW" → Human Final Review(HFR) PENDING.
 //   - "BLOCKED_PROJECT_LOCK"                 → 다른 프로세스가 이미 이 project를 쓰는 중.
 //   - "BLOCKED_REMOTE_GIT"                   → Remote Git Safety가 시작 자체를 막음.
-// 이 파일은 이 여섯 가지를 각각 다시 판정하지 않는다 — "CONTINUABLE_OUTCOME이 아니면 멈춘다"는
-// 단일 규칙이 Task Prompt가 요구하는 모든 STOP 조건을 그대로 커버한다(새 상태 체계를 만들지
-// 않는다).
+//
+// AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 위 여섯 가지 중 "RAN_TASK_NOT_APPROVED"와
+// "RAN_TASK_CHECKPOINT_BLOCKED" 딱 두 가지만 예외다: 이 두 outcome이 실제로 만든
+// WAITING_HUMAN이 human-gate-policy.ts의 canonical 판정으로 "기술적 자동 복구 대상"이면
+// (scope violation/REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED — 실제 사람 판단이 필요한 사유가
+// 아님) 이 loop는 멈추지 않고 runOnce()를 다시 호출한다. 그 다음 호출 자신의 canonical
+// 재검사(autodev.ts)가 state.status를 READY로 되돌리고 leftover를 정리한다 — 이 파일은
+// state.json을 직접 쓰지 않는다(production state transition은 항상 autodev.ts 하나가
+// 담당한다는 기존 원칙을 그대로 유지, § autodev.ts human-gate-policy 재검사 블록). 나머지
+// 네 outcome(STOPPED/HFR/두 BLOCKED_*)은 이 판정 대상이 아니다 — 이 파일은 그 넷을 각각
+// 다시 판정하지 않는다(새 상태 체계를 만들지 않는다).
 //
 // runAutodevOnce()가 던지는 예외(처리되지 않은 fatal/unrecoverable 오류)는 여기서 삼키지
 // 않고 그대로 다시 던진다 — 무슨 일이 있었는지 알 수 없는 상태에서 조용히 다음 task로
 // 넘어가지 않는다(fail-closed, § autodev.ts의 catch(err){ lockShouldRelease=false; throw err; }
 // 와 동일한 원칙을 이 바깥 loop도 그대로 따른다).
 const CONTINUABLE_OUTCOME: AutodevRunOutcome = "RAN_TASK_APPROVED_AND_CHECKPOINTED";
+
+/** 이 두 outcome만 "WAITING_HUMAN으로 끝났을 수 있는" 결과다(§ 파일 상단 주석) — 기술적
+ *  자동 복구 재검사 대상은 이 집합으로 고정한다(다른 네 outcome은 절대 포함하지 않는다). */
+const WAITING_HUMAN_OUTCOMES: ReadonlySet<AutodevRunOutcome> = new Set(["RAN_TASK_NOT_APPROVED", "RAN_TASK_CHECKPOINT_BLOCKED"]);
+
+/** maxIterations(task 진행 backstop)와 별개의 예산 — 반복 횟수 자체로 사람 승인을 강제하지
+ *  않는다는 정책(§ human-gate-policy.ts)과, 진짜 무한루프 버그로부터 리소스를 보호해야 한다는
+ *  요구를 함께 만족시킨다. 이 상한에 도달해도 project-state.json을 WAITING_HUMAN으로 강제
+ *  전환하지 않는다 — 이 continuous 실행(프로세스 1회)의 예산을 다 썼다는 뜻일 뿐이며, 다음
+ *  실행(재시작)이 다시 canonical 판정부터 시작한다. */
+const DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS = 50;
 
 export interface ContinuousRunnerOptions extends AutodevRunOptions {
   /**
@@ -48,10 +69,16 @@ export interface ContinuousRunnerOptions extends AutodevRunOptions {
    * 주입한 manifest)에서 유도한 값이다.
    */
   maxIterations?: number;
+  /**
+   * 기술적(사람 판단 불필요) WAITING_HUMAN 자동 복구 재시도의 최대 횟수 — maxIterations와는
+   * 별개의 예산이다(§ DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS 상단 주석). 지정하지 않으면
+   * 기본값(50)을 쓴다.
+   */
+  maxTechnicalRecoveryAttempts?: number;
 }
 
 export interface ContinuousRunnerIterationRecord {
-  /** 1부터 시작하는 순번. */
+  /** 1부터 시작하는 순번(기술적 자동 복구 재시도 포함, 실제 runOnce() 호출마다 1씩 증가). */
   iteration: number;
   result: AutodevRunResult;
 }
@@ -61,7 +88,12 @@ export type ContinuousRunnerStopReason =
   /** 같은 taskId가 이 연속 실행 안에서 두 번 "checkpoint 완료"로 보고됨 — project-state가
    *  실제로는 진행되지 않고 있다는 뜻이라 즉시 멈춘다. */
   | { kind: "LIVELOCK_NO_PROGRESS"; taskId: string }
-  | { kind: "MAX_ITERATIONS_REACHED"; maxIterations: number };
+  | { kind: "MAX_ITERATIONS_REACHED"; maxIterations: number }
+  /** 기술적 WAITING_HUMAN 자동 복구를 maxTechnicalRecoveryAttempts회 넘게 반복했다 — 사람
+   *  판단이 필요해진 것은 아니다(§ human-gate-policy.ts), 이 프로세스 1회의 리소스 예산을
+   *  다 썼다는 순수 안전장치일 뿐이다. project-state.json은 여전히 WAITING_HUMAN(기술적)
+   *  상태로 남으며, 다음 실행이 다시 canonical 판정부터 자동으로 이어간다. */
+  | { kind: "TECHNICAL_RECOVERY_LIMIT_REACHED"; maxTechnicalRecoveryAttempts: number; taskId?: string };
 
 export interface ContinuousRunnerResult {
   /** 이번 연속 실행이 실제로 수행한 runAutodevOnce() 호출 기록(순서대로). */
@@ -93,33 +125,80 @@ export async function runAutodevContinuous(
   if (!opts || !opts.manifest) {
     throw new Error("runAutodevContinuous: manifest가 필요합니다 — runAutodevOnce()와 동일한 요구사항입니다.");
   }
-  const { maxIterations: explicitMaxIterations, ...runOptions } = opts;
+  const { maxIterations: explicitMaxIterations, maxTechnicalRecoveryAttempts: explicitMaxTechnicalRecoveryAttempts, ...runOptions } = opts;
   const maxIterations = explicitMaxIterations ?? opts.manifest.taskRegistry.length + 1;
   if (!Number.isInteger(maxIterations) || maxIterations < 1) {
     throw new Error(`runAutodevContinuous: maxIterations는 1 이상의 정수여야 합니다(받은 값: ${maxIterations}).`);
   }
+  const maxTechnicalRecoveryAttempts = explicitMaxTechnicalRecoveryAttempts ?? DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS;
+  if (!Number.isInteger(maxTechnicalRecoveryAttempts) || maxTechnicalRecoveryAttempts < 0) {
+    throw new Error(`runAutodevContinuous: maxTechnicalRecoveryAttempts는 0 이상의 정수여야 합니다(받은 값: ${maxTechnicalRecoveryAttempts}).`);
+  }
   const runOnce = testDeps.runOnce ?? runAutodevOnce;
+  const statePathForRecoveryCheck = runOptions.statePath ?? opts.manifest.statePath;
 
   const iterations: ContinuousRunnerIterationRecord[] = [];
   const completedTaskIdsSeenThisRun = new Set<string>();
+  // taskAdvancementCount: 기존 for-loop의 maxIterations backstop과 정확히 같은 것을 센다
+  // (CONTINUABLE_OUTCOME으로 실제 task 진행이 있었던 호출 수). 기술적 자동 복구 재시도는
+  // 이 예산을 소모하지 않는다 — 그 재시도는 별도의 technicalRecoveryCount로만 제한한다(§
+  // 파일 상단 주석 — "반복 횟수 자체로 사람 승인을 요구하지 않는다"는 정책과, 기존
+  // maxIterations의 "task 진행" 의미를 둘 다 그대로 지키기 위함).
+  let taskAdvancementCount = 0;
+  let technicalRecoveryCount = 0;
+  let iterationNumber = 0;
 
-  for (let iteration = 1; iteration <= maxIterations; iteration++) {
+  while (true) {
+    if (taskAdvancementCount >= maxIterations) {
+      return {
+        iterations,
+        stop: { kind: "MAX_ITERATIONS_REACHED", maxIterations },
+        finalResult: iterations[iterations.length - 1].result,
+      };
+    }
+
+    iterationNumber += 1;
     const result: AutodevRunResult = await runOnce(runOptions as AutodevRunOptions);
-    iterations.push({ iteration, result });
+    iterations.push({ iteration: iterationNumber, result });
 
-    if (result.outcome !== CONTINUABLE_OUTCOME) {
-      return { iterations, stop: { kind: "OUTCOME_STOP", outcome: result.outcome, reason: result.reason }, finalResult: result };
+    if (result.outcome === CONTINUABLE_OUTCOME) {
+      taskAdvancementCount += 1;
+      // 실제 task 진행이 있었으므로 기술적 자동 복구 예산을 다음 task를 위해 새로 채운다.
+      technicalRecoveryCount = 0;
+      if (!result.taskId || completedTaskIdsSeenThisRun.has(result.taskId)) {
+        return { iterations, stop: { kind: "LIVELOCK_NO_PROGRESS", taskId: result.taskId ?? "(unknown)" }, finalResult: result };
+      }
+      completedTaskIdsSeenThisRun.add(result.taskId);
+      continue;
     }
 
-    if (!result.taskId || completedTaskIdsSeenThisRun.has(result.taskId)) {
-      return { iterations, stop: { kind: "LIVELOCK_NO_PROGRESS", taskId: result.taskId ?? "(unknown)" }, finalResult: result };
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — RAN_TASK_NOT_APPROVED/RAN_TASK_CHECKPOINT_BLOCKED
+    // 는 WAITING_HUMAN으로 끝났을 수 있다. 이 project-state.json을 다시 읽어 canonical
+    // Human Gate Policy로 재검사한다 — 기술적 자동 복구 대상이면 이 loop는 state를 직접
+    // 건드리지 않고(그 mutation은 항상 autodev.ts 하나가 담당) 그대로 runOnce()를 다시
+    // 호출한다. 다음 호출 자신의 canonical 재검사가 READY 전환 + leftover 정리를 수행한다.
+    if (WAITING_HUMAN_OUTCOMES.has(result.outcome)) {
+      let recoverable = false;
+      try {
+        recoverable = isTechnicalAutoRecoverableWaitingHuman(loadState(statePathForRecoveryCheck));
+      } catch {
+        // state.json을 읽을 수 없으면(손상/삭제 등) fail-closed로 사람 판단이 필요한
+        // 것으로 취급한다 — 확인하지 못한 상태를 자동 복구 대상으로 추측하지 않는다.
+        recoverable = false;
+      }
+      if (recoverable) {
+        technicalRecoveryCount += 1;
+        if (technicalRecoveryCount > maxTechnicalRecoveryAttempts) {
+          return {
+            iterations,
+            stop: { kind: "TECHNICAL_RECOVERY_LIMIT_REACHED", maxTechnicalRecoveryAttempts, taskId: result.taskId },
+            finalResult: result,
+          };
+        }
+        continue;
+      }
     }
-    completedTaskIdsSeenThisRun.add(result.taskId);
+
+    return { iterations, stop: { kind: "OUTCOME_STOP", outcome: result.outcome, reason: result.reason }, finalResult: result };
   }
-
-  return {
-    iterations,
-    stop: { kind: "MAX_ITERATIONS_REACHED", maxIterations },
-    finalResult: iterations[iterations.length - 1].result,
-  };
 }

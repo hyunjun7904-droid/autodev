@@ -9,6 +9,7 @@ import { scanChangesForSecrets } from "./secret-scanner";
 import type { SecretFinding } from "./secret-scanner";
 import { scanChangesForDependencyRisk, npmAuditVulnerabilitySource } from "./dependency-scanner";
 import type { DependencyFinding, DependencyScanVerdict, VulnerabilityAuditSource } from "./dependency-scanner";
+import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 
 // 자동 Git CHECKPOINT — GPT 승인(Critical 0 / High 0) + 필수 테스트 전부 PASS일 때만
 // commit을 만든다. commit 대상은 해당 task가 실제로 바꾼(allowedPathPrefixes 안의) 파일만
@@ -146,7 +147,7 @@ export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformChec
   if (plan.unexpected.length > 0) {
     const unexpectedFiles = plan.unexpected.map((c) => c.path);
     log("checkpoint BLOCK — allowedPathPrefixes 밖 예상치 못한 변경 발견", { taskId: taskDef.id, unexpectedFiles });
-    return { ok: false, reason: "예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다.", unexpectedFiles };
+    return { ok: false, reason: CHECKPOINT_SCOPE_VIOLATION_REASON, unexpectedFiles };
   }
   if (plan.allowed.length === 0) {
     return { ok: false, reason: "commit할 변경 파일이 없습니다." };

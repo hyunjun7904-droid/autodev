@@ -1241,6 +1241,168 @@ async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeN
   );
 }
 
+// AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Canonical Human Gate Policy(§ human-gate-policy.ts)
+// 기반 기술적 WAITING_HUMAN 자동 복구. REQUIRED_TEST_CONFIGURATION_ERROR 외에도
+// REVIEW_CYCLE_EXHAUSTED/CHECKPOINT_SCOPE_VIOLATION/REVIEW_BLOCKED로 저장된 과거 WAITING_HUMAN은
+// Telegram 승인 없이 자동으로 READY로 복구되어 같은 task가 재개돼야 한다.
+async function scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    lastGptDecision: { decision: "REVISE", severity: { critical: 0, high: 0, medium: 1 }, feedback: "테스트: REVISE 반복", nextTask: null },
+    deferredHumanTasks: [
+      "REVIEW_CYCLE_EXHAUSTED: REVISE가 MAX_REVIEW_CYCLES(5)회 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리 불가).",
+    ],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-review-cycle-recovery.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: REVIEW_CYCLE_EXHAUSTED 자동복구 이후 정상 진행",
+      changedFiles: ["proj/marker-review-cycle-recovery.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check(
+    "REVIEW_CYCLE_EXHAUSTED 자동복구: Telegram 승인 없이 같은 task가 재개되어 checkpoint까지 도달",
+    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+  check("REVIEW_CYCLE_EXHAUSTED 자동복구: Claude Developer가 정상적으로 재호출됨", claudeCalls === 1);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("REVIEW_CYCLE_EXHAUSTED 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+  check(
+    "REVIEW_CYCLE_EXHAUSTED 자동복구: 옛 deferredHumanTasks 마커가 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.includes("REVIEW_CYCLE_EXHAUSTED"))
+  );
+}
+
+// CHECKPOINT_SCOPE_VIOLATION은 GPT Reviewer가 아니라 Core checkpoint 자신의 독립 판정(§
+// checkpoint.ts plan.unexpected)으로도 발생할 수 있다(Reviewer는 PASS했지만 범위 밖 파일이
+// 남아있던 경우) — 이 leftover는 state.lastGptDecision.scopeViolations에는 없고 오직
+// deferredHumanTasks의 CHECKPOINT_BLOCKED 마커 안에만 있다. 자동 복구가 이 마커에서도 정리
+// 대상을 추출해(§ human-gate-policy.ts extractCheckpointScopeViolationFiles) 정리하는지 검증한다.
+async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover(): Promise<void> {
+  const repo = makeTempGitRepo();
+  writeRepoFile(repo, "other/leftover-from-checkpoint-block.txt", "leftover\n");
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null },
+    deferredHumanTasks: [
+      "CHECKPOINT_BLOCKED(P1.2): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다. — unexpected: other/leftover-from-checkpoint-block.txt",
+    ],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2, allowedPathPrefixes=["proj/"]
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-checkpoint-block-recovery.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: CHECKPOINT_SCOPE_VIOLATION 자동복구 이후 정상 진행",
+      changedFiles: ["proj/marker-checkpoint-block-recovery.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check(
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구: Telegram 승인 없이 같은 task가 재개되어 checkpoint까지 도달",
+    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+  check("CHECKPOINT_SCOPE_VIOLATION 자동복구: Claude Developer가 정상적으로 재호출됨", claudeCalls === 1);
+  check(
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구: GPT가 보고하지 않은 leftover도 checkpoint 마커 기반으로 정리됨",
+    !existsSync(join(repo, "other/leftover-from-checkpoint-block.txt"))
+  );
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("CHECKPOINT_SCOPE_VIOLATION 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+}
+
+// 실제 비용이 얽힌 WAITING_HUMAN(BUDGET_EXCEEDED)은 canonical policy로도 절대 자동 복구되지
+// 않아야 한다 — humanFinalReview gate와 무관한 별도 보호 경로를 직접 증명한다.
+async function scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    deferredHumanTasks: ["BUDGET_EXCEEDED: 테스트 — 예산 상한 초과"],
+  });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  const result = await runAutodevOnce({ manifest });
+
+  check("BUDGET_EXCEEDED 보호: 기술적 자동 복구 대상이 아니므로 STOPPED 유지", result.outcome === "STOPPED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("BUDGET_EXCEEDED 보호: status가 여전히 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "BUDGET_EXCEEDED 보호: deferredHumanTasks 마커가 그대로 보존됨(자동 삭제되지 않음)",
+    finalState.deferredHumanTasks.some((t) => t.includes("BUDGET_EXCEEDED"))
+  );
+}
+
+// Secret/Dependency Scanner Gate로 인한 CHECKPOINT_BLOCKED(scope violation과 다른 사유)는
+// 절대 자동 복구되지 않아야 한다 — 마커 텍스트가 CHECKPOINT_SCOPE_VIOLATION_REASON과 다르면
+// fail-closed로 GENUINE_HUMAN_JUDGMENT로 남는다는 것을 직접 증명한다.
+async function scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트", nextTask: null },
+    deferredHumanTasks: [
+      "CHECKPOINT_BLOCKED(P1.2): commit 대상 파일에서 secret으로 의심되는 패턴이 발견되어 commit을 중단했습니다.",
+    ],
+  });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  const result = await runAutodevOnce({ manifest });
+
+  check("Secret Scanner 보호: scope violation과 다른 사유의 CHECKPOINT_BLOCKED는 자동 복구되지 않음", result.outcome === "STOPPED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("Secret Scanner 보호: status가 여전히 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+}
+
+// AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED(기술적 자동 복구 대상)로
+// 끝난 run은 generic HUMAN_APPROVAL_REQUIRED("orchestrator status=...") event를 만들지
+// 않아야 한다 — 그 event가 approval.ts에서 ORCHESTRATOR_NOT_APPROVED_GENERIC(실제 Telegram
+// APPROVE 버튼)으로 분류되기 때문에, 자동으로 복구될 사안에 불필요한 사람 승인 알림을 보내지
+// 않는다는 것을 직접 증명한다. RUN_BLOCKED(대시보드 실패 집계 기준)와 orchestrator.ts 자신의
+// REVIEW_CYCLE_EXHAUSTED event는 그대로 기록되어야 한다(감사 기록/집계는 그대로 유지).
+async function scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2
+  const events = createInMemoryEventStore();
+
+  const claudeRunner = async (): Promise<ClaudeResult> => ({
+    success: true,
+    summary: "테스트: required test 항상 실패",
+    changedFiles: [],
+    tests: [{ name: "proj:check", pass: false }],
+    rawOutput: "",
+  });
+
+  const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
+  const all = events.query().events;
+  check(
+    "REVIEW_CYCLE_EXHAUSTED 알림 억제: generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 생성되지 않음(Telegram APPROVE 버튼 없음)",
+    !all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
+  );
+  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: RUN_BLOCKED event는 그대로 기록됨(대시보드 실패 집계 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
+  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: orchestrator의 REVIEW_CYCLE_EXHAUSTED event는 그대로 기록됨(감사 기록 유지)", all.some((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED"));
+}
+
 async function scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
@@ -1543,6 +1705,11 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman();
     await scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper();
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
+    await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
+    await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
+    await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();
+    await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();
+    await scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();

@@ -37,6 +37,7 @@
     "test:continuous-runner": "npm run build && node dist/continuous-runner-tests.js",
     "test:task-registry": "npm run build && node dist/task-registry-tests.js",
     "test:required-test-preflight": "npm run build && node dist/required-test-preflight-tests.js",
+    "test:human-gate-policy": "npm run build && node dist/human-gate-policy-tests.js",
     "test:failure-stagnation": "npm run build && node dist/failure-stagnation-tests.js",
     "test:problem-memory": "npm run build && node dist/problem-memory-tests.js",
     "test:round-status": "npm run build && node dist/round-status-tests.js",

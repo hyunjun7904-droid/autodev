@@ -209,53 +209,120 @@ async function scenarioHumanFinalReviewPendingStopsImmediately(): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// E — checkpoint 자체가 BLOCK(허용 경로 밖 변경) → 즉시 STOP, 다음 task 실행 금지.
+// E — AutoDev / JARVIS 신뢰성 보완(2026-08-27) — checkpoint가 scope violation(허용 경로 밖
+// 변경)으로 BLOCK되면, 이는 canonical Human Gate Policy상 기술적 자동 복구 대상이다(§
+// human-gate-policy.ts) — Telegram 승인 없이 continuous runner가 스스로 재시도하고, 다음
+// 시도가 올바른 위치에 구현하면 그대로 checkpoint까지 진행되며 나머지 task도 이어진다.
 // ---------------------------------------------------------------------------
-async function scenarioCheckpointBlockedStopsImmediately(): Promise<void> {
+async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
 
   const calls: string[] = [];
+  let firstAttemptDone = false;
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
     calls.push(task);
-    writeRepoFile(repo, "other/unexpected.txt", "허용 경로 밖 변경");
-    return { success: true, summary: "테스트: 허용 경로 밖 변경", changedFiles: ["other/unexpected.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+    if (!firstAttemptDone) {
+      firstAttemptDone = true;
+      writeRepoFile(repo, "other/unexpected.txt", "허용 경로 밖 변경(1차 시도)");
+      return {
+        success: true,
+        summary: "테스트: 허용 경로 밖 변경(1차 시도)",
+        changedFiles: ["other/unexpected.txt"],
+        tests: [{ name: "proj:check", pass: true }],
+        rawOutput: "",
+      };
+    }
+    const fileName = `proj/marker-${calls.length}.txt`;
+    writeRepoFile(repo, fileName, task);
+    return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
 
   const result = await runAutodevContinuous({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
-  check("E) checkpoint BLOCK: 정확히 1회만 호출되고 즉시 STOP", result.iterations.length === 1);
-  check("E) outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.iterations[0].result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
-  check("E) T2는 실행되지 않음", calls.length === 1);
+  check("E) 1차 시도: outcome=RAN_TASK_CHECKPOINT_BLOCKED(기술적, scope violation)", result.iterations[0].result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check(
+    "E) Telegram 승인 없이 자동으로 재시도되어 T1이 checkpoint까지 도달(2번째 호출)",
+    result.iterations[1].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[1].result.taskId === "T1"
+  );
+  check("E) 이전 시도의 leftover(허용 경로 밖 파일)가 자동 정리됨", !existsSync(join(repo, "other", "unexpected.txt")));
+  check("E) 자동 복구 이후 나머지 task(T2/T3)도 정상적으로 이어져 project complete로 종료", result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "STOPPED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("E) completedTasks 변화 없음, status=WAITING_HUMAN", finalState.completedTasks.length === 0 && finalState.status === "WAITING_HUMAN");
+  check("E) 최종 completedTasks=[T1,T2,T3]", JSON.stringify(finalState.completedTasks) === JSON.stringify(["T1", "T2", "T3"]));
+  check("E) 최종 status가 WAITING_HUMAN이 아님(사람 승인 필요 없이 끝까지 진행됨)", (finalState.status as unknown as string) !== "WAITING_HUMAN");
 }
 
 // ---------------------------------------------------------------------------
-// F — Required Test 실패 → REVISE 반복 → REVIEW_CYCLE_EXHAUSTED → STOP, 다음 task 실행 금지.
+// F — AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Required Test 실패가 REVISE 반복 →
+// REVIEW_CYCLE_EXHAUSTED로 끝나는 것도 기술적 자동 복구 대상이다 — Telegram 승인 없이
+// continuous runner가 스스로 재시도하고, 다음 시도가 실제로 테스트를 통과시키면 그대로
+// 진행된다.
 // ---------------------------------------------------------------------------
-async function scenarioRequiredTestFailureStopsImmediately(): Promise<void> {
+async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
 
   const calls: string[] = [];
+  let callCount = 0;
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
+    callCount += 1;
     calls.push(task);
-    return { success: true, summary: "테스트: required test 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
+    // 처음 5회(1차 시도의 REVISE 반복 5 cycle 전부)는 계속 실패한다 — REVIEW_CYCLE_EXHAUSTED에
+    // 도달할 때까지. reviewer가 PASS라고 해도 실패한 required test는 orchestrator.ts의 기존
+    // 강제 REVISE 안전장치(hasFailedRequiredTest)가 덮어쓴다(§ 기존 F 시나리오와 동일 원리).
+    if (callCount <= 5) {
+      return { success: true, summary: "테스트: required test 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
+    }
+    // 6번째 호출부터(=자동 복구된 2차 시도)는 실제로 통과한다.
+    const fileName = `proj/marker-${callCount}.txt`;
+    writeRepoFile(repo, fileName, task);
+    return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
-  const passReviewerDespiteFailure = fakePassReviewer(); // reviewer가 PASS라고 해도 실패한
-  // required test는 orchestrator.ts의 기존 강제 REVISE 안전장치(hasFailedRequiredTest)가
-  // 덮어쓴다 — 이 파일은 그 판정을 다시 구현하지 않고 결과(outcome)만 관찰한다.
 
-  const result = await runAutodevContinuous({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: passReviewerDespiteFailure } });
+  const result = await runAutodevContinuous({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
-  check("F) required test 실패: 정확히 1회만 호출되고 즉시 STOP", result.iterations.length === 1);
-  check("F) outcome=RAN_TASK_NOT_APPROVED", result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED");
-  check("F) T2는 실행되지 않음(developer는 T1에 대해서만 REVISE 반복 호출됨)", calls.every((c) => c === "Task1 prompt"));
+  check("F) 1차 시도: outcome=RAN_TASK_NOT_APPROVED(REVIEW_CYCLE_EXHAUSTED)", result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED");
+  check("F) 1차 시도에서 developer가 정확히 5회 REVISE 반복 호출됨(전부 T1)", calls.slice(0, 5).every((c) => c === "Task1 prompt") && calls.slice(0, 5).length === 5);
+  check(
+    "F) Telegram 승인 없이 자동으로 재시도되어 T1이 checkpoint까지 도달(2번째 runOnce 호출)",
+    result.iterations[1].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[1].result.taskId === "T1"
+  );
+  check("F) 자동 복구 이후 project complete로 종료", result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "STOPPED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("F) completedTasks 변화 없음", finalState.completedTasks.length === 0);
+  check("F) 최종 completedTasks=[T1,T2,T3]", JSON.stringify(finalState.completedTasks) === JSON.stringify(["T1", "T2", "T3"]));
+}
+
+// ---------------------------------------------------------------------------
+// F2 — 기술적 자동 복구도 무한정은 아니다: maxTechnicalRecoveryAttempts를 넘으면 멈춘다(진짜
+// 무한루프 버그로부터의 순수 리소스 안전장치일 뿐 — 이 상한 도달 자체가 사람 판단 사유로
+// 격상되지는 않는다, § human-gate-policy.ts).
+// ---------------------------------------------------------------------------
+async function scenarioTechnicalRecoveryLimitStopsRunawayRetries(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  const manifest = buildManifest(repo, statePath);
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    // 항상 허용 경로 밖에만 써서 매번 CHECKPOINT_SCOPE_VIOLATION(기술적)으로 끝나게 한다 —
+    // 실제로는 있을 수 없는 "영원히 고쳐지지 않는 버그"를 흉내낸다.
+    writeRepoFile(repo, "other/always-wrong.txt", `attempt-${Date.now()}-${Math.random()}`);
+    return { success: true, summary: "테스트: 항상 허용 경로 밖 변경", changedFiles: ["other/always-wrong.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevContinuous(
+    { manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() }, maxTechnicalRecoveryAttempts: 3 },
+    {}
+  );
+
+  check("F2) stop.kind=TECHNICAL_RECOVERY_LIMIT_REACHED(maxTechnicalRecoveryAttempts=3)", result.stop.kind === "TECHNICAL_RECOVERY_LIMIT_REACHED");
+  check(
+    "F2) 정확히 maxTechnicalRecoveryAttempts+1회 시도 후 멈춤(최초 1회 + 재시도 3회)",
+    result.iterations.length === 4
+  );
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("F2) 상한 도달해도 project-state.json이 사람 승인이 필요한 상태로 위장되지 않음(여전히 기술적 WAITING_HUMAN)", finalState.status === "WAITING_HUMAN");
 }
 
 // ---------------------------------------------------------------------------
@@ -448,8 +515,9 @@ async function main(): Promise<void> {
     await scenarioMultiTaskContinuousToProjectComplete();
     await scenarioWaitingHumanStopsImmediately();
     await scenarioHumanFinalReviewPendingStopsImmediately();
-    await scenarioCheckpointBlockedStopsImmediately();
-    await scenarioRequiredTestFailureStopsImmediately();
+    await scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval();
+    await scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion();
+    await scenarioTechnicalRecoveryLimitStopsRunawayRetries();
     await scenarioSecretScannerBlockStopsImmediately();
     await scenarioLivelockAndMaxIterationsProtection();
     await scenarioProjectLockPreserved();

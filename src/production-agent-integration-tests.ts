@@ -571,7 +571,16 @@ async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
   check("event 기록: reviseCycle=5가 정확히 담김", exhausted?.reviseCycle === 5);
   check("event 기록: humanInterventionRequired=true", exhausted?.humanInterventionRequired === true);
   check("event 기록: REVIEW_REVISE가 5회(각 cycle) 기록됨", events.query({ eventType: "REVIEW_REVISE" }).events.length === 5);
-  check("event 기록: HUMAN_APPROVAL_REQUIRED도 함께 기록됨(run-level bookend)", events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 1);
+  // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED는 canonical Human Gate
+  // Policy상 기술적 자동 복구 대상이다(§ human-gate-policy.ts) — generic HUMAN_APPROVAL_REQUIRED
+  // ("orchestrator status=...") run-level bookend는 approval.ts에서 ORCHESTRATOR_NOT_APPROVED_
+  // GENERIC(실제 Telegram APPROVE 버튼)으로 분류되므로, 자동 복구될 사안에는 더 이상 만들지
+  // 않는다(§ autodev.ts) — REVIEW_CYCLE_EXHAUSTED event 자신(위에서 이미 검증)과 RUN_BLOCKED
+  // (아래)만으로 audit 기록/대시보드 집계는 충분하다.
+  check(
+    "event 기록: generic HUMAN_APPROVAL_REQUIRED bookend는 더 이상 기록되지 않음(기술적 자동 복구 대상 — Telegram 알림 억제)",
+    events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 0
+  );
   check(
     "event 기록: RUN_BLOCKED가 기록됨(RUN_COMPLETED가 아님)",
     events.query({ eventType: "RUN_BLOCKED" }).events.length === 1 && events.query({ eventType: "RUN_COMPLETED" }).events.length === 0

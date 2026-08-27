@@ -120,10 +120,11 @@ const CHILD_PROCESS_ENV_DENYLIST: readonly string[] = [
   "AUTODEV_TELEGRAM_BOT_TOKEN",
   "AUTODEV_TELEGRAM_CHAT_ID",
   "AUTODEV_TELEGRAM_USER_ID",
-  // AutoDev / JARVIS 지능형 오류 복구 하드닝 § 12/16 — ntfy가 이제 Telegram보다 우선하는
-  // 알림 채널이다(§ notification-provider-ntfy.ts) — 같은 이유(실제 알림 채널 credential이
-  // test/fixture 자식 프로세스로 새어 들어가 test event에 대해 진짜 알림이 트리거되는 것을
-  // 막는다)로 동일하게 방어한다.
+  // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — ntfy는 production에서 이미 완전히 은퇴했다
+  // (notification-provider-ntfy.ts는 selectDefault 경로 어디서도 더 이상 선택되지 않는다).
+  // 이 3개 항목은 그 은퇴 이전부터 존재하던 defense-in-depth를 그대로 유지할 뿐이다 — 혹시
+  // 남아있는 레거시 환경변수/스크립트가 있더라도 그 credential이 test/fixture 자식 프로세스로
+  // 새어 들어가 test event에 대해 진짜 알림이 트리거되는 일을 막는다.
   "AUTODEV_NTFY_TOPIC",
   "AUTODEV_NTFY_TOKEN",
   "AUTODEV_NTFY_BASE_URL",
