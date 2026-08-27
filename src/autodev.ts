@@ -1,4 +1,4 @@
-import { relative, sep } from "node:path";
+import { relative, sep, join } from "node:path";
 import { loadState, saveState } from "./state";
 import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
@@ -52,6 +52,9 @@ import { isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import { randomUUID } from "node:crypto";
 import { log } from "./logger";
+import { rmSync } from "node:fs";
+import { getWorkingTreeChanges } from "./git-changes";
+import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
@@ -903,6 +906,50 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 순차 처리한다 — 다른 task의 실패가 섞여 들어올 여지가 없다).
     if (state.lastClaudeResult && state.lastGptDecision && state.lastGptDecision.decision !== "PASS") {
       previousAttemptResult = state.lastClaudeResult;
+    }
+
+    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 7 —
+    // 직전 시도가 scope violation으로 BLOCK됐다면, 그 파일들을 이 attempt 시작 전에
+    // 결정론적으로 제거한다. Developer(LLM ACTION_REQUEST)에는 파일 삭제 action 자체가
+    // 없고(§ safe-executor.ts ExecutorAction), 이 파일들은 이미 이 task의 allowedPathPrefixes
+    // 밖이라 Developer가 WRITE_FILE로도 지울 수 없다 — 정리하지 않으면 Developer가 다음
+    // 시도에서 올바른 경로에 정확히 다시 구현해도(실제 JARVIS Task 2.1 재현에서 확인됨)
+    // Reviewer의 scope-violation 검사가 여전히 남아있는 옛 미승인 파일을 매번 다시 찾아내
+    // 영구히 BLOCK을 반복한다. 안전조건을 전부 만족할 때만 삭제한다:
+    //   1) 직전 GPT decision이 PASS가 아님(미승인 종료가 실제로 있었음)
+    //   2) 삭제 대상 경로가 state.lastGptDecision.scopeViolations에 정확히 그 문자열
+    //      그대로 나열돼 있음(추측/패턴 매칭 없음 — Reviewer 자신이 이미 내린 판정만 그대로
+    //      재사용한다)
+    //   3) 지금 다시 git으로 확인해도 실제로 untracked임(한 번도 commit된 적 없는 파일만
+    //      — tracked 파일, 즉 이미 커밋된 사용자/과거 작업은 이 경로로 절대 건드리지 않는다)
+    //   4) 이 task의 현재 allowedPathPrefixes 밖(범위 안 미완성 변경은 기존 "재개 감지"
+    //      로직이 이어서 진행하도록 그대로 보존한다 — 이 정리 대상과 절대 겹치지 않는다)
+    const lastGptDecisionForCleanup = state.lastGptDecision as (typeof state.lastGptDecision & { scopeViolations?: string[] }) | null;
+    if (
+      lastGptDecisionForCleanup &&
+      lastGptDecisionForCleanup.decision !== "PASS" &&
+      lastGptDecisionForCleanup.scopeViolations &&
+      lastGptDecisionForCleanup.scopeViolations.length > 0
+    ) {
+      const currentUntracked = new Set(getWorkingTreeChanges([], executorContext.projectRoot).untracked.map((c) => c.path));
+      const removable = lastGptDecisionForCleanup.scopeViolations.filter(
+        (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes)
+      );
+      for (const relPath of removable) {
+        try {
+          rmSync(join(executorContext.projectRoot, ...relPath.split("/")), { force: true });
+          log("직전 시도의 미승인 scope-violation 파일 정리(untracked, 허용 경로 밖 — commit 이력 없음)", {
+            taskId: taskDef.id,
+            path: relPath,
+          });
+        } catch (e) {
+          log("직전 시도의 미승인 scope-violation 파일 정리 실패(무시하고 계속 진행)", {
+            taskId: taskDef.id,
+            path: relPath,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
     }
 
     // AutoDev 신뢰성 보완(2026-08-27, "응답 형식 오류도 기존 문제 해결 흐름에 포함") — 이

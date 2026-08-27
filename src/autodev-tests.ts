@@ -1174,6 +1174,73 @@ async function scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDe
   );
 }
 
+// 필수 검증 — 직전 시도의 미승인 scope-violation 작업물을 attempt 시작 전에 결정론적으로
+// 정리한다(§ autodev.ts Phase 7). untracked + 현재 task의 allowedPathPrefixes 밖 + 직전
+// lastGptDecision.scopeViolations에 정확히 나열된 경우에만 삭제되고, tracked 파일이나
+// scopeViolations에 없는 파일, 허용 경로 안 파일은 절대 건드리지 않는다.
+async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt(): Promise<void> {
+  const repo = makeTempGitRepo();
+  // 허용 경로(proj/) 밖에 직전 시도가 남긴 untracked 파일 — 삭제 대상.
+  writeRepoFile(repo, "other/wrong-place.txt", "leftover\n");
+  // scopeViolations에 없는 untracked 파일 — 절대 건드리면 안 됨(범위 밖이라도 명시적으로
+  // 나열된 것만 삭제한다).
+  writeRepoFile(repo, "other/unrelated.txt", "unrelated\n");
+  // 허용 경로(proj/) 안의 untracked 파일이 실수로 scopeViolations에 나열돼도 삭제되면
+  // 안 됨(범위 안은 항상 "이어서 진행" 대상이지 정리 대상이 아니다).
+  writeRepoFile(repo, "proj/in-scope-leftover.txt", "in-scope\n");
+  // tracked(이미 commit된) 파일이 scopeViolations에 나열돼도 절대 삭제하면 안 됨 — 이미
+  // 커밋된 사용자/과거 작업을 이 경로로 지우지 않는다는 안전조건의 핵심 증거.
+  writeRepoFile(repo, "other/tracked-file.txt", "already committed\n");
+  spawnSync("git", ["add", "--", "other/tracked-file.txt"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "tracked file"], { cwd: repo });
+
+  const statePath = makeTempStateFile(repo, {
+    status: "READY",
+    lastClaudeResult: {
+      success: true,
+      summary: "이전 시도 요약",
+      changedFiles: ["other/wrong-place.txt"],
+      tests: [{ name: "x", pass: false }],
+      rawOutput: "",
+    },
+    lastGptDecision: {
+      decision: "BLOCK",
+      severity: { critical: 0, high: 0, medium: 1 },
+      feedback: "허용 경로 밖 변경입니다.",
+      nextTask: null,
+      scopeViolations: ["other/wrong-place.txt", "proj/in-scope-leftover.txt", "other/tracked-file.txt"],
+    } as unknown as ProjectState["lastGptDecision"],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2, allowedPathPrefixes=["proj/"]
+
+  const developerClaudeCaller = async (): Promise<RealClaudeResult> => ({
+    success: true,
+    summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "완료", changedFiles: [], testsRequested: [] }),
+    changedFiles: [],
+    tests: [],
+    rawOutput: "",
+  });
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+
+  check(
+    "scope-violation 정리: untracked + 허용 경로 밖 + scopeViolations에 정확히 나열된 파일은 삭제됨",
+    !existsSync(join(repo, "other/wrong-place.txt"))
+  );
+  check(
+    "scope-violation 정리: scopeViolations에 없는 untracked 파일은 삭제되지 않음(추측 삭제 금지)",
+    existsSync(join(repo, "other/unrelated.txt"))
+  );
+  check(
+    "scope-violation 정리: 허용 경로 안 파일은 scopeViolations에 나열돼도 삭제되지 않음(이어서 진행 대상 보존)",
+    existsSync(join(repo, "proj/in-scope-leftover.txt"))
+  );
+  check(
+    "scope-violation 정리: tracked(이미 commit된) 파일은 scopeViolations에 나열돼도 절대 삭제되지 않음",
+    existsSync(join(repo, "other/tracked-file.txt"))
+  );
+}
+
 async function scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
@@ -1475,6 +1542,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestConfigWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman();
     await scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper();
+    await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();
