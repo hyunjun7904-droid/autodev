@@ -1,7 +1,10 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { getDashboardSnapshot } from "./dashboard-snapshot-provider";
+import type { DashboardSnapshot } from "./dashboard-snapshot-provider";
 import { DASHBOARD_HTML } from "./dashboard-html";
+import { appendDashboardLog } from "./dashboard-log";
+import { join } from "node:path";
 
 // Local Operations Dashboard — 읽기 전용 HTTP server (Phase G Task G4.1).
 //
@@ -57,23 +60,85 @@ function sendHtml(res: ServerResponse, status: number, html: string): void {
   res.end(html);
 }
 
+// AutoDev 대시보드 서버 장애 원인분석·복구·하드닝 — 실제 재현된 결함: 이전에는 이 파일의
+// request handler가 getDashboardSnapshot()의 예외를 전혀 잡지 않았다. event 파일이 순간적으로
+// 없거나/잠겨 있거나/손상됐거나(§ 요구사항 4의 fault-injection 목록, 예: EISDIR/ENOENT/EACCES)
+// project adapter 설정이 잘못돼 있으면 그 예외가 이 request listener 밖으로 그대로 전파되어
+// Node의 HTTP 서버 전체가 uncaught exception으로 죽었다(직접 실제 서버로 재현해 확인함 —
+// eventsFilePath를 디렉터리로 바꿔 GET /api/snapshot 한 번으로 프로세스가 죽는 것을 관찰했다).
+// 이제 이 경계(§ trySnapshot)가 모든 snapshot 생성 예외를 흡수해 500/DEGRADED로만 응답하고
+// 프로세스는 항상 살아있게 한다 — 성공한 것처럼 응답하지 않고, 보안 오류를 무시하지도 않는다
+// (실제 실패는 정직하게 DEGRADED/500으로 드러낸다, 원문 예외 메시지/경로는 응답에 담지 않는다).
+type SnapshotAttempt = { ok: true; snapshot: DashboardSnapshot } | { ok: false; reason: string };
+
+function trySnapshot(eventsFilePath?: string): SnapshotAttempt {
+  try {
+    const snapshot = eventsFilePath !== undefined ? getDashboardSnapshot(eventsFilePath) : getDashboardSnapshot();
+    return { ok: true, snapshot };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.constructor.name : "UNKNOWN_ERROR" };
+  }
+}
+
+const DASHBOARD_LOG_PATH = join(process.cwd(), "logs", "dashboard.log");
+
 function createRequestHandler(eventsFilePath?: string) {
   return (req: IncomingMessage, res: ServerResponse): void => {
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      sendJson(res, 405, { error: "READ_ONLY_DASHBOARD_GET_ONLY" });
-      return;
+    // 클라이언트가 응답 중간에 연결을 끊으면(§ 요구사항 4 시나리오 16) res(ServerResponse)에
+    // 'error' 이벤트가 뜰 수 있다 — EventEmitter는 'error' 리스너가 하나도 없으면 그 예외를
+    // 다시 throw해 프로세스를 죽인다. 리스너를 달아 조용히 흡수한다(응답을 이미 보낼 수 없는
+    // 상태이므로 추가로 할 일이 없다 — 성공으로 위장하지 않는다, 그냥 로그만 남긴다).
+    res.on("error", () => {
+      appendDashboardLog(DASHBOARD_LOG_PATH, { event: "RESPONSE_STREAM_ERROR", path: req.url ?? "/" });
+    });
+
+    try {
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        sendJson(res, 405, { error: "READ_ONLY_DASHBOARD_GET_ONLY" });
+        return;
+      }
+      const path = (req.url ?? "/").split("?")[0];
+      if (path === "/api/snapshot") {
+        const attempt = trySnapshot(eventsFilePath);
+        if (attempt.ok) {
+          sendJson(res, 200, attempt.snapshot);
+        } else {
+          appendDashboardLog(DASHBOARD_LOG_PATH, { event: "SNAPSHOT_READ_FAILED", reason: attempt.reason });
+          sendJson(res, 500, { status: "DEGRADED", error: "SNAPSHOT_READ_FAILED" });
+        }
+        return;
+      }
+      if (path === "/health") {
+        const attempt = trySnapshot(eventsFilePath);
+        sendJson(res, 200, {
+          server: "UP",
+          snapshotSource: attempt.ok ? "OK" : "DEGRADED",
+          generatedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      if (path === "/" || path === "/index.html") {
+        sendHtml(res, 200, DASHBOARD_HTML);
+        return;
+      }
+      sendJson(res, 404, { error: "NOT_FOUND" });
+    } catch (e) {
+      // 위 분기 어디선가(예: sendJson/sendHtml 자체) 예외가 나도 마지막 방어선으로 여기서
+      // 흡수한다 — 이 서버는 읽기 전용 관측 도구일 뿐이므로 어떤 요청 하나의 실패도 서버
+      // 프로세스 전체를 끌고 내려가서는 안 된다.
+      appendDashboardLog(DASHBOARD_LOG_PATH, {
+        event: "REQUEST_HANDLER_EXCEPTION",
+        reason: e instanceof Error ? e.constructor.name : "UNKNOWN_ERROR",
+      });
+      if (!res.headersSent) {
+        try {
+          sendJson(res, 500, { status: "DEGRADED", error: "REQUEST_HANDLER_EXCEPTION" });
+        } catch {
+          // 응답조차 보낼 수 없는 상태(예: 소켓이 이미 닫힘) — 더 이상 손쓸 방법이 없으니
+          // 조용히 포기한다. 프로세스는 이미 안전하다(예외가 여기서 더 전파되지 않는다).
+        }
+      }
     }
-    const path = (req.url ?? "/").split("?")[0];
-    if (path === "/api/snapshot") {
-      const snapshot = eventsFilePath !== undefined ? getDashboardSnapshot(eventsFilePath) : getDashboardSnapshot();
-      sendJson(res, 200, snapshot);
-      return;
-    }
-    if (path === "/" || path === "/index.html") {
-      sendHtml(res, 200, DASHBOARD_HTML);
-      return;
-    }
-    sendJson(res, 404, { error: "NOT_FOUND" });
   };
 }
 
@@ -83,18 +148,44 @@ export function startDashboardServer(opts: DashboardServerOptions = {}): Promise
   const port = opts.port ?? DEFAULT_PORT;
   return new Promise((resolvePromise, reject) => {
     const server: Server = createServer(createRequestHandler(opts.eventsFilePath));
-    server.once("error", reject);
+    // § 요구사항 5 — startup 실패(예: EADDRINUSE)는 이 Promise를 reject해야 하지만, listen이
+    // 이미 성공한 뒤에 발생하는 'error'(드물지만 가능 — 예: accept 단계의 일시적 OS 오류)까지
+    // 조용히 삼키면 안 되면서도 프로세스를 죽여서는 안 된다. 이전 코드는 `server.once("error",
+    // reject)` 뒤 listen 성공 시 그 리스너를 완전히 제거했다 — 그 뒤로는 'error' 리스너가
+    // 하나도 없는 상태가 되어, listen 이후 서버에서 나는 어떤 'error'든 uncaught exception으로
+    // 프로세스를 죽일 수 있었다(EventEmitter는 'error' 리스너가 0개면 그 값을 throw한다). 이제
+    // 리스너를 절대 제거하지 않고, "아직 시작 전인가"만 플래그로 구분한다.
+    let started = false;
+    server.on("error", (err) => {
+      if (!started) {
+        reject(err);
+        return;
+      }
+      appendDashboardLog(DASHBOARD_LOG_PATH, {
+        event: "SERVER_ERROR",
+        port,
+        reason: err instanceof Error ? err.constructor.name : "UNKNOWN_ERROR",
+      });
+    });
     server.listen(port, LOCALHOST, () => {
-      server.removeListener("error", reject);
+      started = true;
       const address = server.address();
       const boundPort = typeof address === "object" && address !== null ? address.port : port;
+      appendDashboardLog(DASHBOARD_LOG_PATH, { event: "LISTENING", port: boundPort });
       resolvePromise({
         url: `http://${LOCALHOST}:${boundPort}`,
         host: LOCALHOST,
         port: boundPort,
         close: () =>
           new Promise((resolveClose, rejectClose) => {
-            server.close((err) => (err ? rejectClose(err) : resolveClose()));
+            server.close((err) => {
+              if (err) {
+                rejectClose(err);
+              } else {
+                appendDashboardLog(DASHBOARD_LOG_PATH, { event: "SHUTDOWN", port: boundPort });
+                resolveClose();
+              }
+            });
           }),
       });
     });
