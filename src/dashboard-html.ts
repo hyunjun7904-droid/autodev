@@ -360,6 +360,29 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("최근 외부 인공지능 호출 기록", html, true);
   }
 
+  function renderAttemptOutcomes(data) {
+    var ao = data.attemptOutcomes;
+    if (!ao || (ao.successCount === 0 && ao.failureCount === 0)) {
+      return card("작업 시도 결과(성공/실패 사례)", '<div class="empty">아직 확정된 시도(checkpoint 성공 또는 최종 차단)가 없습니다.</div>');
+    }
+    var html = row("성공 사례", fmtNum(ao.successCount), ao.successCount > 0 ? "GREEN" : "GRAY") +
+      row("실패 사례", fmtNum(ao.failureCount), ao.failureCount > 0 ? "YELLOW" : "GRAY");
+    var recent = ao.recent || [];
+    if (recent.length > 0) {
+      html += '<div class="tablewrap"><table class="calls"><thead><tr>' +
+        "<th>시각</th><th>작업</th><th>결과</th><th>사유</th>" +
+        "</tr></thead><tbody>";
+      recent.forEach(function (a) {
+        var tone = a.result === "SUCCESS" ? "GREEN" : "RED";
+        var label = a.result === "SUCCESS" ? "성공" : "실패";
+        html += "<tr><td>" + esc(fmtDateTime(a.occurredAt)) + "</td><td>" + orDash(a.taskId) + '</td><td class="value ' + tone + '">' +
+          label + "</td><td>" + esc(orDash(a.reason)) + "</td></tr>";
+      });
+      html += "</tbody></table></div>";
+    }
+    return card("작업 시도 결과(성공/실패 사례)", html, true);
+  }
+
   function renderCost(snap) {
     var u = snap.usage;
     var actual = fmtUsd(u.actualCostUsd);
@@ -478,6 +501,7 @@ export const DASHBOARD_HTML = `<!doctype html>
       renderUsage(data) +
       renderServiceUsage(data) +
       renderRecentCalls(data) +
+      renderAttemptOutcomes(data) +
       renderCost(snap) +
       renderSubscription(snap) +
       renderQuality(data) +

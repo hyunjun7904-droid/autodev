@@ -13,6 +13,8 @@ import type { ProblemSolvingSnapshot } from "./dashboard-problem-solving";
 import { createFileUsageLedger, resolveUsageLedgerFilePath, RUNTIME_USAGE_LEDGER_DIR } from "./usage-ledger";
 import { readRoundStatus, isRoundStatusLive, RUNTIME_ROUND_STATUS_PATH } from "./round-status";
 import type { RoundStatusSnapshot } from "./round-status";
+import { buildAttemptOutcomes } from "./dashboard-attempt-outcomes";
+import type { AttemptOutcomesSummary } from "./dashboard-attempt-outcomes";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -105,6 +107,10 @@ export interface DashboardSnapshot {
    *  일치하고 충분히 최근(§ ROUND_STATUS_MAX_AGE_MS)인 round-status.json 값이 있을 때만
    *  채워진다. 오래됐거나 다른 run/task의 값이면 undefined(추측해서 보여주지 않는다). */
   roundStatus?: RoundStatusSnapshot;
+  /** § dashboard-attempt-outcomes.ts — 이 project(projectId가 없으면 전체)의 실제 완료된
+   *  task attempt들을 CHECKPOINT_CREATED(성공)/RUN_BLOCKED(실패) event만으로 집계한다.
+   *  runId 하나도 기록된 적이 없으면(NO_RUN_YET) 이 필드 자체가 없다. */
+  attemptOutcomes?: AttemptOutcomesSummary;
 }
 
 // round-status.json은 claude CLI가 실제로 응답을 받은 round 시작 시점에만 갱신된다 — 그
@@ -201,5 +207,6 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, 
     problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId),
     callEfficiency: aggregateCallEfficiency(snapshot.taskId ? result.events.filter((e) => e.taskId === snapshot.taskId) : result.events),
     roundStatus,
+    attemptOutcomes: buildAttemptOutcomes(result.events, snapshot.projectId),
   };
 }

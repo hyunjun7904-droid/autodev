@@ -2,7 +2,7 @@ import { existsSync, unlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdir
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { runDeveloperTaskViaSafeExecutor } from "./claude-developer";
+import { runDeveloperTaskViaSafeExecutor, isPathWithinAllowedPrefixes } from "./claude-developer";
 import { PROJECT_ROOT, configureSafeExecutor, createSafeExecutorContext } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { RealClaudeResult, ClaudeErrorCode } from "./claude-runner";
@@ -391,6 +391,101 @@ async function scenarioT_requiredTestFailureEvidencePropagated(): Promise<void> 
     typeof t?.failureEvidence?.exitCode === "number" && t.failureEvidence.exitCode !== 0
   );
   check("T: failureEvidence.stderrTail에 실제 git 에러 메시지가 보존됨", (t?.failureEvidence?.stderrTail ?? "").length > 0);
+}
+
+// ---------------------------------------------------------------------------
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
+// isPathWithinAllowedPrefixes 순수 함수 검증(§ 필수 검증 44~46). 경로 세그먼트 경계에서만
+// 일치해야 한다 — "backend/device-trust/"가 "backend/device-trust-evil/"까지 허용된 것으로
+// 오판하면 안 된다.
+// ---------------------------------------------------------------------------
+function scenarioPathScope_normalSubpathAllowed(): void {
+  check("정상 하위 경로 허용: backend/example/manager.mjs", isPathWithinAllowedPrefixes("backend/example/manager.mjs", ["backend/example/"]));
+  check("접두사와 정확히 일치하는 디렉터리 자체도 허용", isPathWithinAllowedPrefixes("backend/example", ["backend/example/"]));
+}
+
+function scenarioPathScope_similarSiblingPrefixRejected(): void {
+  check(
+    "유사 접두사(sibling) 거부: backend/example-evil/x.mjs는 backend/example/에 포함되지 않음",
+    !isPathWithinAllowedPrefixes("backend/example-evil/x.mjs", ["backend/example/"])
+  );
+  check(
+    "유사 접두사(sibling) 거부: backend/device-trust-manager.mjs는 backend/device-trust/에 포함되지 않음(실제 JARVIS 재현)",
+    !isPathWithinAllowedPrefixes("backend/device-trust-manager.mjs", ["backend/device-trust/"])
+  );
+}
+
+function scenarioPathScope_dotDotEscapeRejected(): void {
+  check("상위 탈출(../) 거부: backend/example/../other/x.mjs", !isPathWithinAllowedPrefixes("backend/example/../other/x.mjs", ["backend/example/"]));
+  check("상위 탈출 시작 거부: ../backend/example/x.mjs", !isPathWithinAllowedPrefixes("../backend/example/x.mjs", ["backend/example/"]));
+}
+
+function scenarioPathScope_absolutePathsRejected(): void {
+  check("Windows 드라이브 절대경로 거부", !isPathWithinAllowedPrefixes("C:/backend/example/x.mjs", ["backend/example/"]));
+  check("POSIX 절대경로 거부", !isPathWithinAllowedPrefixes("/backend/example/x.mjs", ["backend/example/"]));
+  check("UNC 경로 거부", !isPathWithinAllowedPrefixes("//server/share/backend/example/x.mjs", ["backend/example/"]));
+}
+
+function scenarioPathScope_separatorNormalization(): void {
+  check("Windows 구분자(\\) 정규화 후 허용", isPathWithinAllowedPrefixes("backend\\example\\manager.mjs", ["backend/example/"]));
+  check("연속 구분자 정규화 후 허용", isPathWithinAllowedPrefixes("backend//example//manager.mjs", ["backend/example/"]));
+}
+
+function scenarioPathScope_caseSensitive(): void {
+  check("대소문자 불일치는 허용하지 않음(엄격 일치)", !isPathWithinAllowedPrefixes("Backend/Example/manager.mjs", ["backend/example/"]));
+}
+
+function scenarioPathScope_emptyOrMultiplePrefixes(): void {
+  check("빈 경로 거부", !isPathWithinAllowedPrefixes("", ["backend/example/"]));
+  check("여러 허용 경로 중 하나라도 일치하면 허용", isPathWithinAllowedPrefixes("backend/supabase/x.sql", ["backend/example/", "backend/supabase/"]));
+}
+
+// ---------------------------------------------------------------------------
+// 필수 검증 44 — WRITE_FILE이 이 task의 allowedPathPrefixes 밖을 가리키면 실제 Safe
+// Executor를 호출하지 않고 즉시 거부하고, Developer는 그 denyReason을 보고 같은 attempt
+// 안에서 스스로 올바른 경로로 재시도할 수 있어야 한다(사람 대기 없이).
+// ---------------------------------------------------------------------------
+async function scenarioAC_writeOutsideAllowedPathPrefixesIsDeniedBeforeSafeExecutorThenRecovers(): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "claude-developer-scope-gate-"));
+  try {
+    spawnSync("git", ["init", "-q"], { cwd: root });
+    spawnSync("git", ["config", "user.email", "claude-developer-tests@example.com"], { cwd: root });
+    spawnSync("git", ["config", "user.name", "Claude Developer Tests"], { cwd: root });
+
+    const policy: ProjectExecutionPolicy = {
+      allowedReadPrefixes: ["backend/"],
+      allowedWritePrefixes: ["backend/"],
+      allowedCommands: [],
+    };
+    const executor = createSafeExecutorContext(root, policy);
+
+    // 1라운드: 허용 경로(backend/example/) 밖(backend/example-evil/)에 WRITE_FILE 시도 —
+    // 실제 파일이 디스크에 쓰이면 안 된다. 2라운드: 거부 사유를 보고 올바른 경로로 재시도해
+    // 정상 성공한다.
+    const wrongPathWrite = JSON.stringify({
+      type: "ACTION_REQUEST",
+      actions: [{ type: "WRITE_FILE", path: "backend/example-evil/manager.mjs", content: "wrong\n" }],
+    });
+    const correctPathWrite = JSON.stringify({
+      type: "ACTION_REQUEST",
+      actions: [{ type: "WRITE_FILE", path: "backend/example/manager.mjs", content: "correct\n" }],
+    });
+    const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "올바른 경로로 재작성 완료", changedFiles: ["backend/example/manager.mjs"], testsRequested: [] });
+    const scripted = makeScriptedClaudeCaller([wrongPathWrite, correctPathWrite, taskComplete]);
+
+    const result = await runDeveloperTaskViaSafeExecutor("경로 보호 시나리오(범위 밖 쓰기 차단 후 자체 복구)", 1, {
+      claudeCaller: scripted.call,
+      allowedPathPrefixes: ["backend/example/"],
+      executor,
+    });
+
+    check("AC: 범위 밖 파일이 실제 디스크에 쓰이지 않음", !existsSync(join(root, "backend/example-evil/manager.mjs")));
+    check("AC: 올바른 경로 재시도 이후 정상 성공(TASK_COMPLETE)", result.success === true);
+    check("AC: 올바른 경로의 파일은 실제로 작성됨", existsSync(join(root, "backend/example/manager.mjs")));
+    check("AC: 추가 REVISE 라운드 없이 정확히 3라운드(거부→재시도→완료)만 소모", scripted.callCount() === 3);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 async function scenarioAB_selfRepairsMissingRequiredTestScriptAtTaskComplete(): Promise<void> {
@@ -973,6 +1068,15 @@ async function main(): Promise<void> {
   // 검사라 격리 root 준비 이전에 먼저 실행한다.
   scenarioS_sourceRegressionProductionPathCannotBypassSafeExecutor();
 
+  // isPathWithinAllowedPrefixes는 순수 함수라 격리 root 없이 먼저 실행한다.
+  scenarioPathScope_normalSubpathAllowed();
+  scenarioPathScope_similarSiblingPrefixRejected();
+  scenarioPathScope_dotDotEscapeRejected();
+  scenarioPathScope_absolutePathsRejected();
+  scenarioPathScope_separatorNormalization();
+  scenarioPathScope_caseSensitive();
+  scenarioPathScope_emptyOrMultiplePrefixes();
+
   // 이 파일의 시나리오는 ACTION_REQUEST를 통해 실제 Safe Executor(automation/ 범위)를
   // 통과한다 — Safe Executor는 configureSafeExecutor()로 명시적으로 주입되기 전까지 어떤
   // 프로젝트로도 조용히 fallback하지 않으므로, 여기서 이 파일 전용 격리된 임시 root+정책을
@@ -992,6 +1096,7 @@ async function main(): Promise<void> {
     await scenarioH_requiredTestFailureReflectedForReal();
     await scenarioT_requiredTestFailureEvidencePropagated();
     await scenarioAB_selfRepairsMissingRequiredTestScriptAtTaskComplete();
+    await scenarioAC_writeOutsideAllowedPathPrefixesIsDeniedBeforeSafeExecutorThenRecovers();
     await scenarioI_lockBlocksReadThenWriteSucceeds();
     await scenarioJ_lockBlocksContinuedReadUntilStagnation();
     await scenarioK_lockPlanOnceThenWriteSucceeds();

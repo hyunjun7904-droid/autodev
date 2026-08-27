@@ -45,6 +45,7 @@
     "test:work-time": "npm run build && node dist/work-time-tests.js",
     "test:dashboard-project-progress": "npm run build && node dist/dashboard-project-progress-tests.js",
     "test:dashboard-usage": "npm run build && node dist/dashboard-usage-tests.js",
+    "test:dashboard-attempt-outcomes": "npm run build && node dist/dashboard-attempt-outcomes-tests.js",
     "test:dashboard-problem-solving": "npm run build && node dist/dashboard-problem-solving-tests.js",
     "test:dashboard-entrypoint": "npm run build && node dist/dashboard-tests.js",
     "test:spec-intake": "npm run build && node dist/spec-intake-tests.js",

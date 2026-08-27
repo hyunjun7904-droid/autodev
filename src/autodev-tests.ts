@@ -12,6 +12,7 @@ import type { GptReviewerReturn } from "./orchestrator";
 import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
+import type { RealClaudeResult } from "./claude-runner";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -1119,6 +1120,60 @@ async function scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWait
   );
 }
 
+// 필수 검증 53 — 실패 작업물 다음 시도 전달: 직전 시도가 scope violation으로 BLOCK된 뒤
+// (예: Telegram 승인으로 status가 READY로 복귀했지만 lastGptDecision/lastClaudeResult는
+// 그대로 남아있는 실제 auto-resume.ts 패턴), 다음 attempt의 Developer 초기 transcript에
+// "이 파일은 완료된 기존 구현이 아니라 미승인 변경"이라는 사실과 scope violation 목록/
+// Reviewer 지적이 실제로 전달되는지 검증한다(§ autodev.ts previousAttemptResult seed).
+async function scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "READY",
+    lastClaudeResult: {
+      success: true,
+      summary: "이전 시도 요약",
+      changedFiles: ["proj/wrong-place.txt"],
+      tests: [{ name: "rtp-check", pass: false }],
+      rawOutput: "",
+    },
+    lastGptDecision: {
+      decision: "BLOCK",
+      severity: { critical: 0, high: 0, medium: 1 },
+      feedback: "허용 경로 밖 변경입니다.",
+      nextTask: null,
+      scopeViolations: ["proj/wrong-place.txt"],
+    } as unknown as ProjectState["lastGptDecision"],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2, requiredTests=[]
+
+  let capturedFirstRoundInput: string | undefined;
+  const developerClaudeCaller = async (input: string): Promise<RealClaudeResult> => {
+    if (capturedFirstRoundInput === undefined) capturedFirstRoundInput = input;
+    return {
+      success: true,
+      summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "재작업 완료", changedFiles: [], testsRequested: [] }),
+      changedFiles: [],
+      tests: [],
+      rawOutput: "",
+    };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+
+  check(
+    "실패 작업물 전달: 이전 시도가 미승인 변경이라는 안내가 Developer 초기 입력에 포함됨",
+    !!capturedFirstRoundInput?.includes("미승인")
+  );
+  check(
+    "실패 작업물 전달: scope violation 파일 목록이 실제로 전달됨",
+    !!capturedFirstRoundInput?.includes("proj/wrong-place.txt")
+  );
+  check(
+    "실패 작업물 전달: Reviewer 지적 내용이 실제로 전달됨",
+    !!capturedFirstRoundInput?.includes("허용 경로 밖 변경입니다")
+  );
+}
+
 async function scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
@@ -1419,6 +1474,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceProceedsDespiteMissingRequiredTestScriptForArbitraryFutureTask();
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestConfigWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman();
+    await scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();

@@ -11,6 +11,7 @@ import {
   checkRequiredTestScriptRegistration,
   attemptSafeRequiredTestScriptRepair,
   commitRequiredTestScriptRepair,
+  readPackageJsonScripts,
 } from "./required-test-preflight";
 
 // Claude Developer — built-in Read/Edit/Write/Bash를 전혀 주지 않는다(항상 --tools "").
@@ -469,6 +470,41 @@ function actionKey(action: ExecutorAction): string {
   return JSON.stringify(action).slice(0, 300);
 }
 
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
+// Write-time task scope enforcement. Safe Executor(safe-executor.ts)의
+// allowedReadPrefixes/allowedWritePrefixes는 project 전체 기준(project-wide)이고 task 단위
+// 경계를 모른다 — 그래서 실제 JARVIS Task 2.1 실행에서 Developer가 이 task의
+// allowedPathPrefixes(예: "backend/device-trust/") 밖(예: "backend/device-trust-manager.mjs")에
+// WRITE_FILE을 요청해도 Safe Executor는 그대로 통과시켰고, 그 결과 GPT Reviewer 단계에서야
+// scope violation으로 발견되어 WAITING_HUMAN(BLOCK)으로 종료됐다. 이 함수는 그 경계를
+// WRITE_FILE/APPLY_PATCH 요청 시점에 미리 검사해, Reviewer까지 가지 않고 같은 attempt 안에서
+// Developer에게 즉시 거부 사유를 돌려준다(§ 아래 호출부 — 실제 Safe Executor 호출 전에
+// 막는다, denyReason이 있는 기존 result.ok===false 처리 경로를 그대로 재사용한다).
+//
+// 단순 문자열 startsWith만 쓰면 "backend/device-trust/"가 "backend/device-trust-evil/"까지
+// 허용된 것으로 오판할 수 있다(§ 요구사항) — 반드시 경로 세그먼트 경계에서만 일치해야
+// 한다("backend/device-trust" 자체이거나 그 뒤에 "/"가 와야 함). 절대경로(Windows 드라이브
+// 문자, POSIX 절대경로, UNC)와 ".." 상위 탈출 세그먼트는 무조건 거부한다(project root 밖으로
+// 나가려는 시도는 allowedPathPrefixes와 무관하게 항상 범위 밖이다). Windows `\`와 POSIX `/`
+// 구분자, 연속된 구분자를 모두 `/` 하나로 정규화한 뒤 비교한다.
+function normalizeActionPathForScopeCheck(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+/g, "/");
+}
+
+export function isPathWithinAllowedPrefixes(path: string, allowedPathPrefixes: readonly string[]): boolean {
+  if (typeof path !== "string" || path.length === 0) return false;
+  const normalized = normalizeActionPathForScopeCheck(path);
+  if (/^[a-zA-Z]:\//.test(normalized)) return false; // Windows 드라이브 절대경로
+  if (normalized.startsWith("/")) return false; // POSIX 절대경로 또는 UNC(//)
+  const segments = normalized.split("/");
+  if (segments.some((s) => s === "..")) return false; // 상위 디렉터리 탈출 시도
+  return allowedPathPrefixes.some((rawPrefix) => {
+    const prefix = normalizeActionPathForScopeCheck(rawPrefix).replace(/\/+$/, "");
+    if (prefix.length === 0) return false;
+    return normalized === prefix || normalized.startsWith(`${prefix}/`);
+  });
+}
+
 // Claude가 지시를 어기고 마크다운 코드펜스나 설명 텍스트를 덧붙이는 경우까지 관대하게
 // 처리한다 — 코드펜스 제거 후 직접 파싱을 시도하고, 그래도 실패하면 첫 번째 균형 잡힌
 // {...} 블록을 브레이스 카운팅으로 찾아 그 부분만 파싱한다.
@@ -559,6 +595,39 @@ export async function runDeveloperTaskViaSafeExecutor(
   // 해결책을 무조건 적용하지 않는다).
   if (opts.memoryHint) {
     transcript.push(opts.memoryHint);
+  }
+
+  // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
+  // required test의 정확한 npm 명령과(등록돼 있다면) 그 명령이 실제로 가리키는 테스트 파일
+  // 경로, 그리고 이 task의 허용 경로를 Developer에게 명시적으로 전달한다. 실제 JARVIS Task
+  // 2.1에서 Developer가 required test 이름/경로를 임의로 다르게 지어(등록/폐기 통합 단일
+  // 테스트 파일을 허용 경로 밖에 생성) required test가 MODULE_NOT_FOUND로 실패한 사례를
+  // 재현하지 않기 위함이다 — 이 정보는 이미 taskDef.requiredTests/allowedPathPrefixes(task-
+  // registry.ts)에 존재하는 데이터를 그대로 노출할 뿐, 새 계약을 만들지 않는다.
+  if (opts.requiredTests && opts.requiredTests.length > 0) {
+    const pkg = executor?.projectRoot ? readPackageJsonScripts(executor.projectRoot) : { ok: false as const, reason: "no executor" };
+    const lines = opts.requiredTests.map((rt) => {
+      const cmdLabel = [rt.command, ...rt.args].join(" ");
+      if (rt.command === "npm" && rt.args[0] === "run" && typeof rt.args[1] === "string" && pkg.ok) {
+        const scriptName = rt.args[1];
+        const resolved = pkg.scripts[scriptName];
+        if (typeof resolved === "string") {
+          return `- ${rt.name}: \`${cmdLabel}\` → 실제 실행 명령: \`${resolved}\``;
+        }
+        return `- ${rt.name}: \`${cmdLabel}\`(아직 package.json에 등록되지 않음 — 이 task의 허용 경로 안에 대응하는 테스트 파일을 정확히 하나만 만들면 AutoDev가 자동으로 등록합니다)`;
+      }
+      return `- ${rt.name}: \`${cmdLabel}\``;
+    });
+    transcript.push(
+      "# AutoDev 안내(필수 테스트 계약)\n" +
+        "이 task는 다음 required test가 실제 exitCode로 검증됩니다(Claude의 자체 완료 보고는 신뢰되지 않습니다):\n" +
+        lines.join("\n") +
+        (opts.allowedPathPrefixes && opts.allowedPathPrefixes.length > 0
+          ? `\n반드시 이 허용 경로 안에만 파일을 작성/수정하세요: ${opts.allowedPathPrefixes.join(", ")}. ` +
+            "위에 \"실제 실행 명령\"이 표시된 항목이 있다면 그 정확한 파일 경로에 테스트를 작성하세요 — " +
+            "다른 이름이나 다른 위치에 테스트 파일을 만들면 그 required test는 파일을 찾지 못해 실패합니다."
+          : "")
+    );
   }
 
   // 이전 시도(새 프로세스로 재시작 등)의 in-scope 미완성 작업물이 이미 디스크에 있으면,
@@ -923,6 +992,33 @@ export async function runDeveloperTaskViaSafeExecutor(
 
       const roundResults: unknown[] = [];
       for (const rawAction of roundActions) {
+        // Phase 6 — WRITE_FILE/APPLY_PATCH가 이 task의 allowedPathPrefixes 밖을 가리키면
+        // Safe Executor를 호출하기 전에 여기서 막는다(§ isPathWithinAllowedPrefixes 상단
+        // 주석). opts.allowedPathPrefixes가 지정되지 않은 호출부(기존 테스트 등)는 이 검사
+        // 자체가 no-op이라 기존 동작이 100% 보존된다.
+        if (
+          opts.allowedPathPrefixes &&
+          opts.allowedPathPrefixes.length > 0 &&
+          (rawAction.type === "WRITE_FILE" || rawAction.type === "APPLY_PATCH") &&
+          !isPathWithinAllowedPrefixes(rawAction.path, opts.allowedPathPrefixes)
+        ) {
+          const denyReason = `이 task에 허용된 경로(${opts.allowedPathPrefixes.join(", ")}) 밖입니다: "${rawAction.path}". 반드시 허용된 경로 안에 파일을 작성/수정하세요.`;
+          log(`developer 라운드 ${round} — task scope 밖 ${rawAction.type} 거부(Safe Executor 호출 전 차단)`, {
+            path: rawAction.path,
+            allowedPathPrefixes: opts.allowedPathPrefixes,
+          });
+          const key = actionKey(rawAction);
+          const count = (forbiddenRepeatCount.get(key) ?? 0) + 1;
+          forbiddenRepeatCount.set(key, count);
+          const deniedResult = { ok: false, action: rawAction.type, denyReason };
+          if (count >= FORBIDDEN_REPEAT_LIMIT) {
+            deferredHumanTasks.push(`반복 거부(${count}회): ${key} — ${denyReason}`);
+            roundResults.push({ ...deniedResult, deferred: true, note: "3회 이상 거부됨 — 사람 검토로 넘겨짐, 다른 접근 필요" });
+          } else {
+            roundResults.push(deniedResult);
+          }
+          continue;
+        }
         const result = await doValidateAndExecute(rawAction);
         if (!result.ok) {
           const key = actionKey(rawAction);

@@ -890,6 +890,20 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 하기 때문이다.
     const memoryStagnationTracker = createStagnationTracker();
     let previousAttemptResult: ClaudeResult | undefined;
+    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
+    // 이 task가 이전의 별도 실행(runAutodevOnce 프로세스 자체가 다시 시작된 경우 포함)에서
+    // 이미 한 번 시도됐지만 아직 승인(decision==="PASS")되지 못한 채 끝났다면, 그 결과를 이번
+    // fresh 실행의 "직전 시도"로 간주해 아래(§ Section 4/5/9/10) 실패 기억/전략 전환 로직이
+    // 이어서 재사용하게 한다. 이 seed가 없으면 매 runAutodevOnce() 호출마다
+    // previousAttemptResult가 항상 undefined로 초기화되어(§ loop-local, 위 주석) 같은 task를
+    // 재시도하는 새 프로세스는 직전 시도의 실패를 전혀 모른 채 시작한다 — 실제 JARVIS Task 2.1
+    // 재현 사례(허용 경로 밖에 남은 미승인 변경을 다음 시도가 "이미 구현됨"으로 오인)의 근본
+    // 원인이었다. decideNextAction()은 completedTasks에 없는 task만 다시 선택하므로, 이
+    // leftover state는 항상 지금 선택된 이 task 자신의 것이다(AutoDev는 한 번에 한 task만
+    // 순차 처리한다 — 다른 task의 실패가 섞여 들어올 여지가 없다).
+    if (state.lastClaudeResult && state.lastGptDecision && state.lastGptDecision.decision !== "PASS") {
+      previousAttemptResult = state.lastClaudeResult;
+    }
 
     // AutoDev 신뢰성 보완(2026-08-27, "응답 형식 오류도 기존 문제 해결 흐름에 포함") — 이
     // 정확한 task가 과거에 PROTOCOL_ERROR(§ claude-developer.ts PROTOCOL_FAILURE_HARD_STOP)로
@@ -919,36 +933,65 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // 실수를 맹목적으로 반복하지 않게 한다(§ claude-developer.ts opts.memoryHint).
       let memoryHint: string | undefined = !previousAttemptResult && hadPriorProtocolFailureForThisTask ? PRIOR_PROTOCOL_FAILURE_HINT : undefined;
       let lookupEntryIdThisCycle: string | undefined;
-      if (previousAttemptResult && hasFailedRequiredTest(previousAttemptResult.tests)) {
-        const fingerprint = computeProblemFingerprint(previousAttemptResult.tests);
-        const repeatCount = memoryStagnationTracker.observe(fingerprint);
-        const priorFailedDescriptions = problemProjectStore
-          .load()
-          .filter((e) => e.projectId === manifest.projectId && e.taskId === taskDef.id && e.fingerprint === fingerprint)
-          .flatMap((e) => e.attemptedSolutions.filter((s) => s.outcome === "FAILURE").map((s) => s.description));
-
-        const lookup = lookupSolution({
-          projectId: manifest.projectId,
-          taskId: taskDef.id,
-          tests: previousAttemptResult.tests,
-          projectStore: problemProjectStore,
-          commonStore: problemCommonStore,
-          projectRootForAncestryCheck: executorContext.projectRoot,
-        });
-
+      if (previousAttemptResult) {
         const hintParts: string[] = [];
-        if (lookup) {
-          lookupEntryIdThisCycle = lookup.entry.id;
+
+        // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
+        // 직전 시도가 scope violation(allowedPathPrefixes 밖 변경)으로 승인되지 않았다면,
+        // 그 파일들을 "이미 완료된 기존 구현"이 아니라 "미승인 변경"으로 명시한다 — 그렇지
+        // 않으면 Developer가 working tree에 남아있는 그 파일들을 발견하고 완료된 것으로
+        // 오인해 아무 수정 없이 다시 TASK_COMPLETE를 선언할 수 있다(실제 JARVIS Task 2.1
+        // 2차 시도에서 재현된 실패 패턴).
+        const lastGptDecisionWithScope = state.lastGptDecision as (typeof state.lastGptDecision & { scopeViolations?: string[] }) | null;
+        if (
+          lastGptDecisionWithScope &&
+          lastGptDecisionWithScope.decision !== "PASS" &&
+          lastGptDecisionWithScope.scopeViolations &&
+          lastGptDecisionWithScope.scopeViolations.length > 0
+        ) {
           hintParts.push(
-            `# AutoDev 안내(과거 해결 사례 — ${lookup.tier === "PROJECT" ? "같은 프로젝트의 다른 Task" : "AutoDev 공통 지식"})\n` +
-              "이 문제와 동일한 조건(같은 required test 실패 신호)이 과거에 다음과 같이 해결된 적이 있습니다. " +
-              "이것은 검증된 정답이 아니라 우선적으로 검토할 후보입니다 — 현재 코드/조건에 실제로 적용 가능한지 " +
-              "먼저 판단하고, 적용할 수 없다면 다른 접근을 시도하세요:\n" +
-              lookup.entry.finalSuccessfulSolution
+            "# AutoDev 안내(직전 시도 — 미승인, 검토 실패)\n" +
+              "다음 파일은 이미 완료된 기존 구현이 아닙니다. 직전 시도에서 만들어졌지만 아직 " +
+              "commit되지 않았고, GPT Reviewer가 이 task의 허용 경로(allowedPathPrefixes) 밖 " +
+              "변경이라는 이유로 승인하지 않았습니다:\n" +
+              `- 허용 경로 밖 변경 파일: ${lastGptDecisionWithScope.scopeViolations.join(", ")}\n` +
+              `- Reviewer 지적: ${lastGptDecisionWithScope.feedback}\n` +
+              "이 파일들을 그대로 두고 완료로 선언하지 마세요 — 지적 사유를 해결하도록 허용된 " +
+              "경로로 옮기거나 수정하고, 더 이상 필요 없는 파일이면 삭제하세요."
           );
         }
-        const escalation = buildEscalationGuidance(repeatCount, priorFailedDescriptions);
-        if (escalation) hintParts.push(escalation);
+
+        if (hasFailedRequiredTest(previousAttemptResult.tests)) {
+          const fingerprint = computeProblemFingerprint(previousAttemptResult.tests);
+          const repeatCount = memoryStagnationTracker.observe(fingerprint);
+          const priorFailedDescriptions = problemProjectStore
+            .load()
+            .filter((e) => e.projectId === manifest.projectId && e.taskId === taskDef.id && e.fingerprint === fingerprint)
+            .flatMap((e) => e.attemptedSolutions.filter((s) => s.outcome === "FAILURE").map((s) => s.description));
+
+          const lookup = lookupSolution({
+            projectId: manifest.projectId,
+            taskId: taskDef.id,
+            tests: previousAttemptResult.tests,
+            projectStore: problemProjectStore,
+            commonStore: problemCommonStore,
+            projectRootForAncestryCheck: executorContext.projectRoot,
+          });
+
+          if (lookup) {
+            lookupEntryIdThisCycle = lookup.entry.id;
+            hintParts.push(
+              `# AutoDev 안내(과거 해결 사례 — ${lookup.tier === "PROJECT" ? "같은 프로젝트의 다른 Task" : "AutoDev 공통 지식"})\n` +
+                "이 문제와 동일한 조건(같은 required test 실패 신호)이 과거에 다음과 같이 해결된 적이 있습니다. " +
+                "이것은 검증된 정답이 아니라 우선적으로 검토할 후보입니다 — 현재 코드/조건에 실제로 적용 가능한지 " +
+                "먼저 판단하고, 적용할 수 없다면 다른 접근을 시도하세요:\n" +
+                lookup.entry.finalSuccessfulSolution
+            );
+          }
+          const escalation = buildEscalationGuidance(repeatCount, priorFailedDescriptions);
+          if (escalation) hintParts.push(escalation);
+        }
+
         if (hintParts.length > 0) memoryHint = hintParts.join("\n\n");
       }
 
