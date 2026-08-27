@@ -1161,14 +1161,20 @@ export async function runDeveloperTaskWithRetry(
 
   const exhausted = last as DeveloperResult;
   log(
-    `developer transient 재시도 소진(${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회, 마지막 오류=${exhausted.errorCode}) — WAITING_HUMAN으로 넘어갑니다`
+    `developer transient 재시도 소진(${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회, 마지막 오류=${exhausted.errorCode}) — orchestrator의 durable provider wait으로 넘어갑니다`
   );
   return {
     ...exhausted,
-    summary: `Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류(${exhausted.errorCode})로 실패했습니다 — 반복된 timeout/일시적 실패로 사람 확인이 필요합니다. 마지막 오류: ${exhausted.summary}`,
+    summary: `Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류(${exhausted.errorCode})로 실패했습니다 — 마지막 오류: ${exhausted.summary}`,
     deferredHumanTasks: [
       ...(exhausted.deferredHumanTasks ?? []),
-      `DEVELOPER_TRANSIENT_RETRY_EXHAUSTED(${exhausted.errorCode}): Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류로 응답하지 못했습니다.`,
+      `${DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX}${exhausted.errorCode}): Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류로 응답하지 못했습니다.`,
     ],
   };
 }
+
+// AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry(2026-08-27 후속).
+// 이 prefix는 orchestrator.ts(진짜 사람 판단 전에 durable provider wait으로 먼저 흡수)와
+// human-gate-policy.ts(같은 마커가 저장된 stale WAITING_HUMAN을 자동 복구 대상으로 분류)가
+// 그대로 재사용하는 단일 출처다 — 문자열을 복제하지 않는다.
+export const DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX = "DEVELOPER_TRANSIENT_RETRY_EXHAUSTED(";

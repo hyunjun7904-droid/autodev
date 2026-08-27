@@ -159,23 +159,79 @@ async function scenarioNonTransientNoRetry(): Promise<void> {
 
 // ---- orchestrator.ts 레벨 통합 테스트(claudeRunner로 이 wrapper를 주입) ----
 
-// D.3(orchestrator 레벨) + C — 재시도 소진 시 orchestrator가 WAITING_HUMAN으로 전환하고
-// 그 사유가 state.deferredHumanTasks/lastClaudeResult에 남는다(HUMAN_APPROVAL_REQUIRED 기존
-// 파이프라인이 이 state를 그대로 소비한다 — orchestrator.ts/autodev.ts는 이 테스트에서 전혀
-// 수정되지 않았다).
-async function scenarioOrchestratorExhaustionProducesWaitingHuman(statePath: string): Promise<void> {
-  const seq = makeSequence([TIMEOUT_RESULT, TIMEOUT_RESULT, TIMEOUT_RESULT]);
+// AutoDev / JARVIS 신뢰성 보완(2026-08-27 후속) — 실제 JARVIS Task 2.2(security-critical
+// biometric 인증 구현 중 Claude Developer가 3회 연속 TIMEOUT)에서 발견된 실제 결함을 그대로
+// 재현하는 회귀 fixture다: Task 위험도(security-critical)와 실패 원인 위험도(provider
+// timeout)를 분리한다 — attempt 내 재시도(D.3)가 한 번 소진됐다고 곧바로 genuine
+// WAITING_HUMAN으로 넘어가지 않고, WAITING_CLAUDE_LIMIT과 동일한 durable wait-then-retry를
+// 거쳐 같은 task를 자동으로 재개한다.
+async function scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(statePath: string): Promise<void> {
+  // security-critical 문구를 실제 JARVIS currentTask 텍스트처럼 포함시켜 "task 내용이
+  // security-critical이라는 사실 자체가 이 durable retry를 막지 않는다"를 명시적으로 검증한다.
+  const securityCriticalTask =
+    "고위험 Action 실행 전 Android 공식 경로(BiometricPrompt + Android Keystore)를 통한 강한 인증을 수행한다.";
+  const seq = makeSequence([TIMEOUT_RESULT, TIMEOUT_RESULT, TIMEOUT_RESULT, SUCCESS_RESULT]);
   const claudeRunner = (task: string, attempt: number) =>
     runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => FAKE_PASS_REVIEW;
 
-  const { finalState } = await runOrchestrator("orchestrator: TIMEOUT x3 소진", { claudeRunner, statePath });
-  check("D.3(orchestrator): 최종 상태 WAITING_HUMAN", finalState.status === "WAITING_HUMAN");
-  check("D.7(orchestrator): claudeRunner(오케스트레이터 관점 1 cycle) 안에서 attempt 정확히 3회만", seq.callCount() === 3);
+  const observedStatuses: string[] = [];
+  let sleepCalls = 0;
+  let lastSleepMs: number | undefined;
+
+  const { finalState } = await runOrchestrator(securityCriticalTask, {
+    claudeRunner,
+    gptReviewer,
+    statePath,
+    onProgress: (info) => observedStatuses.push(info.status),
+    sleep: async (ms) => {
+      sleepCalls += 1;
+      lastSleepMs = ms;
+    },
+  });
+
   check(
-    "C(orchestrator): deferredHumanTasks에 DEVELOPER_TRANSIENT_RETRY_EXHAUSTED 사유가 저장됨",
-    finalState.deferredHumanTasks.some((t) => t.startsWith("DEVELOPER_TRANSIENT_RETRY_EXHAUSTED"))
+    "JARVIS 실제 사례: 3회 TIMEOUT 소진 후에도 WAITING_HUMAN이 즉시 관측되지 않음(genuine 승격 안 함)",
+    !observedStatuses.includes("WAITING_HUMAN")
   );
-  check("C(orchestrator): lastClaudeResult.errorCode가 TIMEOUT으로 남아 원인 추적 가능", (finalState.lastClaudeResult as ClaudeResult & { errorCode?: string } | null)?.errorCode === "TIMEOUT");
+  check("JARVIS 실제 사례: WAITING_PROVIDER_RETRY(durable wait) 상태가 관측됨", observedStatuses.includes("WAITING_PROVIDER_RETRY"));
+  check("durable wait: sleep이 정확히 1회 호출됨(bounded)", sleepCalls === 1);
+  check("durable wait: 5분(300000ms) 단위로 대기함", lastSleepMs === 5 * 60 * 1000);
+  check("JARVIS 실제 사례: durable wait 이후 같은 task가 자동으로 재개되어 최종 APPROVED", finalState.status === "APPROVED");
+  check("developerProviderWaitCount가 durable wait 1회를 기록함", finalState.developerProviderWaitCount === 1);
+  check(
+    "durable wait는 review cycle 예산을 소비하지 않음(claudeLimitWaitCount와 동일 관례) — reviewCycle=1로 정상 완료",
+    finalState.reviewCycle === 1
+  );
+}
+
+// durable wait 예산(MAX_DEVELOPER_PROVIDER_WAITS)까지 전부 소진해도 계속 실패하면 그때만
+// genuine WAITING_HUMAN으로 넘어간다 — 무한 자동복구가 아니라는 것(bounded)을 직접 증명한다.
+async function scenarioOrchestratorDurableWaitBoundedThenGenuineWaitingHuman(statePath: string): Promise<void> {
+  const seq = makeSequence([TIMEOUT_RESULT]); // 계속 TIMEOUT만 반환(clamp)
+  const claudeRunner = (task: string, attempt: number) =>
+    runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
+  let sleepCalls = 0;
+
+  const { finalState } = await runOrchestrator("orchestrator: TIMEOUT 영구 지속", {
+    claudeRunner,
+    statePath,
+    sleep: async () => {
+      sleepCalls += 1;
+    },
+  });
+
+  check("bounded: durable wait 예산(6회)을 넘으면 그제서야 WAITING_HUMAN", finalState.status === "WAITING_HUMAN");
+  check("bounded: sleep이 정확히 MAX_DEVELOPER_PROVIDER_WAITS(6)회만 호출됨(무한 대기 아님)", sleepCalls === 6);
+  check("bounded: developerProviderWaitCount가 정확히 6에서 멈춤", finalState.developerProviderWaitCount === 6);
+  check(
+    "bounded: 최종 마커는 DEVELOPER_PROVIDER_WAIT_EXHAUSTED(새 마커, 자동 복구 목록에 없음)",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("DEVELOPER_PROVIDER_WAIT_EXHAUSTED("))
+  );
+  check(
+    "bounded: attempt 총 횟수도 유한함((6+1)cycle × 3attempt = 21, 무한 재시도 아님)",
+    seq.callCount() === 21
+  );
 }
 
 // D.1/D.2(orchestrator 레벨) — 재시도로 성공하면 orchestrator 입장에서는 claudeRunner 호출이
@@ -225,7 +281,8 @@ async function main(): Promise<void> {
     await scenarioSecondRetryStillRetries();
     await scenarioExhaustionNoInfiniteRetry();
     await scenarioNonTransientNoRetry();
-    await scenarioOrchestratorExhaustionProducesWaitingHuman(makeTempStatePath());
+    await scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(makeTempStatePath());
+    await scenarioOrchestratorDurableWaitBoundedThenGenuineWaitingHuman(makeTempStatePath());
     await scenarioOrchestratorRetryTransparentToReviewLoop(makeTempStatePath());
     await scenarioRealHumanGateStillImmediate(makeTempStatePath());
   } finally {

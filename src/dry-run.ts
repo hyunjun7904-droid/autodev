@@ -31,6 +31,7 @@ function makeTempStatePath(): string {
     lastGptDecision: null,
     status: "IDLE",
     claudeLimitWaitCount: 0,
+    developerProviderWaitCount: 0,
     deferredHumanTasks: [],
     completedTasks: [],
   };

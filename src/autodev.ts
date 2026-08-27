@@ -729,7 +729,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 함수로 유지한다 — getNextTask()(decideNextAction이 내부적으로 쓰는 것과 동일한 순수
     // 함수)를 여기서 먼저 호출해 "지금 mid-flight로 남아있는 task가 실제로 무엇인지"만
     // 미리 확인한다(완료되지 않은 task만 대상이므로 항상 이 값과 일치한다).
-    const MID_FLIGHT_ORCHESTRATOR_STATUSES = new Set(["CLAUDE_WORKING", "WAITING_GPT_REVIEW", "REVISION_REQUIRED", "WAITING_CLAUDE_LIMIT"]);
+    const MID_FLIGHT_ORCHESTRATOR_STATUSES = new Set([
+      "CLAUDE_WORKING",
+      "WAITING_GPT_REVIEW",
+      "REVISION_REQUIRED",
+      "WAITING_CLAUDE_LIMIT",
+      // AutoDev / JARVIS 신뢰성 보완(2026-08-27 후속) — Developer provider durable wait
+      // (§ orchestrator.ts WAITING_PROVIDER_RETRY) 도중 프로세스가 죽어도 WAITING_CLAUDE_LIMIT과
+      // 동일하게 "한 번의 재시작은 허용"으로 취급한다 — 별도 판정 로직을 추가하지 않는다.
+      "WAITING_PROVIDER_RETRY",
+    ]);
     const MAX_UNEXPECTED_EXITS_BEFORE_CIRCUIT_BREAK = 2;
     const inFlightTaskCandidate = getNextTask(manifest.taskRegistry, state.completedTasks);
     if (inFlightTaskCandidate && MID_FLIGHT_ORCHESTRATOR_STATUSES.has(state.status as string)) {
@@ -1309,12 +1318,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     }
 
     // AutoDev / JARVIS 최종 무인개발 구조 보완 — Provider Timeout Circuit Breaker(§ 요구사항
-    // 20/21). 이미 claude-developer.ts의 runDeveloperTaskWithRetry가 TIMEOUT/CLI_NOT_FOUND
-    // 같은 일시적 실패를 한 attempt 안에서 최대 재시도까지 소진한 뒤에만 여기 도달한다 —
-    // 그 자체로 이미 가장 보수적인 circuit breaker(한 번의 반복만으로 즉시 genuine
-    // WAITING_HUMAN)다. 이 블록은 그 판정을 바꾸지 않는다 — 다만 이 task에서 누적된 provider
-    // timeout 횟수를 durable하게 기록해(재시작해도 유지) 사람이 "이번이 몇 번째인지" 즉시
-    // 확인할 수 있게 하고, 근본원인 분류(PROVIDER_ERROR)를 명시적으로 남긴다.
+    // 20/21), 2026-08-27 신뢰성 보완 후속으로 갱신: claude-developer.ts의
+    // runDeveloperTaskWithRetry가 attempt 내 최대 재시도까지 소진해도, orchestrator.ts는 이제
+    // 곧바로 genuine WAITING_HUMAN으로 넘기지 않고 먼저 durable provider wait-then-retry(§
+    // orchestrator.ts WAITING_PROVIDER_RETRY, MAX_DEVELOPER_PROVIDER_WAITS)를 거친다 —
+    // 여기 도달했다는 것은 그 durable wait 예산까지 이미 다 썼거나(finalState의
+    // deferredHumanTasks에 DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX 마커가 있음) 다른
+    // 이유로 orchestrator가 genuine WAITING_HUMAN으로 끝났다는 뜻이다. 이 블록은 그 판정을
+    // 바꾸지 않는다 — 다만 이 task에서 누적된 provider timeout 횟수를 durable하게 기록해
+    // (재시작해도 유지) 사람이 "이번이 몇 번째인지" 즉시 확인할 수 있게 하고, 근본원인
+    // 분류(PROVIDER_ERROR)를 명시적으로 남긴다.
     if (failedClaudeResult && failedClaudeResult.success === false && (failedClaudeResult.errorCode === "TIMEOUT" || failedClaudeResult.errorCode === "CLI_NOT_FOUND")) {
       const durable = loadDurableFailureStateForTask(state, taskDef.id);
       const providerTimeoutCount = durable.providerTimeoutCount + 1;

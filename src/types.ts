@@ -115,6 +115,7 @@ export type OrchestratorStatus =
   | "REVISION_REQUIRED"
   | "WAITING_HUMAN"
   | "WAITING_CLAUDE_LIMIT"
+  | "WAITING_PROVIDER_RETRY"
   | "APPROVED"
   | "BLOCKED";
 
@@ -196,6 +197,21 @@ export interface CoreState {
 
   /** Claude 사용량 제한(USAGE_LIMIT) 대기 횟수 — 재시작 후에도 이어가기 위해 저장. */
   claudeLimitWaitCount: number;
+
+  /**
+   * AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry. Developer가
+   * 일시적 오류(TIMEOUT/CLI_NOT_FOUND)로 attempt 내 재시도까지 소진했을 때(§
+   * claude-developer.ts DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX), claudeLimitWaitCount와
+   * 완전히 동일한 방식으로 이 값을 늘리며 durable하게 대기 후 같은 task를 재시도한다(§
+   * orchestrator.ts WAITING_PROVIDER_RETRY). MAX_DEVELOPER_PROVIDER_WAITS를 넘으면 그때만
+   * genuine WAITING_HUMAN으로 넘어간다 — Task 위험도(예: security-critical)와 실패 원인
+   * 위험도(provider timeout)를 분리한다: provider가 일시적으로 응답하지 못했다는 사실 자체는
+   * 사람 판단이 필요한 사유가 아니다. claudeLimitWaitCount와 마찬가지로 매 run 시작 시 0으로
+   * 리셋된다. optional인 이유는 humanFinalReview와 동일하다 — 지정하지 않으면(undefined)
+   * 기존 project-state.json 파일과 100% 하위 호환되고, orchestrator.ts가 runOrchestrator()
+   * 시작 시 항상 0으로 먼저 리셋하므로 실제 판정 로직은 undefined를 절대 만나지 않는다.
+   */
+  developerProviderWaitCount?: number;
 
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];

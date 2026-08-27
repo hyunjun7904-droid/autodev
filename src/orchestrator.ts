@@ -1,6 +1,6 @@
 import { loadState, saveState, DEFAULT_STATE_PATH } from "./state";
 import { runClaudeTask as fakeRunClaudeTask } from "./fake-claude-runner";
-import { runDeveloperTaskWithRetry } from "./claude-developer";
+import { runDeveloperTaskWithRetry, DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewer";
 import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
@@ -20,6 +20,18 @@ export const MAX_GPT_CALLS = 10; // review "cycle" 단위 상한(REVISE 루프 �
 export const MAX_GPT_RAW_CALLS = 30; // gptTransportRetry 포함 실제 API 호출 총합의 hard cap(사용자 미지정 — 무한호출 방지용 보수적 기본값)
 export const MAX_CLAUDE_LIMIT_WAITS = 12;
 export const CLAUDE_LIMIT_WAIT_MS = 30 * 60 * 1000; // 30분
+
+// AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry(2026-08-27 후속).
+// WAITING_CLAUDE_LIMIT과 동일한 설계다: Developer가 일시적 오류(TIMEOUT/CLI_NOT_FOUND)로
+// attempt 내 재시도(claude-developer.ts DEVELOPER_TRANSIENT_MAX_ATTEMPTS)까지 소진해도, 그
+// 사실 자체는 사람 판단이 필요한 사유가 아니다(Task 위험도와 실패 원인 위험도를 분리) —
+// bounded 횟수만큼 durable하게 더 기다렸다가 같은 task를 자동으로 재시도한다. 이 한도를
+// 넘으면 그때 처음으로 genuine WAITING_HUMAN(§ DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX,
+// human-gate-policy.ts가 auto-recoverable 목록에 넣지 않는 새 마커)으로 넘어간다 — 무한
+// 재시도가 아니다(MAX_DEVELOPER_PROVIDER_WAITS × DEVELOPER_PROVIDER_WAIT_MS = 30분).
+export const MAX_DEVELOPER_PROVIDER_WAITS = 6;
+export const DEVELOPER_PROVIDER_WAIT_MS = 5 * 60 * 1000; // 5분
+export const DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX = "DEVELOPER_PROVIDER_WAIT_EXHAUSTED(";
 
 export interface GptReviewerReturn extends GptReviewResult {
   errorCode?: string;
@@ -65,6 +77,9 @@ export interface OrchestratorDeps {
   ) => Promise<GptReviewerReturn>;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   claudeLimitWaitMs?: number;
+  /** Developer provider transient 재시도 소진 후 durable wait 시간(ms) — 테스트에서만 짧게
+   *  override, 실제 운용은 항상 5분(§ DEVELOPER_PROVIDER_WAIT_MS). */
+  developerProviderWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
   /** 상태 전이마다 호출 — autodev.ts가 콘솔에 task/status/reviewCycle을 표시하는 데 사용. */
   onProgress?: (info: { task: string; status: OrchestratorStatus; reviewCycle: number }) => void;
@@ -168,6 +183,7 @@ export async function runOrchestrator(
   const claudeRunner = deps.claudeRunner ?? selectDefaultClaudeRunner();
   const gptReviewer = deps.gptReviewer ?? selectDefaultGptReviewer(deps.executor);
   const claudeLimitWaitMs = deps.claudeLimitWaitMs ?? CLAUDE_LIMIT_WAIT_MS;
+  const developerProviderWaitMs = deps.developerProviderWaitMs ?? DEVELOPER_PROVIDER_WAIT_MS;
   const sleep = deps.sleep ?? defaultSleep;
   // 실제 운영 경로가 기본값이다 — 테스트는 반드시 deps.statePath로 임시 경로를 넘겨야
   // 실제 project-state.json을 건드리지 않는다(§ 요구사항 4).
@@ -222,6 +238,7 @@ export async function runOrchestrator(
   state.currentTask = task;
   state.reviewCycle = 0;
   state.claudeLimitWaitCount = 0;
+  state.developerProviderWaitCount = 0;
   state.lastClaudeResult = null;
   state.lastGptDecision = null;
   state.deferredHumanTasks = [];
@@ -276,9 +293,36 @@ export async function runOrchestrator(
     }
 
     // Claude 자체가 구조적으로 실패한 경우(subprocess/파싱/권한 게이트 등) — 리뷰할 코드
-    // 변경이 없으므로 GPT 호출을 낭비하지 않고 바로 사람에게 넘긴다.
+    // 변경이 없으므로 GPT 호출을 낭비하지 않는다. Developer가 일시적 오류(TIMEOUT/
+    // CLI_NOT_FOUND)로 attempt 내 재시도까지 소진한 경우만(§
+    // DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX) WAITING_CLAUDE_LIMIT과 동일한 durable
+    // wait-then-retry를 거친다 — Task 위험도와 실패 원인 위험도를 분리한다: provider가
+    // 일시적으로 응답하지 못했다는 사실 자체는 사람 판단이 필요한 사유가 아니다. 그 외
+    // 구조적 실패(파싱/권한 게이트 등, transient 마커가 없는 경우)는 기존과 동일하게 즉시
+    // WAITING_HUMAN이다.
     if (!claudeResult.success) {
       const errorCode = (claudeResult as ClaudeResult & { errorCode?: string }).errorCode;
+      const claudeResultDeferred = (claudeResult as ClaudeResult & { deferredHumanTasks?: string[] }).deferredHumanTasks ?? [];
+      const isTransientRetryExhausted = claudeResultDeferred.some((m: string) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
+
+      if (isTransientRetryExhausted) {
+        if (state.developerProviderWaitCount >= MAX_DEVELOPER_PROVIDER_WAITS) {
+          log(`Developer provider durable wait ${MAX_DEVELOPER_PROVIDER_WAITS}회 초과 — WAITING_HUMAN`, { errorCode });
+          state.deferredHumanTasks.push(
+            `${DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX}${errorCode}): Claude Developer 일시적 오류가 durable wait ${MAX_DEVELOPER_PROVIDER_WAITS}회 동안에도 반복되어 로컬 진단이 필요합니다.`
+          );
+          setStatus("WAITING_HUMAN");
+          break;
+        }
+        state.developerProviderWaitCount += 1;
+        state.reviewCycle -= 1; // durable wait은 실제 시도로 소비하지 않는다(claudeLimitWaitCount와 동일 관례).
+        setStatus("WAITING_PROVIDER_RETRY");
+        saveCurrentState(state);
+        log(`Developer provider 일시적 오류(${errorCode}) 감지 — ${developerProviderWaitMs}ms 대기 후 동일 task 재시도 (${state.developerProviderWaitCount}/${MAX_DEVELOPER_PROVIDER_WAITS})`);
+        await sleep(developerProviderWaitMs);
+        continue;
+      }
+
       log("Claude 결과가 실패(success=false) — GPT 리뷰 생략, WAITING_HUMAN", { errorCode });
       setStatus("WAITING_HUMAN");
       break;

@@ -1,6 +1,7 @@
 import type { CoreState } from "./types";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
+import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 
 // Canonical Human Gate Policy Evaluator — AutoDev / JARVIS 지능형 오류 복구 하드닝 §
 // 신뢰성 보완(2026-08-27).
@@ -43,6 +44,17 @@ import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 //   - REVIEW_CYCLE_EXHAUSTED_REASON 마커 — REVISE가 MAX_REVIEW_CYCLES에 도달해 멈춘 경우.
 //   - state.lastGptDecision.decision이 "BLOCK" 또는 "HUMAN_REQUIRED"인 경우(Reviewer 자신의
 //     BLOCK 판정 — 코드 품질/scope 문제로, Developer가 고쳐야 할 기술적 사안이다).
+//   - DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX 마커(claude-developer.ts) — Developer가
+//     일시적 오류(TIMEOUT/CLI_NOT_FOUND)로 attempt 내 재시도를 소진한 경우. 2026-08-27
+//     신뢰성 보완 후속: orchestrator.ts가 이제 이 마커를 곧바로 저장하지 않고 먼저 durable
+//     provider wait-then-retry(§ WAITING_PROVIDER_RETRY, MAX_DEVELOPER_PROVIDER_WAITS)를
+//     거치므로, 이 마커 하나만 저장된 WAITING_HUMAN은 그 durable wait 도입 이전에 만들어진
+//     stale 상태이거나(정상 대상) 이 마커만으로는 실제로 provider가 회복 불가능한 상태임을
+//     구분할 방법이 없는 경우다 — Task 위험도(예: security-critical)와 실패 원인 위험도
+//     (provider timeout)를 분리한다는 원칙에 따라 자동 복구 대상으로 취급한다. durable wait
+//     자체가 진짜로 소진되면 orchestrator.ts는 이 마커 대신 별도의
+//     DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX 마커를 저장하는데, 그 마커는 이 목록에 없어
+//     자연히 fail-closed로 genuine human judgment로 남는다.
 
 export type WaitingHumanClassification = "GENUINE_HUMAN_JUDGMENT" | "TECHNICAL_AUTO_RECOVERABLE";
 
@@ -84,8 +96,9 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const hasReviewCycleExhausted = markers.some((m) => m.startsWith(`${REVIEW_CYCLE_EXHAUSTED_REASON}:`));
   const decision = state.lastGptDecision?.decision;
   const hasReviewBlocked = decision === "BLOCK" || decision === "HUMAN_REQUIRED";
+  const hasDeveloperTransientRetryExhausted = markers.some((m) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
 
-  if (hasCheckpointScopeViolation || hasReviewCycleExhausted || hasReviewBlocked) {
+  if (hasCheckpointScopeViolation || hasReviewCycleExhausted || hasReviewBlocked || hasDeveloperTransientRetryExhausted) {
     return "TECHNICAL_AUTO_RECOVERABLE";
   }
 
