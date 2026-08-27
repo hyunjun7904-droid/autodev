@@ -5,6 +5,8 @@ import {
   checkRequiredTestScriptRegistration,
   attemptSafeRequiredTestScriptRepair,
   reconcileStaleRequiredTestConfigurationTasks,
+  validateRequiredTestRegistrationRequest,
+  registerValidatedRequiredTestScripts,
 } from "./required-test-preflight";
 import type { RequiredTestCommand } from "./task-registry";
 
@@ -264,6 +266,261 @@ function scenarioReconcileEmptyIsNotResolved(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// D~K) Phase 8 — Developer-declared Required Test Registration Channel
+// ---------------------------------------------------------------------------
+function scenarioDeclaredRegistrationValidAndRegistered(): void {
+  // D) Developer가 유효한 test target 생성 및 registration 선언 → 검증 후 등록.
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "device-trust-revocation.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const outcome = registerValidatedRequiredTestScripts(
+      [{ scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/device-trust-revocation.test.mjs" }],
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/device-trust-revocation.test.mjs"]
+    );
+    check("D) 유효한 registration은 REGISTERED로 분류됨", outcome.outcomes[0]?.outcome === "REGISTERED");
+    check("D) toCommit에 정확히 1건 반영됨", outcome.toCommit.length === 1);
+    const pkgAfter = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    check(
+      "D) package.json에 실제로 등록되어 이후 preflight가 통과함",
+      pkgAfter.scripts["test:device-trust-revocation"] === "node backend/device-trust/device-trust-revocation.test.mjs"
+    );
+    const recheck = checkRequiredTestScriptRegistration(requiredTests, root);
+    check("D) 등록 이후 재검사하면 ok=true", recheck.ok === true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioUnknownScriptNameRejected(): void {
+  // E) Developer가 임의 script 이름 요청 → 거부.
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "sneaky.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:not-a-real-required-test", runner: "node", target: "backend/device-trust/sneaky.test.mjs" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/sneaky.test.mjs"]
+    );
+    check("E) canonical requiredTests에 없는 임의 scriptName은 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioOutsideWritablePathRejected(): void {
+  // F) Developer가 writablePaths 밖 target 요청 → 거부.
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "src", "outside"), { recursive: true });
+    writeFileSync(join(root, "src", "outside", "sneaky.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:device-trust-revocation", runner: "node", target: "src/outside/sneaky.test.mjs" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["src/outside/sneaky.test.mjs"]
+    );
+    check("F) allowedPathPrefixes 밖 target은 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioAbsoluteDotDotUncRejected(): void {
+  // G) absolute/../UNC path → 거부.
+  const root = makeProjectRoot({});
+  try {
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const cases = ["/etc/passwd.test.mjs", "C:\\evil\\file.test.mjs", "backend/device-trust/../../../etc/evil.test.mjs", "//server/share/evil.test.mjs"];
+    let allRejected = true;
+    for (const target of cases) {
+      const validation = validateRequiredTestRegistrationRequest(
+        { scriptName: "test:device-trust-revocation", runner: "node", target },
+        requiredTests,
+        ["backend/device-trust/"],
+        root,
+        [target]
+      );
+      if (validation.ok) allRejected = false;
+    }
+    check("G) absolute/traversal/UNC 경로는 전부 거부됨", allRejected);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioShellInjectionRejected(): void {
+  // H) shell injection 형태 command → 거부.
+  const root = makeProjectRoot({});
+  try {
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const cases = [
+      "backend/device-trust/x.test.mjs; rm -rf /",
+      "backend/device-trust/x.test.mjs && echo pwned",
+      "backend/device-trust/x.test.mjs`whoami`",
+      "backend/device-trust/x.test.mjs | cat /etc/passwd",
+      "backend/device-trust/x.test.mjs$(id)",
+    ];
+    let allRejected = true;
+    for (const target of cases) {
+      const validation = validateRequiredTestRegistrationRequest(
+        { scriptName: "test:device-trust-revocation", runner: "node", target },
+        requiredTests,
+        ["backend/device-trust/"],
+        root,
+        [target]
+      );
+      if (validation.ok) allRejected = false;
+    }
+    check("H) shell metacharacter가 포함된 target은 전부 거부됨", allRejected);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioConflictingTargetIsDriftNotOverwrite(): void {
+  // I) 기존 script와 다른 target 충돌 → 자동 overwrite 금지, drift 분류.
+  const root = makeProjectRoot({ "test:device-trust-revocation": "node backend/device-trust/original.test.mjs" });
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "different.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const outcome = registerValidatedRequiredTestScripts(
+      [{ scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/different.test.mjs" }],
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/different.test.mjs"]
+    );
+    check("I) 기존 값과 다른 target 요청은 DRIFT로 분류됨", outcome.outcomes[0]?.outcome === "DRIFT");
+    check("I) 자동 덮어쓰기하지 않음(toCommit 비어있음)", outcome.toCommit.length === 0);
+    const pkgAfter = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    check("I) 기존 등록값이 그대로 보존됨", pkgAfter.scripts["test:device-trust-revocation"] === "node backend/device-trust/original.test.mjs");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioIdempotentDoubleRegistration(): void {
+  // J) 동일 registration 두 번 수행 → 두 번째는 변경 없음.
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "device-trust-revocation.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const request = [{ scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/device-trust-revocation.test.mjs" }];
+    const changedFiles = ["backend/device-trust/device-trust-revocation.test.mjs"];
+
+    const first = registerValidatedRequiredTestScripts(request, requiredTests, ["backend/device-trust/"], root, changedFiles);
+    check("J) 첫 번째 등록은 REGISTERED", first.outcomes[0]?.outcome === "REGISTERED");
+
+    const second = registerValidatedRequiredTestScripts(request, requiredTests, ["backend/device-trust/"], root, changedFiles);
+    check("J) 두 번째 등록은 ALREADY_REGISTERED(추가 변경 없음)", second.outcomes[0]?.outcome === "ALREADY_REGISTERED" && second.toCommit.length === 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioNonExistentTargetRejected(): void {
+  const root = makeProjectRoot({});
+  try {
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/not-created-yet.test.mjs" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/not-created-yet.test.mjs"]
+    );
+    check("실제로 존재하지 않는 target은 거부됨(추측으로 등록하지 않음)", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioNotInChangedFilesRejected(): void {
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "device-trust-revocation.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/device-trust-revocation.test.mjs" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      [] // 이번 attempt의 changedFiles에 없음
+    );
+    check("이번 attempt의 changedFiles에 없는 target은 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioDisallowedRunnerRejected(): void {
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "device-trust"), { recursive: true });
+    writeFileSync(join(root, "backend", "device-trust", "device-trust-revocation.test.mjs"), "// fixture\n", "utf-8");
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:device-trust-revocation", runner: "bash", target: "backend/device-trust/device-trust-revocation.test.mjs" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/device-trust-revocation.test.mjs"]
+    );
+    check("allow-list 밖 runner(bash 등)는 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioWhitespaceArgumentSmugglingRejected(): void {
+  // 공백으로 추가 CLI flag를 밀반입해 node 실행 시점에 임의 모듈을 로드시키는 시도 방지.
+  const root = makeProjectRoot({});
+  try {
+    const requiredTests = [npmRun("device-trust-revocation-tests", "test:device-trust-revocation")];
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "test:device-trust-revocation", runner: "node", target: "backend/device-trust/x.test.mjs --require /tmp/evil.js" },
+      requiredTests,
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/x.test.mjs --require /tmp/evil.js"]
+    );
+    check("target에 공백으로 추가 CLI flag를 밀반입하려는 요청은 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioLifecycleScriptNameRejected(): void {
+  const root = makeProjectRoot({});
+  try {
+    const validation = validateRequiredTestRegistrationRequest(
+      { scriptName: "postinstall", runner: "node", target: "backend/device-trust/device-trust-revocation.test.mjs" },
+      [npmRun("x", "postinstall")],
+      ["backend/device-trust/"],
+      root,
+      ["backend/device-trust/device-trust-revocation.test.mjs"]
+    );
+    check("K) npm lifecycle hook 이름(postinstall 등)은 명시적으로 거부됨", validation.ok === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function main(): void {
   scenarioRegisteredScriptPasses();
   scenarioMissingScriptFlagged();
@@ -279,6 +536,18 @@ function main(): void {
   scenarioReconcileNotResolvedWhenStillMissing();
   scenarioReconcileFailClosedOnUnrelatedReason();
   scenarioReconcileEmptyIsNotResolved();
+  scenarioDeclaredRegistrationValidAndRegistered();
+  scenarioUnknownScriptNameRejected();
+  scenarioOutsideWritablePathRejected();
+  scenarioAbsoluteDotDotUncRejected();
+  scenarioShellInjectionRejected();
+  scenarioConflictingTargetIsDriftNotOverwrite();
+  scenarioIdempotentDoubleRegistration();
+  scenarioNonExistentTargetRejected();
+  scenarioNotInChangedFilesRejected();
+  scenarioDisallowedRunnerRejected();
+  scenarioWhitespaceArgumentSmugglingRejected();
+  scenarioLifecycleScriptNameRejected();
 
   console.log("\n=== required-test-preflight 테스트 결과 ===");
   for (const r of results) console.log(r);

@@ -12,7 +12,10 @@ import {
   attemptSafeRequiredTestScriptRepair,
   commitRequiredTestScriptRepair,
   readPackageJsonScripts,
+  registerValidatedRequiredTestScripts,
+  commitRequiredTestRegistration,
 } from "./required-test-preflight";
+import type { RequiredTestRegistrationRequest } from "./required-test-preflight";
 
 // Claude Developer — built-in Read/Edit/Write/Bash를 전혀 주지 않는다(항상 --tools "").
 // 대신 Claude는 JSON ACTION_REQUEST로 무엇을 읽고/검색하고/수정하고 싶은지 "요청"만 하고,
@@ -626,7 +629,12 @@ export async function runDeveloperTaskViaSafeExecutor(
           ? `\n반드시 이 허용 경로 안에만 파일을 작성/수정하세요: ${opts.allowedPathPrefixes.join(", ")}. ` +
             "위에 \"실제 실행 명령\"이 표시된 항목이 있다면 그 정확한 파일 경로에 테스트를 작성하세요 — " +
             "다른 이름이나 다른 위치에 테스트 파일을 만들면 그 required test는 파일을 찾지 못해 실패합니다."
-          : "")
+          : "") +
+        "\n아직 등록되지 않은 required test가 있고 이 task의 허용 경로 안에 그 테스트 파일을 " +
+        "정확히 어디에 만들었는지 명시하고 싶다면, TASK_COMPLETE 응답에 " +
+        '`"requiredTestRegistrations":[{"scriptName":"<위 required test 이름 그대로>",' +
+        '"runner":"node","target":"<이 task의 허용 경로 안의 실제 파일 경로>"}]`를 추가하세요 ' +
+        "(package.json을 직접 쓸 권한은 없습니다 — 이 요청은 AutoDev가 검증 후에만 등록합니다)."
     );
   }
 
@@ -908,7 +916,43 @@ export async function runDeveloperTaskViaSafeExecutor(
       // script")를 그대로 tests[].failureEvidence에 남기고, 그 실패는 기존 GPT Reviewer
       // REVISE 루프가 일반 구현 미완료와 동일하게 처리한다(§ 새 사람 대기 경로를 만들지
       // 않는다 — autodev.ts REQUIRED_TEST_CONFIGURATION_ERROR 처리와 동일한 원칙).
+      const changedFilesForTaskComplete = getActualChangedFiles(changeScopeDirs, executor);
+      let requiredTestRegistrationDrift = false;
       if (executor?.projectRoot && opts.allowedPathPrefixes && opts.allowedPathPrefixes.length > 0) {
+        // Phase 8 — Developer가 명시적으로 선언한 registration 요청(있으면)을 먼저 검증/등록한다.
+        // Developer는 package.json을 직접 쓸 권한이 없다 — 이 함수가 엄격히 검증한 요청만
+        // AutoDev infrastructure가 등록한다(§ required-test-preflight.ts
+        // validateRequiredTestRegistrationRequest).
+        const rawRegistrations = (parsed as { requiredTestRegistrations?: unknown }).requiredTestRegistrations;
+        if (Array.isArray(rawRegistrations) && rawRegistrations.length > 0) {
+          const requests: RequiredTestRegistrationRequest[] = rawRegistrations
+            .filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+            .map((r) => ({
+              scriptName: typeof r.scriptName === "string" ? r.scriptName : "",
+              runner: typeof r.runner === "string" ? r.runner : "",
+              target: typeof r.target === "string" ? r.target : "",
+            }));
+          const registration = registerValidatedRequiredTestScripts(
+            requests,
+            opts.requiredTests,
+            opts.allowedPathPrefixes,
+            executor.projectRoot,
+            changedFilesForTaskComplete
+          );
+          requiredTestRegistrationDrift = registration.outcomes.some((o) => o.outcome === "DRIFT");
+          if (registration.outcomes.length > 0) {
+            log("developer TASK_COMPLETE — required test registration 요청 처리", { outcomes: registration.outcomes });
+          }
+          if (registration.toCommit.length > 0) {
+            const commit = commitRequiredTestRegistration(executor.projectRoot, registration.toCommit);
+            if (!commit.ok) {
+              log("developer TASK_COMPLETE — required test registration commit 실패(package.json은 등록된 채로 남음, 다음 attempt가 재시도할 수 있음)", {
+                reason: commit.reason,
+              });
+            }
+          }
+        }
+
         const requiredTestPreflight = checkRequiredTestScriptRegistration(opts.requiredTests, executor.projectRoot);
         if (!requiredTestPreflight.ok) {
           const repair = attemptSafeRequiredTestScriptRepair(requiredTestPreflight.issues, executor.projectRoot, opts.allowedPathPrefixes);
@@ -933,10 +977,11 @@ export async function runDeveloperTaskViaSafeExecutor(
       return {
         success: true,
         summary,
-        changedFiles: getActualChangedFiles(changeScopeDirs, executor),
+        changedFiles: changedFilesForTaskComplete,
         tests,
         rawOutput: sanitizeForLog(claudeRaw.summary),
         deferredHumanTasks,
+        ...(requiredTestRegistrationDrift ? { requiredTestRegistrationDrift: true } : {}),
         ...usageFields(),
       };
     }

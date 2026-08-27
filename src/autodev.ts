@@ -4,7 +4,10 @@ import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
 import { runDeveloperTaskWithRetry } from "./claude-developer";
 import type { DeveloperProjectContext, DeveloperTaskOptions } from "./claude-developer";
+import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
+import { wrapGptReviewerWithFireworksCallLimiter } from "./root-cause-analysis";
+import type { RootCauseAnalysisEvent } from "./root-cause-analysis";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
 import { validateProjectManifest, resolveRemoteGitSafetyPolicy, isHumanFinalReviewEnabled } from "./project-manifest";
@@ -932,6 +935,12 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 하기 때문이다.
     const memoryStagnationTracker = createStagnationTracker();
     let previousAttemptResult: ClaudeResult | undefined;
+    // AutoDev / JARVIS 최종 무인개발 하드닝 — Fireworks Same-Finding Call Limiting & Root
+    // Cause Analysis(§ root-cause-analysis.ts)가 RCA를 트리거하면(동일 reviewer finding이
+    // 2회 연속 REVISE로 반복됨) 이 run 전용 wrapped gptReviewer가 그 사실을 여기 채워 넣는다
+    // — defaultClaudeRunner가 다음 라운드 시작 시 이 값을 읽어 memoryHint에 반영하고 소비한다
+    // (loop-local, project-state.json에 저장하지 않는다 — previousAttemptResult와 동일한 원칙).
+    let pendingRootCauseGuidance: RootCauseAnalysisEvent | undefined;
     // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
     // 이 task가 이전의 별도 실행(runAutodevOnce 프로세스 자체가 다시 시작된 경우 포함)에서
     // 이미 한 번 시도됐지만 아직 승인(decision==="PASS")되지 못한 채 끝났다면, 그 결과를 이번
@@ -1029,6 +1038,23 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       let lookupEntryIdThisCycle: string | undefined;
       if (previousAttemptResult) {
         const hintParts: string[] = [];
+
+        // AutoDev / JARVIS 최종 무인개발 하드닝 — RCA가 트리거됐다면(§ root-cause-analysis.ts)
+        // 그 분류/권장 조치/직전 Reviewer 지적을 이번 라운드 프롬프트에 명시적으로 전달한다
+        // (§ 요구사항 17 IMPLEMENTATION_ERROR 복구 — "막연한 REVISE가 아니라 이전 finding을
+        // 함께 전달"). 한 번 소비하면 즉시 비운다 — 같은 안내를 여러 라운드에 반복하지 않는다.
+        if (pendingRootCauseGuidance) {
+          const g = pendingRootCauseGuidance;
+          pendingRootCauseGuidance = undefined;
+          hintParts.push(
+            "# AutoDev 안내(Root Cause Analysis — 동일 reviewer finding 반복)\n" +
+              "동일한 reviewer 지적사항이 연속으로 반복되어 AutoDev가 근본원인 분석을 수행했습니다. " +
+              "이미 시도한 접근을 그대로 반복하지 말고 아래 지적을 정확히 해결하세요:\n" +
+              `- 분류: ${g.category}\n` +
+              `- 권장 조치: ${g.recoveryAction}\n` +
+              `- 직전 Reviewer 지적: ${g.priorFeedback}`
+          );
+        }
 
         // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 6 —
         // 직전 시도가 scope violation(allowedPathPrefixes 밖 변경)으로 승인되지 않았다면,
@@ -1144,6 +1170,34 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       return result;
     };
 
+    // AutoDev / JARVIS 최종 무인개발 하드닝 — production(dry-run이 아닌) 실행에서만 실제
+    // Fireworks reviewer를 Same-Finding Call Limiting/RCA wrapper로 감싼다. dry-run이거나
+    // opts.orchestratorDeps.gptReviewer가 지정되면(테스트가 흔히 그렇게 한다) 이 값은 아래
+    // "...opts.orchestratorDeps" spread가 그대로 덮어써 무시된다 — 기존 테스트 동작에 영향
+    // 없음. AUTOMATION_DRY_RUN 판정은 orchestrator.ts의 selectDefaultGptReviewer와 동일한
+    // 조건을 그대로 재사용한다(로직 복제가 아니라 동일 환경변수 규약을 그대로 따르는 것).
+    const isDryRun = process.env.AUTOMATION_DRY_RUN !== "false";
+    const gptReviewer = isDryRun
+      ? undefined
+      : wrapGptReviewerWithFireworksCallLimiter(
+          (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline) =>
+            realReviewClaudeResult(result, reviewCycle, task, {
+              allowedPathPrefixes,
+              projectContext,
+              executor: executorContext,
+              gptCallCount,
+              gptRawCallTotal,
+              baseline,
+            }),
+          {
+            taskId: taskDef.id,
+            executor: executorContext,
+            onRootCauseAnalysis: (event) => {
+              pendingRootCauseGuidance = event;
+            },
+          }
+        );
+
     const orchestratorResult = await runOrchestrator(taskDef.prompt, {
       statePath,
       allowedPathPrefixes: taskDef.allowedPathPrefixes,
@@ -1152,6 +1206,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // Phase C Task C2 — deps.gptReviewer를 명시적으로 지정하지 않는 한(테스트가 흔히 그렇게
       // 한다) orchestrator의 기본 real GPT reviewer가 이 context를 써서 rules 파일/실제 git
       // 변경을 읽는다 — module-level singleton에 의존하지 않는다.
+      gptReviewer,
       executor: executorContext,
       // Phase G Task G2 — REVISE loop의 각 cycle마다(DEVELOPER_RETRY_STARTED/TEST_COMPLETED/
       // REVIEW_STARTED/REVIEW_APPROVED·REVISE·BLOCKED/REVIEW_CYCLE_EXHAUSTED) event를 남기는

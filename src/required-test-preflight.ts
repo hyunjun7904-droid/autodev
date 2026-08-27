@@ -39,7 +39,7 @@ export interface RequiredTestPreflightResult {
 /** RequiredTestCommand가 "npm run <script>" 형태일 때만 그 script 이름을 반환한다.
  *  gradlew/npx/"npm test -- ..." 등 다른 형태는 이 preflight의 대상이 아니다 — 그런
  *  형태에는 package.json.scripts 등록이라는 개념 자체가 적용되지 않는다. */
-function extractNpmRunScript(rt: RequiredTestCommand): string | undefined {
+export function extractNpmRunScript(rt: RequiredTestCommand): string | undefined {
   if (rt.command !== "npm") return undefined;
   if (!Array.isArray(rt.args) || rt.args.length < 2) return undefined;
   if (rt.args[0] !== "run") return undefined;
@@ -365,5 +365,272 @@ export function commitRequiredTestScriptRepair(
     commitHash: hashRes.ok ? hashRes.stdout : undefined,
     repaired: repaired.map((r) => r.npmScript),
   });
+  return { ok: true, commitHash: hashRes.ok ? hashRes.stdout : undefined };
+}
+
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 8 —
+// Developer-declared Required Test Registration Channel.
+//
+// 위 attemptSafeRequiredTestScriptRepair()는 allowedPathPrefixes 안에 후보 *.test.mjs가
+// "정확히 하나"일 때만 자동 등록한다 — 후보가 모호하거나(여러 개) Developer가 다른 확장자/
+// 위치를 선택했다면 그 glob 기반 추측은 안전하게 포기하고 unresolved로 남긴다. 이 섹션은
+// 그 보완 채널이다: Developer가 TASK_COMPLETE 응답에 명시적으로 "이 npm script를 이 파일에
+// 등록해달라"(ClaudeResult.requiredTestRegistrations)고 선언하면, 그 요청을 절대 그대로
+// 신뢰하지 않고 아래 validateRequiredTestRegistrationRequest()가 전부 검증한 것만
+// registerValidatedRequiredTestScripts()가 등록한다. Developer는 여전히 package.json을
+// 직접 쓸 수 없다 — "요청"만 반환하고, 실제 mutation은 이 파일(AutoDev infrastructure)이
+// 수행한다.
+
+export interface RequiredTestRegistrationRequest {
+  scriptName: string;
+  runner: string;
+  target: string;
+}
+
+export type RequiredTestRegistrationValidation =
+  | { ok: true; expectedScript: string; canonicalRequiredTestName: string }
+  | { ok: false; reason: string };
+
+// 허용되는 실행기는 기존 JARVIS/AutoDev required-test convention이 실제로 쓰는 형태로만
+// 제한한다(§ 요구사항 9) — package.json의 모든 기존 required-test script가 "node <path>"
+// 형태다(§ CANDIDATE_TEST_FILE_SUFFIX 기반 glob 복구가 만드는 값과 동일). 다른 실행기는
+// 이 채널에서 등록할 수 없다(새 위험한 실행 형태를 열지 않는다).
+const ALLOWED_TEST_RUNNERS: ReadonlySet<string> = new Set(["node"]);
+
+// npm/yarn lifecycle hook 이름 — scriptName이 canonical requiredTests 목록에 정확히
+// 일치해야 한다는 검증만으로도 구조적으로 막히지만(task-registry.ts가 이런 이름을 절대
+// requiredTests로 선언하지 않는다), 방어적으로 한 번 더 명시적으로 거부한다.
+const FORBIDDEN_LIFECYCLE_SCRIPT_NAMES: ReadonlySet<string> = new Set([
+  "preinstall",
+  "install",
+  "postinstall",
+  "prepare",
+  "prepublish",
+  "prepublishOnly",
+  "preversion",
+  "version",
+  "postversion",
+]);
+
+// shell metacharacter — 이 채널이 만드는 값은 항상 "<runner> <target>" 형태의 단순 문자열로
+// npm이 그대로 shell에 넘기므로, target 자체에 이런 문자가 있으면 명령 연결/치환/리다이렉션이
+// 가능해진다(§ 요구사항 11/13). 세미콜론/파이프/앰퍼샌드/백틱/달러/리다이렉션/따옴표/괄호/
+// 개행을 모두 거부한다.
+const SHELL_METACHARACTER_PATTERN = /[;&|`$<>"'(){}\r\n\\]/;
+
+function isSafeRepositoryRelativeTarget(target: string): boolean {
+  if (typeof target !== "string" || target.length === 0) return false;
+  if (SHELL_METACHARACTER_PATTERN.test(target)) return false;
+  // 공백 문자(스페이스/탭)도 거부한다 — "<runner> <target>" 문자열은 npm이 그대로 셸에 넘기므로,
+  // target에 공백이 있으면 "node x.test.mjs --require <악성 모듈>"처럼 추가 CLI flag를
+  // 밀반입해 node 실행 시점에 임의 모듈을 로드시킬 수 있다(§ 요구사항 16 arbitrary command
+  // injection 불가). 정상적인 테스트 파일 경로는 공백을 필요로 하지 않는다.
+  if (/\s/.test(target)) return false;
+  // 절대경로(POSIX "/" 시작, Windows drive letter, UNC "\\server\share" 또는 "//server/share").
+  if (target.startsWith("/") || target.startsWith("\\")) return false;
+  if (/^[A-Za-z]:/.test(target)) return false;
+  const normalized = target.split("\\").join("/");
+  if (normalized.startsWith("//")) return false;
+  // ".." traversal — 경로 구성요소 단위로 확인한다(예: "..foo"는 허용, "../foo"는 거부).
+  if (normalized.split("/").some((seg) => seg === "..")) return false;
+  return true;
+}
+
+/**
+ * Developer가 반환한 registration 요청 하나를 검증한다(§ 요구사항 9, 16개 항목). 이 함수는
+ * 어떤 파일도 쓰지 않는다 — 순수 판정만 한다. `changedFiles`는 이번 Developer attempt에서
+ * 실제로 변경된 파일 목록(ClaudeResult.changedFiles)이어야 한다 — 다른 attempt/다른 task의
+ * 파일을 등록 대상으로 인정하지 않는다.
+ */
+export function validateRequiredTestRegistrationRequest(
+  request: RequiredTestRegistrationRequest,
+  requiredTests: RequiredTestCommand[] | undefined,
+  allowedPathPrefixes: string[],
+  projectRoot: string,
+  changedFiles: string[]
+): RequiredTestRegistrationValidation {
+  if (!request || typeof request !== "object") return { ok: false, reason: "요청이 object가 아님" };
+  if (typeof request.scriptName !== "string" || request.scriptName.length === 0) {
+    return { ok: false, reason: "scriptName이 비어있음" };
+  }
+  if (FORBIDDEN_LIFECYCLE_SCRIPT_NAMES.has(request.scriptName)) {
+    return { ok: false, reason: `scriptName이 npm lifecycle hook 이름과 동일함: ${request.scriptName}` };
+  }
+  // 1/2 — scriptName이 현재 task의 canonical requiredTests(npm run 형태)에 정확히 존재해야
+  // 한다. 여기 없는 임의 이름은 새 script를 추가하는 것이므로 거부한다(§ 요구사항 1/2).
+  const canonicalNames = (requiredTests ?? []).map(extractNpmRunScript).filter((s): s is string => typeof s === "string");
+  if (!canonicalNames.includes(request.scriptName)) {
+    return { ok: false, reason: `scriptName(${request.scriptName})이 현재 task의 canonical requiredTests에 없음` };
+  }
+  // runner allow-list(§ 요구사항 — 허용되는 runner는 기존 convention에서 실제 쓰는 형태만).
+  if (typeof request.runner !== "string" || !ALLOWED_TEST_RUNNERS.has(request.runner)) {
+    return { ok: false, reason: `허용되지 않은 runner: ${String(request.runner)}` };
+  }
+  // 3~6 — repository-relative path, 절대경로/".."/UNC 금지, shell metacharacter 금지.
+  if (!isSafeRepositoryRelativeTarget(request.target)) {
+    return { ok: false, reason: "target이 안전한 repository-relative 경로가 아님(절대경로/traversal/UNC/shell metacharacter 금지)" };
+  }
+  const normalizedTarget = request.target.split("\\").join("/");
+  // 7 — target이 이 task의 writablePaths(allowedPathPrefixes) 안에 있어야 한다.
+  if (!allowedPathPrefixes.some((prefix) => normalizedTarget.startsWith(prefix))) {
+    return { ok: false, reason: `target이 이 task의 allowedPathPrefixes 밖: ${normalizedTarget}` };
+  }
+  // 10 — 확장자/형식이 기존 repository 정책(§ CANDIDATE_TEST_FILE_SUFFIX)과 일치해야 한다.
+  if (!normalizedTarget.endsWith(CANDIDATE_TEST_FILE_SUFFIX)) {
+    return { ok: false, reason: `target이 ${CANDIDATE_TEST_FILE_SUFFIX} 확장자가 아님: ${normalizedTarget}` };
+  }
+  // 8 — target 파일이 실제로 존재해야 한다(추측으로 아직 없는 파일을 등록하지 않는다).
+  const absTarget = join(projectRoot, ...normalizedTarget.split("/"));
+  // 방어적 재확인 — join 결과가 실제로 projectRoot 내부에 있는지(경로 조합 결과가 어떤 경로
+  // 정규화 특이 케이스로든 벗어나지 않았는지)를 한 번 더 확인한다.
+  const relFromRoot = relative(projectRoot, absTarget).split(sep).join("/");
+  if (relFromRoot.startsWith("..") || relFromRoot !== normalizedTarget) {
+    return { ok: false, reason: "target이 project root 밖으로 벗어남" };
+  }
+  let st;
+  try {
+    st = lstatSync(absTarget);
+  } catch {
+    return { ok: false, reason: "target 파일이 존재하지 않음(아직 구현 전 — 나중에 다시 시도)" };
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    return { ok: false, reason: "target이 실제 regular file이 아님(symlink/디렉터리 등)" };
+  }
+  // 9 — 이번 Developer attempt에서 실제로 생성/변경된 파일이어야 한다(다른 attempt의 파일을
+  // 끌어다 등록할 수 없다).
+  if (!changedFiles.includes(normalizedTarget)) {
+    return { ok: false, reason: "target이 이번 attempt에서 변경된 파일 목록(changedFiles)에 없음" };
+  }
+  return { ok: true, expectedScript: `${request.runner} ${normalizedTarget}`, canonicalRequiredTestName: request.scriptName };
+}
+
+export interface RequiredTestRegistrationOutcome {
+  scriptName: string;
+  expectedScript: string;
+  outcome: "REGISTERED" | "ALREADY_REGISTERED" | "REJECTED" | "DRIFT";
+  reason?: string;
+}
+
+/**
+ * 검증된 요청들을 실제로 package.json에 등록한다(§ 요구사항 11 — idempotent, 최소 변경,
+ * JSON 유효성, atomic write, Secret Scanner Gate 재적용). 이미 동일한 값으로 등록돼 있으면
+ * 아무것도 쓰지 않는다(ALREADY_REGISTERED — 두 번째 실행이 추가 변경을 만들지 않는다, §
+ * 요구사항 J). 다른 값으로 이미 등록돼 있으면 절대 덮어쓰지 않고 DRIFT로 분류한다(§ 요구사항
+ * 10 — REQUIRED_TEST_REGISTRATION_DRIFT).
+ */
+export function registerValidatedRequiredTestScripts(
+  requests: RequiredTestRegistrationRequest[],
+  requiredTests: RequiredTestCommand[] | undefined,
+  allowedPathPrefixes: string[],
+  projectRoot: string,
+  changedFiles: string[]
+): { outcomes: RequiredTestRegistrationOutcome[]; toCommit: { scriptName: string; expectedScript: string }[] } {
+  const outcomes: RequiredTestRegistrationOutcome[] = [];
+  const toWrite: { scriptName: string; expectedScript: string }[] = [];
+
+  const validations = requests.map((r) => ({ request: r, validation: validateRequiredTestRegistrationRequest(r, requiredTests, allowedPathPrefixes, projectRoot, changedFiles) }));
+
+  const pkg = readPackageJsonScripts(projectRoot);
+  const existingScripts: Record<string, unknown> = pkg.ok ? pkg.scripts : {};
+
+  for (const { request, validation } of validations) {
+    if (!validation.ok) {
+      outcomes.push({ scriptName: request.scriptName, expectedScript: `${request.runner} ${request.target}`, outcome: "REJECTED", reason: validation.reason });
+      continue;
+    }
+    const existing = existingScripts[validation.canonicalRequiredTestName];
+    if (existing === undefined) {
+      toWrite.push({ scriptName: validation.canonicalRequiredTestName, expectedScript: validation.expectedScript });
+      outcomes.push({ scriptName: validation.canonicalRequiredTestName, expectedScript: validation.expectedScript, outcome: "REGISTERED" });
+    } else if (existing === validation.expectedScript) {
+      outcomes.push({ scriptName: validation.canonicalRequiredTestName, expectedScript: validation.expectedScript, outcome: "ALREADY_REGISTERED" });
+    } else {
+      // 기존 script가 다른 target을 가리킴 — 절대 덮어쓰지 않는다(§ 요구사항 10).
+      outcomes.push({
+        scriptName: validation.canonicalRequiredTestName,
+        expectedScript: validation.expectedScript,
+        outcome: "DRIFT",
+        reason: `package.json에 이미 다른 값으로 등록됨: ${String(existing)}`,
+      });
+    }
+  }
+
+  if (toWrite.length === 0) return { outcomes, toCommit: [] };
+
+  const pkgPath = join(projectRoot, "package.json");
+  const raw = readFileSync(pkgPath, "utf-8");
+  const json = JSON.parse(raw) as Record<string, unknown>;
+  const scripts = (json.scripts && typeof json.scripts === "object" && !Array.isArray(json.scripts) ? (json.scripts as Record<string, unknown>) : {}) as Record<string, unknown>;
+  for (const w of toWrite) scripts[w.scriptName] = w.expectedScript;
+  json.scripts = scripts;
+
+  const serialized = JSON.stringify(json, null, 2) + "\n";
+  const secretFindings = scanContentForSecrets(serialized, "package.json");
+  if (secretFindings.length > 0) {
+    log("REQUIRED_TEST_REGISTRATION BLOCK — package.json 갱신 내용에서 secret 패턴 감지", {
+      findingKinds: secretFindings.map((f) => f.kind),
+    });
+    return {
+      outcomes: outcomes.map((o) => (toWrite.some((w) => w.scriptName === o.scriptName) ? { ...o, outcome: "REJECTED", reason: "secret 패턴 감지로 등록 취소" } : o)),
+      toCommit: [],
+    };
+  }
+
+  const tmpDir = mkdtempSync(join(projectRoot, ".autodev-pkg-registration-"));
+  const tmpPath = join(tmpDir, "package.json.tmp");
+  try {
+    writeFileSync(tmpPath, serialized, "utf-8");
+    const fd = openSync(tmpPath, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmpPath, pkgPath);
+    log("REQUIRED_TEST_REGISTRATION — Developer 선언 registration 등록", { registered: toWrite });
+  } finally {
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup.
+    }
+  }
+
+  return { outcomes, toCommit: toWrite };
+}
+
+/**
+ * registerValidatedRequiredTestScripts()가 만든 변경을 별도 infra commit으로 확정한다(§
+ * commitRequiredTestScriptRepair와 동일한 원칙 — Task 자신의 구현 commit과 섞지 않는다,
+ * package.json 외 다른 파일이 함께 staged되면 index를 reset하고 실패로 반환한다).
+ */
+export function commitRequiredTestRegistration(
+  projectRoot: string,
+  toCommit: { scriptName: string; expectedScript: string }[]
+): RequiredTestScriptRepairCommitResult {
+  if (toCommit.length === 0) return { ok: true };
+
+  const addRes = runGit(["add", "--", "package.json"], projectRoot);
+  if (!addRes.ok) return { ok: false, reason: `git add(package.json) 실패: ${addRes.stderr}` };
+
+  const stagedRes = runGit(["diff", "--cached", "--name-only"], projectRoot);
+  const staged = stagedRes.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (staged.length === 0) return { ok: true };
+  if (staged.length !== 1 || staged[0] !== "package.json") {
+    runGit(["reset"], projectRoot);
+    return { ok: false, reason: `package.json 외 다른 파일이 함께 staged됨(index reset됨): ${staged.join(", ")}` };
+  }
+
+  const message =
+    `fix: register developer-declared required test script(s)\n\n` +
+    toCommit.map((r) => `- ${r.scriptName}: ${r.expectedScript}`).join("\n") +
+    `\n\nDeveloper가 선언한 required-test registration 요청을 AutoDev infrastructure가 검증 후 등록했습니다.`;
+  const commitRes = runGit(["commit", "-m", message], projectRoot);
+  if (!commitRes.ok) {
+    runGit(["reset"], projectRoot);
+    return { ok: false, reason: `git commit(package.json) 실패(index reset됨): ${commitRes.stderr}` };
+  }
+  const hashRes = runGit(["rev-parse", "HEAD"], projectRoot);
+  log("REQUIRED_TEST_REGISTRATION commit 생성", { commitHash: hashRes.ok ? hashRes.stdout : undefined, registered: toCommit.map((r) => r.scriptName) });
   return { ok: true, commitHash: hashRes.ok ? hashRes.stdout : undefined };
 }

@@ -20,6 +20,22 @@ export interface ClaudeResult {
       stdoutTail?: string;
     };
   }[];
+  /**
+   * AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 8 —
+   * Developer가 이번 attempt에서 만든 required test 대상 파일에 대해 "이 npm script로
+   * 등록해달라"고 선언하는 요청 목록(§ required-test-preflight.ts
+   * validateRequiredTestRegistrationRequest). Developer는 package.json을 직접 수정할 권한이
+   * 없다 — 이 필드는 등록 "요청" 정보일 뿐이며, 실제 package.json mutation은 AutoDev
+   * infrastructure(claude-developer.ts TASK_COMPLETE 처리)가 엄격한 보안 검증을 통과한
+   * 요청에 대해서만 수행한다. Developer가 이 필드를 채우지 않아도(undefined) 기존 glob 기반
+   * 자동 복구(attemptSafeRequiredTestScriptRepair)가 그대로 동작한다 — 이 필드는 그 보완
+   * 채널이다.
+   */
+  requiredTestRegistrations?: {
+    scriptName: string;
+    runner: string;
+    target: string;
+  }[];
   rawOutput: string;
   /** Phase G Task G3.1 — 실제 Claude CLI JSON 출력(§ claude-runner.ts parseClaudeJsonOutput)이
    *  제공한 경우만 채운다. 제공하지 않으면 undefined(추정하지 않음). */
