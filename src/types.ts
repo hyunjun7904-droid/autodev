@@ -206,12 +206,24 @@ export interface CoreState {
    * orchestrator.ts WAITING_PROVIDER_RETRY). MAX_DEVELOPER_PROVIDER_WAITS를 넘으면 그때만
    * genuine WAITING_HUMAN으로 넘어간다 — Task 위험도(예: security-critical)와 실패 원인
    * 위험도(provider timeout)를 분리한다: provider가 일시적으로 응답하지 못했다는 사실 자체는
-   * 사람 판단이 필요한 사유가 아니다. claudeLimitWaitCount와 마찬가지로 매 run 시작 시 0으로
-   * 리셋된다. optional인 이유는 humanFinalReview와 동일하다 — 지정하지 않으면(undefined)
-   * 기존 project-state.json 파일과 100% 하위 호환되고, orchestrator.ts가 runOrchestrator()
-   * 시작 시 항상 0으로 먼저 리셋하므로 실제 판정 로직은 undefined를 절대 만나지 않는다.
+   * 사람 판단이 필요한 사유가 아니다 — 이 값은 상한이 없다(재시도 횟수 자체를 bounded로
+   * 제한해 결국 사람에게 넘기지 않는다, § 2026-08-28 정책 수정). 같은 task를 이어가는 동안만
+   * 누적되고(프로세스가 죽었다 재시작돼도 durable하게 보존됨), 다른 task로 전환되면
+   * 리셋된다(§ orchestrator.ts resumingSameTask). optional인 이유는 humanFinalReview와
+   * 동일하다 — 지정하지 않으면(undefined) 기존 project-state.json 파일과 100% 하위
+   * 호환된다.
    */
   developerProviderWaitCount?: number;
+
+  /**
+   * 위 developerProviderWaitCount와 짝을 이루는 durable timestamp(ISO 8601) — 다음 재시도가
+   * 예정된 시각. orchestrator.ts가 durable wait을 시작하기 "전에"(sleep 전에) 저장해, 그
+   * 대기 도중 프로세스가 죽어도 재시작 후 남은 시간만큼만 마저 기다리고 재시도한다(전체
+   * 간격을 처음부터 다시 기다리지 않는다 — § 요구사항 "nextRetryAt 저장/복원"). 대기가 실제로
+   * 끝나면(같은 프로세스 안에서 살아남았든, 재시작 후 남은 시간을 마저 기다렸든) null로
+   * 되돌린다 — 남아있는 값이 있으면 그 자체가 "아직 대기가 끝나지 않았다"는 뜻이다.
+   */
+  developerProviderNextRetryAt?: string | null;
 
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];

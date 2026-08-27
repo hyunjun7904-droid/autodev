@@ -717,18 +717,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
     const state = loadState(statePath);
 
-    // AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart Circuit Breaker(§ 요구사항
-    // 20/21). 정상적으로 끝난 실행은 항상 orchestrator.ts의 while 루프가 break 전에 남기는
-    // 종결 상태(APPROVED/WAITING_HUMAN/BLOCKED)로 종료한다 — 그 종결 상태가 아닌 mid-flight
-    // 상태(developer/reviewer 호출 도중을 뜻하는 값)로 새 프로세스가 이 project를 다시
-    // 발견했다면, 그 이유는 직전 프로세스가 그 상태를 종결하지 못한 채(수동 종료/timeout/OS
-    // kill 등) 죽었다는 것뿐이다 — 새로운 판정 로직을 만들지 않고 이미 저장된 status 값만
-    // 재사용한다. 같은 task에서 이 일이 반복되면(기본 2회) "죽었으니 또 실행"을 무한
-    // 반복하지 않고 자동 재시작을 멈춰 사람이 로컬 진단하게 한다(§ 요구사항 20 — durable
-    // unexpectedExitCount, § durable-recovery-state.ts). decideNextAction()은 여전히 순수
-    // 함수로 유지한다 — getNextTask()(decideNextAction이 내부적으로 쓰는 것과 동일한 순수
-    // 함수)를 여기서 먼저 호출해 "지금 mid-flight로 남아있는 task가 실제로 무엇인지"만
-    // 미리 확인한다(완료되지 않은 task만 대상이므로 항상 이 값과 일치한다).
+    // AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart 재시작 감지(§ 요구사항
+    // 20/21, 2026-08-28 정책 수정). 정상적으로 끝난 실행은 항상 orchestrator.ts의 while
+    // 루프가 break 전에 남기는 종결 상태(APPROVED/WAITING_HUMAN/BLOCKED)로 종료한다 — 그
+    // 종결 상태가 아닌 mid-flight 상태(developer/reviewer 호출 도중을 뜻하는 값)로 새
+    // 프로세스가 이 project를 다시 발견했다면, 그 이유는 직전 프로세스가 그 상태를 종결하지
+    // 못한 채(수동 종료/timeout/OS kill 등) 죽었다는 것뿐이다 — 새로운 판정 로직을 만들지
+    // 않고 이미 저장된 status 값만 재사용한다. 프로세스가 예상치 못하게 죽는 것 자체는
+    // 기술적 사건이지 사람 판단이 필요한 사유가 아니다(§ 정책 수정 — "process crash" 카테고리
+    // 는 Human Gate로 연결하지 않는다) — 이전 버전은 같은 task에서 2회 반복되면 genuine
+    // WAITING_HUMAN으로 전환했으나, 그 escalation 자체를 제거한다: 몇 번이 반복되든 항상
+    // 제한적 재시작을 허용한다. durable unexpectedExitCount는 계속 기록해(§
+    // durable-recovery-state.ts) 사람이 대시보드/로그로 "이번이 몇 번째인지" 확인할 수 있게만
+    // 한다(관측 가능 — 조용히 멈추지 않는다). 이 저장소에는 이 프로세스를 빠르게 자동
+    // 재시작시키는 별도 supervisor가 없으므로(사람 또는 외부 스케줄러가 재시작을 트리거함),
+    // orchestrator.ts의 durable provider wait처럼 자체 sleep 기반 throttle을 추가하지
+    // 않는다 — 그런 supervisor가 도입되면 그때 이 판단을 재검토해야 한다.
     const MID_FLIGHT_ORCHESTRATOR_STATUSES = new Set([
       "CLAUDE_WORKING",
       "WAITING_GPT_REVIEW",
@@ -739,28 +743,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // 동일하게 "한 번의 재시작은 허용"으로 취급한다 — 별도 판정 로직을 추가하지 않는다.
       "WAITING_PROVIDER_RETRY",
     ]);
-    const MAX_UNEXPECTED_EXITS_BEFORE_CIRCUIT_BREAK = 2;
     const inFlightTaskCandidate = getNextTask(manifest.taskRegistry, state.completedTasks);
     if (inFlightTaskCandidate && MID_FLIGHT_ORCHESTRATOR_STATUSES.has(state.status as string)) {
       const durable = loadDurableFailureStateForTask(state, inFlightTaskCandidate.id);
       const unexpectedExitCount = durable.unexpectedExitCount + 1;
       state.technicalRecoveryState = { ...durable, unexpectedExitCount, updatedAt: new Date().toISOString() };
-      if (unexpectedExitCount >= MAX_UNEXPECTED_EXITS_BEFORE_CIRCUIT_BREAK) {
-        console.log(
-          `[autodev] task ${inFlightTaskCandidate.id} — 예상치 못한 프로세스 종료가 ${unexpectedExitCount}회 반복되어(PROCESS_RESTART_CIRCUIT_BREAKER) 자동 재시작을 중단합니다. 사람의 확인이 필요합니다.`
-        );
-        log("PROCESS_RESTART_CIRCUIT_BREAKER — 자동 재시작 중단", { taskId: inFlightTaskCandidate.id, unexpectedExitCount, priorStatus: state.status });
-        state.status = "WAITING_HUMAN";
-        state.deferredHumanTasks.push(
-          `PROCESS_RESTART_CIRCUIT_BREAKER(${inFlightTaskCandidate.id}): 동일 task에서 예상치 못한 프로세스 종료가 ${unexpectedExitCount}회 반복되어 자동 재시작을 중단합니다 — 로컬 진단이 필요합니다.`
-        );
-      } else {
-        log("AutoDev 프로세스가 mid-flight 상태에서 재시작됨 — 제한적 재시작 허용(§ 요구사항 20)", {
-          taskId: inFlightTaskCandidate.id,
-          unexpectedExitCount,
-          priorStatus: state.status,
-        });
-      }
+      log("AutoDev 프로세스가 mid-flight 상태에서 재시작됨 — 제한적 재시작 허용(§ 요구사항 20, 횟수 무관)", {
+        taskId: inFlightTaskCandidate.id,
+        unexpectedExitCount,
+        priorStatus: state.status,
+      });
       saveState(state, statePath);
     }
 
@@ -1318,16 +1310,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     }
 
     // AutoDev / JARVIS 최종 무인개발 구조 보완 — Provider Timeout Circuit Breaker(§ 요구사항
-    // 20/21), 2026-08-27 신뢰성 보완 후속으로 갱신: claude-developer.ts의
-    // runDeveloperTaskWithRetry가 attempt 내 최대 재시도까지 소진해도, orchestrator.ts는 이제
-    // 곧바로 genuine WAITING_HUMAN으로 넘기지 않고 먼저 durable provider wait-then-retry(§
-    // orchestrator.ts WAITING_PROVIDER_RETRY, MAX_DEVELOPER_PROVIDER_WAITS)를 거친다 —
-    // 여기 도달했다는 것은 그 durable wait 예산까지 이미 다 썼거나(finalState의
-    // deferredHumanTasks에 DEVELOPER_PROVIDER_WAIT_EXHAUSTED_PREFIX 마커가 있음) 다른
-    // 이유로 orchestrator가 genuine WAITING_HUMAN으로 끝났다는 뜻이다. 이 블록은 그 판정을
-    // 바꾸지 않는다 — 다만 이 task에서 누적된 provider timeout 횟수를 durable하게 기록해
-    // (재시작해도 유지) 사람이 "이번이 몇 번째인지" 즉시 확인할 수 있게 하고, 근본원인
-    // 분류(PROVIDER_ERROR)를 명시적으로 남긴다.
+    // 20/21), 2026-08-28 정책 수정으로 갱신: claude-developer.ts의 runDeveloperTaskWithRetry가
+    // attempt 내 최대 재시도까지 소진해도, orchestrator.ts는 이제 절대 genuine WAITING_HUMAN
+    // 으로 승격하지 않는다 — durable provider wait-then-retry(§ orchestrator.ts
+    // WAITING_PROVIDER_RETRY)를 무한히(횟수 무제한, 간격만 bounded) 계속한다. 이 코드가 여기
+    // 도달했다는 것은(failedClaudeResult.success===false && errorCode가 TIMEOUT/
+    // CLI_NOT_FOUND) orchestrator가 이번 cycle에서 attempt 내 재시도가 소진돼 durable wait에
+    // 들어갔다는 뜻이지, genuine WAITING_HUMAN이 됐다는 뜻이 아니다(그건 이 실행에서 발생하지
+    // 않는다). 이 블록은 그 사실 자체를 바꾸지 않는다 — 다만 이 task에서 누적된 provider
+    // timeout 횟수를 durable하게 기록해(재시작해도 유지) 사람이 대시보드/로그로 "이번이 몇
+    // 번째인지" 확인할 수 있게 하고, 근본원인 분류(PROVIDER_ERROR)를 명시적으로 남긴다.
     if (failedClaudeResult && failedClaudeResult.success === false && (failedClaudeResult.errorCode === "TIMEOUT" || failedClaudeResult.errorCode === "CLI_NOT_FOUND")) {
       const durable = loadDurableFailureStateForTask(state, taskDef.id);
       const providerTimeoutCount = durable.providerTimeoutCount + 1;

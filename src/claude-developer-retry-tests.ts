@@ -205,32 +205,103 @@ async function scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(statePath: s
   );
 }
 
-// durable wait 예산(MAX_DEVELOPER_PROVIDER_WAITS)까지 전부 소진해도 계속 실패하면 그때만
-// genuine WAITING_HUMAN으로 넘어간다 — 무한 자동복구가 아니라는 것(bounded)을 직접 증명한다.
-async function scenarioOrchestratorDurableWaitBoundedThenGenuineWaitingHuman(statePath: string): Promise<void> {
+// 2026-08-28 정책 수정 — 기술적 provider 실패(TIMEOUT/RATE_LIMIT/PROVIDER_UNAVAILABLE류)는
+// 아무리 반복돼도 genuine WAITING_HUMAN으로 승격하지 않는다(재시도 "횟수"는 무한하지만
+// 재시도 "간격"만 bounded). 옛 정책의 bound(6회)를 훨씬 넘는 10 cycle 동안 계속 실패해도
+// WAITING_HUMAN이 전혀 관측되지 않음을 직접 증명한다 — 무한 루프 자체를 테스트가 안전하게
+// 끝내기 위해 fake sleep이 N회 호출되면 sentinel 예외를 던져 강제로 빠져나온다(테스트
+// 기법일 뿐, orchestrator.ts 자체에 그런 예외 처리가 있는 게 아니다).
+async function scenarioProviderTimeoutNeverEscalatesAndStaysBounded(statePath: string): Promise<void> {
   const seq = makeSequence([TIMEOUT_RESULT]); // 계속 TIMEOUT만 반환(clamp)
   const claudeRunner = (task: string, attempt: number) =>
     runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
-  let sleepCalls = 0;
+  const observedStatuses: string[] = [];
+  const delays: number[] = [];
+  const STOP_AFTER = 10; // 옛 bound(6)를 넘겨서도 계속 진행됨을 증명
 
-  const { finalState } = await runOrchestrator("orchestrator: TIMEOUT 영구 지속", {
-    claudeRunner,
+  let stoppedByTestSentinel = false;
+  try {
+    await runOrchestrator("orchestrator: TIMEOUT 영구 지속(정책상 무한 재시도)", {
+      claudeRunner,
+      statePath,
+      developerProviderWaitScheduleMs: [10, 20, 30],
+      developerProviderWaitCooldownMs: 40,
+      onProgress: (info) => observedStatuses.push(info.status),
+      sleep: async (ms) => {
+        delays.push(ms);
+        if (delays.length >= STOP_AFTER) throw new Error("TEST_STOP_INFINITE_LOOP_SENTINEL");
+      },
+    });
+  } catch (e) {
+    stoppedByTestSentinel = e instanceof Error && e.message === "TEST_STOP_INFINITE_LOOP_SENTINEL";
+  }
+
+  check("무한 재시도가 실제로 계속됨(테스트가 인위적으로 멈출 때까지 10회 진행)", stoppedByTestSentinel);
+  check(
+    "정책: 기술적 provider 실패는 아무리 반복돼도(10회 > 옛 bound 6) WAITING_HUMAN이 전혀 관측되지 않음",
+    !observedStatuses.includes("WAITING_HUMAN")
+  );
+  check("재시도 간격은 처음엔 schedule을 그대로 따름(10, 20, 30)", delays[0] === 10 && delays[1] === 20 && delays[2] === 30);
+  check("schedule 소진 후에는 고정 cooldown(40)으로 bounded됨(무한 가속 없음)", delays[3] === 40 && delays[9] === 40);
+}
+
+// § 요구사항 "retry metadata 영속화 → nextRetryAt 저장 → 프로세스 종료/재시작 → 동일 retry
+// state 복원 → nextRetryAt 도달 → 자동 재시도". 실제 프로세스를 죽이지 않고, 크래시 직전까지
+// 디스크에 저장된 state.json을 그대로 이용해 "재시작"을 정확하게 재현한다 — 두 번째
+// runOrchestrator 호출이 전체 간격을 처음부터 다시 기다리지 않고 남은 시간만 기다리는지
+// fake now()로 직접 검증한다.
+async function scenarioDurableWaitRestartResumesWithRemainingTime(statePath: string): Promise<void> {
+  const sameTask = "orchestrator: TIMEOUT 후 프로세스 재시작 시뮬레이션";
+  const seq1 = makeSequence([TIMEOUT_RESULT]);
+  const claudeRunner1 = (task: string, attempt: number) =>
+    runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq1.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
+
+  let crashed: unknown;
+  try {
+    await runOrchestrator(sameTask, {
+      claudeRunner: claudeRunner1,
+      statePath,
+      now: () => 1_000_000_000,
+      developerProviderWaitScheduleMs: [100_000], // 100초
+      developerProviderWaitCooldownMs: 200_000,
+      // durable wait에 막 들어가는 순간(state 저장 직후) 프로세스가 죽었다고 가정한다.
+      sleep: async () => {
+        throw new Error("SIMULATED_PROCESS_DEATH_MID_WAIT");
+      },
+    });
+  } catch (e) {
+    crashed = e;
+  }
+  check("1차 프로세스: durable wait 진입 직후(sleep 호출 시점) 죽음(시뮬레이션)", crashed instanceof Error);
+
+  const stateAfterCrash = JSON.parse(readFileSync(statePath, "utf-8")) as { developerProviderNextRetryAt?: string; developerProviderWaitCount?: number };
+  check("크래시 전에 developerProviderNextRetryAt이 디스크에 저장됨(durable)", typeof stateAfterCrash.developerProviderNextRetryAt === "string");
+  check("크래시 전에 developerProviderWaitCount=1이 디스크에 저장됨", stateAfterCrash.developerProviderWaitCount === 1);
+
+  // 재시작: 같은 task, "아직 40초가 남은 시점"으로 시계를 맞춘다 — 전체 100초가 아니라 남은
+  // 40초만 대기해야 durable resume이 실제로 동작하는 것이다.
+  const scheduledAtMs = Date.parse(stateAfterCrash.developerProviderNextRetryAt as string);
+  const seq2 = makeSequence([SUCCESS_RESULT]);
+  const claudeRunner2 = (task: string, attempt: number) =>
+    runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq2.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => FAKE_PASS_REVIEW;
+  let secondSleepMs: number | undefined;
+
+  const { finalState } = await runOrchestrator(sameTask, {
+    claudeRunner: claudeRunner2,
+    gptReviewer,
     statePath,
-    sleep: async () => {
-      sleepCalls += 1;
+    now: () => scheduledAtMs - 40_000,
+    sleep: async (ms) => {
+      secondSleepMs = ms;
     },
   });
 
-  check("bounded: durable wait 예산(6회)을 넘으면 그제서야 WAITING_HUMAN", finalState.status === "WAITING_HUMAN");
-  check("bounded: sleep이 정확히 MAX_DEVELOPER_PROVIDER_WAITS(6)회만 호출됨(무한 대기 아님)", sleepCalls === 6);
-  check("bounded: developerProviderWaitCount가 정확히 6에서 멈춤", finalState.developerProviderWaitCount === 6);
+  check("재시작 후: 전체 간격(100초)이 아니라 남은 시간(40초)만 대기함(durable resume)", secondSleepMs === 40_000);
+  check("재시작 후: durable wait 재개 이후 같은 task가 정상적으로 완료되어 최종 APPROVED", finalState.status === "APPROVED");
   check(
-    "bounded: 최종 마커는 DEVELOPER_PROVIDER_WAIT_EXHAUSTED(새 마커, 자동 복구 목록에 없음)",
-    finalState.deferredHumanTasks.some((t) => t.startsWith("DEVELOPER_PROVIDER_WAIT_EXHAUSTED("))
-  );
-  check(
-    "bounded: attempt 총 횟수도 유한함((6+1)cycle × 3attempt = 21, 무한 재시도 아님)",
-    seq.callCount() === 21
+    "재시작 후: developerProviderNextRetryAt이 소비되어 비워짐",
+    finalState.developerProviderNextRetryAt === null || finalState.developerProviderNextRetryAt === undefined
   );
 }
 
@@ -282,7 +353,8 @@ async function main(): Promise<void> {
     await scenarioExhaustionNoInfiniteRetry();
     await scenarioNonTransientNoRetry();
     await scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(makeTempStatePath());
-    await scenarioOrchestratorDurableWaitBoundedThenGenuineWaitingHuman(makeTempStatePath());
+    await scenarioProviderTimeoutNeverEscalatesAndStaysBounded(makeTempStatePath());
+    await scenarioDurableWaitRestartResumesWithRemainingTime(makeTempStatePath());
     await scenarioOrchestratorRetryTransparentToReviewLoop(makeTempStatePath());
     await scenarioRealHumanGateStillImmediate(makeTempStatePath());
   } finally {

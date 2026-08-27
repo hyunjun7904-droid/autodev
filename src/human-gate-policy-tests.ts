@@ -98,21 +98,6 @@ function scenarioDeveloperTransientRetryExhaustedIsTechnical(): void {
   check("isTechnicalAutoRecoverableWaitingHuman()도 동일하게 true", isTechnicalAutoRecoverableWaitingHuman(s));
 }
 
-// orchestrator.ts가 durable provider wait 예산(MAX_DEVELOPER_PROVIDER_WAITS)까지 전부 쓰고도
-// 계속 실패하면 별도의(자동 복구 목록에 없는) 마커를 저장한다 — 이 마커는 이 목록에 없으므로
-// fail-closed로 GENUINE에 남아야 한다(무한 자동복구 방지 안전장치가 여전히 살아있음을 증명).
-function scenarioDeveloperProviderWaitExhaustedStaysGenuine(): void {
-  const s = state({
-    deferredHumanTasks: [
-      "DEVELOPER_PROVIDER_WAIT_EXHAUSTED(TIMEOUT): Claude Developer 일시적 오류가 durable wait 6회 동안에도 반복되어 로컬 진단이 필요합니다.",
-    ],
-  });
-  check(
-    "durable wait 예산까지 소진된 DEVELOPER_PROVIDER_WAIT_EXHAUSTED 마커 → GENUINE(무한 자동복구 방지)",
-    classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT"
-  );
-}
-
 function scenarioUnknownReasonDefaultsToGenuine(): void {
   const s = state({ deferredHumanTasks: [] });
   check("알려진 기술 마커가 전혀 없으면(예: HIGH_RISK_ACTION_PREGATE/사용량 제한) fail-closed로 GENUINE", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
@@ -148,7 +133,6 @@ function main(): void {
   scenarioCheckpointBlockedOtherReasonIsGenuine();
   scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal();
   scenarioDeveloperTransientRetryExhaustedIsTechnical();
-  scenarioDeveloperProviderWaitExhaustedStaysGenuine();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();
 

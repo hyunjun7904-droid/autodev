@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runOrchestrator, MAX_GPT_CALLS, MAX_CLAUDE_LIMIT_WAITS } from "./orchestrator";
+import { runOrchestrator, MAX_GPT_CALLS } from "./orchestrator";
 import { sanitizeForLog } from "./logger";
 import { MAX_REVIEW_CYCLES } from "./policy";
 import { DEFAULT_STATE_PATH } from "./state";
@@ -167,9 +167,14 @@ async function scenarioMaxGptCalls(statePath: string): Promise<void> {
   check("GPT 호출 상한: 최종 상태 WAITING_HUMAN", finalState.status === "WAITING_HUMAN");
 }
 
+// 2026-08-28 정책 수정 — USAGE_LIMIT은 이제 상한 없이 계속 재시도한다(RATE_LIMIT류는 아무리
+// 반복돼도 Human Gate로 승격하지 않는다). 이 데모는 무한 루프를 안전하게 끝내기 위해 sleep이
+// N회 호출되면 sentinel 예외로 강제 종료한다(orchestrator.ts 자체의 동작이 아니라 데모 스크립트
+// 기법일 뿐이다).
 async function scenarioClaudeLimitRetry(statePath: string): Promise<void> {
   let claudeCalls = 0;
   let sleepCalls = 0;
+  const STOP_AFTER = 15; // 구 MAX_CLAUDE_LIMIT_WAITS(12)보다 많이 반복해도 계속됨을 보여준다.
   const alwaysUsageLimit = async (task: string, attempt: number): Promise<ClaudeResult & { errorCode?: string }> => {
     claudeCalls += 1;
     return {
@@ -183,24 +188,24 @@ async function scenarioClaudeLimitRetry(statePath: string): Promise<void> {
   };
   const fastSleep = async (_ms: number) => {
     sleepCalls += 1;
+    if (sleepCalls >= STOP_AFTER) throw new Error("DRY_RUN_STOP_INFINITE_LOOP_SENTINEL");
   };
 
-  const { finalState } = await runOrchestrator("Claude 사용량 제한 재시도 테스트", {
-    claudeRunner: alwaysUsageLimit,
-    claudeLimitWaitMs: 1,
-    sleep: fastSleep,
-    statePath,
-  });
+  let stoppedBySentinel = false;
+  try {
+    await runOrchestrator("Claude 사용량 제한 재시도 테스트", {
+      claudeRunner: alwaysUsageLimit,
+      claudeLimitWaitMs: 1,
+      sleep: fastSleep,
+      statePath,
+    });
+  } catch (e) {
+    stoppedBySentinel = e instanceof Error && e.message === "DRY_RUN_STOP_INFINITE_LOOP_SENTINEL";
+  }
 
-  check(
-    `사용량 제한 재시도: 정확히 ${MAX_CLAUDE_LIMIT_WAITS}회 대기 후 WAITING_HUMAN`,
-    finalState.status === "WAITING_HUMAN" && finalState.claudeLimitWaitCount === MAX_CLAUDE_LIMIT_WAITS
-  );
-  check(`사용량 제한 재시도: sleep 정확히 ${MAX_CLAUDE_LIMIT_WAITS}회 호출(실제 호출 카운트로 증명)`, sleepCalls === MAX_CLAUDE_LIMIT_WAITS);
-  check(
-    `사용량 제한 재시도: Claude 호출 ${MAX_CLAUDE_LIMIT_WAITS + 1}회(매 대기마다 재시도 + 최종 1회)`,
-    claudeCalls === MAX_CLAUDE_LIMIT_WAITS + 1
-  );
+  check(`사용량 제한 재시도: ${STOP_AFTER}회(구 상한 12회보다 많음)를 넘겨도 WAITING_HUMAN으로 승격하지 않고 계속 재시도함`, stoppedBySentinel);
+  check(`사용량 제한 재시도: sleep이 정확히 ${STOP_AFTER}회 호출됨(테스트가 멈출 때까지)`, sleepCalls === STOP_AFTER);
+  check(`사용량 제한 재시도: Claude 호출 ${STOP_AFTER}회(매 대기마다 재시도)`, claudeCalls === STOP_AFTER);
 }
 
 function scenarioSanitizer(): void {
