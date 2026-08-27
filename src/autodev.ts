@@ -8,6 +8,7 @@ import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import { wrapGptReviewerWithFireworksCallLimiter } from "./root-cause-analysis";
 import type { RootCauseAnalysisEvent } from "./root-cause-analysis";
+import { loadDurableFailureStateForTask, resolveDurableFailureStateForReviewer, clearDurableFailureState } from "./durable-recovery-state";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
 import type { TaskDefinition } from "./task-registry";
 import { validateProjectManifest, resolveRemoteGitSafetyPolicy, isHumanFinalReviewEnabled } from "./project-manifest";
@@ -716,6 +717,44 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
     const state = loadState(statePath);
 
+    // AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart Circuit Breaker(§ 요구사항
+    // 20/21). 정상적으로 끝난 실행은 항상 orchestrator.ts의 while 루프가 break 전에 남기는
+    // 종결 상태(APPROVED/WAITING_HUMAN/BLOCKED)로 종료한다 — 그 종결 상태가 아닌 mid-flight
+    // 상태(developer/reviewer 호출 도중을 뜻하는 값)로 새 프로세스가 이 project를 다시
+    // 발견했다면, 그 이유는 직전 프로세스가 그 상태를 종결하지 못한 채(수동 종료/timeout/OS
+    // kill 등) 죽었다는 것뿐이다 — 새로운 판정 로직을 만들지 않고 이미 저장된 status 값만
+    // 재사용한다. 같은 task에서 이 일이 반복되면(기본 2회) "죽었으니 또 실행"을 무한
+    // 반복하지 않고 자동 재시작을 멈춰 사람이 로컬 진단하게 한다(§ 요구사항 20 — durable
+    // unexpectedExitCount, § durable-recovery-state.ts). decideNextAction()은 여전히 순수
+    // 함수로 유지한다 — getNextTask()(decideNextAction이 내부적으로 쓰는 것과 동일한 순수
+    // 함수)를 여기서 먼저 호출해 "지금 mid-flight로 남아있는 task가 실제로 무엇인지"만
+    // 미리 확인한다(완료되지 않은 task만 대상이므로 항상 이 값과 일치한다).
+    const MID_FLIGHT_ORCHESTRATOR_STATUSES = new Set(["CLAUDE_WORKING", "WAITING_GPT_REVIEW", "REVISION_REQUIRED", "WAITING_CLAUDE_LIMIT"]);
+    const MAX_UNEXPECTED_EXITS_BEFORE_CIRCUIT_BREAK = 2;
+    const inFlightTaskCandidate = getNextTask(manifest.taskRegistry, state.completedTasks);
+    if (inFlightTaskCandidate && MID_FLIGHT_ORCHESTRATOR_STATUSES.has(state.status as string)) {
+      const durable = loadDurableFailureStateForTask(state, inFlightTaskCandidate.id);
+      const unexpectedExitCount = durable.unexpectedExitCount + 1;
+      state.technicalRecoveryState = { ...durable, unexpectedExitCount, updatedAt: new Date().toISOString() };
+      if (unexpectedExitCount >= MAX_UNEXPECTED_EXITS_BEFORE_CIRCUIT_BREAK) {
+        console.log(
+          `[autodev] task ${inFlightTaskCandidate.id} — 예상치 못한 프로세스 종료가 ${unexpectedExitCount}회 반복되어(PROCESS_RESTART_CIRCUIT_BREAKER) 자동 재시작을 중단합니다. 사람의 확인이 필요합니다.`
+        );
+        log("PROCESS_RESTART_CIRCUIT_BREAKER — 자동 재시작 중단", { taskId: inFlightTaskCandidate.id, unexpectedExitCount, priorStatus: state.status });
+        state.status = "WAITING_HUMAN";
+        state.deferredHumanTasks.push(
+          `PROCESS_RESTART_CIRCUIT_BREAKER(${inFlightTaskCandidate.id}): 동일 task에서 예상치 못한 프로세스 종료가 ${unexpectedExitCount}회 반복되어 자동 재시작을 중단합니다 — 로컬 진단이 필요합니다.`
+        );
+      } else {
+        log("AutoDev 프로세스가 mid-flight 상태에서 재시작됨 — 제한적 재시작 허용(§ 요구사항 20)", {
+          taskId: inFlightTaskCandidate.id,
+          unexpectedExitCount,
+          priorStatus: state.status,
+        });
+      }
+      saveState(state, statePath);
+    }
+
     // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 아래 canonical Human Gate 재검사가
     // CHECKPOINT_SCOPE_VIOLATION 기술적 WAITING_HUMAN을 복구할 때, deferredHumanTasks를
     // 비우기 "전에" 그 마커에 이미 담겨 있던 checkpoint.unexpectedFiles 목록을 여기 보존한다
@@ -1192,6 +1231,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           {
             taskId: taskDef.id,
             executor: executorContext,
+            // durable-recovery-state.ts — 프로세스가 도중에 죽었다 재시작해도 이 task의
+            // failure fingerprint/Fireworks 호출 횟수/RCA 횟수가 0으로 초기화되지 않는다(§
+            // 요구사항 19). runOrchestrator()가 끝난 뒤의 state.lastGptDecision을 통해 그대로
+            // 다시 저장된다 — orchestrator.ts는 수정하지 않는다.
+            initialDurableState: resolveDurableFailureStateForReviewer(state, taskDef.id),
             onRootCauseAnalysis: (event) => {
               pendingRootCauseGuidance = event;
             },
@@ -1261,6 +1305,26 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         changedFiles: failedClaudeResult.changedFiles,
         attemptDescription: failedClaudeResult.summary,
         outcome: "FAILURE",
+      });
+    }
+
+    // AutoDev / JARVIS 최종 무인개발 구조 보완 — Provider Timeout Circuit Breaker(§ 요구사항
+    // 20/21). 이미 claude-developer.ts의 runDeveloperTaskWithRetry가 TIMEOUT/CLI_NOT_FOUND
+    // 같은 일시적 실패를 한 attempt 안에서 최대 재시도까지 소진한 뒤에만 여기 도달한다 —
+    // 그 자체로 이미 가장 보수적인 circuit breaker(한 번의 반복만으로 즉시 genuine
+    // WAITING_HUMAN)다. 이 블록은 그 판정을 바꾸지 않는다 — 다만 이 task에서 누적된 provider
+    // timeout 횟수를 durable하게 기록해(재시작해도 유지) 사람이 "이번이 몇 번째인지" 즉시
+    // 확인할 수 있게 하고, 근본원인 분류(PROVIDER_ERROR)를 명시적으로 남긴다.
+    if (failedClaudeResult && failedClaudeResult.success === false && (failedClaudeResult.errorCode === "TIMEOUT" || failedClaudeResult.errorCode === "CLI_NOT_FOUND")) {
+      const durable = loadDurableFailureStateForTask(state, taskDef.id);
+      const providerTimeoutCount = durable.providerTimeoutCount + 1;
+      const afterProviderTimeout = loadState(statePath);
+      afterProviderTimeout.technicalRecoveryState = { ...durable, providerTimeoutCount, lastRecoveryAction: `PROVIDER_ERROR(${failedClaudeResult.errorCode})`, updatedAt: new Date().toISOString() };
+      saveState(afterProviderTimeout, statePath);
+      log("PROVIDER_ERROR — Developer 호출이 재시도 소진 후에도 실패(durable 카운트 갱신)", {
+        taskId: taskDef.id,
+        errorCode: failedClaudeResult.errorCode,
+        providerTimeoutCount,
       });
     }
 
@@ -1683,6 +1747,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   updated.gitCheckpoint = checkpoint.commitHash ?? updated.gitCheckpoint;
   updated.currentPhase = taskDef.phase;
   updated.lastGptDecision = finalState.lastGptDecision;
+  // durable-recovery-state.ts — 이 task가 실제로 완료(checkpoint 성공)됐다. 이 task의 failure
+  // fingerprint/Fireworks 호출 횟수/RCA 횟수/provider timeout 횟수/예상치 못한 종료 횟수를
+  // 완전히 비운다 — 다음 task가 이 task의 실패 이력을 물려받지 않게 한다(§ 요구사항 19).
+  clearDurableFailureState(updated);
   // checkpoint가 실제로 성공했으므로 이 gate는 완전히 소비됐다 — 다음 실행에서 stale하게
   // 남아 재해석되지 않도록 명시적으로 비운다(§ 요구사항 13 Test 7 — checkpoint exactly once).
   updated.humanFinalReview = null;

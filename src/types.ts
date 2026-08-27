@@ -220,6 +220,40 @@ export interface CoreState {
    *  checkpoint 성공 후에는 null로 되돌린다(§ autodev.ts). 지정하지 않으면(undefined) 이
    *  gate가 전혀 없다는 뜻 — 기존 project-state.json 파일과 100% 하위 호환된다. */
   humanFinalReview?: HumanFinalReviewGate | null;
+
+  /**
+   * AutoDev / JARVIS 최종 무인개발 구조 보완 — Durable Failure/Recovery State(§
+   * durable-recovery-state.ts). orchestrator.ts의 gptCallCount/stagnationTracker와 달리
+   * 이 값은 loop-local이 아니라 project-state.json에 그대로 저장되는 durable 값이다 —
+   * AutoDev 프로세스가 재시작돼도(수동 종료/timeout/kill 어떤 이유든) 동일 task에 대한
+   * failure fingerprint/Fireworks 호출 횟수/RCA 횟수/provider timeout 횟수/예상치 못한
+   * 프로세스 종료 횟수가 0으로 초기화되지 않게 한다. taskId가 현재 진행 중인 task와
+   * 다르면(새 task로 전환) 이 필드는 안전하게 리셋된다(§ loadDurableFailureStateForTask) —
+   * 다른 task로 이 상태가 새어나가지 않는다. 지정하지 않으면(undefined) 기존
+   * project-state.json 파일과 100% 하위 호환된다.
+   */
+  technicalRecoveryState?: DurableFailureState | null;
+}
+
+/** § durable-recovery-state.ts에도 재수출되는 것과 동일한 타입 — CoreState가 이 타입을
+ *  참조해야 하므로 여기(types.ts)에 원본을 둔다(순환 import 방지). */
+export interface DurableFailureState {
+  taskId: string;
+  failureFingerprint?: string;
+  /** 동일 fingerprint가 연속으로 REVISE 판정을 받은 횟수(= 그 fingerprint에 대해 실제로
+   *  소비된 Fireworks 호출 횟수와 동일 — § root-cause-analysis.ts 설계). */
+  sameFailureCount: number;
+  rootCauseAnalysisCount: number;
+  providerTimeoutCount: number;
+  /** 이 task가 완료되지 않은 채(비정상 종료) 새 프로세스가 다시 이 task를 발견한 횟수. */
+  unexpectedExitCount: number;
+  lastRecoveryAction?: string;
+  /** RCA가 현재 pending 상태(로컬 재검증을 아직 통과하지 못해 다음 Fireworks 호출이 차단된
+   *  상태)인지 — 이 값과 pendingSnapshotKey가 함께 있어야 프로세스 재시작 후에도
+   *  "세 번째 호출 차단" 상태를 정확히 복원할 수 있다(§ root-cause-analysis.ts). */
+  pendingRootCauseCategory?: string;
+  pendingSnapshotKey?: string;
+  updatedAt: string;
 }
 
 /**

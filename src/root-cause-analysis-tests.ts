@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { createSafeExecutorContext } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
-import type { ClaudeResult } from "./types";
+import type { ClaudeResult, DurableFailureState } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
 import {
   computeReviewCycleFingerprint,
@@ -290,6 +290,56 @@ async function runWrapperScenario_RepeatAfterRevalidationTriggersRcaAgain(): Pro
   }
 }
 
+// ---------------------------------------------------------------------------
+// AutoDev / JARVIS 최종 무인개발 구조 보완 — durable seed로 RCA-pending 상태를 복원(§
+// 요구사항 19, 30 "재시작해도 Fireworks count 보존"). 프로세스가 RCA 트리거 직후(3번째
+// 호출을 막아야 하는 상태) 죽었다가 다시 시작된 상황을 흉내낸다 — 새 wrapper 인스턴스의
+// 첫 호출임에도 durable seed만으로 즉시 3번째 실제 호출을 차단해야 한다.
+// ---------------------------------------------------------------------------
+async function scenarioDurableSeedBlocksThirdCallAfterRestart(): Promise<void> {
+  let innerCallCount = 0;
+  const inner = async (): Promise<GptReviewerReturn> => {
+    innerCallCount += 1;
+    return reviseResult("동일한 audit logging 문제가 반복됩니다");
+  };
+  const seed: DurableFailureState = {
+    taskId: "2.2",
+    failureFingerprint: "seeded-fp",
+    sameFailureCount: 2,
+    rootCauseAnalysisCount: 1,
+    providerTimeoutCount: 0,
+    unexpectedExitCount: 1,
+    pendingRootCauseCategory: "IMPLEMENTATION_ERROR",
+    // fakeResult()의 기본 changedFiles(backend/device-trust/device-trust-manager.mjs)까지
+    // 포함한 실제 snapshot key 형식과 정확히 일치해야 한다(§ computeAttemptSnapshotKey).
+    pendingSnapshotKey: "attempt:seeded-prior::backend/device-trust/device-trust-manager.mjs",
+    lastRecoveryAction: "구현 결함으로 분류됨",
+    updatedAt: new Date().toISOString(),
+  };
+  const wrapped = wrapGptReviewerWithFireworksCallLimiter(inner, { taskId: "2.2", initialDurableState: seed });
+
+  // 이 새 프로세스의 첫 attempt가 이전과 구분되지 않는 산출물(동일 snapshot)을 다시
+  // 제출했다면 RECOVERY_APPLIED=NO로 즉시 막혀야 한다 — inner가 전혀 호출되지 않는다.
+  const unchangedAttempt = attemptResult("seeded-prior");
+  const r1 = await wrapped(unchangedAttempt, 1, "task", [], undefined, 1, 1, undefined);
+  check("durable seed 복원 — 재시작 직후 첫 호출도 이전과 동일한 산출물이면 Fireworks를 호출하지 않음", innerCallCount === 0 && r1.decision === "REVISE");
+
+  // 새로운(구분되는) attempt를 제출하고 로컬 검증도 통과하면 그제서야 재검증 1회를 허용한다.
+  const r2 = await wrapped(attemptResult("seeded-new"), 2, "task", [], undefined, 2, 2, undefined);
+  check("durable seed 복원 — 새 attempt + 로컬 검증 통과 후에만 재검증 1회 허용", innerCallCount === 1 && r2.decision === "REVISE");
+}
+
+function scenarioSeededLimiterContinuesCountFromDisk(): void {
+  // durable-recovery-state.ts가 이미 taskId 일치를 확인한 뒤 넘긴다는 계약(§
+  // resolveDurableFailureStateForReviewer, durable-recovery-state-tests.ts에서 별도 검증) —
+  // 여기서는 createReviewCallLimiter가 그 seed 위에서 정상적으로 카운트를 이어간다는 것만
+  // 직접 확인한다(재시작 전 repeatCount=1이었다면 재시작 후 같은 fingerprint 재관측 시
+  // repeatCount=2가 되어야 트리거된다).
+  const limiter = createReviewCallLimiter(2, { fingerprint: "fp-a", repeatCount: 1 });
+  const observed = limiter.observeReviseFingerprint("fp-a");
+  check("createReviewCallLimiter seed — 시딩된 repeatCount 위에서 정상적으로 이어서 카운트함", observed.repeatCount === 2 && observed.triggerRootCauseAnalysis === true);
+}
+
 async function main(): Promise<void> {
   scenarioFingerprintDeterministicForSameInput();
   scenario7_NewFindingProducesNewFingerprint();
@@ -307,6 +357,8 @@ async function main(): Promise<void> {
   await runWrapperScenario_LocalVerificationFailsBlocksThirdCall();
   await runWrapperScenario_RecoveryNotAppliedBlocksRecall();
   await runWrapperScenario_RepeatAfterRevalidationTriggersRcaAgain();
+  await scenarioDurableSeedBlocksThirdCallAfterRestart();
+  scenarioSeededLimiterContinuesCountFromDisk();
 
   // limiter 단독 동작(§ 요구사항 — 단순 reviewCycle 증가가 아니라 fingerprint 기반).
   const limiter = createReviewCallLimiter();

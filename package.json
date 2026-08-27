@@ -40,6 +40,7 @@
     "test:human-gate-policy": "npm run build && node dist/human-gate-policy-tests.js",
     "test:failure-stagnation": "npm run build && node dist/failure-stagnation-tests.js",
     "test:root-cause-analysis": "npm run build && node dist/root-cause-analysis-tests.js",
+    "test:durable-recovery-state": "npm run build && node dist/durable-recovery-state-tests.js",
     "test:problem-memory": "npm run build && node dist/problem-memory-tests.js",
     "test:round-status": "npm run build && node dist/round-status-tests.js",
     "test:notification-provider-ntfy": "npm run build && node dist/notification-provider-ntfy-tests.js",

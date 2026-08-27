@@ -380,3 +380,32 @@ export function peekProjectLock(
   }
   return { locked: false };
 }
+
+export type ProjectRuntimeLiveness =
+  | { present: false }
+  | { present: true; pid: number; ownerKind: ProjectLockOwnerKind; taskId?: string; liveness: LivenessVerdict };
+
+/**
+ * AutoDev / JARVIS 최종 무인개발 구조 보완 — 대시보드 실행상태 보완(§ 요구사항 24). 이
+ * 함수도 peekProjectLock()과 마찬가지로 읽기 전용(lock을 만들거나 지우지 않는다)이지만,
+ * peekProjectLock()과 달리 "잠겨 있는가"라는 boolean 하나로 뭉개지 않고 실제 owner
+ * PID/liveness 판정 전체를 그대로 노출한다 — 대시보드가 project-state.json의 status 문자열
+ * (예: "CLAUDE_WORKING")만으로 "지금 실제로 실행 중"이라고 추측하지 않고, 이 값과 status를
+ * 함께 조합해 판단할 수 있게 하기 위함이다. lock 파일이 없거나(present:false) 손상됐으면
+ * (§ readLockFile의 "corrupt" — present:false로 취급, "실행 중이 아님"과 동일하게 안전한
+ * 쪽으로 fail-closed) 실행 중이라고 주장하지 않는다.
+ */
+export function inspectProjectRuntimeLiveness(
+  projectId: string,
+  targetProjectRoot: string,
+  testDeps: Pick<ProjectLockTestDeps, "assessLiveness" | "lockDir"> = {}
+): ProjectRuntimeLiveness {
+  const canonicalProjectPath = resolveCanonicalProjectPath(targetProjectRoot);
+  const lockDir = testDeps.lockDir ?? RUNTIME_LOCK_DIR;
+  const filePath = lockFilePathFor(canonicalProjectPath, lockDir);
+  const existing = readLockFile(filePath);
+  if (existing.kind !== "valid") return { present: false };
+  const assessLiveness = testDeps.assessLiveness ?? assessOwnerLiveness;
+  const liveness = assessLiveness(existing.metadata.pid, existing.metadata.processStartedAtMs);
+  return { present: true, pid: existing.metadata.pid, ownerKind: existing.metadata.ownerKind, taskId: existing.metadata.taskId, liveness };
+}

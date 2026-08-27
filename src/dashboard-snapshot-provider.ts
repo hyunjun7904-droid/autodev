@@ -15,6 +15,8 @@ import { readRoundStatus, isRoundStatusLive, RUNTIME_ROUND_STATUS_PATH } from ".
 import type { RoundStatusSnapshot } from "./round-status";
 import { buildAttemptOutcomes } from "./dashboard-attempt-outcomes";
 import type { AttemptOutcomesSummary } from "./dashboard-attempt-outcomes";
+import { loadProjectAdapter } from "./project-adapter-loader";
+import { inspectProjectRuntimeLiveness } from "./project-lock";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -111,6 +113,52 @@ export interface DashboardSnapshot {
    *  task attempt들을 CHECKPOINT_CREATED(성공)/RUN_BLOCKED(실패) event만으로 집계한다.
    *  runId 하나도 기록된 적이 없으면(NO_RUN_YET) 이 필드 자체가 없다. */
   attemptOutcomes?: AttemptOutcomesSummary;
+  /**
+   * AutoDev / JARVIS 최종 무인개발 구조 보완 — 대시보드 실행상태 보완(§ 요구사항 24).
+   * snapshot.runStatus/taskStatus(EventStore의 마지막 event가 무엇이었는지)만으로는 그
+   * 프로세스가 지금도 실제로 살아있는지 알 수 없다 — 마지막 event가 "RUNNING"류였는데
+   * 그 프로세스가 죽었으면 이 값 없이는 영원히 실행 중처럼 보인다. project-lock.ts의
+   * inspectProjectRuntimeLiveness()(읽기 전용, lock을 만들거나 지우지 않는다)로 실제 owner
+   * PID의 생존 여부를 함께 확인해 이 문제를 없앤다 — scheduler/실행 로직은 전혀 건드리지
+   * 않는 순수 표시 필드다(§ 요구사항: "이 변경은 표시/관측 로직에 한정한다"). AUTODEV_
+   * PROJECT_ADAPTER가 설정돼 있지 않거나 project config를 읽을 수 없으면 undefined(추측
+   * 금지).
+   */
+  runtimeTruth?: DashboardRuntimeTruth;
+}
+
+export type DashboardRuntimeState = "RUNNING" | "WAITING" | "STOPPED" | "STALE";
+
+export interface DashboardRuntimeTruth {
+  state: DashboardRuntimeState;
+  reason: string;
+}
+
+/**
+ * lock 파일이 없으면(present:false) 이 project를 대상으로 실행 중인 AutoDev writer가 전혀
+ * 없다는 뜻이다 — project-state.json.status가 무엇이든("CLAUDE_WORKING"이 남아있어도) 그
+ * 값을 신뢰하지 않고 STOPPED로 표시한다(§ 요구사항 24 핵심 사례). owner가 STALE/UNCERTAIN이면
+ * (죽은 PID가 확인됐거나 확인 자체가 불가능함) lock 파일은 남아있어도 실행 중이라고 주장하지
+ * 않는다 — STALE로 표시한다. owner가 ALIVE면 그제서야 event 기반 taskStatus를 참고해
+ * WAITING_HUMAN이면 WAITING, 아니면 RUNNING으로 세분한다.
+ */
+export function computeDashboardRuntimeTruth(
+  liveness: import("./project-lock").ProjectRuntimeLiveness,
+  taskStatus: string | undefined
+): DashboardRuntimeTruth {
+  if (!liveness.present) {
+    return { state: "STOPPED", reason: "실행 중인 AutoDev process lock이 없습니다." };
+  }
+  if (liveness.liveness.verdict === "STALE") {
+    return { state: "STALE", reason: `owner(pid=${liveness.pid})가 더 이상 살아있지 않습니다(${liveness.liveness.evidence}).` };
+  }
+  if (liveness.liveness.verdict === "UNCERTAIN") {
+    return { state: "STALE", reason: `owner(pid=${liveness.pid})의 생존 여부를 확인할 수 없습니다(${liveness.liveness.reason}).` };
+  }
+  if (taskStatus === "WAITING_HUMAN") {
+    return { state: "WAITING", reason: `owner(pid=${liveness.pid})는 살아있지만 사람 승인을 기다리는 중입니다.` };
+  }
+  return { state: "RUNNING", reason: `owner(pid=${liveness.pid})가 실제로 실행 중입니다.` };
 }
 
 // round-status.json은 claude CLI가 실제로 응답을 받은 round 시작 시점에만 갱신된다 — 그
@@ -196,6 +244,21 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, 
   const roundStatus =
     rawRoundStatus && snapshot.taskId && isRoundStatusLive(rawRoundStatus, runId, snapshot.taskId, now, ROUND_STATUS_MAX_AGE_MS) ? rawRoundStatus : undefined;
 
+  // § 요구사항 24 — run.ts가 이미 쓰는 것과 동일한 project config 경로로 targetProjectRoot를
+  // 얻는다(§ project-adapter-loader.ts, 새 설정 방식을 만들지 않는다). 읽을 수 없으면
+  // runtimeTruth는 undefined로 남는다(추측 금지) — 다른 필드에는 전혀 영향을 주지 않는다.
+  let runtimeTruth: DashboardRuntimeTruth | undefined;
+  if (adapterPath) {
+    try {
+      const manifest = loadProjectAdapter(adapterPath);
+      const liveness = inspectProjectRuntimeLiveness(manifest.projectId, manifest.targetProjectRoot);
+      runtimeTruth = computeDashboardRuntimeTruth(liveness, snapshot.taskStatus);
+    } catch {
+      // project config를 읽지 못하면(잘못된 경로 등) 이 필드만 조용히 비운다 — 대시보드
+      // 전체를 무너뜨리지 않는다(§ 요구사항: 추측 금지, 기존 다른 optional 필드와 동일 원칙).
+    }
+  }
+
   return {
     status: "OK",
     generatedAt: snapshot.generatedAt,
@@ -208,5 +271,6 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, 
     callEfficiency: aggregateCallEfficiency(snapshot.taskId ? result.events.filter((e) => e.taskId === snapshot.taskId) : result.events),
     roundStatus,
     attemptOutcomes: buildAttemptOutcomes(result.events, snapshot.projectId),
+    runtimeTruth,
   };
 }

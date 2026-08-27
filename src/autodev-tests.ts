@@ -1329,6 +1329,76 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
   check("CHECKPOINT_SCOPE_VIOLATION 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
 }
 
+// AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart Circuit Breaker(§ 요구사항
+// 20/21). status가 종결값이 아닌 mid-flight 값("CLAUDE_WORKING")으로 남아있다는 것은 직전
+// 프로세스가 그 상태를 종결하지 못한 채 죽었다는 뜻이다. durable
+// technicalRecoveryState.unexpectedExitCount가 이미 1(직전 1회는 제한적으로 재시작을
+// 허용했음을 의미)인 상태에서 또 mid-flight로 발견되면(2회째) 자동 재시작을 멈추고
+// genuine WAITING_HUMAN으로 전환해야 한다 — Developer는 전혀 호출되지 않는다.
+async function scenarioRunAutodevOnceProcessRestartCircuitBreakerBlocksSecondRepeat(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "CLAUDE_WORKING",
+    technicalRecoveryState: {
+      taskId: "P1.2",
+      sameFailureCount: 0,
+      rootCauseAnalysisCount: 0,
+      providerTimeoutCount: 0,
+      unexpectedExitCount: 1,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // completedTasks=["P1.1"] → 다음은 P1.2
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("PROCESS_RESTART_CIRCUIT_BREAKER: 2회째 mid-flight 재발견 시 Developer를 호출하지 않음", claudeCalls === 0);
+  check("PROCESS_RESTART_CIRCUIT_BREAKER: outcome=STOPPED", result.outcome === "STOPPED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("PROCESS_RESTART_CIRCUIT_BREAKER: 최종 status=WAITING_HUMAN(genuine)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "PROCESS_RESTART_CIRCUIT_BREAKER: deferredHumanTasks에 마커 기록됨",
+    finalState.deferredHumanTasks.some((t) => t.includes("PROCESS_RESTART_CIRCUIT_BREAKER"))
+  );
+  check(
+    "PROCESS_RESTART_CIRCUIT_BREAKER: durable unexpectedExitCount가 2로 갱신됨",
+    (finalState.technicalRecoveryState?.unexpectedExitCount ?? 0) === 2
+  );
+}
+
+// 첫 번째 mid-flight 재발견(unexpectedExitCount 0 → 1)은 아직 임계치 미만이므로 정상적으로
+// Developer를 재호출해 진행을 계속해야 한다 — 여기서 즉시 차단되면 §20의 "제한적 재시작
+// 허용"이 깨진다.
+async function scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { status: "WAITING_GPT_REVIEW" });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-restart-recovery.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: 1회차 mid-flight 재발견 이후 정상 진행",
+      changedFiles: ["proj/marker-restart-recovery.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("PROCESS_RESTART_CIRCUIT_BREAKER: 1회차는 제한적으로 재시작을 허용함", claudeCalls === 1);
+  check("PROCESS_RESTART_CIRCUIT_BREAKER: 1회차는 정상적으로 checkpoint까지 도달", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+}
+
 // 실제 비용이 얽힌 WAITING_HUMAN(BUDGET_EXCEEDED)은 canonical policy로도 절대 자동 복구되지
 // 않아야 한다 — humanFinalReview gate와 무관한 별도 보호 경로를 직접 증명한다.
 async function scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman(): Promise<void> {
@@ -1707,6 +1777,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
+    await scenarioRunAutodevOnceProcessRestartCircuitBreakerBlocksSecondRepeat();
+    await scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();
     await scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent();

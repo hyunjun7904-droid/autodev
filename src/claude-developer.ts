@@ -14,6 +14,7 @@ import {
   readPackageJsonScripts,
   registerValidatedRequiredTestScripts,
   commitRequiredTestRegistration,
+  extractNpmRunScript,
 } from "./required-test-preflight";
 import type { RequiredTestRegistrationRequest } from "./required-test-preflight";
 
@@ -609,15 +610,17 @@ export async function runDeveloperTaskViaSafeExecutor(
   // registry.ts)에 존재하는 데이터를 그대로 노출할 뿐, 새 계약을 만들지 않는다.
   if (opts.requiredTests && opts.requiredTests.length > 0) {
     const pkg = executor?.projectRoot ? readPackageJsonScripts(executor.projectRoot) : { ok: false as const, reason: "no executor" };
+    const unregisteredNpmScripts: string[] = [];
     const lines = opts.requiredTests.map((rt) => {
       const cmdLabel = [rt.command, ...rt.args].join(" ");
-      if (rt.command === "npm" && rt.args[0] === "run" && typeof rt.args[1] === "string" && pkg.ok) {
-        const scriptName = rt.args[1];
-        const resolved = pkg.scripts[scriptName];
+      const npmScript = extractNpmRunScript(rt);
+      if (npmScript && pkg.ok) {
+        const resolved = pkg.scripts[npmScript];
         if (typeof resolved === "string") {
           return `- ${rt.name}: \`${cmdLabel}\` → 실제 실행 명령: \`${resolved}\``;
         }
-        return `- ${rt.name}: \`${cmdLabel}\`(아직 package.json에 등록되지 않음 — 이 task의 허용 경로 안에 대응하는 테스트 파일을 정확히 하나만 만들면 AutoDev가 자동으로 등록합니다)`;
+        unregisteredNpmScripts.push(npmScript);
+        return `- ${rt.name}: \`${cmdLabel}\`(아직 package.json에 등록되지 않음 — npm script 이름은 정확히 \`${npmScript}\`입니다. 이 task의 허용 경로 안에 대응하는 테스트 파일을 정확히 하나만 만들면 AutoDev가 자동으로 등록합니다)`;
       }
       return `- ${rt.name}: \`${cmdLabel}\``;
     });
@@ -630,11 +633,16 @@ export async function runDeveloperTaskViaSafeExecutor(
             "위에 \"실제 실행 명령\"이 표시된 항목이 있다면 그 정확한 파일 경로에 테스트를 작성하세요 — " +
             "다른 이름이나 다른 위치에 테스트 파일을 만들면 그 required test는 파일을 찾지 못해 실패합니다."
           : "") +
-        "\n아직 등록되지 않은 required test가 있고 이 task의 허용 경로 안에 그 테스트 파일을 " +
-        "정확히 어디에 만들었는지 명시하고 싶다면, TASK_COMPLETE 응답에 " +
-        '`"requiredTestRegistrations":[{"scriptName":"<위 required test 이름 그대로>",' +
-        '"runner":"node","target":"<이 task의 허용 경로 안의 실제 파일 경로>"}]`를 추가하세요 ' +
-        "(package.json을 직접 쓸 권한은 없습니다 — 이 요청은 AutoDev가 검증 후에만 등록합니다)."
+        (unregisteredNpmScripts.length > 0
+          ? "\n아직 등록되지 않은 required test가 있고 이 task의 허용 경로 안에 그 테스트 파일을 " +
+            "정확히 어디에 만들었는지 명시하고 싶다면, TASK_COMPLETE 응답에 " +
+            '`"requiredTestRegistrations":[{"scriptName":"<npm script 이름 그대로 — 예: ' +
+            `${unregisteredNpmScripts[0]}` +
+            '(위 목록에서 " → 실제 실행 명령"이 아니라 "npm script 이름은 정확히" 뒤에 나온 문자열을 그대로 쓰세요, ' +
+            'required test의 표시 이름(콜론 앞 이름)이 아닙니다)>","runner":"node",' +
+            '"target":"<이 task의 허용 경로 안의 실제 파일 경로>"}]`를 추가하세요 ' +
+            "(package.json을 직접 쓸 권한은 없습니다 — 이 요청은 AutoDev가 검증 후에만 등록합니다)."
+          : "")
     );
   }
 

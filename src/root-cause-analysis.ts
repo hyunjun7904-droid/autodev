@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import type { ClaudeResult, SeverityCounts } from "./types";
+import type { ClaudeResult, SeverityCounts, DurableFailureState } from "./types";
 import type { SafeExecutorContext } from "./safe-executor";
 import type { OrchestratorDeps, GptReviewerReturn } from "./orchestrator";
 import { hasFailedRequiredTest } from "./review-policy";
@@ -88,14 +88,24 @@ export interface ReviewCallLimiter {
    *  Analysis로 전환해야 한다(§ MAX_SAME_FINDING_FIREWORKS_REVIEWS). */
   observeReviseFingerprint(fingerprint: string): { repeatCount: number; triggerRootCauseAnalysis: boolean };
   reset(): void;
+  /** 현재 추적 중인 fingerprint(없으면 undefined) — durable 상태 저장용. */
+  currentFingerprint(): string | undefined;
+  /** 현재 fingerprint의 연속 반복 횟수(fingerprint가 없으면 0) — durable 상태 저장용. */
+  currentRepeatCount(): number;
 }
 
 /** orchestrator 1회 실행(REVISE 루프 전체) 동안만 유효한 loop-local tracker — failure-
  *  stagnation.ts의 StagnationTracker와 동일한 원칙으로 project-state.json에 저장하지
  *  않는다. */
-export function createReviewCallLimiter(maxSameFinding: number = MAX_SAME_FINDING_FIREWORKS_REVIEWS): ReviewCallLimiter {
-  let lastFingerprint: string | undefined;
-  let repeatCount = 0;
+export function createReviewCallLimiter(
+  maxSameFinding: number = MAX_SAME_FINDING_FIREWORKS_REVIEWS,
+  seed?: { fingerprint?: string; repeatCount?: number }
+): ReviewCallLimiter {
+  // durable seed(§ durable-recovery-state.ts) — 프로세스가 재시작돼도 이전에 이미 관측된
+  // fingerprint/반복 횟수를 이어받는다. seed.fingerprint가 없으면(새 task 등) 기존과 동일한
+  // 빈 상태로 시작한다.
+  let lastFingerprint: string | undefined = seed?.fingerprint;
+  let repeatCount = seed?.fingerprint ? (seed.repeatCount ?? 0) : 0;
   return {
     observeReviseFingerprint(fingerprint: string) {
       if (fingerprint === lastFingerprint) repeatCount += 1;
@@ -108,6 +118,12 @@ export function createReviewCallLimiter(maxSameFinding: number = MAX_SAME_FINDIN
     reset() {
       lastFingerprint = undefined;
       repeatCount = 0;
+    },
+    currentFingerprint() {
+      return lastFingerprint;
+    },
+    currentRepeatCount() {
+      return lastFingerprint ? repeatCount : 0;
     },
   };
 }
@@ -232,6 +248,14 @@ export interface FireworksCallLimiterOptions {
    *  지정하지 않으면 순수 로그만 남긴다(기존 다른 optional deps와 동일한 no-op 원칙). */
   onRootCauseAnalysis?: (event: RootCauseAnalysisEvent) => void;
   maxSameFinding?: number;
+  /** AutoDev / JARVIS 최종 무인개발 구조 보완 — durable-recovery-state.ts가 loadState()
+   *  직후 계산한 이 task의 이전 durable 상태. 지정하지 않으면(undefined) 이전과 완전히
+   *  동일한 in-memory-only 동작이다(§ 요구사항 19는 opt-in — autodev.ts만 실제로 이 값을
+   *  채운다). */
+  initialDurableState?: DurableFailureState;
+  /** fingerprint/repeatCount/rootCauseAnalysisCount가 바뀔 때마다 호출된다 — 호출부가
+   *  project-state.json에 즉시 반영해 프로세스 재시작에도 살아남게 한다. */
+  onDurableStateChange?: (next: DurableFailureState) => void;
 }
 
 /**
@@ -247,11 +271,71 @@ function computeAttemptSnapshotKey(result: ClaudeResult): string {
   return `${result.summary}::${[...result.changedFiles].sort().join(",")}`;
 }
 
-export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, opts: FireworksCallLimiterOptions): GptReviewerFn {
-  const limiter = createReviewCallLimiter(opts.maxSameFinding);
-  let pendingRootCause: { category: RootCauseCategory; fingerprint: string; priorFeedback: string; snapshotKey: string } | undefined;
+/** wrapGptReviewerWithFireworksCallLimiter()가 반환하는 함수의 실제 반환 타입 — orchestrator.ts
+ *  가 기대하는 GptReviewerFn(Promise<GptReviewerReturn>)의 subtype이라 그대로 대입 가능하다
+ *  (함수 반환 타입 covariance). durable 상태(§ 요구사항 19)는 이 extra field를 통해서만
+ *  전달된다 — orchestrator.ts를 전혀 수정하지 않고도 그 파일이 이미 하는
+ *  `state.lastGptDecision = { ...gptResult, decision }` 스프레드 + 기존 saveCurrentState()
+ *  호출에 그대로 편승해 project-state.json에 저장된다(§ 파일 상단 주석과 동일한 원칙 —
+ *  claude-developer.ts의 errorCode/requiredTestRegistrationDrift처럼 이 저장소 전반에서
+ *  이미 쓰이는 "결과 객체에 extra field를 얹는다" 관례를 그대로 재사용한다).
+ */
+export type GptReviewerFnWithDurableState = (
+  ...args: Parameters<GptReviewerFn>
+) => Promise<GptReviewerReturn & { technicalRecoveryState?: DurableFailureState }>;
 
-  return async (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline): Promise<GptReviewerReturn> => {
+export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, opts: FireworksCallLimiterOptions): GptReviewerFnWithDurableState {
+  const seed = opts.initialDurableState;
+  const limiter = createReviewCallLimiter(
+    opts.maxSameFinding,
+    seed?.failureFingerprint ? { fingerprint: seed.failureFingerprint, repeatCount: seed.sameFailureCount } : undefined
+  );
+  let rootCauseAnalysisCount = seed?.rootCauseAnalysisCount ?? 0;
+  // durable seed가 이미 RCA-pending 상태였다면(프로세스 재시작 전에 트리거됐지만 아직 로컬
+  // 재검증을 통과하지 못한 상태) 이 새 wrapper 인스턴스도 그 상태를 그대로 복원한다 — 그렇지
+  // 않으면 재시작 직후 첫 review 호출이 곧바로(차단 없이) 세 번째 실제 Fireworks 호출이 되어
+  // durable 추적의 의미가 없어진다.
+  let pendingRootCause: { category: RootCauseCategory; fingerprint: string; priorFeedback: string; snapshotKey: string } | undefined =
+    seed?.pendingRootCauseCategory && seed?.pendingSnapshotKey && seed?.failureFingerprint
+      ? {
+          category: seed.pendingRootCauseCategory as RootCauseCategory,
+          fingerprint: seed.failureFingerprint,
+          priorFeedback: seed.lastRecoveryAction ?? "(이전 프로세스의 Reviewer 지적 — 세부 내용은 로그를 참고하세요)",
+          snapshotKey: seed.pendingSnapshotKey,
+        }
+      : undefined;
+
+  let durableSnapshot: DurableFailureState = {
+    taskId: opts.taskId,
+    failureFingerprint: seed?.failureFingerprint,
+    sameFailureCount: seed?.sameFailureCount ?? 0,
+    rootCauseAnalysisCount,
+    providerTimeoutCount: seed?.providerTimeoutCount ?? 0,
+    unexpectedExitCount: seed?.unexpectedExitCount ?? 0,
+    pendingRootCauseCategory: seed?.pendingRootCauseCategory,
+    pendingSnapshotKey: seed?.pendingSnapshotKey,
+    lastRecoveryAction: seed?.lastRecoveryAction,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const persistDurableState = (patch: Partial<DurableFailureState>): void => {
+    durableSnapshot = {
+      taskId: opts.taskId,
+      failureFingerprint: limiter.currentFingerprint(),
+      sameFailureCount: limiter.currentRepeatCount(),
+      rootCauseAnalysisCount,
+      providerTimeoutCount: durableSnapshot.providerTimeoutCount,
+      unexpectedExitCount: durableSnapshot.unexpectedExitCount,
+      pendingRootCauseCategory: durableSnapshot.pendingRootCauseCategory,
+      pendingSnapshotKey: durableSnapshot.pendingSnapshotKey,
+      lastRecoveryAction: durableSnapshot.lastRecoveryAction,
+      updatedAt: new Date().toISOString(),
+      ...patch,
+    };
+    opts.onDurableStateChange?.(durableSnapshot);
+  };
+
+  return async (result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline) => {
     if (pendingRootCause) {
       const recoveryAction = describeRootCauseRecoveryAction(pendingRootCause.category);
       const currentSnapshotKey = computeAttemptSnapshotKey(result);
@@ -280,6 +364,7 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
           feedback: `AUTODEV_ROOT_CAUSE_ANALYSIS(${pendingRootCause.category}): 아직 새로운 수정이 확인되지 않아 Fireworks를 호출하지 않고 재시도합니다.`,
           nextTask: null,
           requestAttempted: false,
+          technicalRecoveryState: durableSnapshot,
         };
       }
       const local = runLocalVerificationBeforeFireworksRecall(result, allowedPathPrefixes, opts.executor);
@@ -288,6 +373,7 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
         // 비교 기준으로 삼는다(다음 시도가 이번과 동일하면 위 RECOVERY_APPLIED=NO 분기로
         // 수렴한다).
         pendingRootCause = { ...pendingRootCause, snapshotKey: currentSnapshotKey };
+        persistDurableState({ pendingRootCauseCategory: pendingRootCause.category, pendingSnapshotKey: currentSnapshotKey, lastRecoveryAction: local.reason });
         log("ROOT_CAUSE_ANALYSIS — 로컬 검증 실패, Fireworks 호출 없이 Developer 재시도로 되돌림", {
           taskId: opts.taskId,
           category: pendingRootCause.category,
@@ -308,6 +394,7 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
           feedback: `AUTODEV_ROOT_CAUSE_ANALYSIS(${pendingRootCause.category}): 로컬 검증 실패(${local.reason}) — Fireworks를 호출하지 않고 재시도합니다.`,
           nextTask: null,
           requestAttempted: false,
+          technicalRecoveryState: durableSnapshot,
         };
       }
       log("ROOT_CAUSE_ANALYSIS — 로컬 검증 통과, Fireworks 재검증 1회 허용", { taskId: opts.taskId, category: pendingRootCause.category });
@@ -320,6 +407,7 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
         localVerification: "PASS",
       });
       pendingRootCause = undefined;
+      persistDurableState({ pendingRootCauseCategory: undefined, pendingSnapshotKey: undefined, lastRecoveryAction: `${recoveryAction}(로컬 검증 통과 — 재검증 진행)` });
     }
 
     const gptResult = await inner(result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline);
@@ -336,6 +424,16 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
           tests: result.tests,
         });
         pendingRootCause = { category, fingerprint, priorFeedback: gptResult.feedback, snapshotKey: computeAttemptSnapshotKey(result) };
+        rootCauseAnalysisCount += 1;
+        const recoveryAction = describeRootCauseRecoveryAction(category);
+        persistDurableState({
+          failureFingerprint: fingerprint,
+          sameFailureCount: repeatCount,
+          rootCauseAnalysisCount,
+          pendingRootCauseCategory: category,
+          pendingSnapshotKey: pendingRootCause.snapshotKey,
+          lastRecoveryAction: recoveryAction,
+        });
         log("ROOT_CAUSE_ANALYSIS_TRIGGERED — 동일 reviewer finding이 연속 REVISE로 반복됨", {
           taskId: opts.taskId,
           category,
@@ -349,14 +447,22 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
           category,
           fingerprint,
           priorFeedback: gptResult.feedback,
-          recoveryAction: describeRootCauseRecoveryAction(category),
+          recoveryAction,
           triggered: true,
         });
+      } else {
+        // 아직 임계치에 도달하지 않은 반복(1회차 또는 새 fingerprint) — durable 카운터만
+        // 최신 상태로 반영해 다음 프로세스 재시작에도 이 진행 상황이 보존되게 한다.
+        persistDurableState({ failureFingerprint: fingerprint, sameFailureCount: repeatCount });
       }
     } else {
       limiter.reset();
+      // PASS/BLOCK/HUMAN_REQUIRED — 이 review cycle의 REVISE 반복 추적은 끝났다. task
+      // 완료(checkpoint)/새 task 전환 시점의 최종 초기화는 autodev.ts가
+      // clearDurableFailureState()로 명시적으로 수행한다(§ durable-recovery-state.ts) — 이
+      // wrapper는 그 결정을 내리지 않는다(BLOCK/HUMAN_REQUIRED는 아직 "완료"가 아닐 수 있음).
     }
 
-    return gptResult;
+    return { ...gptResult, technicalRecoveryState: durableSnapshot };
   };
 }

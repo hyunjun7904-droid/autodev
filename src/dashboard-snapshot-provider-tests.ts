@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { createFileEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 import type { AutoDevEventInput } from "./observability-event";
-import { getDashboardSnapshot, resetDashboardSnapshotCacheForTests } from "./dashboard-snapshot-provider";
+import { getDashboardSnapshot, resetDashboardSnapshotCacheForTests, computeDashboardRuntimeTruth } from "./dashboard-snapshot-provider";
 import { createRoundStatusReporterForTests } from "./round-status";
+import type { ProjectRuntimeLiveness } from "./project-lock";
 
 // Local Operations Dashboard — Read Service / Cache Seam 테스트(Phase G Task G4.1). 실제
 // Claude/GPT 유료 API를 호출하지 않는다 — 이 파일은 파일 기반 EventStore에 직접 event를
@@ -205,6 +206,43 @@ function scenarioRoundStatusHiddenWhenTaskDiffersOrMissing(): void {
   check("round-status 파일이 없으면 roundStatus가 undefined", snapshotNoFile.roundStatus === undefined);
 }
 
+// ---------------------------------------------------------------------------
+// AutoDev / JARVIS 최종 무인개발 구조 보완 — computeDashboardRuntimeTruth(§ 요구사항 24, 32).
+// 실제 lock/PID 조회는 project-lock-tests.ts가 이미 검증한다 — 여기서는 이 순수 결합 함수만
+// 직접 검증한다(§ 요구사항 32의 세 가지 최소 시나리오).
+// ---------------------------------------------------------------------------
+function scenarioRuntimeTruthNoLockIsStopped(): void {
+  const liveness: ProjectRuntimeLiveness = { present: false };
+  const result = computeDashboardRuntimeTruth(liveness, "CLAUDE_WORKING");
+  check(
+    "project-state=CLAUDE_WORKING이어도 lock이 없으면(runner 죽음) RUNNING으로 표시하지 않음(STOPPED)",
+    result.state === "STOPPED"
+  );
+}
+
+function scenarioRuntimeTruthAliveAndWaitingHuman(): void {
+  const liveness: ProjectRuntimeLiveness = { present: true, pid: 12345, ownerKind: "autodev", liveness: { verdict: "ALIVE" } };
+  const result = computeDashboardRuntimeTruth(liveness, "WAITING_HUMAN");
+  check("owner가 살아있고 taskStatus가 WAITING_HUMAN이면 WAITING으로 표시", result.state === "WAITING");
+}
+
+function scenarioRuntimeTruthAliveAndRunning(): void {
+  const liveness: ProjectRuntimeLiveness = { present: true, pid: 12345, ownerKind: "autodev", liveness: { verdict: "ALIVE" } };
+  const result = computeDashboardRuntimeTruth(liveness, "RUNNING");
+  check("runner PID가 살아있고 정상 상태면 RUNNING으로 표시", result.state === "RUNNING");
+}
+
+function scenarioRuntimeTruthStaleLockDoesNotClaimRunning(): void {
+  const liveness: ProjectRuntimeLiveness = {
+    present: true,
+    pid: 99999,
+    ownerKind: "autodev",
+    liveness: { verdict: "STALE", evidence: "PID_NOT_RUNNING" },
+  };
+  const result = computeDashboardRuntimeTruth(liveness, "CLAUDE_WORKING");
+  check("stale lock/dead PID는 RUNNING이 아닌 STALE로 표시", result.state === "STALE");
+}
+
 function main(): void {
   try {
     scenarioNoRunYet();
@@ -217,6 +255,10 @@ function main(): void {
     scenarioUsageOverviewAndRecentCallsPopulatedFromRealEvents();
     scenarioProjectProgressUndefinedWithoutAdapterEnv();
     scenarioProblemSolvingUndefinedWithoutMemoryData();
+    scenarioRuntimeTruthNoLockIsStopped();
+    scenarioRuntimeTruthAliveAndWaitingHuman();
+    scenarioRuntimeTruthAliveAndRunning();
+    scenarioRuntimeTruthStaleLockDoesNotClaimRunning();
   } finally {
     resetDashboardSnapshotCacheForTests();
     for (const d of tempDirs) {

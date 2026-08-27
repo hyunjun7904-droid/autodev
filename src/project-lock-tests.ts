@@ -8,6 +8,7 @@ import {
   peekProjectLock,
   resolveCanonicalProjectPath,
   assessOwnerLiveness,
+  inspectProjectRuntimeLiveness,
   PROJECT_LOCK_SCHEMA_VERSION,
 } from "./project-lock";
 import type { ProjectLockMetadata, LivenessVerdict } from "./project-lock";
@@ -400,6 +401,49 @@ async function scenarioRealConcurrentAcquisition(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// AutoDev / JARVIS 최종 무인개발 구조 보완 — inspectProjectRuntimeLiveness(§ 요구사항 24,
+// 대시보드 실행상태 보완의 근거 데이터).
+// ---------------------------------------------------------------------------
+function scenarioInspectRuntimeLivenessNoLock(): void {
+  const root = makeProjectRoot("plock-inspect-none-");
+  const lockDir = makeLockDir("plock-inspect-none-dir-");
+  const result = inspectProjectRuntimeLiveness("p1", root, { lockDir });
+  check("inspect: lock 파일이 없으면 present:false", result.present === false);
+}
+
+function scenarioInspectRuntimeLivenessAliveOwner(): void {
+  const root = makeProjectRoot("plock-inspect-alive-");
+  const lockDir = makeLockDir("plock-inspect-alive-dir-");
+  const acquired = acquireProjectLock({ projectId: "p1", targetProjectRoot: root, ownerKind: "autodev", taskId: "2.2" }, { lockDir });
+  check("사전조건: acquire 성공", acquired.ok === true);
+  if (!acquired.ok) return;
+  const alwaysAlive = (): LivenessVerdict => ({ verdict: "ALIVE" });
+  const result = inspectProjectRuntimeLiveness("p1", root, { lockDir, assessLiveness: alwaysAlive });
+  check("inspect: 살아있는 owner는 present:true + liveness ALIVE", result.present === true && result.liveness.verdict === "ALIVE");
+  check("inspect: taskId가 그대로 노출됨", result.present === true && result.taskId === "2.2");
+  releaseProjectLock(acquired.lock);
+}
+
+function scenarioInspectRuntimeLivenessStaleOwner(): void {
+  const root = makeProjectRoot("plock-inspect-stale-");
+  const lockDir = makeLockDir("plock-inspect-stale-dir-");
+  const acquired = acquireProjectLock({ projectId: "p1", targetProjectRoot: root, ownerKind: "autodev" }, { lockDir });
+  check("사전조건: acquire 성공", acquired.ok === true);
+  if (!acquired.ok) return;
+  const alwaysStale = (): LivenessVerdict => ({ verdict: "STALE", evidence: "PID_NOT_RUNNING" });
+  const result = inspectProjectRuntimeLiveness("p1", root, { lockDir, assessLiveness: alwaysStale });
+  check(
+    "inspect: 죽은 owner(stale lock)는 present:true + liveness STALE — 실행 중이라고 주장하지 않음",
+    result.present === true && result.liveness.verdict === "STALE"
+  );
+  try {
+    rmSync(acquired.lock.filePath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
 async function main(): Promise<void> {
   scenarioAcquireFreshSucceedsWithMetadata();
   scenarioSecondAcquireBlockedWhileFirstAlive();
@@ -409,6 +453,9 @@ async function main(): Promise<void> {
   scenarioCorruptLocksFailClosed();
   scenarioRealLivenessAssessment();
   scenarioPeekProjectLock();
+  scenarioInspectRuntimeLivenessNoLock();
+  scenarioInspectRuntimeLivenessAliveOwner();
+  scenarioInspectRuntimeLivenessStaleOwner();
   await scenarioRealConcurrentAcquisition();
 
   console.log("\n=== project-lock.ts(G7) 테스트 결과 ===");
