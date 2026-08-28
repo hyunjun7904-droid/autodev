@@ -152,7 +152,7 @@ async function scenarioPlainCodeTaskZeroAdvisoryCalls(): Promise<void> {
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   const { runner: advisoryReadOnlyRunner, calls } = countingReadOnlyRunner();
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, advisoryReadOnlyRunner });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, advisoryReadOnlyRunner });
 
   check("plain task: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check("plain task: developer가 정확히 1회 호출됨", callCount() === 1);
@@ -282,7 +282,7 @@ async function scenarioAdvisoryFailureNotFailOpen(): Promise<void> {
 
   const result = await runAutodevOnce({
     manifest,
-    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() },
+    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() },
     advisoryReadOnlyRunner: failingAdvisoryRunner,
   });
 
@@ -294,6 +294,14 @@ async function scenarioAdvisoryFailureNotFailOpen(): Promise<void> {
 // 9) Core required test 실패를 advisory(qa/security)가 "문제 없다"고 낙관 보고해도
 //    덮어쓰지 못한다 — 최종 판정은 여전히 review-policy.ts(hasFailedRequiredTest)가 결정.
 // ---------------------------------------------------------------------------
+// AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 시나리오의 claudeRunner는
+// required test가 절대 통과하지 않도록 의도적으로 고정돼 있다(§ 이 시나리오의 원래 목적:
+// "advisory가 낙관적으로 보고해도 Core test 실패를 뒤집을 수 없다"). REVIEW_CYCLE_EXHAUSTED가
+// 더 이상 WAITING_HUMAN으로 끝나지 않고 durable하게 재시도하도록 바뀐 뒤로도(§
+// root-cause-analysis.ts/orchestrator.ts, 같은 세션의 정책 수정) 이 fixture는 결국 끝난다 —
+// 이 정책 수정과 무관한 기존 비용 안전장치 MAX_GPT_CALLS(10, orchestrator.ts)가 여전히
+// genuine WAITING_HUMAN으로 이어지기 때문이다(§ scenarioMaxCycleExhaustedRecordsAuditEvents와
+// 동일한 원리). sleep을 fake로 주입해 그 10회 호출이 실제 대기 없이 빠르게 일어나게 한다.
 async function scenarioAdvisoryCannotOverrideCoreTestFailure(): Promise<void> {
   const repo = makeTempGitRepo();
   const taskDef = makeTaskDef({ needsQaAdvisory: true, needsSecurityReview: true, requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
@@ -307,7 +315,7 @@ async function scenarioAdvisoryCannotOverrideCoreTestFailure(): Promise<void> {
 
   const result = await runAutodevOnce({
     manifest,
-    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() },
+    orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() },
     advisoryReadOnlyRunner: optimisticAdvisoryRunner,
   });
 
@@ -386,7 +394,7 @@ async function scenarioRequiredTestFailureBlocksCompletion(): Promise<void> {
     return { success: true, summary: "구현했지만 test 실패", changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
   };
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() } });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() } });
 
   check("required test 실패: outcome이 APPROVED_AND_CHECKPOINTED가 아님(체크포인트 완료 불가)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check("required test 실패: checkpoint가 시도되지 않음", result.checkpoint === undefined);
@@ -403,37 +411,63 @@ async function scenarioCriticalHighBlocksApproval(): Promise<void> {
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   const gptReviewer = fakeReviewer({ decision: "PASS", severity: { critical: 1, high: 0, medium: 0 } });
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
 
   check("critical 존재: outcome이 APPROVED_AND_CHECKPOINTED가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check("critical 존재: checkpoint가 시도되지 않음", result.checkpoint === undefined);
 }
 
 // ---------------------------------------------------------------------------
-// 7/8) MAX_REVIEW_CYCLES 소진 → WAITING_HUMAN + REVIEW_CYCLE_EXHAUSTED reason(review-policy.ts
-//      단일 출처) — 단순 승인으로 COMPLETED/APPROVED로 바뀌지 않는다(그런 경로 자체가 없음).
+// 7/8) MAX_REVIEW_CYCLES 소진 → AutoDev Efficiency / Review Stagnation Hardening(2026-08-28
+//      정책 수정) 이후: 더 이상 genuine WAITING_HUMAN이 아니다. developerProviderWaitCount와
+//      동일한 durable wait-then-retry(재시도 횟수 무제한, 간격만 bounded)로 전환해 reviewCycle
+//      예산을 리셋하고 계속 진행한다 — review가 결국 수렴하면(§ 이 fake reviewer가 6번째
+//      호출부터 PASS로 전환) 정상적으로 APPROVED + checkpoint까지 도달해야 한다(사람 승인 없이).
 // ---------------------------------------------------------------------------
-async function scenarioMaxCycleExhaustedReasonRecorded(): Promise<void> {
+async function scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman(): Promise<void> {
   const repo = makeTempGitRepo();
   const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
   const statePath = makeTempStateFile(repo);
   const manifest = buildManifest(repo, statePath, [taskDef]);
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
-  const gptReviewer = fakeReviewer({ decision: "REVISE", feedback: "계속 REVISE" });
+  // 처음 MAX_REVIEW_CYCLES(5)회는 REVISE로 소진시켜 durable wait 경로를 실제로 타게 하고,
+  // 그 이후(reviewCycle이 리셋되어 다시 시작된 6번째 developer 호출)부터는 PASS로 전환해 이
+  // task가 실제로 수렴/완료될 수 있음을 함께 증명한다.
+  const gptReviewer = async (): Promise<GptReviewerReturn> =>
+    callCount() <= 5
+      ? { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: "계속 REVISE", nextTask: null }
+      : { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "이제 통과", nextTask: null };
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
 
-  check("max cycle 소진: outcome=RAN_TASK_NOT_APPROVED(COMPLETED로 바뀌지 않음)", result.outcome === "RAN_TASK_NOT_APPROVED");
-  check("max cycle 소진: developer가 MAX_REVIEW_CYCLES(5)회로 제한됨", callCount() === 5);
-  check("max cycle 소진: state.status=WAITING_HUMAN(APPROVED 아님)", finalState.status === "WAITING_HUMAN");
+  check("max cycle 소진: developer가 5회를 넘어 계속 재시도됨(하드 컷오프 아님)", callCount() > 5);
+  check("max cycle 소진: 결국 수렴하면 checkpoint까지 완료됨(사람 승인 없이)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  // checkpoint 성공 후 state.status는(autodev.ts) 다음 task가 있으면 "READY"로, 이 fixture처럼
+  // task가 이거 하나뿐이면(getNextTask가 null) PLAN_MARKERS.PROJECT_COMPLETE로 설정된다 —
+  // "APPROVED"라는 문자열 값 자체는 이 필드에 존재하지 않는다(orchestrator 내부 finalState의
+  // 필드 이름과 혼동하지 않는다). 이 fixture manifest는 task를 정확히 하나만 등록하므로
+  // PROJECT_COMPLETE가 된다.
   check(
-    "max cycle 소진: deferredHumanTasks에 REVIEW_CYCLE_EXHAUSTED reason이 기록됨(review-policy.ts 단일 출처)",
-    finalState.deferredHumanTasks.some((t) => t.includes("REVIEW_CYCLE_EXHAUSTED"))
+    "max cycle 소진: state.status=PROJECT_COMPLETE(WAITING_HUMAN 아님, checkpoint 성공 후 다음 task 없음)",
+    finalState.status === "PROJECT_COMPLETE"
   );
-  check("max cycle 소진: checkpoint/commit이 생성되지 않음", result.checkpoint === undefined);
+  check(
+    "max cycle 소진: reviewStagnationWaitCount가 최소 1회 이상 durable하게 기록됨",
+    (finalState.reviewStagnationWaitCount ?? 0) >= 1
+  );
+  check(
+    "max cycle 소진: deferredHumanTasks에 REVIEW_CYCLE_EXHAUSTED reason이 더 이상 기록되지 않음(Human Gate 아님)",
+    !finalState.deferredHumanTasks.some((t) => t.includes("REVIEW_CYCLE_EXHAUSTED"))
+  );
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
-  check("max cycle 소진: git commit이 init 1건뿐(product/administrative commit 없음)", log.trim().split("\n").length === 1);
+  check("max cycle 소진: product checkpoint commit이 실제로 생성됨", log.trim().split("\n").length > 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +514,7 @@ async function scenarioApprovedRunRecordsRealEvents(): Promise<void> {
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   const events = createInMemoryEventStore();
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events });
 
   check("event 기록(정상 승인): outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   const { events: all, integrityIssues } = events.query();
@@ -528,7 +562,7 @@ async function scenarioProductionEntrypointInjectsEventStoreByDefault(): Promise
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
 
   // opts.events를 아예 지정하지 않는다 — production entrypoint(run.ts)와 동일한 호출 형태.
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() } });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() } });
 
   check("production entrypoint: opts.events 생략해도 정상 완료됨(관측이 꺼져서 실행이 막히지 않음)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
 }
@@ -572,22 +606,42 @@ async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
   const gptReviewer = fakeReviewer({ decision: "REVISE", feedback: "계속 REVISE" });
   const events = createInMemoryEventStore();
 
-  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer }, events });
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 fake reviewer는 항상
+  // REVISE만 반환하므로, REVIEW_CYCLE_EXHAUSTED는 이제 durable wait-then-retry로 계속
+  // 반복된다(사람에게 넘기지 않음). 이 run이 실제로 끝나는 지점은 이 정책 수정과 무관한 기존
+  // 비용 안전장치 MAX_GPT_CALLS(10, orchestrator.ts, 이 Maintenance가 건드리지 않음)다 —
+  // reviewCycle이 MAX_REVIEW_CYCLES(5)마다 리셋되며 durable wait을 2번 거친 뒤(gptCallCount
+  // 5, 10) 11번째 review 시도에서 gptCallCount>10으로 genuine WAITING_HUMAN이 된다. sleep을
+  // 즉시 반환하도록 주입해 실제 대기 없이 테스트한다.
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() }, events });
 
-  const exhausted = events.query({ eventType: "REVIEW_CYCLE_EXHAUSTED" }).events[0];
+  const exhaustedEvents = events.query({ eventType: "REVIEW_CYCLE_EXHAUSTED" }).events;
+  const exhausted = exhaustedEvents[0];
   check("event 기록(cycle 소진): REVIEW_CYCLE_EXHAUSTED event가 audit 카테고리로 기록됨", exhausted?.categories.includes("audit") === true);
   check("event 기록: reviseCycle=5가 정확히 담김", exhausted?.reviseCycle === 5);
-  check("event 기록: humanInterventionRequired=true", exhausted?.humanInterventionRequired === true);
-  check("event 기록: REVIEW_REVISE가 5회(각 cycle) 기록됨", events.query({ eventType: "REVIEW_REVISE" }).events.length === 5);
-  // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED는 canonical Human Gate
-  // Policy상 기술적 자동 복구 대상이다(§ human-gate-policy.ts) — generic HUMAN_APPROVAL_REQUIRED
-  // ("orchestrator status=...") run-level bookend는 approval.ts에서 ORCHESTRATOR_NOT_APPROVED_
-  // GENERIC(실제 Telegram APPROVE 버튼)으로 분류되므로, 자동 복구될 사안에는 더 이상 만들지
-  // 않는다(§ autodev.ts) — REVIEW_CYCLE_EXHAUSTED event 자신(위에서 이미 검증)과 RUN_BLOCKED
-  // (아래)만으로 audit 기록/대시보드 집계는 충분하다.
   check(
-    "event 기록: generic HUMAN_APPROVAL_REQUIRED bookend는 더 이상 기록되지 않음(기술적 자동 복구 대상 — Telegram 알림 억제)",
-    events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 0
+    "event 기록: humanInterventionRequired=false(더 이상 Human Gate가 아님, 2026-08-28 정책 수정)",
+    exhausted?.humanInterventionRequired === false
+  );
+  check("event 기록: REVIEW_CYCLE_EXHAUSTED가 2회(사람에게 넘기지 않고 durable하게 재시도했으므로) 기록됨", exhaustedEvents.length === 2);
+  check("event 기록: REVIEW_REVISE가 10회(두 번의 5-cycle 예산) 기록됨", events.query({ eventType: "REVIEW_REVISE" }).events.length === 10);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("event 기록: 결국 MAX_GPT_CALLS(기존, 변경되지 않은 비용 안전장치)로 genuine WAITING_HUMAN에 도달", finalState.status === "WAITING_HUMAN");
+  check(
+    "event 기록: 그 WAITING_HUMAN은 REVIEW_CYCLE_EXHAUSTED가 아니라 MAX_GPT_CALLS 사유임(deferredHumanTasks에 REVIEW_CYCLE_EXHAUSTED 없음)",
+    !finalState.deferredHumanTasks.some((t) => t.includes("REVIEW_CYCLE_EXHAUSTED"))
+  );
+  // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED 자체는 canonical Human
+  // Gate Policy상 기술적 자동 복구 대상이다(§ human-gate-policy.ts classifyWaitingHumanReason).
+  // 하지만 이 시나리오가 최종적으로 도달하는 WAITING_HUMAN은 REVIEW_CYCLE_EXHAUSTED가 아니라
+  // MAX_GPT_CALLS(위에서 이미 검증) — 그리고 classifyWaitingHumanReason은 "GPT 호출 횟수 상한"을
+  // 의도적으로 TECHNICAL_AUTO_RECOVERABLE 목록에 넣지 않고 fail-closed GENUINE_HUMAN_JUDGMENT로
+  // 남긴다(비용 관련 안전장치이므로 사람이 실제로 알아야 한다는 기존 설계, § human-gate-
+  // policy.ts 상단 주석 "GPT 호출 횟수 상한 등은 여기서 fail-closed로 사람 판단을 유지한다").
+  // 그래서 generic HUMAN_APPROVAL_REQUIRED bookend는 이 경우 정상적으로 기록돼야 한다.
+  check(
+    "event 기록: MAX_GPT_CALLS로 인한 WAITING_HUMAN은 genuine이므로 generic HUMAN_APPROVAL_REQUIRED bookend가 정상적으로 기록됨(Telegram 알림 유지)",
+    events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 1
   );
   check(
     "event 기록: RUN_BLOCKED가 기록됨(RUN_COMPLETED가 아님)",
@@ -604,7 +658,7 @@ async function scenarioAdvisoryAgentsRecordAgentEvents(): Promise<void> {
   const advisoryReadOnlyRunner: ReadOnlyAgentRunner = async () => ({ success: true, summary: "[FAKE] 보안 검토 완료", rawOutput: "" });
   const events = createInMemoryEventStore();
 
-  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events, advisoryReadOnlyRunner });
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events, advisoryReadOnlyRunner });
 
   check("event 기록(advisory): AGENT_SELECTED가 security에 대해 기록됨", events.query({ eventType: "AGENT_SELECTED", agentId: "core-security" }).events.length === 1);
   check("event 기록(advisory): AGENT_STARTED가 기록됨", events.query({ eventType: "AGENT_STARTED", agentId: "core-security" }).events.length === 1);
@@ -636,7 +690,7 @@ async function scenarioAuditCriticalAppendFailureNotFailOpen(): Promise<void> {
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   const events = makeAuditFailingEventStore();
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events });
 
   check("audit-critical 실패: run outcome은 정상 진행됨(observability 장애가 code 배포를 막지 않음)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
@@ -687,7 +741,7 @@ async function scenarioTelemetryFailureDoesNotBlockRun(): Promise<void> {
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   const events = makeTelemetryFailingEventStore();
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events });
 
   check("telemetry 실패: run outcome은 정상 진행됨(APPROVED_AND_CHECKPOINTED)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
@@ -726,7 +780,7 @@ async function scenarioAuditStoreUnavailableBeforeCheckpointBlocksCommit(): Prom
   const events = makeAuditUnwritableEventStore();
   const commitsBefore = commitCount(repo);
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events });
 
   check("audit store 사용 불가(사전 확인): outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
   check("audit store 사용 불가(사전 확인): git commit이 전혀 만들어지지 않음(commit 수 불변)", commitCount(repo) === commitsBefore);
@@ -759,7 +813,7 @@ async function scenarioSecurityBlockedAuditFailureKeepsBlock(): Promise<void> {
   const events = makeAuditFailingEventStore();
   const commitsBefore = commitCount(repo);
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer() }, events });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakeReviewer(), sleep: async () => {}, now: () => Date.now() }, events });
 
   check("SECURITY_BLOCKED + audit 실패: outcome=RAN_TASK_CHECKPOINT_BLOCKED(원래 Security BLOCK 유지)", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
   check("SECURITY_BLOCKED + audit 실패: secret이 담긴 commit이 만들어지지 않음(commit 수 불변)", commitCount(repo) === commitsBefore);
@@ -818,7 +872,7 @@ async function main(): Promise<void> {
     await scenarioReviseOnceThenApprove();
     await scenarioRequiredTestFailureBlocksCompletion();
     await scenarioCriticalHighBlocksApproval();
-    await scenarioMaxCycleExhaustedReasonRecorded();
+    await scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman();
     await scenarioReviewerErrorNotFailOpen();
     await scenarioApprovedRunRecordsRealEvents();
     await scenarioProductionEntrypointInjectsEventStoreByDefault();

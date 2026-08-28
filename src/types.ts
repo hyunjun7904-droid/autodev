@@ -242,6 +242,21 @@ export interface CoreState {
    */
   reviewerProviderNextRetryAt?: string | null;
 
+  /**
+   * AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — REVIEW_CYCLE_EXHAUSTED
+   * (REVISE가 MAX_REVIEW_CYCLES에 도달)는 developerProviderWaitCount와 동일한 원칙으로
+   * genuine WAITING_HUMAN으로 승격하지 않는다: review가 수렴하지 못한다는 사실 자체는 provider
+   * timeout과 마찬가지로 "재시도 간격을 늘려가며 계속 시도해볼 기술적 상황"이지, 사람 판단이
+   * 필요한 사유가 아니다. developerProviderWaitCount와 동일하게 상한이 없다(재시도 "횟수"는
+   * 무제한, "간격"만 computeDeveloperProviderWaitDelayMs로 bounded). 같은 task를 이어가는
+   * 동안만 누적되고, 다른 task로 전환되면 리셋된다.
+   */
+  reviewStagnationWaitCount?: number;
+
+  /** 위 reviewStagnationWaitCount와 짝을 이루는 durable timestamp — developerProviderNextRetryAt
+   *  과 동일하게, 재시작 시 남은 시간만큼만 마저 기다린다. */
+  reviewStagnationNextRetryAt?: string | null;
+
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];
 

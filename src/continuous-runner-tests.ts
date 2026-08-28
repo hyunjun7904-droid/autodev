@@ -254,10 +254,15 @@ async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(
 }
 
 // ---------------------------------------------------------------------------
-// F — AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Required Test 실패가 REVISE 반복 →
-// REVIEW_CYCLE_EXHAUSTED로 끝나는 것도 기술적 자동 복구 대상이다 — Telegram 승인 없이
-// continuous runner가 스스로 재시도하고, 다음 시도가 실제로 테스트를 통과시키면 그대로
-// 진행된다.
+// F — AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
+// Hardening(2026-08-28)로 갱신 — Required Test 실패가 REVISE 반복 → REVIEW_CYCLE_EXHAUSTED로
+// 끝나는 것도 기술적 자동 복구 대상이다. 예전에는 이 복구가 "runAutodevOnce가
+// RAN_TASK_NOT_APPROVED로 끝난 뒤 continuous-runner의 다음 iteration이 재시도"하는 형태로
+// 관찰됐다. 지금은 REVIEW_CYCLE_EXHAUSTED 자체가 orchestrator.ts 안에서(§ root-cause-
+// analysis.ts/orchestrator.ts) durable하게 재시도되므로, 이 정확히 같은 시나리오(5회
+// 실패 후 통과 시작)는 outer continuous-runner의 두 번째 iteration을 기다리지 않고 "첫
+// 번째" runAutodevOnce 호출 자체가 내부적으로 재시도해 성공한다 — Telegram 승인이
+// 필요 없다는 결과는 동일하지만, 그 결과에 도달하는 iteration 개수가 달라졌다.
 // ---------------------------------------------------------------------------
 async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion(): Promise<void> {
   const repo = makeTempGitRepo();
@@ -269,25 +274,34 @@ async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion()
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
     callCount += 1;
     calls.push(task);
-    // 처음 5회(1차 시도의 REVISE 반복 5 cycle 전부)는 계속 실패한다 — REVIEW_CYCLE_EXHAUSTED에
-    // 도달할 때까지. reviewer가 PASS라고 해도 실패한 required test는 orchestrator.ts의 기존
-    // 강제 REVISE 안전장치(hasFailedRequiredTest)가 덮어쓴다(§ 기존 F 시나리오와 동일 원리).
+    // 처음 5회(REVISE 반복 5 cycle 전부, durable retry 발동 전까지)는 계속 실패한다.
+    // reviewer가 PASS라고 해도 실패한 required test는 orchestrator.ts의 기존 강제 REVISE
+    // 안전장치(hasFailedRequiredTest)가 덮어쓴다(§ 기존 F 시나리오와 동일 원리).
     if (callCount <= 5) {
       return { success: true, summary: "테스트: required test 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
     }
-    // 6번째 호출부터(=자동 복구된 2차 시도)는 실제로 통과한다.
+    // 6번째 호출부터(=durable retry로 리셋된 새 REVISE 예산의 첫 라운드)는 실제로 통과한다.
     const fileName = `proj/marker-${callCount}.txt`;
     writeRepoFile(repo, fileName, task);
     return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
 
-  const result = await runAutodevContinuous({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  const result = await runAutodevContinuous({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
+  });
 
-  check("F) 1차 시도: outcome=RAN_TASK_NOT_APPROVED(REVIEW_CYCLE_EXHAUSTED)", result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED");
-  check("F) 1차 시도에서 developer가 정확히 5회 REVISE 반복 호출됨(전부 T1)", calls.slice(0, 5).every((c) => c === "Task1 prompt") && calls.slice(0, 5).length === 5);
   check(
-    "F) Telegram 승인 없이 자동으로 재시도되어 T1이 checkpoint까지 도달(2번째 runOnce 호출)",
-    result.iterations[1].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[1].result.taskId === "T1"
+    "F) T1이 첫 번째 runOnce 호출 안에서 durable retry로 자동 복구되어 checkpoint까지 도달(Telegram 승인 없이)",
+    result.iterations[0].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[0].result.taskId === "T1"
+  );
+  check(
+    "F) developer가 실패 5회(REVISE 소진) + 성공 1회 = 최소 6회 호출됨, 전부 T1",
+    // claudeRunner는 T1/T2/T3 전체 continuous 실행에 걸쳐 공유되므로(callCount가 task 경계를
+    // 넘어 계속 증가) 앞의 6회(실패 5 + 성공 1)만 T1에 대한 호출이고 그 뒤(T2/T3)는 다른
+    // task의 정상 호출이다 — 앞 6개만 범위로 검사한다(§ 원래 calls.slice(0,5) 검사와 동일한
+    // 원칙, durable retry로 늘어난 만큼만 6개로 확장).
+    calls.length >= 6 && calls.slice(0, 6).every((c) => c === "Task1 prompt")
   );
   check("F) 자동 복구 이후 project complete로 종료", result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "STOPPED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;

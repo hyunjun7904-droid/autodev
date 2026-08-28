@@ -425,9 +425,15 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
     nextTask: "다시 시도",
   });
 
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — REVIEW_CYCLE_EXHAUSTED는
+  // 더 이상 MAX_REVIEW_CYCLES(5)에서 즉시 WAITING_HUMAN으로 끝나지 않고 durable하게(무제한
+  // 횟수, bounded 간격) 재시도한다(§ orchestrator.ts/root-cause-analysis.ts). 이 alwaysRevise는
+  // 절대 수렴하지 않으므로, 이 정책 수정과 무관한 기존 비용 안전장치 MAX_GPT_CALLS(10)가 결국
+  // genuine WAITING_HUMAN으로 이끈다 — sleep을 fake로 주입해 실제 대기 없이 그 지점까지
+  // 빠르게 도달한다.
   const result = await runAutodevOnce({
     manifest,
-    orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise },
+    orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise, sleep: async () => {}, now: () => Date.now() },
   });
 
   check("runAutodevOnce 미승인: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
@@ -438,7 +444,10 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
 
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
   check("runAutodevOnce 미승인: commit이 생성되지 않음(init 1건만)", log.trim().split("\n").length === 1);
-  check("runAutodevOnce 미승인: MAX_REVIEW_CYCLES(5) 초과하지 않고 Claude 호출됨", claudeCalls > 0 && claudeCalls <= 5);
+  check(
+    "runAutodevOnce 미승인: MAX_REVIEW_CYCLES에서 하드 컷오프되지 않고 durable하게 재시도되다가 결국 MAX_GPT_CALLS(10)로 멈춤",
+    claudeCalls > 5 && claudeCalls <= 12
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +759,14 @@ async function scenarioHumanFinalReviewReviewerNotApprovedNeverEntersGate(): Pro
     nextTask: "다시 시도",
   });
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise } });
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — REVIEW_CYCLE_EXHAUSTED durable
+  // retry(§ 위 scenarioRunAutodevOnceNotApprovedSkipsCheckpoint와 동일 원리) 때문에 sleep을
+  // fake로 주입한다 — 이 alwaysRevise도 결국 기존 MAX_GPT_CALLS(10) 안전장치로 WAITING_HUMAN에
+  // 도달한다(여전히 humanFinalReview gate와는 무관).
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: alwaysRevise, sleep: async () => {}, now: () => Date.now() },
+  });
 
   check("HFR Test5: outcome=RAN_TASK_NOT_APPROVED(Human Final Review 진입 안 함)", result.outcome === "RAN_TASK_NOT_APPROVED");
   const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
@@ -1456,12 +1472,17 @@ async function scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWa
   check("Secret Scanner 보호: status가 여전히 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
 }
 
-// AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED(기술적 자동 복구 대상)로
-// 끝난 run은 generic HUMAN_APPROVAL_REQUIRED("orchestrator status=...") event를 만들지
-// 않아야 한다 — 그 event가 approval.ts에서 ORCHESTRATOR_NOT_APPROVED_GENERIC(실제 Telegram
-// APPROVE 버튼)으로 분류되기 때문에, 자동으로 복구될 사안에 불필요한 사람 승인 알림을 보내지
-// 않는다는 것을 직접 증명한다. RUN_BLOCKED(대시보드 실패 집계 기준)와 orchestrator.ts 자신의
-// REVIEW_CYCLE_EXHAUSTED event는 그대로 기록되어야 한다(감사 기록/집계는 그대로 유지).
+// AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
+// Hardening(2026-08-28)로 갱신 — REVIEW_CYCLE_EXHAUSTED 자신은 canonical Human Gate
+// Policy상 기술적 자동 복구 대상이라 그 자체로는 genuine WAITING_HUMAN을 만들지 않는다(§
+// human-gate-policy.ts, § orchestrator.ts durable retry). 이 claudeRunner의 required test는
+// 절대 통과하지 않으므로 이 run은 REVIEW_CYCLE_EXHAUSTED를 여러 번(durable하게) 거친 뒤
+// 결국 이 정책 수정과 무관한 기존 비용 안전장치 MAX_GPT_CALLS(10)로 genuine WAITING_HUMAN에
+// 도달한다 — 그 MAX_GPT_CALLS는 human-gate-policy.ts가 의도적으로 fail-closed
+// GENUINE_HUMAN_JUDGMENT로 분류하므로, generic HUMAN_APPROVAL_REQUIRED("orchestrator
+// status=...") bookend는 이 경우 정상적으로 기록돼야 한다(REVIEW_CYCLE_EXHAUSTED 그 자체가
+// 아니라 MAX_GPT_CALLS가 만든 것). RUN_BLOCKED와 orchestrator.ts 자신의
+// REVIEW_CYCLE_EXHAUSTED event는 그대로 기록된다(감사 기록/집계는 그대로 유지).
 async function scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
@@ -1476,13 +1497,21 @@ async function scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericAppro
     rawOutput: "",
   });
 
-  const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  const result = await runAutodevOnce({
+    manifest,
+    events,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
+  });
 
   check("REVIEW_CYCLE_EXHAUSTED 알림 억제: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
   const all = events.query().events;
   check(
-    "REVIEW_CYCLE_EXHAUSTED 알림 억제: generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 생성되지 않음(Telegram APPROVE 버튼 없음)",
-    !all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
+    "REVIEW_CYCLE_EXHAUSTED 알림 억제: REVIEW_CYCLE_EXHAUSTED event 자신은 humanInterventionRequired=false(genuine 아님)",
+    all.filter((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED").every((e) => e.humanInterventionRequired === false)
+  );
+  check(
+    "REVIEW_CYCLE_EXHAUSTED 알림 억제: 결국 MAX_GPT_CALLS(genuine)로 종료되어 generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 정상적으로 기록됨(Telegram APPROVE 버튼 유지)",
+    all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
   );
   check("REVIEW_CYCLE_EXHAUSTED 알림 억제: RUN_BLOCKED event는 그대로 기록됨(대시보드 실패 집계 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
   check("REVIEW_CYCLE_EXHAUSTED 알림 억제: orchestrator의 REVIEW_CYCLE_EXHAUSTED event는 그대로 기록됨(감사 기록 유지)", all.some((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED"));
@@ -1686,11 +1715,17 @@ async function scenarioSameTaskDoesNotRepeatFailedStrategy(): Promise<void> {
     return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
   };
 
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 caller는 절대
+  // 문제를 해결하지 않으므로(§ 이 시나리오의 목적: 반복 실패 escalation 안내 검증) required
+  // test가 계속 실패해 REVIEW_CYCLE_EXHAUSTED durable retry를 실제로 거친다 — sleep을 fake로
+  // 주입해 실제 대기 없이 결국 기존 MAX_GPT_CALLS 안전장치까지 빠르게 도달하게 한다(이 검증
+  // 자체는 3번째 attempt 시점의 transcript만 보므로 그 이후 얼마나 더 재시도되는지는
+  // 무관하다).
   await runAutodevOnce({
     manifest,
     problemMemoryStores,
     developerClaudeCaller: caller,
-    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    orchestratorDeps: { gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
   });
 
   check("I) 3번째 attempt 이후 transcript에 반복 전략 금지 안내가 실제로 주입됨", receivedInputs.some((inp) => inp.includes("전략 재사용 금지")));

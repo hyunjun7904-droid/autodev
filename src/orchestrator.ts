@@ -271,6 +271,8 @@ export async function runOrchestrator(
     state.developerProviderNextRetryAt = null;
     state.reviewerProviderWaitCount = 0;
     state.reviewerProviderNextRetryAt = null;
+    state.reviewStagnationWaitCount = 0;
+    state.reviewStagnationNextRetryAt = null;
   }
   state.lastClaudeResult = null;
   state.lastGptDecision = null;
@@ -309,6 +311,21 @@ export async function runOrchestrator(
         setStatus("WAITING_PROVIDER_RETRY");
         saveCurrentState(state);
         log(`재시작 후 durable provider wait 재개 — 남은 ${remainingMs}ms만 대기 후 재시도`);
+        await sleep(remainingMs);
+      }
+    }
+
+    // AutoDev Efficiency / Review Stagnation Hardening — developerProviderNextRetryAt과 동일한
+    // 재시작-복원 원칙(§ 위 블록). REVIEW_CYCLE_EXHAUSTED durable wait 도중 죽었다가 재시작된
+    // 경우 남은 시간만 마저 기다린다.
+    if (state.reviewStagnationNextRetryAt) {
+      const scheduledAtMs = Date.parse(state.reviewStagnationNextRetryAt);
+      const remainingMs = Number.isFinite(scheduledAtMs) ? Math.max(0, scheduledAtMs - now()) : 0;
+      state.reviewStagnationNextRetryAt = null;
+      if (remainingMs > 0) {
+        setStatus("WAITING_PROVIDER_RETRY");
+        saveCurrentState(state);
+        log(`재시작 후 review stagnation durable wait 재개 — 남은 ${remainingMs}ms만 대기 후 재시도`);
         await sleep(remainingMs);
       }
     }
@@ -584,24 +601,38 @@ export async function runOrchestrator(
       tokenUsage: gptResult.tokenUsage,
     });
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
-      log(`연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — WAITING_HUMAN`);
-      // Phase F Task F4 — 이 상태는 "사람이 승인하면 통과"가 아니다: critical/high나
-      // 미해결 REVISE 지적사항이 그대로 남아있을 수 있다. agent-orchestrator.ts(F2/F3)의
-      // BLOCKED+REVIEW_CYCLE_EXHAUSTED와 같은 의미를 이 파일의 기존 WAITING_HUMAN enum
-      // 위에서 deferredHumanTasks reason으로 명확히 남긴다(enum 자체는 바꾸지 않는다).
-      state.deferredHumanTasks.push(
-        `${REVIEW_CYCLE_EXHAUSTED_REASON}: REVISE가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})회 도달로 자동 진행을 중단합니다(단순 승인으로 완료 처리 불가).`
-      );
-      setStatus("WAITING_HUMAN");
+      // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28 정책 수정) — REVIEW_CYCLE_EXHAUSTED
+      // 는 더 이상 genuine WAITING_HUMAN이 아니다(§ types.ts reviewStagnationWaitCount 상단
+      // 주석). review가 MAX_REVIEW_CYCLES 안에 수렴하지 못했다는 사실 자체는 순수 기술적
+      // 상황이며, Developer provider timeout과 동일한 durable wait-then-retry 원칙(재시도
+      // "횟수"는 무제한, "간격"만 bounded)을 그대로 재사용한다 — 새 스케줄/상수를 만들지
+      // 않는다. 대기 후 reviewCycle을 0으로 되돌려 이 task에 새 REVISE 예산을 준다(같은
+      // task이므로 developerProviderWaitCount 등 다른 durable counter는 건드리지 않는다).
+      // REVIEW_CYCLE_EXHAUSTED event/로그는 계속 남긴다(관측 가능성 유지 — "조용히 멈추지
+      // 않는다") — 다만 humanInterventionRequired/deferredHumanTasks push는 더 이상 하지
+      // 않는다(그 마커가 있으면 human-gate-policy.ts가 기술적 자동 복구 대상으로 판정하긴
+      //하지만, 애초에 이 프로세스 안에서 WAITING_HUMAN 자체가 되지 않으므로 그 판정 경로를
+      // 탈 필요가 없다).
+      state.reviewStagnationWaitCount = (state.reviewStagnationWaitCount ?? 0) + 1;
+      const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewStagnationWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
+      state.reviewStagnationNextRetryAt = new Date(now() + delayMs).toISOString();
+      state.reviewCycle = 0;
+      setStatus("WAITING_PROVIDER_RETRY");
       emitEvent({
         eventType: "REVIEW_CYCLE_EXHAUSTED",
         executionPhase: "review",
-        outcome: "BLOCKED",
-        humanInterventionRequired: true,
-        reviseCycle: state.reviewCycle,
-        reason: `${REVIEW_CYCLE_EXHAUSTED_REASON}: MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달`,
+        outcome: "PENDING",
+        humanInterventionRequired: false,
+        reviseCycle: MAX_REVIEW_CYCLES,
+        reason: `${REVIEW_CYCLE_EXHAUSTED_REASON}: MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달 — ${delayMs}ms 대기 후 새 REVISE 예산으로 재시도(${state.reviewStagnationWaitCount}회째, Human Gate로 승격하지 않음)`,
       });
-      break;
+      saveCurrentState(state);
+      log(
+        `연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — ${delayMs}ms 대기 후 새 REVISE 예산으로 재시도 (${state.reviewStagnationWaitCount}회째, 기술적 review 정체는 Human Gate로 승격하지 않고 계속 재시도합니다)`
+      );
+      await sleep(delayMs);
+      state.reviewStagnationNextRetryAt = null;
+      continue;
     }
     setStatus("REVISION_REQUIRED");
   }

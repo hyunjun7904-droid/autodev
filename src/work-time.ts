@@ -37,7 +37,22 @@ const ACTIVE_STATUSES: ReadonlySet<LiveStatus> = new Set(["RUNNING", "TESTING", 
  * 활성 상태일 때만 카운트) — 그래서 오토데브가 멈춰 있거나 사람을 기다리는 동안에는 이
  * 값이 더 이상 증가하지 않는다.
  */
-export function computeActiveWorkMs(events: AutoDevEvent[], now: number): number {
+export interface ComputeActiveWorkMsOptions {
+  /**
+   * AutoDev / JARVIS Dashboard Stale-State Reconciliation(2026-08-28) — 이 값이 true면 마지막
+   * event 이후의 tail 구간(§ 위 주석)을 절대 집계하지 않는다. finalStatus가 ACTIVE_STATUSES에
+   * 속하더라도(예: 마지막 event가 REVIEW_STARTED라 event 기록만으로는 여전히 "검토 중") 실제
+   * owner 프로세스가 죽었거나(§ dashboard-snapshot-provider.ts의 DashboardRuntimeTruth
+   * state==="STALE") 아예 실행 중인 프로세스가 없으면(state==="STOPPED") 그 시점 이후로는
+   * 실제 작업이 발생할 수 없다는 사실을 이미 알고 있기 때문이다 — event log만으로는 프로세스
+   * 생존 여부를 알 수 없다는 이 파일 상단 주석의 한계를 호출부가 실제 liveness 판정으로 메운다.
+   * event 사이의 이미 지나간 구간(과거 tail이 아닌 부분) 집계는 이 옵션과 무관하게 그대로다 —
+   * "프로세스가 죽기 전까지 실제로 흐른 시간"은 여전히 정확하게 인정한다.
+   */
+  freezeTail?: boolean;
+}
+
+export function computeActiveWorkMs(events: AutoDevEvent[], now: number, options?: ComputeActiveWorkMsOptions): number {
   if (events.length === 0) return 0;
   let total = 0;
   for (let i = 1; i < events.length; i++) {
@@ -48,7 +63,7 @@ export function computeActiveWorkMs(events: AutoDevEvent[], now: number): number
     }
   }
   const finalStatus = walkEvents(events).status;
-  if (ACTIVE_STATUSES.has(finalStatus)) {
+  if (ACTIVE_STATUSES.has(finalStatus) && !options?.freezeTail) {
     const tailMs = now - Date.parse(events[events.length - 1].timestamp);
     total += Math.max(0, tailMs);
   }
@@ -58,7 +73,7 @@ export function computeActiveWorkMs(events: AutoDevEvent[], now: number): number
 /** 한 run 안의 여러 task에 걸친 이력(§ 프로젝트 전체 실제 작업시간)을 taskId별로 나눠 각각
  *  계산한 뒤 합산한다 — task 경계를 넘어 상태를 섞지 않는다(다른 task의 REVIEW_BLOCKED가
  *  이 task의 작업 구간 판정에 영향을 주지 않는다). */
-export function computeActiveWorkMsAcrossTasks(events: AutoDevEvent[], now: number): number {
+export function computeActiveWorkMsAcrossTasks(events: AutoDevEvent[], now: number, options?: ComputeActiveWorkMsOptions): number {
   const byTask = new Map<string, AutoDevEvent[]>();
   const noTaskId: AutoDevEvent[] = [];
   for (const e of events) {
@@ -72,11 +87,11 @@ export function computeActiveWorkMsAcrossTasks(events: AutoDevEvent[], now: numb
   }
   let total = 0;
   for (const taskEvents of byTask.values()) {
-    total += computeActiveWorkMs(taskEvents, now);
+    total += computeActiveWorkMs(taskEvents, now, options);
   }
   // taskId가 없는 event만으로 구성된 구간(예: task 선택 이전의 RUN_STARTED 등)도 동일한
   // 규칙으로 포함한다 — 다만 이런 event만으로는 대개 활성 상태로 전이되지 않는다(§
   // STATUS_TRANSITIONS는 TASK_STARTED부터 RUNNING으로 전이시킨다).
-  total += computeActiveWorkMs(noTaskId, now);
+  total += computeActiveWorkMs(noTaskId, now, options);
   return total;
 }

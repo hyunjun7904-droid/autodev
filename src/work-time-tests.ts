@@ -103,12 +103,61 @@ function scenarioAcrossTasksSumsIndependently(): void {
   check("E) Task1(5초) + Task2(3초) = 8초로 정확히 합산됨(Task2의 대기시간은 제외)", total === 8_000);
 }
 
+// ---------------------------------------------------------------------------
+// F) AutoDev / JARVIS Dashboard Stale-State Reconciliation(2026-08-28) — freezeTail. 실제
+//    production incident 재현: 마지막 event가 REVIEW_STARTED(REVIEWING, ACTIVE_STATUSES에
+//    속함)인 채로 owner 프로세스가 죽으면, freezeTail 없이는 그 시점 이후 몇 시간이 지나든
+//    tail이 계속 늘어난다. freezeTail=true는 그 tail을 완전히 0으로 만든다 — 죽기 전까지
+//    실제로 흐른 구간(사건 사이 간격)은 그대로 인정한다는 것도 함께 증명한다.
+// ---------------------------------------------------------------------------
+function scenarioFreezeTailStopsGrowthAfterProcessDeath(): void {
+  const store = makeStore();
+  append(store, 0, { eventType: "TASK_STARTED", runId: "r1", taskId: "T1", executionPhase: "task_selection", outcome: "PENDING" });
+  append(store, 5_000, { eventType: "REVIEW_STARTED", runId: "r1", taskId: "T1", executionPhase: "review", outcome: "PENDING", reviseCycle: 1 });
+
+  const events = store.query({ runId: "r1" }).events;
+  const nowShortlyAfter = T0 + 5_000 + 1_000;
+  const nowManyHoursLater = T0 + 5_000 + 15 * 60 * 60 * 1000;
+
+  const withoutFreeze = computeActiveWorkMs(events, nowManyHoursLater);
+  check(
+    "F) freezeTail 없이는(기존 동작) 프로세스 죽음과 무관하게 tail이 계속 늘어남(회귀 대상 버그 재현)",
+    withoutFreeze > 60_000
+  );
+
+  const frozenShortlyAfter = computeActiveWorkMs(events, nowShortlyAfter, { freezeTail: true });
+  const frozenManyHoursLater = computeActiveWorkMs(events, nowManyHoursLater, { freezeTail: true });
+  check("F) freezeTail=true면 마지막 event까지의 구간(5초)만 집계됨", frozenShortlyAfter === 5_000);
+  check(
+    "F) freezeTail=true면 그 이후 시간이 아무리 지나도 값이 늘지 않음(11시간 이상 정체돼도 작업시간 고정)",
+    frozenManyHoursLater === 5_000 && frozenManyHoursLater === frozenShortlyAfter
+  );
+}
+
+function scenarioFreezeTailAcrossTasks(): void {
+  const store = makeStore();
+  append(store, 0, { eventType: "TASK_STARTED", runId: "r1", taskId: "T1", executionPhase: "task_selection", outcome: "PENDING" });
+  append(store, 5_000, { eventType: "TASK_COMPLETED", runId: "r1", taskId: "T1", executionPhase: "state_update", outcome: "SUCCESS" });
+  append(store, 5_000, { eventType: "TASK_STARTED", runId: "r1", taskId: "T2", executionPhase: "task_selection", outcome: "PENDING" });
+  append(store, 8_000, { eventType: "REVIEW_STARTED", runId: "r1", taskId: "T2", executionPhase: "review", outcome: "PENDING", reviseCycle: 1 });
+
+  const events = store.query({ runId: "r1" }).events;
+  const nowMuchLater = T0 + 8_000 + 12 * 60 * 60 * 1000;
+  const total = computeActiveWorkMsAcrossTasks(events, nowMuchLater, { freezeTail: true });
+  check(
+    "F) 여러 task 합산에서도 freezeTail이 적용됨 — T1(5초, 이미 완료돼 원래도 안 늘어남) + T2(3초, 죽은 프로세스의 tail은 집계 안 됨) = 8초",
+    total === 8_000
+  );
+}
+
 function main(): void {
   scenarioSimpleActiveSpanCounted();
   scenarioWaitingHumanTailExcluded();
   scenarioCompletedDoesNotKeepGrowing();
   scenarioDeterministicAcrossReReads();
   scenarioAcrossTasksSumsIndependently();
+  scenarioFreezeTailStopsGrowthAfterProcessDeath();
+  scenarioFreezeTailAcrossTasks();
 
   console.log("\n=== work-time 테스트 결과 ===");
   for (const r of results) console.log(r);

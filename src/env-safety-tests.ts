@@ -38,10 +38,23 @@ const DANGEROUS_PATTERNS: { name: string; pattern: RegExp }[] = [
 
 // self-dev-complete.ts의 sanitizedChildEnv()는 이미 이 파일이 검증하는(§
 // scenarioChildProcessDenylistCoversAllNotificationCredentials) denylist 삭제를 곧바로
-// 수행하는 검토된 유일한 예외다 — process.env를 spread한 직후 민감 키를 delete하고, 그
-// 결과만 자식 프로세스 env로 쓴다(로그/출력 어디에도 남기지 않는다). 다른 어떤 파일도 이
-// 패턴을 새로 도입해서는 안 된다.
-const REVIEWED_ENV_SPREAD_EXCEPTIONS: ReadonlySet<string> = new Set(["self-dev-complete.ts"]);
+// 수행하는 검토된 예외다 — process.env를 spread한 직후 민감 키를 delete하고, 그 결과만
+// 자식 프로세스 env로 쓴다(로그/출력 어디에도 남기지 않는다). 그 child는 검증/회귀 실행
+// 전용이라 Telegram/ntfy 자격증명이 애초에 필요 없다.
+//
+// runner-supervisor.ts(2026-08-28 Maintenance, Continuous Runner Lifecycle Independence)의
+// spawnChild()도 검토된 예외다 — 성격이 다르다: 이 child는 `node dist/run.js --continuous`,
+// 즉 AutoDev의 실제 production continuous runner 자신이다. 이 프로세스는 Claude/GPT API
+// 키와 Telegram/ntfy 알림 자격증명을 실제로 사용해야만 정상 동작한다(예: 기술적
+// WAITING_HUMAN을 사람에게 알리는 경로 자체가 Telegram credential에 의존한다) — 그래서
+// self-dev-complete.ts처럼 특정 키를 delete하는 denylist 패턴을 적용하면 그 필요한 기능
+// 자체가 깨진다. 이 supervisor가 새로 만들어지기 전에도 run.js는 항상 부모 shell의 전체
+// 환경을 그대로 상속하며 직접 실행됐다(child_process가 env 옵션을 생략하면 기본적으로
+// process.env 전체를 상속한다) — 이 spread는 그 기존 동작을 명시적인 코드로 그대로
+// 재현할 뿐, 이전에 없던 새로운 노출 경로를 만들지 않는다. 로그/출력으로 env를 직렬화하지
+// 않는다(config.env override 두 개(AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME)만 별도
+// 로그에 남을 뿐이다 — § runner-supervisor.ts appendDashboardLog 호출부 확인).
+const REVIEWED_ENV_SPREAD_EXCEPTIONS: ReadonlySet<string> = new Set(["self-dev-complete.ts", "runner-supervisor.ts"]);
 
 function scenarioNoBroadEnvDumpInProductionSource(): void {
   const files = listProductionSourceFiles();

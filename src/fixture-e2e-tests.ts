@@ -472,7 +472,14 @@ async function scenarioBlockOnRequiredTestFailure(): Promise<void> {
     nextTask: null,
   });
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner: brokenClaudeRunner, gptReviewer: carelessPassReviewer } });
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 buggy 구현은 절대
+  // 스스로 고쳐지지 않으므로 REVIEW_CYCLE_EXHAUSTED durable retry를 거친 뒤 결국 기존
+  // MAX_GPT_CALLS 안전장치로 WAITING_HUMAN에 도달한다(§ RAN_TASK_NOT_APPROVED는 여전히
+  // 동일). sleep을 fake로 주입해 실제 대기 없이 진행한다.
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner: brokenClaudeRunner, gptReviewer: carelessPassReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
 
   check("[9-B/K] 실제 fixture 테스트가 매 시도마다 진짜로 FAIL함(exit code 기준)", claudeCalls > 0);
   check("[9-B/K] outcome=RAN_TASK_NOT_APPROVED(checkpoint 시도조차 되지 않음)", result.outcome === "RAN_TASK_NOT_APPROVED");
@@ -531,7 +538,13 @@ async function scenarioBlockOnCriticalHighSeverity(): Promise<void> {
     nextTask: null,
   });
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner: cleanClaudeRunner, gptReviewer: criticalButPassReviewer } });
+  // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — criticalButPassReviewer는
+  // 매번 동일하게 critical 1건과 함께 PASS를 반환하므로 이 run도 절대 스스로 수렴하지 않는다
+  // — sleep을 fake로 주입해 실제 대기 없이 기존 MAX_GPT_CALLS 안전장치까지 도달한다.
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner: cleanClaudeRunner, gptReviewer: criticalButPassReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
 
   check("[9-C/L] outcome이 RAN_TASK_APPROVED_AND_CHECKPOINTED가 아님(APPROVED 불가)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check("[9-C/L] outcome=RAN_TASK_NOT_APPROVED(REVISE 강제 후 WAITING_HUMAN)", result.outcome === "RAN_TASK_NOT_APPROVED");

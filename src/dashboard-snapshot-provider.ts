@@ -207,15 +207,30 @@ function buildUsageOverview(allEvents: QueryResult["events"], projectId: string 
   return { allTime, currentTask, usageLedgerEntryCount };
 }
 
-function buildActualWorkTime(allEvents: QueryResult["events"], projectId: string | undefined, currentTaskId: string | undefined, now: number): ActualWorkTime {
+/**
+ * AutoDev / JARVIS Dashboard Stale-State Reconciliation(2026-08-28) — freezeTail은
+ * runtimeTruth(실제 owner 프로세스 생존 여부, § computeDashboardRuntimeTruth)가 STALE/STOPPED일
+ * 때만 true로 전달된다. event log만으로는(§ work-time.ts 상단 주석의 알려진 한계) 프로세스가
+ * 죽은 뒤에도 마지막 event의 상태가 계속 "작업 중"으로 보여 tail 구간이 무한히 늘어난다 —
+ * 실제 production incident(Maintenance agent가 세션 한도로 죽은 뒤에도 대시보드가 11시간 넘게
+ * "검토 중"으로 표시하며 작업시간을 계속 늘린 사례)를 이 필드로 재현/검증한다.
+ */
+function buildActualWorkTime(
+  allEvents: QueryResult["events"],
+  projectId: string | undefined,
+  currentTaskId: string | undefined,
+  now: number,
+  freezeTail: boolean
+): ActualWorkTime {
   const result: ActualWorkTime = {};
+  const options = { freezeTail };
   if (currentTaskId) {
     const taskEvents = allEvents.filter((e) => e.taskId === currentTaskId).sort((a, b) => a.sequence - b.sequence);
-    result.currentTaskMs = computeActiveWorkMs(taskEvents, now);
+    result.currentTaskMs = computeActiveWorkMs(taskEvents, now, options);
   }
   if (projectId) {
     const projectEvents = allEvents.filter((e) => e.projectId === projectId).sort((a, b) => a.sequence - b.sequence);
-    result.projectTotalMs = computeActiveWorkMsAcrossTasks(projectEvents, now);
+    result.projectTotalMs = computeActiveWorkMsAcrossTasks(projectEvents, now, options);
   }
   return result;
 }
@@ -264,7 +279,13 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, 
     generatedAt: snapshot.generatedAt,
     snapshot,
     projectProgress: projectProgressResult.ok ? projectProgressResult.progress : undefined,
-    actualWorkTime: buildActualWorkTime(result.events, snapshot.projectId, snapshot.taskId, now),
+    actualWorkTime: buildActualWorkTime(
+      result.events,
+      snapshot.projectId,
+      snapshot.taskId,
+      now,
+      runtimeTruth !== undefined && (runtimeTruth.state === "STALE" || runtimeTruth.state === "STOPPED")
+    ),
     usageOverview: buildUsageOverview(result.events, snapshot.projectId, snapshot.taskId),
     recentCalls: buildRecentCalls(result.events, RECENT_CALLS_LIMIT),
     problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId),

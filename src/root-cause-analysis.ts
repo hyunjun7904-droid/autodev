@@ -410,7 +410,38 @@ export function wrapGptReviewerWithFireworksCallLimiter(inner: GptReviewerFn, op
       persistDurableState({ pendingRootCauseCategory: undefined, pendingSnapshotKey: undefined, lastRecoveryAction: `${recoveryAction}(로컬 검증 통과 — 재검증 진행)` });
     }
 
-    const gptResult = await inner(result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline);
+    const rawGptResult = await inner(result, reviewCycle, task, allowedPathPrefixes, projectContext, gptCallCount, gptRawCallTotal, baseline);
+
+    // AutoDev / JARVIS Reviewer BLOCK/HUMAN_REQUIRED Root-Cause Routing(2026-08-28 정책 수정
+    // — "REVIEWER_BLOCK_WITH_ACTIONABLE_FINDING은 WAITING_HUMAN 금지"). Reviewer 자신의 raw
+    // 판정이 BLOCK/HUMAN_REQUIRED라도, (1) scope violation(§ Core 하드룰 — allowedPathPrefixes
+    // 밖 변경, 절대 완화하지 않는다)도 없고 (2) 실제 비용/보안 provider 사유(AUTH_ERROR/
+    // QUOTA_EXCEEDED/BUDGET_EXCEEDED/PROVIDER_SECURITY_BLOCKED — human-gate-policy.ts
+    // GENUINE_MARKER_PREFIXES와 정확히 동일한 목록, 그 목록을 복제하지 않고 여기서도 같은
+    // 네 개만 명시적으로 나열한다)도 없으면 "Developer가 고칠 수 있는 code-level finding"으로
+    // 간주해 REVISE로 취급한다 — 아래 기존 same-finding 반복 감지/RCA(로컬 검증 우선, Fireworks
+    // 재호출 제한)가 그대로 이어서 처리하고, orchestrator.ts의 REVISE 루프(기존
+    // MAX_REVIEW_CYCLES 상한 + 위에서 함께 수정한 REVIEW_CYCLE_EXHAUSTED durable wait)가
+    // WAITING_HUMAN 없이 계속 진행한다. severity(critical/high)는 이 판단과 무관하다 — "사람
+    // 판단이 필요한가"와 "심각도가 높은가"는 분리된 질문이다. scope violation/genuine
+    // errorCode가 하나라도 있으면 이 변환을 절대 하지 않는다 — orchestrator.ts가 기존 그대로
+    // WAITING_HUMAN으로 처리한다(이 wrapper는 그 경로를 전혀 건드리지 않는다).
+    const hasScopeViolation = !!(rawGptResult.scopeViolations && rawGptResult.scopeViolations.length > 0);
+    const hasGenuineReviewerErrorCode =
+      rawGptResult.errorCode === "AUTH_ERROR" ||
+      rawGptResult.errorCode === "QUOTA_EXCEEDED" ||
+      rawGptResult.errorCode === "BUDGET_EXCEEDED" ||
+      rawGptResult.errorCode === "PROVIDER_SECURITY_BLOCKED";
+    const isActionableReviewerBlock =
+      (rawGptResult.decision === "BLOCK" || rawGptResult.decision === "HUMAN_REQUIRED") && !hasScopeViolation && !hasGenuineReviewerErrorCode;
+    if (isActionableReviewerBlock) {
+      log("REVIEWER_BLOCK_ROUTED_TO_ROOT_CAUSE_REPAIR — actionable finding, WAITING_HUMAN으로 승격하지 않고 REVISE 루프로 처리", {
+        taskId: opts.taskId,
+        rawDecision: rawGptResult.decision,
+        severity: rawGptResult.severity,
+      });
+    }
+    const gptResult = isActionableReviewerBlock ? { ...rawGptResult, decision: "REVISE" as const } : rawGptResult;
 
     if (gptResult.decision === "REVISE") {
       const fingerprint = computeReviewCycleFingerprint(opts.taskId, gptResult, result.tests);

@@ -145,6 +145,22 @@ export const DASHBOARD_HTML = `<!doctype html>
     REVISING: "수정 중", WAITING_HUMAN: "사람 승인 대기", BLOCKED: "차단됨",
     CHECKPOINTING: "저장 지점 생성 중", COMPLETED: "완료", UNKNOWN: "확인 불가"
   };
+  // AutoDev / JARVIS Dashboard Stale-State Reconciliation(2026-08-28) — runtimeTruth.state가
+  // STALE/STOPPED이면 event log가 무엇을 마지막으로 기록했든(예: REVIEW_STARTED만 남긴 채
+  // 프로세스가 죽어 event 기준으로는 영원히 "검토 중") 실제로는 그 작업을 수행하는 프로세스가
+  // 없다는 뜻이다 — STATUS_LABEL_KO만으로 표시하지 않고 이 값으로 덮어쓴다(§ 요구사항 13/17,
+  // 실제 production incident: Maintenance agent가 세션 한도로 죽은 뒤에도 11시간 넘게 "검토
+  // 중"으로 표시됨).
+  var RUNTIME_STALE_LABEL_KO = {
+    STOPPED: "중단됨(실행 중인 프로세스 없음)",
+    STALE: "정체됨(응답 없음 — 확인 필요)"
+  };
+  function resolveRuntimeStatus(taskStatus, runtimeTruth) {
+    if (runtimeTruth && (runtimeTruth.state === "STOPPED" || runtimeTruth.state === "STALE")) {
+      return { label: RUNTIME_STALE_LABEL_KO[runtimeTruth.state], tone: runtimeTruth.state === "STALE" ? "RED" : "GRAY" };
+    }
+    return { label: STATUS_LABEL_KO[taskStatus] || taskStatus, tone: STATUS_TONE[taskStatus] || "GRAY" };
+  }
   var TEST_STATUS_LABEL_KO = { PASS: "통과", FAIL: "실패", UNKNOWN: "확인 불가" };
   var REVIEW_DECISION_LABEL_KO = { PASS: "통과", REVISE: "수정 필요", HUMAN_REQUIRED: "사람 확인 필요", BLOCK: "차단됨" };
   var ADVISORY_ROLES = [
@@ -223,8 +239,24 @@ export const DASHBOARD_HTML = `<!doctype html>
       esc(snap.integrityNote || "일부 기록이 누락되었거나 손상되었을 수 있습니다.") + "</div></div>";
   }
 
-  function overallTone(snap) {
+  // AutoDev / JARVIS Dashboard Stale-State Reconciliation(2026-08-28, § 요구사항 17
+  // "Dashboard 상태 모순 탐지") — 저장된 event log 상 상태(예: REVIEWING)와 실제 프로세스
+  // 생존 여부(runtimeTruth)가 어긋나면(마지막 event 이후 프로세스가 죽었거나 애초에 없음)
+  // 이 사실을 숨기지 않고 명시적으로 알린다. runtimeTruth가 RUNNING/WAITING이거나 애초에
+  // 확인 불가(undefined)면 아무것도 표시하지 않는다(추측 금지).
+  var ACTIVE_LOOKING_TASK_STATUSES = { RUNNING: true, TESTING: true, REVIEWING: true, REVISING: true, CHECKPOINTING: true };
+  function renderConsistencyWarning(snap, runtimeTruth) {
+    if (!runtimeTruth || (runtimeTruth.state !== "STALE" && runtimeTruth.state !== "STOPPED")) return "";
+    if (!ACTIVE_LOOKING_TASK_STATUSES[snap.taskStatus]) return "";
+    return '<div class="audit-degraded">상태 불일치(STATE_CONSISTENCY_WARNING)<div class="note">' +
+      "저장된 상태는 '" + esc(STATUS_LABEL_KO[snap.taskStatus] || snap.taskStatus) + "'이나 실제로는 실행 중인 프로세스가 없습니다 — " +
+      esc(runtimeTruth.reason) + "</div></div>";
+  }
+
+  function overallTone(snap, runtimeTruth) {
+    if (runtimeTruth && runtimeTruth.state === "STALE") return "RED";
     if (snap.safety.securityBlocked || snap.taskStatus === "BLOCKED" || snap.runStatus === "BLOCKED") return "RED";
+    if (runtimeTruth && runtimeTruth.state === "STOPPED") return "GRAY";
     if (
       snap.taskStatus === "WAITING_HUMAN" ||
       snap.taskStatus === "REVISING" ||
@@ -238,10 +270,12 @@ export const DASHBOARD_HTML = `<!doctype html>
     return tone === "RED" ? "YELLOW" : tone;
   }
 
-  function renderQuickGlance(snap) {
+  function renderQuickGlance(data) {
+    var snap = data.snapshot;
     var approvalNeeded = snap.taskStatus === "WAITING_HUMAN" || snap.safety.humanApprovalRequired;
+    var runtimeStatus = resolveRuntimeStatus(snap.taskStatus, data.runtimeTruth);
     var items = [
-      { k: "오토데브 상태", v: STATUS_LABEL_KO[snap.taskStatus] || snap.taskStatus, tone: STATUS_TONE[snap.taskStatus] || "GRAY" },
+      { k: "오토데브 상태", v: runtimeStatus.label, tone: runtimeStatus.tone },
       { k: "승인 필요", v: approvalNeeded ? "예" : "아니오", tone: approvalNeeded ? "YELLOW" : "GREEN" },
       { k: "검사", v: TEST_STATUS_LABEL_KO[snap.tests.status] || snap.tests.status, tone: snap.tests.status === "PASS" ? "GREEN" : snap.tests.status === "FAIL" ? "RED" : "GRAY" },
       { k: "검토", v: snap.review.decision ? (REVIEW_DECISION_LABEL_KO[snap.review.decision] || snap.review.decision) : "없음", tone: snap.review.decision === "PASS" ? "GREEN" : snap.review.decision === "REVISE" ? "YELLOW" : snap.review.decision ? "RED" : "GRAY" },
@@ -277,8 +311,9 @@ export const DASHBOARD_HTML = `<!doctype html>
       ? snap.currentOperation.activeAgentRole + " (" + orDash(snap.currentOperation.activeAgentId) + ")"
       : "없음";
     var rs = data.roundStatus;
+    var runtimeStatus = resolveRuntimeStatus(snap.runStatus, data.runtimeTruth);
     var rows =
-      row("오토데브 상태", esc(STATUS_LABEL_KO[snap.runStatus] || snap.runStatus), STATUS_TONE[snap.runStatus]) +
+      row("오토데브 상태", esc(runtimeStatus.label), runtimeStatus.tone) +
       row("프로젝트", orDash(snap.projectId)) +
       row("실행", orDash(snap.runId ? snap.runId.slice(0, 8) : undefined)) +
       row("현재 작업", orDash(snap.taskId)) +
@@ -487,13 +522,15 @@ export const DASHBOARD_HTML = `<!doctype html>
       return;
     }
     var snap = data.snapshot;
-    var tone = overallTone(snap);
+    var tone = overallTone(snap, data.runtimeTruth);
+    var bannerStatus = resolveRuntimeStatus(snap.taskStatus, data.runtimeTruth);
     var html = "";
     html += renderAuditBanner(snap);
-    html += '<div class="banner badge-' + tone + '"><span>오토데브 ' + esc(STATUS_LABEL_KO[snap.taskStatus] || snap.taskStatus) +
+    html += renderConsistencyWarning(snap, data.runtimeTruth);
+    html += '<div class="banner badge-' + tone + '"><span>오토데브 ' + esc(bannerStatus.label) +
       '</span><span class="sub">' + esc(orDash(snap.taskId)) + "</span></div>";
     html += '<div class="grid">' +
-      renderQuickGlance(snap) +
+      renderQuickGlance(data) +
       renderProjectProgress(data) +
       renderCurrentStatus(data) +
       renderActualWorkTime(data) +
