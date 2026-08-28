@@ -269,6 +269,14 @@ async function scenarioMarkerRemovalPreservesUnrelatedMarkersBeforeResumeStarts(
   const stateAfter = readState(statePath);
   check("9) 해결된 마커(CHECKPOINT_BLOCKED(T1))는 제거됨", !stateAfter.deferredHumanTasks.includes(targetMarker));
   check("9) 무관한 다른 Human Gate 마커(AUDIT_STORE_UNAVAILABLE)는 보존됨(전체 삭제 아님)", stateAfter.deferredHumanTasks.includes(unrelatedMarker));
+  // resumeApprovedTask()가 READY 전환 지점(Git Safety 통과 이후)에 도달하기도 전에
+  // BLOCKED를 반환했더라도, 이미 확정된 사람 승인 판단에 따라 이 함수 자신이 status를
+  // READY로 전환해야 한다(§ 실제 production 사례 — 그렇지 않으면 마커 없는 WAITING_HUMAN
+  // 모호 상태로 영구히 남는다). 이 검증이 바로 그 회귀 방지 테스트다.
+  check(
+    "9) resumeApprovedTask가 READY 전환 전에 BLOCKED되어도 이 함수가 status를 READY로 정리함(모호한 WAITING_HUMAN 잔류 방지)",
+    (stateAfter.status as unknown as string) === "READY"
+  );
 }
 
 // ---------------------------------------------------------------------------

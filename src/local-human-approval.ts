@@ -187,8 +187,8 @@ export async function performLocalHumanApproval(
 
   // 지금 해결된 마커만 정확히 제거한다 — 다른 deferredHumanTasks(다른 task/다른 사유)는
   // 절대 건드리지 않는다(§ 요구사항: "다른 deferredHumanTasks가 있다면 무조건 전체 삭제하지
-  // 마라"). status는 아직 WAITING_HUMAN으로 남겨둔다 — READY 전환은 resumeApprovedTask()
-  // 내부에서(기존 Telegram 경로와 정확히 동일한 지점에서) 이뤄진다.
+  // 마라"). status는 아직 WAITING_HUMAN으로 남겨둔다 — resumeApprovedTask()가 자신의
+  // stale-state 재확인(state.status==="WAITING_HUMAN" 요구)을 통과해야 하기 때문이다.
   const afterMarkerRemoval = loadState(opts.statePath);
   afterMarkerRemoval.deferredHumanTasks = (afterMarkerRemoval.deferredHumanTasks ?? []).filter((m) => m !== matchingMarker);
   saveState(afterMarkerRemoval, opts.statePath);
@@ -206,6 +206,27 @@ export async function performLocalHumanApproval(
   });
 
   if (outcome.kind === "BLOCKED") {
+    // resumeApprovedTask()는 Project Lock/Remote Git Safety 사전 재확인이 실패하면 자신의
+    // READY 전환 지점(그 함수 안에서 Git Safety 다음, 이 두 확인 이후)에 도달하기도 전에
+    // BLOCKED를 반환한다(§ 실제 production 사례 — 이 gate를 만든 원래 프로세스 자신이 아직
+    // 살아서 lock을 들고 있는 동안 로컬 승인을 먼저 처리하는 경우). 그 경우 여기서 status를
+    // WAITING_HUMAN으로 그대로 두면 "마커는 이미 없는데 여전히 WAITING_HUMAN"이라는 모호한
+    // 상태가 되고, human-gate-policy.ts의 classifyWaitingHumanReason()은 알려진 마커가
+    // 하나도 없으면 fail-closed로 다시 GENUINE_HUMAN_JUDGMENT를 반환하므로(§ 그 파일의
+    // 마지막 fallback) 나중에 lock을 쥔 프로세스가 내려가고 새 프로세스가 떠도 자동으로
+    // 재개되지 않는다. 이미 사람이 직접 승인을 완료한 시점(바로 위)에 이 판단 자체는
+    // 확정됐으므로, project lock/remote git safety 사전 확인 결과와 무관하게 여기서 READY로
+    // 전환해 다음 실행(재시작된 runner child든, 나중의 재시도든)이 정상적으로 이 task를 다시
+    // 선택하게 한다. "정말 안전한지"는 여전히 runAutodevOnce() 내부의 authoritative Gate가
+    // 재실행 시점에 다시 검증한다(§ 이 파일 전체의 원칙 — 이 함수는 그 Gate를 대신하지
+    // 않는다) — 여기서 READY로 전환해도 그 Gate 자체를 우회하지 않는다. COMPLETED인
+    // 경우에는 resumeApprovedTask()/runAutodevOnce()가 이미 state를 완전히 관리했으므로
+    // 이 블록에서 더 손댈 것이 없다.
+    const afterBlockedResume = loadState(opts.statePath);
+    if ((afterBlockedResume.status as unknown as string) === "WAITING_HUMAN") {
+      afterBlockedResume.status = "READY";
+      saveState(afterBlockedResume, opts.statePath);
+    }
     opts.events?.append({
       eventType: "AUTO_RESUME_BLOCKED",
       runId: approval.runId,
