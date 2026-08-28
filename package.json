@@ -92,6 +92,7 @@
     "test:dashboard-log": "npm run build && node dist/dashboard-log-tests.js",
     "test:dashboard-supervisor": "npm run build && node dist/dashboard-supervisor-tests.js",
     "test:runner-supervisor": "npm run build && node dist/runner-supervisor-tests.js",
+    "test:local-human-approval": "npm run build && node dist/local-human-approval-tests.js",
     "test:notification": "npm run build && node dist/notification-tests.js",
     "test:notification-store": "npm run build && node dist/notification-store-tests.js",
     "test:notification-provider": "npm run build && node dist/notification-provider-tests.js",

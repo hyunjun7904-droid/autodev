@@ -8,6 +8,7 @@ import type { EventStore } from "./event-store";
 import type { ApprovalRequest } from "./approval";
 import type { OrchestratorDeps } from "./orchestrator";
 import { peekProjectLock } from "./project-lock";
+import type { ProjectLockOwnerKind } from "./project-lock";
 import { checkRemoteSafeToStart } from "./remote-git-safety";
 
 // Safe Auto Resume — Phase G Task G6.
@@ -53,6 +54,15 @@ import { checkRemoteSafeToStart } from "./remote-git-safety";
 // 이 중 하나라도 실패하면 WAITING_HUMAN 상태(state.status)를 그대로 둔 채(변경하지 않고)
 // BLOCKED를 반환한다 — 안전한 경우에만 state.status를 "READY"로 바꿔 다음 실행이 이 task를
 // 다시 선택할 수 있게 한다.
+//
+// Genuine Human Gate Local Approval(2026-08-29) — 위 2)~5) 재검사와 READY 전환 +
+// runAutodevOnce() 재호출 로직은 resumeApprovedTask()(아래)로 분리했다. performAutoResume()
+// (여전히 이 파일의 유일한 공개 Telegram 경로, 동작 변화 없음)은 1) remotelyApprovable
+// 재확인만 자신이 하고 나머지는 그 함수에 위임한다. local-human-approval.ts는 완전히 다른
+// 승인 정책(로컬 인간이 직접 확인한 genuine Human Gate만, remotelyApprovable=false 전용)을
+// 자신이 검증한 뒤 이 파일의 resumeApprovedTask()만 재사용한다 — performAutoResume()을
+// 호출하지 않으므로 그 함수의 remotelyApprovable=false 거부를 우회하는 경로가 아니다(호출
+// 그래프 자체가 다르다).
 
 export type AutoResumeOutcome = { kind: "COMPLETED"; result: AutodevRunResult } | { kind: "BLOCKED"; reason: string };
 
@@ -67,6 +77,11 @@ export interface AutoResumeOptions {
    *  runAutodevOnce()가 기존과 동일하게 실제 Claude Developer/GPT Reviewer를 그대로 쓴다
    *  (production 동작 변화 없음). */
   orchestratorDeps?: OrchestratorDeps;
+  /** Genuine Human Gate Local Approval(2026-08-29) — project-lock.ts metadata에 남는
+   *  ownerKind. 지정하지 않으면 이 파일의 기존 동작(performAutoResume, "telegram-resume")을
+   *  그대로 유지한다 — local-human-approval.ts만 명시적으로 "local-human-approval"을
+   *  넘긴다. */
+  lockOwnerKind?: ProjectLockOwnerKind;
 }
 
 export interface GitSafetyExpectation {
@@ -91,17 +106,21 @@ export function checkGitSafeToResume(cwd: string, expectation: GitSafetyExpectat
   return { ok: true };
 }
 
-export async function performAutoResume(
+/**
+ * Genuine Human Gate Local Approval(2026-08-29) — 이 함수는 원래 performAutoResume() 본문
+ * 전체(remotelyApprovable 재확인 이후 부분)였다. Telegram 경로(performAutoResume, 아래)와
+ * 로컬 인간 승인 경로(local-human-approval.ts) 둘 다 "이미 승인이 확정된 approval을 실제로
+ * 재개한다"는 이 부분을 그대로 공유한다 — Git Safety/Project Lock/Remote Git Safety 재확인
+ * + state.status READY 전환 + runAutodevOnce() 재호출 로직을 두 곳에 복제하지 않는다. 이
+ * 함수 자신은 remotelyApprovable을 확인하지 않는다 — "이 approval을 지금 재개해도 되는가"는
+ * 호출부(원격 정책 vs 로컬 인간 승인 정책)의 책임이고, 이 함수는 그 판단이 이미 끝났다고
+ * 가정한 뒤의 공통 실행 로직만 담당한다.
+ */
+export async function resumeApprovedTask(
   approval: ApprovalRequest,
   manifest: ProjectManifest,
   opts: AutoResumeOptions = {}
 ): Promise<AutoResumeOutcome> {
-  // 1) remotelyApprovable 재확인 — 이 함수의 호출부(approval-service.ts)가 이미 확인했어도
-  //    다시 확인한다(fail-closed, 단일 검증 지점에만 의존하지 않는다).
-  if (!approval.remotelyApprovable) {
-    return { kind: "BLOCKED", reason: "REMOTE_APPROVAL_NOT_ALLOWED" };
-  }
-
   const statePath = opts.statePath ?? manifest.statePath;
   const cwd = opts.cwd ?? manifest.targetProjectRoot;
 
@@ -163,7 +182,7 @@ export async function performAutoResume(
     manifest,
     statePath,
     cwd,
-    lockOwnerKind: "telegram-resume",
+    lockOwnerKind: opts.lockOwnerKind ?? "telegram-resume",
     ...(opts.events ? { events: opts.events } : {}),
     ...(opts.orchestratorDeps ? { orchestratorDeps: opts.orchestratorDeps } : {}),
   });
@@ -178,4 +197,22 @@ export async function performAutoResume(
     return { kind: "BLOCKED", reason: `REMOTE_GIT_BLOCKED: ${result.reason ?? ""}` };
   }
   return { kind: "COMPLETED", result };
+}
+
+/** Telegram 원격 승인 경로 — 기존 동작을 정확히 그대로 유지한다(remotelyApprovable=false는
+ *  무조건 거부, 그 외에는 resumeApprovedTask()의 공통 로직을 그대로 통과시킨다). 이 함수의
+ *  외부 시그니처/동작은 이번 변경으로 전혀 바뀌지 않았다 — 본문만 공통 로직으로 위임한다. */
+export async function performAutoResume(
+  approval: ApprovalRequest,
+  manifest: ProjectManifest,
+  opts: AutoResumeOptions = {}
+): Promise<AutoResumeOutcome> {
+  // remotelyApprovable 재확인 — 이 함수의 호출부(approval-service.ts)가 이미 확인했어도
+  // 다시 확인한다(fail-closed, 단일 검증 지점에만 의존하지 않는다). 이 검사는 절대 완화하지
+  // 않는다 — local-human-approval.ts는 이 함수를 호출하지 않고 resumeApprovedTask()를
+  // 별도로 호출하므로, 이 게이트를 우회할 방법이 없다.
+  if (!approval.remotelyApprovable) {
+    return { kind: "BLOCKED", reason: "REMOTE_APPROVAL_NOT_ALLOWED" };
+  }
+  return resumeApprovedTask(approval, manifest, opts);
 }

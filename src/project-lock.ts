@@ -28,7 +28,7 @@ import { spawnSync } from "node:child_process";
 
 export const PROJECT_LOCK_SCHEMA_VERSION = 1 as const;
 
-export type ProjectLockOwnerKind = "autodev" | "telegram-resume";
+export type ProjectLockOwnerKind = "autodev" | "telegram-resume" | "local-human-approval";
 
 export interface ProjectLockMetadata {
   schemaVersion: typeof PROJECT_LOCK_SCHEMA_VERSION;
@@ -197,7 +197,7 @@ function isValidLockMetadata(value: unknown): value is ProjectLockMetadata {
     typeof v.processStartedAtMs === "number" &&
     Number.isFinite(v.processStartedAtMs) &&
     typeof v.lockCreatedAt === "string" &&
-    (v.ownerKind === "autodev" || v.ownerKind === "telegram-resume")
+    (v.ownerKind === "autodev" || v.ownerKind === "telegram-resume" || v.ownerKind === "local-human-approval")
   );
 }
 

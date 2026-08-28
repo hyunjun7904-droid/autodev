@@ -75,7 +75,11 @@ function isCheckpointScopeViolationMarker(marker: string): boolean {
   return marker.startsWith("CHECKPOINT_BLOCKED(") && marker.includes(`: ${CHECKPOINT_SCOPE_VIOLATION_REASON}`);
 }
 
-function isNonScopeCheckpointBlockMarker(marker: string): boolean {
+/** Genuine Human Gate Local Approval(2026-08-29)이 재사용한다 — CHECKPOINT_BLOCKED 마커 중
+ *  scope-violation(기술적 자동 복구 대상)이 아닌 것만 골라낸다. 이 파일의 기존 분류 로직을
+ *  복제하지 않고 그대로 export만 추가한다(동작 변화 없음, D2/D3/D4의 기존 export-추가
+ *  패턴과 동일). */
+export function isNonScopeCheckpointBlockMarker(marker: string): boolean {
   return marker.startsWith("CHECKPOINT_BLOCKED(") && !isCheckpointScopeViolationMarker(marker);
 }
 

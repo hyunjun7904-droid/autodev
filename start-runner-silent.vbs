@@ -21,8 +21,18 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 logDir = "C:\dev\auto dev\logs"
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
 
-adapterArg = ""
-If WScript.Arguments.Count > 0 Then adapterArg = " """ & WScript.Arguments(0) & """"
+' Chr(34) (a literal ") is used instead of VBScript's "" escaping here - with an
+' extra adapterArg segment in the mix (start-dashboard-silent.vbs has none), hand-
+' balancing "" escapes across three quoted segments (exe path/adapter path/log path)
+' plus the required outer-wrap-the-whole-/c-argument trick (§ empirically confirmed
+' against start-dashboard-silent.vbs, which DOES have that outer wrap and works) is
+' exactly the kind of nested-quoting mistake this launcher exists to avoid. Chr(34)
+' concatenation makes each quote character explicit and unambiguous instead.
+q = Chr(34)
 
-cmdLine = "cmd /c ""C:\dev\auto dev\start-runner.cmd""" & adapterArg & " >> ""C:\dev\auto dev\logs\runner-startup.log"" 2>&1"
+adapterArg = ""
+If WScript.Arguments.Count > 0 Then adapterArg = " " & q & WScript.Arguments(0) & q
+
+innerCmd = q & "C:\dev\auto dev\start-runner.cmd" & q & adapterArg & " >> " & q & "C:\dev\auto dev\logs\runner-startup.log" & q & " 2>&1"
+cmdLine = "cmd /c " & q & innerCmd & q
 shell.Run cmdLine, 0, False
