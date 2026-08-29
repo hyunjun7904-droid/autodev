@@ -207,6 +207,40 @@ function findCandidateTestFiles(projectRoot: string, allowedPathPrefixes: string
   return [...found];
 }
 
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening — Phase 12
+// (2026-08-29, JARVIS Task 4.6 실측 근본원인). 위 findCandidateTestFiles()는
+// allowedPathPrefixes 각 항목이 디렉터리일 때만 그 밑을 훑는다 — 항목 자체가 이미 구체적인
+// 파일 하나("backend/memory/memory-manager-api.ts"처럼 디렉터리 슬래시 없이 끝나는 단일
+// leaf path")를 가리키면 무조건 스킵된다(`!st.isDirectory()`). Task의 allowedPathPrefixes가
+// 정확히 그런 단일 파일 하나뿐이면(Safe Executor의 write-path 강제 자체가 이미 그 파일
+// 하나만 허용) Developer는 구조적으로 그 옆에 별도 "*.test.mjs" 파일을 만들 방법이 없다 —
+// 그래서 위 glob은 항상 0개를 찾고, 실제로 존재하는 (구현+self-test를 한 파일에 함께 담은)
+// 그 파일 자체는 영원히 후보로 인정되지 않아 매 attempt마다 "Missing script"로 반복
+// 실패했다(§ JARVIS Task 4.6, REVISE 7회/Developer round 69회 낭비 후 실측 확인).
+// allowedPathPrefixes가 정확히 이런 단일 파일 scope일 때만(디렉터리 prefix는 다른 파일이
+// 여럿일 수 있어 모호하므로 대상이 아니다 — 기존 glob 판정을 그대로 유지) 그 파일 자체를
+// 유일하게 안전한 후보로 인정한다 — 파일명을 추측하지 않는다(allowedPathPrefixes 자신이
+// 이미 그 정확한 경로를 명시한다), 실행 가능한 확장자인지, 실제로 존재하는 regular file인지
+// (symlink 아님)만 확인한다.
+const EXECUTABLE_TEST_ENTRY_EXTENSIONS: ReadonlySet<string> = new Set([".ts", ".mts", ".js", ".mjs", ".cjs"]);
+
+function singleFileScopedCandidate(projectRoot: string, allowedPathPrefixes: string[]): string | undefined {
+  if (allowedPathPrefixes.length !== 1) return undefined;
+  const prefix = allowedPathPrefixes[0];
+  if (prefix.endsWith("/")) return undefined; // 디렉터리 scope — 여러 파일이 있을 수 있어 모호함, 대상 아님.
+  const dotIdx = prefix.lastIndexOf(".");
+  if (dotIdx === -1 || !EXECUTABLE_TEST_ENTRY_EXTENSIONS.has(prefix.slice(dotIdx))) return undefined;
+  const absPath = join(projectRoot, ...prefix.split("/"));
+  let st;
+  try {
+    st = lstatSync(absPath);
+  } catch {
+    return undefined; // 아직 구현 전(정상 상태) — 후보 아님, 추측하지 않는다.
+  }
+  if (st.isSymbolicLink() || !st.isFile()) return undefined;
+  return prefix;
+}
+
 export interface RequiredTestScriptRepairResult {
   /** 정확히 하나의 후보 파일을 찾아 안전하게 package.json에 등록한 항목. */
   repaired: (RequiredTestConfigIssue & { expectedScript: string })[];
@@ -233,14 +267,20 @@ export function attemptSafeRequiredTestScriptRepair(
   if (issues.length === 0) return { repaired, unresolved };
 
   const candidates = findCandidateTestFiles(projectRoot, allowedPathPrefixes);
+  // glob이 아무 *.test.mjs도 찾지 못했을 때만(모호하지 않은 경우에만) 단일 파일 scope
+  // fallback을 본다 — glob이 이미 정확히 하나를 찾았다면 그 결과를 그대로 우선한다(§ 위
+  // singleFileScopedCandidate 주석, Phase 12).
+  const singleFileFallback = candidates.length === 0 ? singleFileScopedCandidate(projectRoot, allowedPathPrefixes) : undefined;
 
   for (const issue of issues) {
-    if (candidates.length !== 1) {
+    if (candidates.length === 1) {
+      const relPath = relative(projectRoot, candidates[0]).split(sep).join("/");
+      repaired.push({ ...issue, expectedScript: `node ${relPath}` });
+    } else if (singleFileFallback) {
+      repaired.push({ ...issue, expectedScript: `node ${singleFileFallback}` });
+    } else {
       unresolved.push(issue);
-      continue;
     }
-    const relPath = relative(projectRoot, candidates[0]).split(sep).join("/");
-    repaired.push({ ...issue, expectedScript: `node ${relPath}` });
   }
 
   if (repaired.length === 0) return { repaired, unresolved };

@@ -202,6 +202,86 @@ function scenarioSymlinkedDirectoryIsNotFollowed(): void {
 }
 
 // ---------------------------------------------------------------------------
+// B') 단일 파일 scope fallback(Phase 12, 2026-08-29 — JARVIS Task 4.6 실측 근본원인).
+//     allowedPathPrefixes가 디렉터리가 아니라 정확히 하나의 구체적 파일(예:
+//     "backend/memory/memory-manager-api.ts")만 가리키는 task는 *.test.mjs 관례를 따를
+//     구조적 방법이 없다(Safe Executor가 그 파일 하나로만 write를 강제) — 그 파일 자체를
+//     유일하게 안전한 후보로 인정해야 한다.
+// ---------------------------------------------------------------------------
+function scenarioSingleFileScopeSelfTestFileIsSafelyRegistered(): void {
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "memory"), { recursive: true });
+    writeFileSync(join(root, "backend", "memory", "memory-manager-api.ts"), "// impl + embedded self-test\n", "utf-8");
+
+    const issue = { requiredTestName: "memory-manager-api-tests", npmScript: "test:memory-manager-api" };
+    // allowedPathPrefixes가 디렉터리 슬래시 없이 이 파일 하나만 정확히 가리킨다(실제 JARVIS
+    // task-registry.json 4.6과 동일한 형태) — *.test.mjs glob은 0개를 찾지만(디렉터리가
+    // 아니므로 findCandidateTestFiles가 아예 훑지 않는다), 이 파일 자체가 유일한 후보다.
+    const repair = attemptSafeRequiredTestScriptRepair([issue], root, ["backend/memory/memory-manager-api.ts"]);
+
+    check("B') 디렉터리 없는 단일 파일 scope도 후보로 인정되어 repaired에 담김", repair.repaired.length === 1 && repair.unresolved.length === 0);
+    check(
+      "B') expectedScript가 그 파일을 그대로 가리키는 node 명령으로 계산됨",
+      repair.repaired[0]?.expectedScript === "node backend/memory/memory-manager-api.ts"
+    );
+    const pkgAfter = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+    check(
+      "B') package.json에 실제로 반영됨",
+      pkgAfter.scripts["test:memory-manager-api"] === "node backend/memory/memory-manager-api.ts"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioSingleFileScopeNotYetImplementedStaysUnresolved(): void {
+  const root = makeProjectRoot({});
+  try {
+    // 파일이 아직 만들어지지 않은 정상 "구현 전" 상태 — 파일명을 추측해 만들어내지 않는다.
+    const issue = { requiredTestName: "not-yet-built", npmScript: "test:not-yet-built" };
+    const repair = attemptSafeRequiredTestScriptRepair([issue], root, ["backend/memory/not-yet-created.ts"]);
+    check("B') 단일 파일 scope라도 파일이 아직 없으면 unresolved(추측하지 않음)", repair.repaired.length === 0 && repair.unresolved.length === 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioSingleFileScopeWithNonExecutableExtensionStaysUnresolved(): void {
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "memory"), { recursive: true });
+    writeFileSync(join(root, "backend", "memory", "config.json"), "{}\n", "utf-8");
+
+    const issue = { requiredTestName: "config-tests", npmScript: "test:config" };
+    const repair = attemptSafeRequiredTestScriptRepair([issue], root, ["backend/memory/config.json"]);
+    check(
+      "B') 실행 가능한 확장자가 아닌 단일 파일 scope(.json 등)는 후보로 인정하지 않음",
+      repair.repaired.length === 0 && repair.unresolved.length === 1
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioMultiplePrefixesNeverUseSingleFileFallback(): void {
+  const root = makeProjectRoot({});
+  try {
+    mkdirSync(join(root, "backend", "memory"), { recursive: true });
+    writeFileSync(join(root, "backend", "memory", "memory-manager-api.ts"), "// impl\n", "utf-8");
+    mkdirSync(join(root, "backend", "other"), { recursive: true });
+
+    // allowedPathPrefixes가 2개 이상이면(하나가 단일 파일이어도) 모호함으로 보고 fallback을
+    // 적용하지 않는다 — "정확히 하나의 scope"일 때만 안전하다(§ 요구사항).
+    const issue = { requiredTestName: "ambiguous-multi-prefix", npmScript: "test:ambiguous-multi-prefix" };
+    const repair = attemptSafeRequiredTestScriptRepair([issue], root, ["backend/memory/memory-manager-api.ts", "backend/other/"]);
+    check("B') allowedPathPrefixes가 2개 이상이면 단일 파일 fallback을 적용하지 않음", repair.repaired.length === 0 && repair.unresolved.length === 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // C) reconcileStaleRequiredTestConfigurationTasks — 오래된 REQUIRED_TEST_CONFIGURATION_ERROR
 //    WAITING_HUMAN 재검사(Phase 5).
 // ---------------------------------------------------------------------------
@@ -532,6 +612,10 @@ function main(): void {
   scenarioAmbiguousCandidatesAreUnresolved();
   scenarioNeverOverwritesExistingConflictingEntry();
   scenarioSymlinkedDirectoryIsNotFollowed();
+  scenarioSingleFileScopeSelfTestFileIsSafelyRegistered();
+  scenarioSingleFileScopeNotYetImplementedStaysUnresolved();
+  scenarioSingleFileScopeWithNonExecutableExtensionStaysUnresolved();
+  scenarioMultiplePrefixesNeverUseSingleFileFallback();
   scenarioReconcileResolvedWhenAllScriptsNowRegistered();
   scenarioReconcileNotResolvedWhenStillMissing();
   scenarioReconcileFailClosedOnUnrelatedReason();
