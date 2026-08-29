@@ -3,10 +3,10 @@ import { loadState, saveState } from "./state";
 import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
 import { runDeveloperTaskWithRetry } from "./claude-developer";
-import type { DeveloperProjectContext, DeveloperTaskOptions } from "./claude-developer";
+import type { DeveloperProjectContext, DeveloperTaskOptions, DeveloperContextMetrics } from "./claude-developer";
 import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
-import { wrapGptReviewerWithFireworksCallLimiter } from "./root-cause-analysis";
+import { wrapGptReviewerWithFireworksCallLimiter, MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS } from "./root-cause-analysis";
 import type { RootCauseAnalysisEvent } from "./root-cause-analysis";
 import { loadDurableFailureStateForTask, resolveDurableFailureStateForReviewer, clearDurableFailureState } from "./durable-recovery-state";
 import { getNextTask, PLAN_MARKERS } from "./task-registry";
@@ -28,6 +28,8 @@ import {
   attemptSafeRequiredTestScriptRepair,
   commitRequiredTestScriptRepair,
   reconcileStaleRequiredTestConfigurationTasks,
+  checkRequiredTestExecutionEnvironment,
+  reconcileStaleRequiredTestExecutionEnvironmentTasks,
 } from "./required-test-preflight";
 import { hasFailedRequiredTest } from "./review-policy";
 import {
@@ -41,6 +43,7 @@ import { scanChangesForSecrets } from "./secret-scanner";
 import {
   selectDefaultProblemMemoryStore,
   lookupSolution,
+  lookupSolutionsByRootCauseClass,
   recordAttempt,
   confirmResolution,
   recordReuseOutcome,
@@ -383,7 +386,17 @@ export type AutodevRunOutcome =
    *  CLAUDE.md WAITING_HUMAN 정책) Developer/Reviewer 호출을 막지 않고 그대로 진행한다.
    *  이 union member는 타입 호환성을 위해 남겨두지만 현재 production 코드 경로에서는
    *  반환되지 않는다. */
-  | "BLOCKED_REQUIRED_TEST_CONFIGURATION";
+  | "BLOCKED_REQUIRED_TEST_CONFIGURATION"
+  /** AutoDev Core Maintenance(2026-08-30) — taskDef.requiredTests 중 하나 이상의 cwd가
+   *  resolve하는 절대경로가 실제로 존재하지 않거나(디렉터리 없음), wrapper-style
+   *  executable(gradlew 등)의 wrapper 파일 자체가 그 디렉터리 안에 없는 경우(§
+   *  required-test-preflight.ts checkRequiredTestExecutionEnvironment). 이 문제는
+   *  Developer가 스스로 고칠 수 없다(project adapter config — commandCwdAliases/
+   *  requiredTest.cwd — 자체가 잘못됐고, Developer의 allowedPathPrefixes 밖이며 AutoDev
+   *  Core도 이 파일에 쓰지 않는다) — 그래서 REQUIRED_TEST_CONFIGURATION_ERROR(위, npm
+   *  script 미등록)와 달리 이 경우는 Developer/Reviewer를 전혀 부르지 않고 즉시
+   *  WAITING_HUMAN으로 전환한다. */
+  | "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT";
 
 export interface AutodevRunResult {
   outcome: AutodevRunOutcome;
@@ -796,6 +809,33 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       }
     }
 
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-30, JARVIS Task 5.2 실측) — Stale
+    // REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN Reconciliation. 위
+    // REQUIRED_TEST_CONFIGURATION_ERROR 재검사와 정확히 같은 원칙(같은 deterministic 검사로
+    // "그 결함이 지금도 재현되는가"만 재확인, 다른 사유가 하나라도 섞여 있으면 fail-closed)을
+    // WRAPPER_NOT_FOUND 등 required-test 실행 환경 결함에도 적용한다 — reconciliation.resolved가
+    // true라면 이미 state.status가 "READY"이므로 이 블록은 자연히 아무 것도 하지 않는다(중복
+    // 판정 없음, 위와 동일한 관례).
+    if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
+      const envReconciliation = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+        state.deferredHumanTasks,
+        manifest.taskRegistry,
+        executorContext
+      );
+      if (envReconciliation.resolved) {
+        console.log(
+          `[autodev] 오래된 WAITING_HUMAN(REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR)을 재검사했습니다 — required test 실행 환경 결함이 더 이상 재현되지 않음을 확인, 정상 실행 상태로 자동 복구합니다.`
+        );
+        log("오래된 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN 자동 복구", {
+          projectId: manifest.projectId,
+          previousDeferredHumanTasks: state.deferredHumanTasks,
+        });
+        state.status = "READY";
+        state.deferredHumanTasks = [];
+        saveState(state, statePath);
+      }
+    }
+
     // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Canonical Human Gate Policy 기반 기술적
     // WAITING_HUMAN 자동 복구. 위 REQUIRED_TEST_CONFIGURATION_ERROR 전용 재검사가 이미
     // 해소했다면(reconciliation.resolved) state.status는 이미 "READY"이므로 이 블록은
@@ -938,6 +978,53 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       }
     }
 
+    // AutoDev Core Maintenance(2026-08-30) — Deterministic Execution-Environment
+    // Preflight(§ required-test-preflight.ts checkRequiredTestExecutionEnvironment,
+    // AutodevRunOutcome.BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT 상단 주석). 위 npm
+    // script 등록 검사와 달리 이 검사가 찾는 문제(cwd가 resolve하는 디렉터리가 없음,
+    // wrapper 파일 자체가 없음)는 Developer가 스스로 고칠 수 없는 project adapter config
+    // 결함이다 — 그대로 Developer를 부르면 매 attempt마다 동일한
+    // TRUSTED_EXECUTABLE_NOT_FOUND(또는 유사한) 실패만 반복하며 Claude 호출을 낭비한다(§
+    // 실제 JARVIS Task 5.2 관측 — 이 검사가 도입되기 전 5회 반복). 그래서 이 검사는 npm
+    // script 검사와 달리 실제로 차단한다 — Developer/Reviewer 어느 쪽도 부르지 않고 즉시
+    // WAITING_HUMAN으로 전환한다(자동 복구는 만들지 않는다 — § required-test-preflight.ts
+    // 파일 상단 주석, project adapter config 자체를 고쳐써야 하는 더 민감한 변경이라 이
+    // Task 범위에서 새 쓰기 경로를 만들지 않았다).
+    const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext);
+    if (!executionEnvironmentPreflight.ok) {
+      const detail = executionEnvironmentPreflight.issues
+        .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath} reason=${i.reason ?? ""}`)
+        .join("; ");
+      console.log(
+        `[autodev] task ${taskDef.id} — required test 실행 환경 결함 감지(${detail}) — Developer를 부르지 않고 WAITING_HUMAN으로 전환합니다(project adapter config의 commandCwdAliases/requiredTest.cwd를 직접 확인/수정해야 합니다).`
+      );
+      log("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR — Developer 호출 전 차단", {
+        taskId: taskDef.id,
+        issues: executionEnvironmentPreflight.issues,
+      });
+      state.status = "WAITING_HUMAN";
+      for (const issue of executionEnvironmentPreflight.issues) {
+        state.deferredHumanTasks.push(
+          `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${taskDef.id} requiredTest=${issue.requiredTestName} kind=${issue.kind} cwd=${issue.cwd} resolvedPath=${issue.resolvedPath}`
+        );
+      }
+      emitEvent(events, {
+        eventType: "HUMAN_APPROVAL_REQUIRED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "task_selection",
+        outcome: "BLOCKED",
+        humanInterventionRequired: true,
+        reason: `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR(${taskDef.id}): ${detail}`,
+      });
+      saveState(state, statePath);
+      // 이 분기는 Developer/checkpoint 어느 쪽도 시작하지 않았다 — working tree에 아무
+      // 위험도 남기지 않았으므로 안전하게 release한다(lockShouldRelease는 기본값 true
+      // 그대로, § BLOCKED_PROJECT_LOCK/BLOCKED_REMOTE_GIT과 동일한 원칙).
+      return { outcome: "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT", taskId: taskDef.id, reason: detail };
+    }
+
     console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
     emitEvent(events, { eventType: "TASK_STARTED", runId, projectId: manifest.projectId, taskId: taskDef.id, executionPhase: "task_selection", outcome: "PENDING" });
 
@@ -1069,6 +1156,42 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       "이 작업은 과거에 Claude 응답을 AutoDev 프로토콜(TASK_COMPLETE/PLAN/ACTION_REQUEST)로 해석하지 못해 중단된 적이 있습니다. " +
       "다른 텍스트나 코드펜스 없이 세 형태 중 정확히 하나의 순수 JSON 객체만 출력하세요(ACTION_REQUEST의 actions는 항상 배열).";
 
+    // AutoDev Core Maintenance(2026-08-30) — claude-developer.ts는 event-store.ts를 전혀
+    // 모른다(§ DeveloperTaskOptions.onContextMetrics 주석) — 이 콜백이 그 경계를 지킨 채
+    // durable 저장을 담당한다. round당 1건이라 attempt당 최대 MAX_INTERNAL_ROUNDS(20)건 —
+    // TEST_COMPLETED 등 기존 event들과 동일한 크기 수준이라 별도 rate limit을 두지 않는다.
+    const emitDeveloperContextMetrics = (metrics: DeveloperContextMetrics): void => {
+      emitEvent(events, {
+        eventType: "DEVELOPER_CONTEXT_METRICS",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "development",
+        metadata: {
+          attempt: metrics.attempt,
+          round: metrics.round,
+          systemPromptChars: metrics.systemPromptChars,
+          transcriptChars: metrics.transcriptChars,
+          transcriptEntryCount: metrics.transcriptEntryCount,
+          fileSnapshotChars: metrics.fileSnapshotChars,
+          fileSnapshotCount: metrics.fileSnapshotCount,
+          duplicateReadCount: metrics.duplicateReadCount,
+          trimmedThisRound: metrics.trimmedThisRound,
+        },
+      });
+    };
+    // AutoDev Core Maintenance(2026-08-30) — § work-time.ts computeUsageLimitWaitMs 주석.
+    const emitDeveloperUsageLimitWait = (info: { round: number; retryCount: number; waitMs: number; phase: "START" | "END" }): void => {
+      emitEvent(events, {
+        eventType: info.phase === "START" ? "DEVELOPER_USAGE_LIMIT_WAIT_STARTED" : "DEVELOPER_USAGE_LIMIT_WAIT_ENDED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "development",
+        metadata: { round: info.round, retryCount: info.retryCount, waitMs: info.waitMs },
+      });
+    };
+
     // AutoDev 신뢰성 수정(2026-08-26) — runDeveloperTaskViaSafeExecutor를 직접 부르지 않고
     // runDeveloperTaskWithRetry로 감싼다. TIMEOUT/CLI_NOT_FOUND처럼 명확히 일시적인 실패는
     // 최대 2회까지 자동 재시도(총 3회 시도)한 뒤에도 계속되면 그때 실패로 반환한다(§
@@ -1135,6 +1258,76 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
             .filter((e) => e.projectId === manifest.projectId && e.taskId === taskDef.id && e.fingerprint === fingerprint)
             .flatMap((e) => e.attemptedSolutions.filter((s) => s.outcome === "FAILURE").map((s) => s.description));
 
+          // AutoDev Core Maintenance(2026-08-30) — LOCAL_ROOT_CAUSE_MODE. 동일 required-test
+          // 실패 fingerprint가 이미 MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS번 관측됐다면, 다음
+          // Developer 호출 "전에" 먼저 실행 환경을 결정론적으로 재확인한다(§
+          // required-test-preflight.ts checkRequiredTestExecutionEnvironment, Phase 1과 동일한
+          // 함수 — 로직 복제 없음). 여전히 같은 결함이 확정되면(설정을 아무도 고치지 않았다는
+          // 뜻) Developer를 실제로 호출하지 않고, 변화 없는 동일 실패를 그대로 합성해 반환한다
+          // — 이 attempt는 Claude 호출 0회다. 사람이 config를 고치면(§ Phase 9) 다음 cycle의
+          // 이 재확인이 자연히 통과해 정상적으로 다시 Developer를 호출한다(fail-open이 아니라
+          // "원인이 실제로 해소됨을 재확인"이므로 안전하다). execution-environment 문제가
+          // 아닌 다른 반복(예: 순수 구현 결함)은 이 재확인이 항상 ok:true이므로 이 분기를
+          // 타지 않고 기존 buildEscalationGuidance 경로(아래)로 그대로 진행한다 — 이
+          // LOCAL_ROOT_CAUSE_MODE는 결정론적으로 재확인 가능한 execution-environment
+          // 카테고리만 다룬다(§ 요구사항 — 추측으로 "변화 없음"을 판정하지 않는다).
+          if (repeatCount >= MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS) {
+            const envRecheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext);
+            if (!envRecheck.ok) {
+              const detail = envRecheck.issues
+                .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath}`)
+                .join("; ");
+              // AutoDev Core Maintenance(2026-08-30) — advisory-only(§ problem-memory.ts
+              // lookupSolutionsByRootCauseClass 주석 — "검증된 정답이 아니라 우선 검토할
+              // 후보"). Developer를 호출하지 않으므로 프롬프트에 주입하지 않는다 — 사람이
+              // WAITING_HUMAN/로그를 확인할 때 참고할 수 있도록 로그에만 남긴다.
+              const similarCases = lookupSolutionsByRootCauseClass({
+                errorType: "INFRASTRUCTURE_CONFIGURATION",
+                projectId: manifest.projectId,
+                projectStore: problemProjectStore,
+                commonStore: problemCommonStore,
+              });
+              log("LOCAL_ROOT_CAUSE_MODE — required test 실행 환경 결함이 반복 확정되어 Developer를 다시 호출하지 않습니다", {
+                taskId: taskDef.id,
+                repeatCount,
+                issues: envRecheck.issues,
+                similarCasesAdvisory: similarCases.map((c) => ({ tier: c.tier, entryId: c.entry.id, solution: c.entry.finalSuccessfulSolution })),
+              });
+              console.log(
+                `[autodev] task ${taskDef.id} — LOCAL_ROOT_CAUSE_MODE(execution environment, ${repeatCount}회 반복 확정, ${detail}) — Developer를 호출하지 않고 동일 실패를 그대로 반환합니다.`
+              );
+              return {
+                success: true,
+                summary: `LOCAL_ROOT_CAUSE_MODE — required test 실행 환경 결함(${detail})이 재확인에서도 그대로 확정되어 Developer를 다시 호출하지 않았습니다. project adapter config(commandCwdAliases/requiredTest.cwd)를 직접 확인/수정해야 합니다.`,
+                changedFiles: [],
+                tests: previousAttemptResult.tests,
+                rawOutput: "",
+              };
+            }
+          }
+
+          // AutoDev Core Maintenance(2026-08-30) — 직전 시도의 실제 실패 근거를 추측 없는
+          // 사실로 먼저 전달한다(§ 아래 lookup/escalation 힌트는 각각 "과거 해결 사례
+          // 후보"와 "행동 경고"일 뿐, 실제 "왜 실패했는지"는 아니었다 — 그 결과 Developer가
+          // 매 attempt마다 원인을 추측했다, § 실제 JARVIS Task 5.2 관측). failureEvidence/
+          // denyReason은 이미 bounded size로 잘려있다(§ types.ts 주석) — 여기서 다시 한번
+          // 여러 실패 테스트 합계 기준으로 좁혀 다음 라운드 context가 과도하게 커지지 않게
+          // 한다.
+          const evidenceLines = previousAttemptResult.tests
+            .filter((t) => !t.pass)
+            .map((t) => {
+              if (t.failureEvidence) {
+                const ev = t.failureEvidence;
+                const tail = ev.stderrTail ? ev.stderrTail.slice(-800) : undefined;
+                return `- ${t.name}: command="${ev.command}" exitCode=${ev.exitCode ?? "(none)"}${tail ? `\n  stderr(tail): ${tail}` : ""}`;
+              }
+              if (t.denyReason) return `- ${t.name}: 명령이 실행되지 못하고 거부됨 — ${t.denyReason.slice(0, 800)}`;
+              return `- ${t.name}: (근거 없음 — 명령이 spawn조차 되지 않음)`;
+            });
+          if (evidenceLines.length > 0) {
+            hintParts.push(`# AutoDev 안내(직전 시도의 실제 실패 근거 — 추측하지 말고 이 사실부터 확인하세요)\n${evidenceLines.join("\n")}`);
+          }
+
           const lookup = lookupSolution({
             projectId: manifest.projectId,
             taskId: taskDef.id,
@@ -1178,6 +1371,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)이 그대로 쓰인다.
         claudeCaller: opts.developerClaudeCaller,
         onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
+        onContextMetrics: emitDeveloperContextMetrics,
+        onUsageLimitWait: emitDeveloperUsageLimitWait,
       });
 
       // Secret Scanner 사전검사(2026-08-29, Task 4.2 SECURITY_BLOCKED 재발 방지) — Developer
@@ -1226,6 +1421,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
               memoryHint: memoryHint ? `${memoryHint}\n\n${secretHint}` : secretHint,
               claudeCaller: opts.developerClaudeCaller,
               onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
+              onContextMetrics: emitDeveloperContextMetrics,
+              onUsageLimitWait: emitDeveloperUsageLimitWait,
             });
           }
           // repeatCount >= 2(같은 finding이 사전검사 수정 시도 이후에도 반복됨) 또는 방금 재시도한

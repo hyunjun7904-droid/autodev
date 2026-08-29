@@ -6,6 +6,7 @@ import {
   recordAttempt,
   confirmResolution,
   lookupSolution,
+  lookupSolutionsByRootCauseClass,
   promoteToCommonIfGeneric,
   recordReuseOutcome,
   scrubPathLikeTokens,
@@ -322,6 +323,135 @@ function scenarioReuseCounters(): void {
   check("I) 재사용 실패 카운트가 정확히 누적됨", reloaded.reuseFailureCount === 1);
 }
 
+// ---------------------------------------------------------------------------
+// J) lookupSolutionsByRootCauseClass — AutoDev Core Maintenance(2026-08-30)
+// ---------------------------------------------------------------------------
+function scenarioRootCauseClassFindsDifferentFingerprintSameClass(): void {
+  const projectStore = makeMemoryStore();
+  const commonStore = makeMemoryStore();
+
+  // 서로 다른 문제(다른 fingerprint)지만 같은 errorType — lookupSolution(정확 일치)은 절대
+  // 서로를 찾지 못하지만, 이 함수는 errorType만으로 후보를 찾는다.
+  const entryA = recordAttempt(projectStore, {
+    projectId: "P1",
+    taskId: "T1",
+    tests: tests([{ name: "wakeword-unit", pass: false, denyReason: "TRUSTED_EXECUTABLE_NOT_FOUND: gradlew.bat" }]),
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    changedFiles: [],
+    attemptDescription: "commandCwdAliases에 wakeword 별칭 추가로 해결",
+    outcome: "SUCCESS",
+  });
+  confirmResolution(projectStore, entryA.id, "abc1234");
+
+  const exactLookup = lookupSolution({
+    projectId: "P1",
+    taskId: "T2",
+    tests: tests([{ name: "other-module-unit", pass: false, denyReason: "TRUSTED_EXECUTABLE_NOT_FOUND: mvnw" }]),
+    projectStore,
+    commonStore,
+  });
+  check("J) 서로 다른 fingerprint는 lookupSolution(정확 일치)로 찾지 못함(기존 원칙 그대로)", exactLookup === undefined);
+
+  const classResults = lookupSolutionsByRootCauseClass({
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    projectId: "P1",
+    projectStore,
+    commonStore,
+  });
+  check("J) 같은 errorType이면 다른 fingerprint라도 advisory 후보로 나옴", classResults.length === 1);
+  check("J) tier=PROJECT로 보고됨", classResults[0]?.tier === "PROJECT");
+  check(
+    "J) 해결책 설명이 실제 성공 설명과 일치",
+    classResults[0]?.entry.finalSuccessfulSolution === "commandCwdAliases에 wakeword 별칭 추가로 해결"
+  );
+}
+
+function scenarioRootCauseClassExcludesDifferentClassAndUnconfirmed(): void {
+  const projectStore = makeMemoryStore();
+  const commonStore = makeMemoryStore();
+
+  recordAttempt(projectStore, {
+    projectId: "P1",
+    taskId: "T1",
+    tests: FAILING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: [],
+    attemptDescription: "구현 결함 — 다른 종류의 문제",
+    outcome: "SUCCESS",
+  });
+  // confirmResolution을 호출하지 않음 — pendingConfirmation 상태로 남는다.
+  recordAttempt(projectStore, {
+    projectId: "P1",
+    taskId: "T2",
+    tests: tests([{ name: "x", pass: false, denyReason: "아직 확정되지 않은 해결책" }]),
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    changedFiles: [],
+    attemptDescription: "아직 checkpoint로 확정되지 않음",
+    outcome: "SUCCESS",
+  });
+
+  const results = lookupSolutionsByRootCauseClass({
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    projectId: "P1",
+    projectStore,
+    commonStore,
+  });
+  check(
+    "J) 다른 errorType(IMPLEMENTATION)과 미확정(pendingConfirmation) 항목은 후보에서 제외됨",
+    results.length === 0
+  );
+}
+
+function scenarioRootCauseClassRespectsLimitAndAlreadyFailedExclusion(): void {
+  const projectStore = makeMemoryStore();
+  const commonStore = makeMemoryStore();
+
+  for (let i = 0; i < 4; i++) {
+    const e = recordAttempt(projectStore, {
+      projectId: "P1",
+      taskId: `T${i}`,
+      tests: tests([{ name: `check-${i}`, pass: false, denyReason: `TRUSTED_EXECUTABLE_NOT_FOUND: variant-${i}` }]),
+      errorType: "INFRASTRUCTURE_CONFIGURATION",
+      changedFiles: [],
+      attemptDescription: `해결책 ${i}`,
+      outcome: "SUCCESS",
+    });
+    confirmResolution(projectStore, e.id, `commit${i}`);
+  }
+  const limited = lookupSolutionsByRootCauseClass({
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    projectId: "P1",
+    projectStore,
+    commonStore,
+    limit: 2,
+  });
+  check("J) limit이 실제로 적용됨(4건 중 2건만)", limited.length === 2);
+
+  // 같은 project에서 이미 "해결책 0"을 실패로 기록했다면(§ 같은 fingerprint의 다른 attempt로
+  // 병합됨 — recordAttempt의 기존 병합 규칙), 그 해결책은 advisory로 다시 추천되지 않는다(§
+  // lookupSolution의 기존 원칙과 동일).
+  recordAttempt(projectStore, {
+    projectId: "P1",
+    taskId: "T0",
+    tests: tests([{ name: "check-0", pass: false, denyReason: "TRUSTED_EXECUTABLE_NOT_FOUND: variant-0" }]),
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    changedFiles: [],
+    attemptDescription: "해결책 0",
+    outcome: "FAILURE",
+  });
+  const afterFailure = lookupSolutionsByRootCauseClass({
+    errorType: "INFRASTRUCTURE_CONFIGURATION",
+    projectId: "P1",
+    projectStore,
+    commonStore,
+    limit: 10,
+  });
+  check(
+    "J) 이 project에서 이미 실패로 기록된 해결책 설명은 advisory 후보에서 제외됨",
+    !afterFailure.some((r) => r.entry.finalSuccessfulSolution === "해결책 0")
+  );
+}
+
 function main(): void {
   scenarioSameTaskDoesNotRecommendAlreadyFailedSolution();
   scenarioCrossTaskReuseWithinSameProject();
@@ -333,6 +463,9 @@ function main(): void {
   scenarioSecretsNotStoredInFreeText();
   scenarioPathScrubbing();
   scenarioReuseCounters();
+  scenarioRootCauseClassFindsDifferentFingerprintSameClass();
+  scenarioRootCauseClassExcludesDifferentClassAndUnconfirmed();
+  scenarioRootCauseClassRespectsLimitAndAlreadyFailedExclusion();
 
   console.log("\n=== problem-memory 테스트 결과 ===");
   for (const r of results) console.log(r);

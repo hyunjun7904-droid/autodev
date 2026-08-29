@@ -3,7 +3,11 @@ import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 import { STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
-import { MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX, CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX } from "./orchestrator";
+import {
+  MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
+  CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
+  DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX,
+} from "./orchestrator";
 
 // Canonical Human Gate Policy Evaluator — AutoDev / JARVIS 지능형 오류 복구 하드닝 §
 // 신뢰성 보완(2026-08-27).
@@ -111,6 +115,15 @@ const GENUINE_MARKER_PREFIXES: readonly string[] = [
   "PROVIDER_SECURITY_BLOCKED:",
   MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
   CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
+  // AutoDev Core Maintenance(2026-08-30) — 같은 cycle에 STAGNATION_DETECTED_MARKER_PREFIX
+  // 마커가 이미 함께 남아있을 수 있다(repeatCount===2 시점에 무조건 push되고, 이 exhaustion
+  // 마커는 그보다 나중 cycle에 추가로 push될 수 있음) — STAGNATION_DETECTED만 있었다면
+  // TECHNICAL_AUTO_RECOVERABLE이 맞지만, 이 마커가 함께 있으면 "단순 반복 관측"이 아니라
+  // "그 반복 때문에 review 예산 자체가 소진되어 genuine 개입이 필요하다고 이미 확정됨"이라는
+  // 뜻이다 — MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX/CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX와
+  // 동일한 이유로 여기 추가한다(§ 위 두 항목의 원래 도입 주석과 동일한 패턴 — STAGNATION_DETECTED
+  // co-occurrence에 의해 조용히 TECHNICAL_AUTO_RECOVERABLE로 뒤집히지 않게 한다).
+  DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX,
 ];
 
 function isCheckpointScopeViolationMarker(marker: string): boolean {

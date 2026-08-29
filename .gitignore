@@ -20,6 +20,9 @@ yarn-error.log*
 # Self-dev task context(Phase G Task G7.3.1b) — 로컬 전용 선언, repo 이력에 남기지 않는다.
 .autodev-self-dev/
 
+# Claude Code 로컬 전용 permission 설정(이 체크아웃에서만 npm run autodev 자동 실행 허용) — 저장소 공유 정책이 아니다.
+.claude/settings.local.json
+
 # OS / editor
 .DS_Store
 Thumbs.db

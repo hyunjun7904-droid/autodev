@@ -99,6 +99,9 @@ export interface DeveloperResult {
     /** Phase 5 — 실패한 required test의 실제 근거(command/exitCode/stdout·stderr 꼬리).
      *  § types.ts ClaudeResult.tests의 동일 필드와 구조를 맞춘다. */
     failureEvidence?: { command: string; exitCode?: number | null; stderrTail?: string; stdoutTail?: string };
+    /** AutoDev Core Maintenance(2026-08-30) — § types.ts ClaudeResult.tests.denyReason과 동일한
+     *  필드/원칙(failureEvidence와 별개 — classifyFailureCategory의 기존 판정을 깨지 않는다). */
+    denyReason?: string;
   }[];
   rawOutput: string;
   errorCode?: DeveloperErrorCode;
@@ -179,6 +182,21 @@ export interface DeveloperTaskOptions {
    *  (하위 호환 — 기존 테스트가 계속 동작한다). 실제 운용(autodev.ts)은 항상 명시적으로
    *  넘긴다. */
   executor?: SafeExecutorContext;
+  /** AutoDev Core Maintenance(2026-08-30) — 매 round마다 buildDeveloperContextMetrics()가
+   *  이미 계산한 값을 그대로 넘긴다(순수 관측용, fire-and-forget — onRoundStart와 동일한
+   *  원칙: 이 콜백이 예외를 던져도 실제 개발 흐름에 영향을 주지 않도록 항상 try/catch로
+   *  감싼다). 지정하지 않으면 기존과 동일(log()만, 어디에도 영속화되지 않음). 이 함수 자신은
+   *  event-store.ts를 전혀 모른다 — 실제 durable 저장은 호출부(autodev.ts)가 담당한다(§
+   *  claude-developer.ts가 event-store.ts에 의존하지 않는다는 기존 설계를 유지). */
+  onContextMetrics?: (metrics: DeveloperContextMetrics) => void;
+  /** AutoDev Core Maintenance(2026-08-30) — § work-time.ts 파일 상단 주석이 이미 문서화한
+   *  한계("단일 Developer attempt 안의 USAGE_LIMIT 내부 재시도 대기는 event로 기록되지
+   *  않아 실제 작업시간에 잘못 포함된다")를 메운다. 실제 sleep 직전/직후에 각각 한 번씩
+   *  호출된다(§ onRoundStart와 동일한 fire-and-forget/예외 무시 원칙) — 지정하지 않으면
+   *  기존과 동일(log만 남음). 이 함수 자신은 여전히 event-store.ts를 모른다(§
+   *  onContextMetrics와 동일한 경계 원칙).
+   */
+  onUsageLimitWait?: (info: { round: number; retryCount: number; waitMs: number; phase: "START" | "END" }) => void;
 }
 
 const MAX_INTERNAL_ROUNDS = 20;
@@ -481,7 +499,11 @@ async function runRequiredTests(
         },
       });
     } else {
-      results.push({ name: t.name, pass: false });
+      // AutoDev Core Maintenance(2026-08-30) — § types.ts ClaudeResult.tests.denyReason 주석.
+      // res.denyReason은 이미 위 log()로 남고 있었지만 결과 객체 자체에는 전혀 담기지 않아
+      // Developer/Reviewer 어느 쪽도 볼 수 없었다. failureEvidence는 여전히 채우지 않는다
+      // (§ classifyFailureCategory의 "명령이 spawn됐는가" 판정을 그대로 보존).
+      results.push({ name: t.name, pass: false, ...(res.denyReason ? { denyReason: res.denyReason } : {}) });
     }
   }
   return results;
@@ -724,6 +746,32 @@ export async function runDeveloperTaskViaSafeExecutor(
   // 계측 전용(§ Stage 4) — 같은 경로가 이미 fileSnapshots에 있던 상태에서 다시 읽힌
   // 횟수(=dedup이 실제로 몇 번 작동했는지). fileSnapshots.size(고유 파일 수)와는 다른 값이다.
   let duplicateReadCount = 0;
+  // AutoDev Core Maintenance(2026-08-30) — fileSnapshots 총 크기 상한(§ Part 1-2, "동일
+  // 파일은 항상 최신 snapshot 1개" 원칙 자체는 유지하되, 서로 다른 파일 수가 많은 task에서
+  // fileSnapshots 자체가 무한히 커지는 것은 별개 문제다 — round당 char 상한(capTranscript)
+  // 안에서 evict되긴 하지만, 그 evict는 "가장 오래된 transcript 항목 전체"를 통째로 버리는
+  // 방식이라 그 시점까지 fileSnapshots 자체는 계속 무제한으로 자란다). least-recently-*read*
+  // 항목부터 evict한다(Map의 insertion order는 재-read 시 갱신되지 않으므로 별도로
+  // 추적한다) — 이번 round에 실제로 읽은 경로는 절대 evict하지 않는다.
+  const MAX_FILE_SNAPSHOTS_TOTAL_CHARS = 400_000;
+  const fileSnapshotLastReadRound = new Map<string, number>();
+  function enforceFileSnapshotsCap(currentRound: number, justReadPaths: ReadonlySet<string>): void {
+    let total = 0;
+    for (const content of fileSnapshots.values()) total += content.length;
+    if (total <= MAX_FILE_SNAPSHOTS_TOTAL_CHARS) return;
+    // 가장 오래 전에 읽힌 경로부터(오름차순) evict — 이번 round에 읽은 경로는 건너뛴다.
+    const byAge = [...fileSnapshotLastReadRound.entries()]
+      .filter(([path]) => !justReadPaths.has(path))
+      .sort((a, b) => a[1] - b[1]);
+    for (const [path] of byAge) {
+      if (total <= MAX_FILE_SNAPSHOTS_TOTAL_CHARS) break;
+      const content = fileSnapshots.get(path);
+      if (content === undefined) continue;
+      total -= content.length;
+      fileSnapshots.delete(path);
+      fileSnapshotLastReadRound.delete(path);
+    }
+  }
 
   const forbiddenRepeatCount = new Map<string, number>();
   const deferredHumanTasks: string[] = [];
@@ -838,19 +886,24 @@ export async function runDeveloperTaskViaSafeExecutor(
     const transcriptEntryCountBeforeCap = transcript.length;
     const input = capTranscript();
     const trimmedThisRound = transcript.length < transcriptEntryCountBeforeCap;
-    log(
-      "developer context 계측(round 직전)",
-      buildDeveloperContextMetrics({
-        attempt,
-        round,
-        systemPromptChars: systemPrompt.length,
-        transcriptInput: input,
-        transcriptEntryCount: transcript.length,
-        fileSnapshots,
-        duplicateReadCount,
-        trimmedThisRound,
-      }) as unknown as Record<string, unknown>
-    );
+    const contextMetrics = buildDeveloperContextMetrics({
+      attempt,
+      round,
+      systemPromptChars: systemPrompt.length,
+      transcriptInput: input,
+      transcriptEntryCount: transcript.length,
+      fileSnapshots,
+      duplicateReadCount,
+      trimmedThisRound,
+    });
+    log("developer context 계측(round 직전)", contextMetrics as unknown as Record<string, unknown>);
+    if (opts.onContextMetrics) {
+      try {
+        opts.onContextMetrics(contextMetrics);
+      } catch (e) {
+        log("onContextMetrics 콜백 실패(무시하고 계속 진행)", { error: e instanceof Error ? e.message : String(e) });
+      }
+    }
     let claudeRaw = await claudeCall(input, timeoutMs);
 
     // USAGE_LIMIT은 일시정지다 — 같은 라운드/같은 input(transcript)으로 재시도한다. round
@@ -877,7 +930,22 @@ export async function runDeveloperTaskViaSafeExecutor(
       log(
         `developer Claude 사용량 제한 감지 — round/discovery budget/lock grace 소비 없이 ${usageLimitWaitMs}ms 대기 후 같은 라운드(${round}) 재시도 (${usageLimitRetries}/${usageLimitMaxRetries})`
       );
+      const waitInfo = { round, retryCount: usageLimitRetries, waitMs: usageLimitWaitMs } as const;
+      if (opts.onUsageLimitWait) {
+        try {
+          opts.onUsageLimitWait({ ...waitInfo, phase: "START" });
+        } catch (e) {
+          log("onUsageLimitWait(START) 콜백 실패(무시하고 계속 진행)", { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       await sleepFn(usageLimitWaitMs);
+      if (opts.onUsageLimitWait) {
+        try {
+          opts.onUsageLimitWait({ ...waitInfo, phase: "END" });
+        } catch (e) {
+          log("onUsageLimitWait(END) 콜백 실패(무시하고 계속 진행)", { error: e instanceof Error ? e.message : String(e) });
+        }
+      }
       claudeRaw = await claudeCall(input, timeoutMs); // 같은 input = 같은 transcript 상태 그대로 재요청
     }
 
@@ -1185,11 +1253,15 @@ export async function runDeveloperTaskViaSafeExecutor(
           const data = (result as { data?: unknown }).data;
           if (data && typeof data === "object" && !Array.isArray(data)) {
             const dataMap = data as Record<string, string>;
+            const justReadPaths = new Set<string>();
             for (const [relPath, content] of Object.entries(dataMap)) {
               if (typeof content !== "string") continue;
               if (fileSnapshots.has(relPath)) duplicateReadCount += 1;
               fileSnapshots.set(relPath, content);
+              fileSnapshotLastReadRound.set(relPath, round);
+              justReadPaths.add(relPath);
             }
+            enforceFileSnapshotsCap(round, justReadPaths);
             roundResults.push({
               ok: true,
               action: "READ_FILES",

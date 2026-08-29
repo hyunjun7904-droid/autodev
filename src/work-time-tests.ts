@@ -1,6 +1,6 @@
 import { createInMemoryEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
-import { computeActiveWorkMs, computeActiveWorkMsAcrossTasks } from "./work-time";
+import { computeActiveWorkMs, computeActiveWorkMsAcrossTasks, computeUsageLimitWaitMs } from "./work-time";
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -150,6 +150,54 @@ function scenarioFreezeTailAcrossTasks(): void {
   );
 }
 
+// ---------------------------------------------------------------------------
+// G) AutoDev Core Maintenance(2026-08-30) — computeUsageLimitWaitMs. § 파일 상단 "알려진
+// 한계" 문단이 문서화한 gap을 메우는 새 함수 — TASK_STARTED~TEST_COMPLETED 구간(전부
+// 활성 상태) 안에 USAGE_LIMIT 내부 재시도 대기가 끼어 있어도, computeActiveWorkMs 자체는
+// (기존 한계 그대로) 전체를 작업시간으로 계산하지만, computeUsageLimitWaitMs는 그 대기
+// 구간만 정확히 분리해낸다 — 호출부가 둘을 빼서 "USAGE_LIMIT 제외 실제 작업시간"을 얻을
+// 수 있다(기존 computeActiveWorkMs의 반환값/시그니처는 전혀 바뀌지 않았다).
+// ---------------------------------------------------------------------------
+function scenarioUsageLimitWaitExcludedFromCorrectedWorkTime(): void {
+  const store = makeStore();
+  append(store, 0, { eventType: "TASK_STARTED", runId: "r1", taskId: "T1", executionPhase: "task_selection", outcome: "PENDING" });
+  append(store, 2_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_STARTED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 32_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_ENDED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 35_000, { eventType: "TEST_COMPLETED", runId: "r1", taskId: "T1", executionPhase: "test", outcome: "SUCCESS" });
+
+  const events = store.query({ runId: "r1" }).events;
+  const workMs = computeActiveWorkMs(events, T0 + 35_000);
+  check("G) 기존 computeActiveWorkMs는 여전히 전체 구간(35초)을 그대로 집계함(기존 한계 — 시그니처/의미 불변)", workMs === 35_000);
+
+  const usageLimitWaitMs = computeUsageLimitWaitMs(events);
+  check("G) computeUsageLimitWaitMs가 STARTED~ENDED 구간(30초)만 정확히 분리함", usageLimitWaitMs === 30_000);
+
+  const corrected = workMs - usageLimitWaitMs;
+  check("G) 조합(workMs - usageLimitWaitMs)이 실제 개발 작업시간(5초)을 정확히 산출함", corrected === 5_000);
+}
+
+function scenarioUsageLimitWaitMultipleRoundsSummed(): void {
+  const store = makeStore();
+  append(store, 0, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_STARTED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 10_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_ENDED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 20_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_STARTED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 45_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_ENDED", runId: "r1", taskId: "T1", executionPhase: "development" });
+
+  const events = store.query({ runId: "r1" }).events;
+  check("G) 여러 STARTED/ENDED 쌍이 정확히 합산됨(10초+25초=35초)", computeUsageLimitWaitMs(events) === 35_000);
+}
+
+function scenarioUsageLimitWaitUnmatchedEndedIgnored(): void {
+  const store = makeStore();
+  // 고아 ENDED(대응하는 STARTED 없음) — 추측으로 구간을 만들지 않고 무시해야 한다.
+  append(store, 0, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_ENDED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  append(store, 5_000, { eventType: "DEVELOPER_USAGE_LIMIT_WAIT_STARTED", runId: "r1", taskId: "T1", executionPhase: "development" });
+  // 짝이 없는 마지막 STARTED(아직 진행 중이거나 프로세스가 죽어 ENDED가 기록되지 않음) — 무시.
+
+  const events = store.query({ runId: "r1" }).events;
+  check("G) 고아 ENDED/짝 없는 마지막 STARTED는 추측으로 구간을 만들지 않고 0으로 처리됨", computeUsageLimitWaitMs(events) === 0);
+}
+
 function main(): void {
   scenarioSimpleActiveSpanCounted();
   scenarioWaitingHumanTailExcluded();
@@ -158,6 +206,9 @@ function main(): void {
   scenarioAcrossTasksSumsIndependently();
   scenarioFreezeTailStopsGrowthAfterProcessDeath();
   scenarioFreezeTailAcrossTasks();
+  scenarioUsageLimitWaitExcludedFromCorrectedWorkTime();
+  scenarioUsageLimitWaitMultipleRoundsSummed();
+  scenarioUsageLimitWaitUnmatchedEndedIgnored();
 
   console.log("\n=== work-time 테스트 결과 ===");
   for (const r of results) console.log(r);

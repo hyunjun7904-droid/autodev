@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -7,8 +7,10 @@ import {
   reconcileStaleRequiredTestConfigurationTasks,
   validateRequiredTestRegistrationRequest,
   registerValidatedRequiredTestScripts,
+  checkRequiredTestExecutionEnvironment,
+  reconcileStaleRequiredTestExecutionEnvironmentTasks,
 } from "./required-test-preflight";
-import type { RequiredTestCommand } from "./task-registry";
+import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -601,6 +603,291 @@ function scenarioLifecycleScriptNameRejected(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// L) checkRequiredTestExecutionEnvironment — AutoDev Core Maintenance(2026-08-30)
+// ---------------------------------------------------------------------------
+function makeExecutionEnvRoot(): string {
+  return mkdtempSync(join(tmpdir(), "autodev-required-test-exec-env-"));
+}
+
+function makeGradleModule(moduleAbs: string): void {
+  mkdirSync(join(moduleAbs, "gradle", "wrapper"), { recursive: true });
+  writeFileSync(join(moduleAbs, "gradlew"), "#!/bin/sh\necho gradlew\n", "utf-8");
+  writeFileSync(join(moduleAbs, "gradlew.bat"), "@echo off\r\necho gradlew\r\n", "utf-8");
+  writeFileSync(join(moduleAbs, "gradle", "wrapper", "gradle-wrapper.properties"), "distributionUrl=https://example.invalid/gradle.zip\n", "utf-8");
+  writeFileSync(join(moduleAbs, "gradle", "wrapper", "gradle-wrapper.jar"), "fixture-jar-bytes", "utf-8");
+}
+
+function makeExecutor(root: string, commandCwdAliases?: Record<string, string>) {
+  return { projectRoot: root, projectRootReal: realpathSync(root), policy: { commandCwdAliases } };
+}
+
+// resolveTrustedGradleWrapper의 win32 분기는 JAVA_HOME을 요구한다(§ gradle-capability.ts) —
+// 이 회귀 테스트는 wrapper 파일 존재/신뢰 판정 자체만 검증하면 충분하므로, platform을
+// "linux"로 고정해 JAVA_HOME 없이도 결정론적으로 동작하게 한다(posix 분기는 java를 거치지
+// 않는다). 실제 production 호출(autodev.ts)은 이 override를 전혀 넘기지 않는다.
+const POSIX_OVERRIDE = { platform: "linux" as NodeJS.Platform };
+
+function scenarioRootCwdWithNonGradleCommandOk(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    check("L) cwd:root + 비-gradle command는 항상 ok=true(디렉터리는 항상 존재)", result.ok === true && result.issues.length === 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioAliasedCwdDirectoryMissingFlagged(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "backend-unit", command: "npm", args: ["run", "test:backend"], cwd: "backend" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { backend: "backend" }), POSIX_OVERRIDE);
+    check(
+      "L) alias가 가리키는 디렉터리가 실제로 없으면 CWD_NOT_FOUND",
+      result.ok === false && result.issues.length === 1 && result.issues[0].kind === "CWD_NOT_FOUND" && result.issues[0].requiredTestName === "backend-unit"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioUndefinedAliasKeySkipped(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "x", command: "npm", args: ["run", "test:x"], cwd: "no-such-alias" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, {}), POSIX_OVERRIDE);
+    check(
+      "L) commandCwdAliases에 없는 alias 키는 이 함수의 대상이 아니므로 조용히 skip(ok=true) — execution-contract.ts의 몫",
+      result.ok === true && result.issues.length === 0
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioGradlewAtRootWithoutWrapperFlagged(): void {
+  // § JARVIS Task 5.2 실제 재현: task-registry.json이 cwd:"root"로 gradlew를 선언했지만
+  // 실제 wrapper는 projectRoot에 없다(항상 android/wakeword/ 처럼 하위 module에 있다).
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    check(
+      "L) cwd:root인데 projectRoot에 gradlew wrapper가 없으면 WRAPPER_NOT_FOUND(JARVIS Task 5.2 재현)",
+      result.ok === false && result.issues.length === 1 && result.issues[0].kind === "WRAPPER_NOT_FOUND"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioGradlewWithCorrectAliasPasses(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    makeGradleModule(join(root, "android", "wakeword"));
+    const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("L) alias가 실제 wrapper가 있는 디렉터리를 정확히 가리키면 ok=true(올바른 설정 — 회귀 방지)", result.ok === true && result.issues.length === 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioGradlewBatVariantRecognized(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew.bat", args: ["testDebugUnitTest"], cwd: "root" };
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    check(
+      "L) command이 gradlew.bat(Windows 표기)이어도 동일하게 wrapper 검증 대상(정규화)",
+      result.ok === false && result.issues[0].kind === "WRAPPER_NOT_FOUND"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioNonAndroidProjectUnaffected(): void {
+  // 일반 Node 프로젝트 회귀 방지 — gradlew가 전혀 없는 project는 이 preflight가 항상 통과한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const rts: RequiredTestCommand[] = [
+      { name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" },
+      { name: "typecheck", command: "npx", args: ["tsc", "--noEmit"], cwd: "root" },
+    ];
+    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root), POSIX_OVERRIDE);
+    check("L) gradlew가 없는 일반 Node 프로젝트는 항상 ok=true(회귀 없음)", result.ok === true && result.issues.length === 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioJarvisShapedFixtureSanitized(): void {
+  // § JARVIS Task 5.2의 실제 .autodev/task-registry.json + execution-policy.json 데이터를
+  // sanitize(프로젝트 고유 이름/경로만 유지)해 그대로 재현한다 — 이 preflight가 실제
+  // 사고를 결정론적으로 잡아냈을 것임을 회귀 테스트로 증명한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    makeGradleModule(join(root, "android", "wakeword"));
+    const rts: RequiredTestCommand[] = [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" }];
+    // 실제 JARVIS execution-policy.json은 backend 별칭만 갖고 있었고 wakeword 별칭이 없었다 —
+    // wrapper 자신은 android/wakeword/에 실제로 존재하지만 requiredTest는 그걸 가리키지 않는다.
+    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root, { backend: "backend" }), POSIX_OVERRIDE);
+    check(
+      "L) JARVIS Task 5.2 sanitized fixture — Developer를 부르기 전에 결정론적으로 감지됨",
+      result.ok === false && result.issues.length === 1 && result.issues[0].kind === "WRAPPER_NOT_FOUND" && result.issues[0].requiredTestName === "wakeword-unit"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// M) reconcileStaleRequiredTestExecutionEnvironmentTasks — AutoDev / JARVIS 신뢰성 보완
+//    (2026-08-30, JARVIS Task 5.2 실측: WRAPPER_NOT_FOUND 복구 후 남은 WAITING_HUMAN).
+// ---------------------------------------------------------------------------
+function makeMinimalTask(id: string, requiredTests: RequiredTestCommand[]): TaskDefinition {
+  return {
+    id,
+    phase: 5,
+    taskNumber: 2,
+    title: "fixture task",
+    prompt: "fixture",
+    requiredTests,
+    allowedPathPrefixes: [],
+    prohibitedOperations: [],
+  };
+}
+
+function envErrorMarker(taskId: string, requiredTestName: string, resolvedPath: string): string {
+  return `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${taskId} requiredTest=${requiredTestName} kind=WRAPPER_NOT_FOUND cwd=wakeword resolvedPath=${resolvedPath}`;
+}
+
+function scenarioEnvReconcileResolvedWhenWrapperNowPresent(): void {
+  // § 실제 JARVIS Task 5.2 재현: 이전엔 wrapper가 없어 WAITING_HUMAN이 됐고, 그 뒤 공식
+  // Gradle wrapper 생성 절차로 wrapper가 복구됐다 — 같은 검사를 다시 돌리면 이제 green이어야
+  // 한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) wrapper가 실제로 복구된 뒤 재검사하면 resolved=true", result.resolved === true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileNotResolvedWhenStillMissing(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    // wrapper를 만들지 않는다 — 결함이 아직 그대로 남아있는 상태.
+    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) wrapper가 여전히 없으면 resolved=false(안전하게 WAITING_HUMAN 유지)", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileFailClosedOnUnrelatedGenuineReason(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [
+        envErrorMarker("5.2", "wakeword-unit", moduleAbs),
+        "HUMAN_FINAL_REVIEW_PENDING(5.2): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다.",
+      ],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check(
+      "M) wrapper는 복구됐어도 실제 사람 판단이 필요한 다른 사유가 섞여 있으면 fail-closed로 resolved=false",
+      result.resolved === false
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileFailClosedOnMixedTaskIds(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [envErrorMarker("5.2", "wakeword-unit", moduleAbs), envErrorMarker("5.3", "other-unit", moduleAbs)],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) 서로 다른 taskId를 가리키는 마커가 섞여 있으면 fail-closed로 resolved=false(다른 task 상태를 건드리지 않음)", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileEmptyIsNotResolved(): void {
+  const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+  const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([], [task], makeExecutor(process.cwd(), {}), POSIX_OVERRIDE);
+  check("M) deferredHumanTasks가 비어 있으면 resolved=false(재검사할 대상 자체가 없음)", result.resolved === false);
+}
+
+function scenarioEnvReconcileUnknownTaskIdNotResolved(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    // taskRegistry에 "5.2"가 없다 — 추측해서 통과시키지 않는다.
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
+      [],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) taskRegistry에서 해당 taskId를 찾지 못하면 resolved=false(fail-closed, 추측 없음)", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileFailClosedOnMalformedEntry(): void {
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      ["some unrelated free-text marker that is not the expected template"],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) 정규식과 맞지 않는 임의 문자열은 절대 매칭시키지 않고 resolved=false", result.resolved === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function main(): void {
   scenarioRegisteredScriptPasses();
   scenarioMissingScriptFlagged();
@@ -632,6 +919,23 @@ function main(): void {
   scenarioDisallowedRunnerRejected();
   scenarioWhitespaceArgumentSmugglingRejected();
   scenarioLifecycleScriptNameRejected();
+
+  scenarioRootCwdWithNonGradleCommandOk();
+  scenarioAliasedCwdDirectoryMissingFlagged();
+  scenarioUndefinedAliasKeySkipped();
+  scenarioGradlewAtRootWithoutWrapperFlagged();
+  scenarioGradlewWithCorrectAliasPasses();
+  scenarioGradlewBatVariantRecognized();
+  scenarioNonAndroidProjectUnaffected();
+  scenarioJarvisShapedFixtureSanitized();
+
+  scenarioEnvReconcileResolvedWhenWrapperNowPresent();
+  scenarioEnvReconcileNotResolvedWhenStillMissing();
+  scenarioEnvReconcileFailClosedOnUnrelatedGenuineReason();
+  scenarioEnvReconcileFailClosedOnMixedTaskIds();
+  scenarioEnvReconcileEmptyIsNotResolved();
+  scenarioEnvReconcileUnknownTaskIdNotResolved();
+  scenarioEnvReconcileFailClosedOnMalformedEntry();
 
   console.log("\n=== required-test-preflight 테스트 결과 ===");
   for (const r of results) console.log(r);

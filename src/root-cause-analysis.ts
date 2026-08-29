@@ -34,6 +34,16 @@ import { log } from "./logger";
 
 export const MAX_SAME_FINDING_FIREWORKS_REVIEWS = 2;
 
+// AutoDev Core Maintenance(2026-08-30) — LOCAL_ROOT_CAUSE_MODE. 위 상수(Reviewer-finding
+// 반복)의 Developer/required-test 반복 쪽 대응물이다 — 동일한 required-test 실패
+// fingerprint가 이 횟수만큼 관측되면(§ failure-stagnation.ts computeProblemFingerprint,
+// autodev.ts memoryStagnationTracker) 다음 Developer 호출 "전에" 결정론적 재확인(§
+// required-test-preflight.ts checkRequiredTestExecutionEnvironment)을 먼저 수행한다 —
+// 재확인에서도 여전히 같은 결함이 확정되면 Developer를 다시 부르지 않는다(§ autodev.ts
+// defaultClaudeRunner). 새 MAX_CALLS를 낮추는 방식이 아니다 — 기존 MAX_REVIEW_CYCLES는
+// 그대로 두고, 그 상한에 도달하기 훨씬 전에 불필요한 실제 호출 자체를 줄인다.
+export const MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS = 2;
+
 export type RootCauseCategory =
   | "INFRASTRUCTURE_CONFIGURATION"
   | "REQUIRED_TEST_REGISTRATION_DRIFT"
@@ -44,7 +54,26 @@ export type RootCauseCategory =
   | "SCOPE_STATE_ERROR"
   | "PROVIDER_ERROR"
   | "SECURITY_OR_POLICY"
-  | "UNKNOWN";
+  | "UNKNOWN"
+  // AutoDev Core Maintenance(2026-08-30) — 아래 3개는 additive 확장이다(기존 값은 하나도
+  // 바뀌지 않았다 — classifyRootCause()의 기존 호출부는 전부 그대로 컴파일/동작한다).
+  //
+  // EXECUTION_CONTRACT — required-test-preflight.ts checkRequiredTestExecutionEnvironment()가
+  // Developer를 부르기 전에 이미 확정적으로 감지한 문제(cwd 디렉터리 없음/wrapper 파일
+  // 없음). classifyRootCause()는 이 카테고리를 스스로 추론하지 않는다 — 그 시점엔 이미
+  // preflight가 결정론적으로 판정을 끝냈으므로, 호출부(autodev.ts LOCAL_ROOT_CAUSE_MODE)가
+  // 이 값을 evidence 기반 추측이 아니라 직접 대입한다(§ 이 파일 하단 어디에서도 이 값을
+  // 반환하지 않는 것이 의도된 설계다 — 자체 조회 결과이지 evidence 휴리스틱 결과가 아니다).
+  | "EXECUTION_CONTRACT"
+  // PATH_RESOLUTION — trusted-executable-resolver.ts의 ExecutableTrustErrorCode
+  // (TRUSTED_EXECUTABLE_NOT_FOUND/EXECUTABLE_IDENTITY_UNTRUSTED/EXECUTABLE_SHADOWING_DETECTED)
+  // 가 denyReason 원문에 그대로(코드 자체의 리터럴 문자열로) 나타날 때만 분류한다 — stderr
+  // 자유 텍스트를 정규식으로 추측하지 않는다(§ 이 파일의 기존 원칙).
+  | "PATH_RESOLUTION"
+  // USAGE_LIMIT — claudeErrorCode==="USAGE_LIMIT"(failure-stagnation.ts
+  // PROVIDER_CLAUDE_ERROR_CODES에 이미 있는 정확한 코드)일 때만. 기존에는 PROVIDER_ERROR로
+  // 뭉뚱그려져 TIMEOUT/CLI_NOT_FOUND와 구분되지 않았다.
+  | "USAGE_LIMIT";
 
 /** 리뷰 feedback 원문(자유 텍스트)을 fingerprint 입력으로 쓸 수 있게 정규화한다 — 표현이
  *  조금씩 달라도(숫자/공백 차이 등) 의미상 같은 지적이면 같은 fingerprint가 되도록
@@ -144,11 +173,32 @@ export interface RootCauseEvidence {
  * 없으면 IMPLEMENTATION_ERROR(가장 흔한, 안전한 기본값: targeted Developer repair로 이어짐)
  * 로 fail-closed한다.
  */
+// § classifyRootCause PATH_RESOLUTION — trusted-executable-resolver.ts ExecutableTrustErrorCode의
+// 정확한 리터럴 문자열만 매칭한다(자유 텍스트 stderr 추측이 아니다 — 이 시스템 자신이 항상
+// "code: reason" 형태로 이 식별자를 denyReason에 그대로 남긴다, § safe-executor.ts/
+// gradle-capability.ts). 값을 복제하지 않기 위해 trusted-executable-resolver.ts를 import하지
+// 않고 문자열만 재사용하는 이유: 그 파일을 import하면 이 파일이 safe-executor.ts 계층에
+// 의존하게 되어 순수 로컬 분류기라는 이 파일의 성격이 흐려진다(기존에도 claudeErrorCode/
+// gptErrorCode를 그냥 string으로 받는 것과 동일한 관례).
+const EXECUTABLE_TRUST_ERROR_CODE_TOKENS: readonly string[] = [
+  "TRUSTED_EXECUTABLE_NOT_FOUND",
+  "EXECUTABLE_IDENTITY_UNTRUSTED",
+  "EXECUTABLE_SHADOWING_DETECTED",
+];
+
 export function classifyRootCause(evidence: RootCauseEvidence): RootCauseCategory {
   if (evidence.claudeErrorCode === "PROTOCOL_ERROR") return "DEVELOPER_RESPONSE_PARSE_ERROR";
   if (evidence.requiredTestRegistrationDrift) return "REQUIRED_TEST_REGISTRATION_DRIFT";
   if (evidence.gptErrorCode === "PROVIDER_SECURITY_BLOCKED") return "SECURITY_OR_POLICY";
   if (evidence.scopeViolations && evidence.scopeViolations.length > 0) return "SCOPE_STATE_ERROR";
+  // AutoDev Core Maintenance(2026-08-30) — dedicated USAGE_LIMIT(기존에는 PROVIDER_ERROR로
+  // TIMEOUT/CLI_NOT_FOUND와 뭉뚱그려졌다).
+  if (evidence.claudeErrorCode === "USAGE_LIMIT") return "USAGE_LIMIT";
+  // AutoDev Core Maintenance(2026-08-30) — dedicated PATH_RESOLUTION(§ types.ts
+  // ClaudeResult.tests.denyReason — 이전에는 이 신호 자체가 결과 객체에 없었다).
+  if (evidence.tests.some((t) => !t.pass && t.denyReason && EXECUTABLE_TRUST_ERROR_CODE_TOKENS.some((code) => t.denyReason!.includes(code)))) {
+    return "PATH_RESOLUTION";
+  }
   const category = classifyFailureCategory(evidence.claudeErrorCode, evidence.gptErrorCode, evidence.tests);
   if (category === "INFRASTRUCTURE_CONFIGURATION") return "INFRASTRUCTURE_CONFIGURATION";
   if (category === "PROVIDER") return "PROVIDER_ERROR";
@@ -177,6 +227,12 @@ export function describeRootCauseRecoveryAction(category: RootCauseCategory): st
       return "실제 보안/정책 판단 — 자동 승인하지 않고 genuine Human Gate를 유지합니다.";
     case "UNKNOWN":
       return "원인을 결정론적으로 특정할 수 없음 — 추측 수정 없이 fail-closed로 처리합니다.";
+    case "EXECUTION_CONTRACT":
+      return "required test의 실행 환경(cwd/wrapper executable)이 project adapter config 자체의 결함으로 판정됨 — Developer 재호출 없이 사람이 config를 직접 고쳐야 합니다.";
+    case "PATH_RESOLUTION":
+      return "신뢰된 실행 파일을 찾지 못함(cwd/별칭 결함으로 의심됨) — 동일 오류를 반복 재현하지 않고 실행 환경 preflight로 먼저 확인합니다.";
+    case "USAGE_LIMIT":
+      return "Claude 사용량 한도 도달로 분류 — 구현 수정이 필요한 문제가 아니므로 기존 provider 대기/재시도 정책을 그대로 사용합니다.";
   }
 }
 

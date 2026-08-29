@@ -1190,6 +1190,120 @@ async function scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDe
   );
 }
 
+// AutoDev Core Maintenance(2026-08-30) — 직전 시도의 required test 실패 근거
+// (failureEvidence/denyReason)가 다음 attempt의 Developer 초기 입력에 실제로 전달되는지
+// 검증한다(§ types.ts ClaudeResult.tests.denyReason, JARVIS Task 5.2 실측 — 이전에는
+// denyReason이 automation.log에만 남고 어디에도 전달되지 않아 Developer가 매번 원인을
+// 추측했다).
+async function scenarioRunAutodevOncePassesPreviousFailureEvidenceToNextDeveloper(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "READY",
+    lastClaudeResult: {
+      success: true,
+      summary: "이전 시도 요약",
+      changedFiles: [],
+      tests: [
+        {
+          name: "wakeword-unit",
+          pass: false,
+          denyReason: "Executable Identity Trust(TRUSTED_EXECUTABLE_NOT_FOUND): gradlew.bat가 존재하지 않습니다.",
+        },
+      ],
+      rawOutput: "",
+    },
+    lastGptDecision: {
+      decision: "REVISE",
+      severity: { critical: 0, high: 0, medium: 1 },
+      feedback: "required test 실패",
+      nextTask: null,
+    } as unknown as ProjectState["lastGptDecision"],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2, requiredTests=[]
+
+  let capturedFirstRoundInput: string | undefined;
+  const developerClaudeCaller = async (input: string): Promise<RealClaudeResult> => {
+    if (capturedFirstRoundInput === undefined) capturedFirstRoundInput = input;
+    return {
+      success: true,
+      summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "재작업 완료", changedFiles: [], testsRequested: [] }),
+      changedFiles: [],
+      tests: [],
+      rawOutput: "",
+    };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+
+  check(
+    "직전 실패 근거 전달: '직전 시도의 실제 실패 근거' 안내 헤더가 포함됨",
+    !!capturedFirstRoundInput?.includes("직전 시도의 실제 실패 근거")
+  );
+  check(
+    "직전 실패 근거 전달: denyReason 원문(TRUSTED_EXECUTABLE_NOT_FOUND)이 그대로 전달됨(추측 아님)",
+    !!capturedFirstRoundInput?.includes("TRUSTED_EXECUTABLE_NOT_FOUND")
+  );
+}
+
+// AutoDev Core Maintenance(2026-08-30) — Deterministic Execution-Environment Preflight가
+// 실제 runAutodevOnce() 경로에 배선되어, 결함 있는 required test 실행 환경에서는 Developer를
+// 전혀 호출하지 않고 즉시 WAITING_HUMAN으로 전환하는지 검증한다(§ required-test-preflight.ts
+// checkRequiredTestExecutionEnvironment, JARVIS Task 5.2 재현 — cwd:"root"인데 실제
+// gradlew wrapper는 android/wakeword/에만 있음).
+const EXECUTION_ENVIRONMENT_TASK_REGISTRY: TaskDefinition[] = [
+  {
+    id: "G1",
+    phase: 1,
+    taskNumber: 1,
+    title: "Android wakeword unit test",
+    prompt: "wakeword 모듈 단위 테스트",
+    requiredTests: [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" }],
+    allowedPathPrefixes: ["android/wakeword/"],
+    prohibitedOperations: [],
+  },
+];
+const EXECUTION_ENVIRONMENT_POLICY: ProjectExecutionPolicy = {
+  allowedReadPrefixes: ["android/wakeword/"],
+  allowedWritePrefixes: ["android/wakeword/"],
+  allowedCommands: [],
+};
+
+async function scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { status: "READY", completedTasks: [] });
+  const manifest: ProjectManifest = {
+    projectId: "execution-env-fixture-project",
+    projectName: "Execution Env Fixture Project",
+    targetProjectRoot: repo,
+    statePath,
+    taskRegistry: EXECUTION_ENVIRONMENT_TASK_REGISTRY,
+    developerInstructions: "허용 범위: android/wakeword/**.",
+    reviewInstructions: "android/wakeword/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["android/wakeword/"],
+    executionPolicy: EXECUTION_ENVIRONMENT_POLICY,
+  };
+
+  let developerCallCount = 0;
+  const developerClaudeCaller = async (): Promise<RealClaudeResult> => {
+    developerCallCount += 1;
+    return { success: true, summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "x", changedFiles: [], testsRequested: [] }), changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+
+  check(
+    "실행 환경 preflight 차단: outcome=BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT",
+    result.outcome === "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT"
+  );
+  check("실행 환경 preflight 차단: Developer가 단 한 번도 호출되지 않음", developerCallCount === 0);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("실행 환경 preflight 차단: status=WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "실행 환경 preflight 차단: deferredHumanTasks에 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 마커가 기록됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:") && t.includes("wakeword-unit"))
+  );
+}
+
 // 필수 검증 — 직전 시도의 미승인 scope-violation 작업물을 attempt 시작 전에 결정론적으로
 // 정리한다(§ autodev.ts Phase 7). untracked + 현재 task의 allowedPathPrefixes 밖 + 직전
 // lastGptDecision.scopeViolations에 정확히 나열된 경우에만 삭제되고, tracked 파일이나
@@ -1666,29 +1780,39 @@ async function scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersis
 }
 
 // AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
-// Hardening(2026-08-28)로 갱신 — REVIEW_CYCLE_EXHAUSTED 자신은 canonical Human Gate
-// Policy상 기술적 자동 복구 대상이라 그 자체로는 genuine WAITING_HUMAN을 만들지 않는다(§
-// human-gate-policy.ts, § orchestrator.ts durable retry). 이 claudeRunner의 required test는
-// 절대 통과하지 않으므로 이 run은 REVIEW_CYCLE_EXHAUSTED를 여러 번(durable하게) 거친 뒤
-// 결국 이 정책 수정과 무관한 기존 비용 안전장치 MAX_GPT_CALLS(10)로 genuine WAITING_HUMAN에
-// 도달한다 — 그 MAX_GPT_CALLS는 human-gate-policy.ts가 의도적으로 fail-closed
-// GENUINE_HUMAN_JUDGMENT로 분류하므로, generic HUMAN_APPROVAL_REQUIRED("orchestrator
-// status=...") bookend는 이 경우 정상적으로 기록돼야 한다(REVIEW_CYCLE_EXHAUSTED 그 자체가
-// 아니라 MAX_GPT_CALLS가 만든 것). RUN_BLOCKED와 orchestrator.ts 자신의
-// REVIEW_CYCLE_EXHAUSTED event는 그대로 기록된다(감사 기록/집계는 그대로 유지).
-async function scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent(): Promise<void> {
+// Hardening(2026-08-28), AutoDev Core Maintenance(2026-08-30)로 갱신.
+//
+// 이 시나리오의 claudeRunner는 매 attempt마다 완전히 동일한 required test 실패를
+// 반환한다 — 2026-08-30 변경 전에는(REVIEW_CYCLE_EXHAUSTED 자신이 canonical Human Gate
+// Policy상 언제나 기술적 자동 복구 대상) 이 반복이 무제한 durable backoff-and-retry로
+// 흡수되어 결국 무관한 비용 안전장치 MAX_GPT_CALLS(10)에서야 genuine WAITING_HUMAN에
+// 도달했다. 이제는 orchestrator.ts가 stagnationTracker의 repeatCount로 "다양한 이유로
+// 계속 REVISE"와 "동일한 이유로 계속 REVISE"를 구분한다(§ DETERMINISTIC_REVIEW_CYCLE_
+// EXHAUSTED_MARKER_PREFIX) — 이 fixture는 정확히 후자이므로, 첫 MAX_REVIEW_CYCLES(5)
+// 소진 시점에 이미 genuine WAITING_HUMAN으로 승격된다(더 이상 10회까지 무제한 반복하지
+// 않는다 — 이것이 바로 이번 변경의 목적: 동일 실패를 무한정 재시도하지 않는다). 그
+// genuine WAITING_HUMAN도 human-gate-policy.ts가 GENUINE_HUMAN_JUDGMENT로 분류하므로,
+// generic HUMAN_APPROVAL_REQUIRED("orchestrator status=...") bookend는 여전히 정상적으로
+// 기록돼야 한다(REVIEW_CYCLE_EXHAUSTED event 자신에 이제 humanInterventionRequired=true가
+// 실려온다 — 더 이상 항상 false가 아니다). RUN_BLOCKED와 orchestrator.ts 자신의
+// REVIEW_CYCLE_EXHAUSTED event는 여전히 그대로 기록된다(감사 기록/집계는 유지).
+async function scenarioRunAutodevOnceDeterministicReviewCycleExhaustionEscalatesEarly(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
   const manifest = buildPlannerManifest(repo, statePath); // P1.2
   const events = createInMemoryEventStore();
 
-  const claudeRunner = async (): Promise<ClaudeResult> => ({
-    success: true,
-    summary: "테스트: required test 항상 실패",
-    changedFiles: [],
-    tests: [{ name: "proj:check", pass: false }],
-    rawOutput: "",
-  });
+  let claudeCallCount = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCallCount += 1;
+    return {
+      success: true,
+      summary: "테스트: required test 항상 동일하게 실패",
+      changedFiles: [],
+      tests: [{ name: "proj:check", pass: false }],
+      rawOutput: "",
+    };
+  };
 
   const result = await runAutodevOnce({
     manifest,
@@ -1696,18 +1820,21 @@ async function scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericAppro
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
   });
 
-  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
+  check("결정론적 반복 조기 승격: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
+  check("결정론적 반복 조기 승격: developer가 MAX_REVIEW_CYCLES(5)에서 멈추고 MAX_GPT_CALLS(10)까지 반복하지 않음", claudeCallCount === 5);
   const all = events.query().events;
+  const exhaustedEvents = all.filter((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED");
+  check("결정론적 반복 조기 승격: REVIEW_CYCLE_EXHAUSTED event가 정확히 1회만 기록됨(무제한 반복 아님)", exhaustedEvents.length === 1);
   check(
-    "REVIEW_CYCLE_EXHAUSTED 알림 억제: REVIEW_CYCLE_EXHAUSTED event 자신은 humanInterventionRequired=false(genuine 아님)",
-    all.filter((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED").every((e) => e.humanInterventionRequired === false)
+    "결정론적 반복 조기 승격: REVIEW_CYCLE_EXHAUSTED event 자신이 이제 humanInterventionRequired=true(동일 반복이 확정됐으므로 genuine)",
+    exhaustedEvents.every((e) => e.humanInterventionRequired === true)
   );
   check(
-    "REVIEW_CYCLE_EXHAUSTED 알림 억제: 결국 MAX_GPT_CALLS(genuine)로 종료되어 generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 정상적으로 기록됨(Telegram APPROVE 버튼 유지)",
+    "결정론적 반복 조기 승격: generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 정상적으로 기록됨(Telegram APPROVE 버튼 유지)",
     all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
   );
-  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: RUN_BLOCKED event는 그대로 기록됨(대시보드 실패 집계 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
-  check("REVIEW_CYCLE_EXHAUSTED 알림 억제: orchestrator의 REVIEW_CYCLE_EXHAUSTED event는 그대로 기록됨(감사 기록 유지)", all.some((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED"));
+  check("결정론적 반복 조기 승격: RUN_BLOCKED event는 그대로 기록됨(대시보드 실패 집계 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
+  check("결정론적 반복 조기 승격: orchestrator의 REVIEW_CYCLE_EXHAUSTED event는 그대로 기록됨(감사 기록 유지)", all.some((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED"));
 }
 
 async function scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues(): Promise<void> {
@@ -2017,6 +2144,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestConfigWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineHumanFinalReviewWaitingHuman();
     await scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper();
+    await scenarioRunAutodevOncePassesPreviousFailureEvidenceToNextDeveloper();
+    await scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment();
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
@@ -2026,7 +2155,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();
     await scenarioSecretPrecheckAutoFixesFindingWithoutHumanGate();
     await scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersists();
-    await scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent();
+    await scenarioRunAutodevOnceDeterministicReviewCycleExhaustionEscalatesEarly();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();

@@ -95,3 +95,30 @@ export function computeActiveWorkMsAcrossTasks(events: AutoDevEvent[], now: numb
   total += computeActiveWorkMs(noTaskId, now, options);
   return total;
 }
+
+// AutoDev Core Maintenance(2026-08-30) — § 파일 상단 "알려진 한계" 문단이 문서화한 gap을
+// 메운다. claude-developer.ts의 USAGE_LIMIT 내부 재시도 sleep이 이제
+// DEVELOPER_USAGE_LIMIT_WAIT_STARTED/ENDED event 쌍으로 관측 가능하다(§ autodev.ts
+// onUsageLimitWait 배선) — 그 STARTED~ENDED 사이 실제 경과 시간만 합산한다. 기존
+// computeActiveWorkMs()의 반환값 의미/시그니처는 전혀 바꾸지 않는다(순수 추가 함수) —
+// 호출부가 필요하면 `computeActiveWorkMs(...) - computeUsageLimitWaitMs(...)`로 조합해서
+// "USAGE_LIMIT 대기를 제외한 실제 개발 작업시간"을 얻는다. sequence 오름차순이 아니거나
+// 짝이 맞지 않는 START(다음 START 전에 END가 없음)/고아 END(대응 START 없음)는 결정론적으로
+// 무시한다(추측으로 구간을 만들지 않는다 — fail-closed로 0 취급).
+export function computeUsageLimitWaitMs(events: AutoDevEvent[]): number {
+  let total = 0;
+  let openStartTimestamp: string | undefined;
+  const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
+  for (const e of sorted) {
+    if (e.eventType === "DEVELOPER_USAGE_LIMIT_WAIT_STARTED") {
+      openStartTimestamp = e.timestamp;
+    } else if (e.eventType === "DEVELOPER_USAGE_LIMIT_WAIT_ENDED") {
+      if (openStartTimestamp !== undefined) {
+        const gapMs = Date.parse(e.timestamp) - Date.parse(openStartTimestamp);
+        total += Math.max(0, gapMs);
+        openStartTimestamp = undefined;
+      }
+    }
+  }
+  return total;
+}

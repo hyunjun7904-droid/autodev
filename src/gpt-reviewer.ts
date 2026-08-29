@@ -498,7 +498,12 @@ export function buildReviewInput(
     result.tests
       .map((t) => {
         const header = `- ${t.name}: ${t.pass ? "PASS" : "FAIL"}`;
-        if (t.pass || !t.failureEvidence) return header;
+        if (t.pass) return header;
+        // AutoDev Core Maintenance(2026-08-30) — 명령이 spawn조차 되지 못하고 거부된 경우(§
+        // types.ts ClaudeResult.tests.denyReason 주석) failureEvidence는 없지만 거부 사유는
+        // 있을 수 있다 — 이전에는 이 사유가 어디에도 전달되지 않아 "pass=false"만 보고 REVISE를
+        // 반복했다.
+        if (!t.failureEvidence) return t.denyReason ? `${header}\n  denyReason: ${t.denyReason}` : header;
         const ev = t.failureEvidence;
         const parts = [`  command: ${ev.command}`, `  exitCode: ${ev.exitCode ?? "(none)"}`];
         if (ev.stderrTail) parts.push(`  stderr(tail):\n${ev.stderrTail}`);

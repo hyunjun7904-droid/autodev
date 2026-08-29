@@ -36,6 +36,20 @@ export const CLAUDE_LIMIT_WAIT_MS = 30 * 60 * 1000; // 30분
 export const MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX = "MAX_GPT_CALLS_EXCEEDED:";
 export const CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX = "CLAUDE_STRUCTURAL_FAILURE(";
 
+// AutoDev Core Maintenance(2026-08-30) — Deterministic Review Cycle Exhaustion. 아래
+// REVIEW_CYCLE_EXHAUSTED 분기(2026-08-28 정책)는 "review가 MAX_REVIEW_CYCLES 안에
+// 수렴하지 못했다는 사실 자체는 순수 기술적 상황"이라는 전제로 항상 backoff-and-retry를
+// 택한다 — 이 전제는 매 cycle 서로 다른 이유로 REVISE가 반복되는 경우(활발히 탐색
+// 중이지만 예산이 부족한 상황)에는 맞다. 하지만 **동일한 required-test 실패
+// fingerprint가 결정론적으로 반복**되는 경우(§ stagnationTracker, 이미 STAGNATION_DETECTED
+// 마커의 근거로 쓰이는 바로 그 신호)는 다르다 — 아무리 기다렸다 재시도해도 같은 입력이
+// 같은 실패를 반복 생산할 뿐이므로, 무제한 backoff-and-retry는 사람 개입 없이 영원히
+// Claude 호출만 반복하게 된다(§ 실제 관측 — Developer 8라운드 반복). 이 마커는 그
+// 구분된 경우에만 genuine WAITING_HUMAN으로 승격한다 — MAX_REVIEW_CYCLES 상수 자체를
+// 낮추거나 위 기존 backoff 경로를 대체하지 않는다(다른 이유로 반복되는 REVISE는 기존
+// 그대로 무제한 backoff-and-retry).
+export const DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX = "DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:";
+
 // AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry(2026-08-28 정책
 // 수정). Developer가 일시적 오류(TIMEOUT/CLI_NOT_FOUND)로 attempt 내 재시도(claude-
 // developer.ts DEVELOPER_TRANSIENT_MAX_ATTEMPTS)까지 소진해도, 그 사실 자체는 사람 판단이
@@ -312,6 +326,12 @@ export async function runOrchestrator(
   // Phase 6 — 같은 실패가 reviewCycle 내내 반복되는지 감지하는 loop-local tracker(위
   // gptCallCount와 동일하게 project-state.json에 영속화하지 않는다).
   const stagnationTracker = createStagnationTracker();
+  // AutoDev Core Maintenance(2026-08-30) — 가장 최근에 관측된 required-test 실패
+  // repeatCount(아래 stagnationTracker.observe 결과를 매 cycle 갱신). MAX_REVIEW_CYCLES
+  // 소진 시점(§ 아래)에 "이 소진이 순수 기술적 비수렴 때문인지, 아니면 동일 실패가
+  // 결정론적으로 반복돼서인지"를 구분하는 데만 쓴다 — 새 tracker/fingerprint 도메인을
+  // 만들지 않고 이미 있는 신호를 재사용한다.
+  let lastRequiredTestRepeatCount = 0;
 
   while (true) {
     // AutoDev / JARVIS 신뢰성 보완(2026-08-28) — 이전 프로세스가 durable provider wait
@@ -445,96 +465,127 @@ export async function runOrchestrator(
       });
     }
 
+    // AutoDev Core Maintenance(2026-08-30) — Reviewer Call Gating. required test가
+    // 실패했는데 이번 attempt에서 변경된 파일이 하나도 없다면(§ autodev.ts
+    // LOCAL_ROOT_CAUSE_MODE가 만드는 합성 결과가 정확히 이 모양이다 —
+    // changedFiles:[], tests는 직전 실패 그대로), Reviewer에게 보여줄 새 diff 자체가 없다
+    // — 검토할 대상이 없는 상태에서 실제 GPT/Fireworks 호출을 반복하는 것은 순수 낭비다.
+    // 이 조건은 의도적으로 "required test 실패 시 항상 생략"보다 훨씬 보수적이다: Reviewer는
+    // 테스트 통과 여부와 무관하게 scope violation/critical·high severity 같은 독립적인
+    // 판정(§ review-policy.ts applyReviewDecisionPolicy)도 수행하므로, "테스트 실패"만으로
+    // 무조건 생략하면 새로 도입된 문제를 Reviewer가 한 번도 보지 못한 채 REVISE 루프만 도는
+    // 위험이 생긴다(§ 요구사항 "Security Gate 약화 금지", "Genuine Human Gate 자동 승인
+    // 금지"). changedFiles가 비어있을 때만은 정의상 새로 리뷰할 내용 자체가 없으므로 이
+    // 위험이 구조적으로 존재하지 않는다 — 그래서 이 조건 하나로만 제한한다.
+    const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
+    const skipReviewerNoNewChanges = requiredTestsFailed && claudeResult.changedFiles.length === 0;
+
     setStatus("WAITING_GPT_REVIEW");
-    gptCallCount += 1;
-    if (gptCallCount > MAX_GPT_CALLS) {
-      log(`GPT 호출 ${MAX_GPT_CALLS}회 초과 — WAITING_HUMAN`);
-      state.deferredHumanTasks.push(`${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 ${gptCallCount}회`);
-      setStatus("WAITING_HUMAN");
-      break;
-    }
+    let gptResult: GptReviewerReturn;
+    if (skipReviewerNoNewChanges) {
+      log("Reviewer 호출 생략 — required test 실패 + 이번 attempt에 변경된 파일 없음(리뷰할 새 diff가 없음)", {
+        reviewCycle: state.reviewCycle,
+      });
+      gptResult = {
+        // applyReviewDecisionPolicy(아래)가 requiredTestsFailed로 REVISE로 강제한다 — 실제
+        // Reviewer가 "이 diff엔 문제 없음"이라고 판단한 것과 동일한 중립 출발점이다.
+        decision: "PASS",
+        severity: { critical: 0, high: 0, medium: 0 },
+        feedback:
+          "AutoDev — 이번 attempt에서 변경된 파일이 없어(예: LOCAL_ROOT_CAUSE_MODE로 Developer를 다시 호출하지 않음) Reviewer를 호출하지 않았습니다. required test가 여전히 실패해 REVISE로 처리합니다.",
+        nextTask: null,
+        requestAttempted: false,
+      };
+    } else {
+      gptCallCount += 1;
+      if (gptCallCount > MAX_GPT_CALLS) {
+        log(`GPT 호출 ${MAX_GPT_CALLS}회 초과 — WAITING_HUMAN`);
+        state.deferredHumanTasks.push(`${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 ${gptCallCount}회`);
+        setStatus("WAITING_HUMAN");
+        break;
+      }
 
-    emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
-    // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
-    // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
-    // SI-3.8D — reviewBaseline(직전 round의 결과, 첫 round는 undefined)도 그대로 전달한다.
-    let gptResult = await gptReviewer(
-      claudeResult,
-      state.reviewCycle,
-      task,
-      deps.allowedPathPrefixes,
-      deps.projectContext,
-      gptCallCount,
-      gptRawCallTotal,
-      reviewBaseline
-    );
-    // 이번 round가 만든 새 baseline을 다음 round를 위해 보존한다(BLOCK/HUMAN_REQUIRED로
-    // 루프가 끝나도 무해하다 — 더 이상 쓰이지 않을 뿐).
-    reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
-    // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
-    // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
-    gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
-    recordGptReviewUsage(gptResult, state.reviewCycle);
-
-    // AutoDev / JARVIS 신뢰성 보완(2026-08-28 정책 수정) — GPT Reviewer 자신의 순수 provider
-    // 일시적 장애(timeout/rate limit류, gpt-reviewer.ts reviewClaudeResultWithRetry가 자체
-    // MAX_ATTEMPTS(5)까지 소진한 뒤에만 이 errorCode를 반환)는 Developer provider durable
-    // wait과 정확히 같은 원칙을 적용한다 — 아무리 반복돼도 genuine WAITING_HUMAN으로 승격하지
-    // 않는다. 대신 같은 diff로 재리뷰만 반복한다(Developer를 다시 호출하지 않음 — claudeResult
-    // 는 이 while(true) 바깥 loop의 값 그대로다). gptCallCount("몇 번째 REVISE round인지")는
-    // 이 재시도로 소비하지 않는다(claudeLimitWaitCount/developerProviderWaitCount와 동일
-    // 관례) — 다만 gptRawCallTotal(실제 API 호출 총합, 비용 안전장치)은 재시도도 실제 호출이므로
-    // 계속 늘어나고, 그 hard cap(MAX_GPT_RAW_CALLS)은 그대로 유지된다 — "얼마나 반복되든 Human
-    // Gate 승격 없음"이 "실제 비용이 무한정 계속 나가도 된다"는 뜻은 아니다(그건 이미
-    // GPT_RAW_CALL_LIMIT_EXCEEDED라는 별도의, 이 정책과 무관한 genuine 비용 사유다).
-    // 참고: Developer provider wait(위)과 달리 이 retry는 재시작 후 "남은 시간만 대기"를
-    // 구현하지 않는다 — claudeResult 자체가 프로세스 재시작에도 살아남을 방법이 없어(디스크에
-    // 영속화하지 않음, 기존 설계 그대로), 재시작하면 어차피 Developer 호출부터 처음부터 다시
-    // 해야 한다(이 특성은 이번 변경으로 새로 생긴 게 아니라 기존 review 단계 전체가 이미 그랬다
-    // — claudeResult를 durable하게 만드는 것은 이번 정책 수정의 범위 밖이다). 따라서
-    // reviewerProviderNextRetryAt은 관측(대시보드/로그)용으로만 저장되고, 재시작 시 남은
-    // 시간만큼만 기다리는 로직은 없다.
-    while (gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" && gptRawCallTotal <= MAX_GPT_RAW_CALLS) {
-      state.reviewerProviderWaitCount = (state.reviewerProviderWaitCount ?? 0) + 1;
-      const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewerProviderWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
-      state.reviewerProviderNextRetryAt = new Date(now() + delayMs).toISOString();
-      setStatus("WAITING_PROVIDER_RETRY");
-      saveCurrentState(state);
-      log(
-        `GPT Reviewer provider 일시적 오류 감지 — ${delayMs}ms 대기 후 같은 diff로 재리뷰 (${state.reviewerProviderWaitCount}회째, gptCallCount 예산은 소비하지 않음, Human Gate로 승격하지 않고 계속 재시도합니다)`
+      emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
+      // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
+      // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
+      // SI-3.8D — reviewBaseline(직전 round의 결과, 첫 round는 undefined)도 그대로 전달한다.
+      gptResult = await gptReviewer(
+        claudeResult,
+        state.reviewCycle,
+        task,
+        deps.allowedPathPrefixes,
+        deps.projectContext,
+        gptCallCount,
+        gptRawCallTotal,
+        reviewBaseline
       );
-      await sleep(delayMs);
-      state.reviewerProviderNextRetryAt = null;
-      setStatus("WAITING_GPT_REVIEW");
-      gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal, reviewBaseline);
+      // 이번 round가 만든 새 baseline을 다음 round를 위해 보존한다(BLOCK/HUMAN_REQUIRED로
+      // 루프가 끝나도 무해하다 — 더 이상 쓰이지 않을 뿐).
       reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
+      // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
+      // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
       gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
       recordGptReviewUsage(gptResult, state.reviewCycle);
-    }
 
-    if (gptRawCallTotal > MAX_GPT_RAW_CALLS) {
-      log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — WAITING_HUMAN`, { gptRawCallTotal });
-      state.deferredHumanTasks.push(`GPT_RAW_CALL_LIMIT_EXCEEDED: 총 ${gptRawCallTotal}회`);
-      setStatus("WAITING_HUMAN");
-      break;
-    }
+      // AutoDev / JARVIS 신뢰성 보완(2026-08-28 정책 수정) — GPT Reviewer 자신의 순수 provider
+      // 일시적 장애(timeout/rate limit류, gpt-reviewer.ts reviewClaudeResultWithRetry가 자체
+      // MAX_ATTEMPTS(5)까지 소진한 뒤에만 이 errorCode를 반환)는 Developer provider durable
+      // wait과 정확히 같은 원칙을 적용한다 — 아무리 반복돼도 genuine WAITING_HUMAN으로 승격하지
+      // 않는다. 대신 같은 diff로 재리뷰만 반복한다(Developer를 다시 호출하지 않음 — claudeResult
+      // 는 이 while(true) 바깥 loop의 값 그대로다). gptCallCount("몇 번째 REVISE round인지")는
+      // 이 재시도로 소비하지 않는다(claudeLimitWaitCount/developerProviderWaitCount와 동일
+      // 관례) — 다만 gptRawCallTotal(실제 API 호출 총합, 비용 안전장치)은 재시도도 실제 호출이므로
+      // 계속 늘어나고, 그 hard cap(MAX_GPT_RAW_CALLS)은 그대로 유지된다 — "얼마나 반복되든 Human
+      // Gate 승격 없음"이 "실제 비용이 무한정 계속 나가도 된다"는 뜻은 아니다(그건 이미
+      // GPT_RAW_CALL_LIMIT_EXCEEDED라는 별도의, 이 정책과 무관한 genuine 비용 사유다).
+      // 참고: Developer provider wait(위)과 달리 이 retry는 재시작 후 "남은 시간만 대기"를
+      // 구현하지 않는다 — claudeResult 자체가 프로세스 재시작에도 살아남을 방법이 없어(디스크에
+      // 영속화하지 않음, 기존 설계 그대로), 재시작하면 어차피 Developer 호출부터 처음부터 다시
+      // 해야 한다(이 특성은 이번 변경으로 새로 생긴 게 아니라 기존 review 단계 전체가 이미 그랬다
+      // — claudeResult를 durable하게 만드는 것은 이번 정책 수정의 범위 밖이다). 따라서
+      // reviewerProviderNextRetryAt은 관측(대시보드/로그)용으로만 저장되고, 재시작 시 남은
+      // 시간만큼만 기다리는 로직은 없다.
+      while (gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" && gptRawCallTotal <= MAX_GPT_RAW_CALLS) {
+        state.reviewerProviderWaitCount = (state.reviewerProviderWaitCount ?? 0) + 1;
+        const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewerProviderWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
+        state.reviewerProviderNextRetryAt = new Date(now() + delayMs).toISOString();
+        setStatus("WAITING_PROVIDER_RETRY");
+        saveCurrentState(state);
+        log(
+          `GPT Reviewer provider 일시적 오류 감지 — ${delayMs}ms 대기 후 같은 diff로 재리뷰 (${state.reviewerProviderWaitCount}회째, gptCallCount 예산은 소비하지 않음, Human Gate로 승격하지 않고 계속 재시도합니다)`
+        );
+        await sleep(delayMs);
+        state.reviewerProviderNextRetryAt = null;
+        setStatus("WAITING_GPT_REVIEW");
+        gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal, reviewBaseline);
+        reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
+        gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
+        recordGptReviewUsage(gptResult, state.reviewCycle);
+      }
 
-    if (
-      gptResult.errorCode === "AUTH_ERROR" ||
-      gptResult.errorCode === "QUOTA_EXCEEDED" ||
-      gptResult.errorCode === "BUDGET_EXCEEDED" ||
-      // SI-3.8E Security Ordering Correction — Provider Security Gate BLOCK도 Budget Guard
-      // BLOCK과 동일한 성격(사람 개입이 필요한 preflight 차단)이므로 동일하게 기록한다.
-      gptResult.errorCode === "PROVIDER_SECURITY_BLOCKED"
-    ) {
-      state.deferredHumanTasks.push(`${gptResult.errorCode}: ${gptResult.feedback}`);
+      if (gptRawCallTotal > MAX_GPT_RAW_CALLS) {
+        log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — WAITING_HUMAN`, { gptRawCallTotal });
+        state.deferredHumanTasks.push(`GPT_RAW_CALL_LIMIT_EXCEEDED: 총 ${gptRawCallTotal}회`);
+        setStatus("WAITING_HUMAN");
+        break;
+      }
+
+      if (
+        gptResult.errorCode === "AUTH_ERROR" ||
+        gptResult.errorCode === "QUOTA_EXCEEDED" ||
+        gptResult.errorCode === "BUDGET_EXCEEDED" ||
+        // SI-3.8E Security Ordering Correction — Provider Security Gate BLOCK도 Budget Guard
+        // BLOCK과 동일한 성격(사람 개입이 필요한 preflight 차단)이므로 동일하게 기록한다.
+        gptResult.errorCode === "PROVIDER_SECURITY_BLOCKED"
+      ) {
+        state.deferredHumanTasks.push(`${gptResult.errorCode}: ${gptResult.feedback}`);
+      }
     }
 
     // GPT decision에 대한 안전장치 override(scope 밖 변경→BLOCK, critical/high 있는데
     // PASS→REVISE, 필수 테스트 실패에도 PASS→REVISE)는 review-policy.ts의 단일 출처를
     // 그대로 쓴다(Phase F Task F4) — agent-orchestrator.ts(F2/F3)의 REVISE loop도 동일한
     // 함수를 쓰므로 두 실행경로의 판정이 서로 달라질 위험이 없다.
-    const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
 
     // Phase 6 — 같은 required test 실패가 반복되는지 deterministic fingerprint로 감지한다.
     // 5회 REVISE 제한 자체는 바꾸지 않는다 — 반복이 처음 확인되는 시점(2회 연속)에 그
@@ -544,6 +595,7 @@ export async function runOrchestrator(
       const claudeErrorCode = (claudeResult as ClaudeResult & { errorCode?: string }).errorCode;
       const fingerprint = computeFailureFingerprint(deps.taskId ?? task, claudeResult.tests);
       const repeatCount = stagnationTracker.observe(fingerprint);
+      lastRequiredTestRepeatCount = repeatCount;
       if (repeatCount === 2) {
         const category = classifyFailureCategory(claudeErrorCode, gptResult.errorCode, claudeResult.tests);
         log("STAGNATION_DETECTED — 동일한 required test 실패가 반복됨", { category, reviewCycle: state.reviewCycle });
@@ -621,6 +673,32 @@ export async function runOrchestrator(
       tokenUsage: gptResult.tokenUsage,
     });
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
+      // AutoDev Core Maintenance(2026-08-30) — 위 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX
+      // 주석 참고. lastRequiredTestRepeatCount는 stagnationTracker가 이미 추적 중인, 바로 이
+      // task의 마지막으로 관측된 required-test 실패 반복 횟수다 — 2 이상이면(STAGNATION_DETECTED
+      // 마커를 이미 남긴 것과 동일한 기준) 이 exhaustion이 "다양한 이유로 계속 REVISE"가 아니라
+      // "같은 이유로 계속 REVISE"임을 뜻한다. 이 경우만 genuine WAITING_HUMAN으로 승격한다 —
+      // 그 외(반복이 확인되지 않은 경우)는 기존 backoff-and-retry 경로를 byte-for-byte 그대로
+      // 유지한다(§ 2026-08-28 정책의 원래 의도 — 순수 기술적 비수렴은 승격하지 않는다).
+      if (lastRequiredTestRepeatCount >= 2) {
+        log(
+          `연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — 동일 required test 실패가 ${lastRequiredTestRepeatCount}회 반복 확인되어(결정론적 정체) WAITING_HUMAN으로 승격합니다(무제한 backoff-and-retry 대신)`
+        );
+        state.deferredHumanTasks.push(
+          `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX} reviewCycle=${state.reviewCycle}에서 동일 required test 실패가 ${lastRequiredTestRepeatCount}회 반복된 채 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달`
+        );
+        setStatus("WAITING_HUMAN");
+        emitEvent({
+          eventType: "REVIEW_CYCLE_EXHAUSTED",
+          executionPhase: "review",
+          outcome: "BLOCKED",
+          humanInterventionRequired: true,
+          reviseCycle: MAX_REVIEW_CYCLES,
+          reason: `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX} MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달 — 동일 required test 실패 ${lastRequiredTestRepeatCount}회 반복(결정론적 정체, backoff 대신 WAITING_HUMAN)`,
+        });
+        saveCurrentState(state);
+        break;
+      }
       // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28 정책 수정) — REVIEW_CYCLE_EXHAUSTED
       // 는 더 이상 genuine WAITING_HUMAN이 아니다(§ types.ts reviewStagnationWaitCount 상단
       // 주석). review가 MAX_REVIEW_CYCLES 안에 수렴하지 못했다는 사실 자체는 순수 기술적

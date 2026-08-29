@@ -122,7 +122,7 @@ function fakeReviewer(
   return async () => ({ decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null, ...overrides });
 }
 
-function fakeClaudeRunnerWriting(repo: string, path: string, tests: { name: string; pass: boolean }[] = [{ name: "proj:check", pass: true }]) {
+function fakeClaudeRunnerWriting(repo: string, path: string, tests: ClaudeResult["tests"] = [{ name: "proj:check", pass: true }]) {
   let calls = 0;
   const runner = async (): Promise<ClaudeResult> => {
     calls += 1;
@@ -468,6 +468,47 @@ async function scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman(): Promise<
   );
   const log = spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "";
   check("max cycle 소진: product checkpoint commit이 실제로 생성됨", log.trim().split("\n").length > 1);
+}
+
+// ---------------------------------------------------------------------------
+// AutoDev Core Maintenance(2026-08-30) — 위 7/8과 정반대 대조군: MAX_REVIEW_CYCLES 소진이
+// "다양한 이유로 계속 REVISE"가 아니라 "동일한 required test 실패가 결정론적으로 반복"되어
+// 발생하면(§ orchestrator.ts DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX), 무제한
+// backoff-and-retry 대신 genuine WAITING_HUMAN으로 승격해야 한다. 위 시나리오와 마찬가지로
+// GPT reviewer는 항상 PASS를 반환하지만(REVISE는 오직 requiredTestsFailed 강제 override로만
+// 발생), required test 자체가 매 attempt마다 완전히 동일하게 실패한다 — "다양한 이유"가
+// 아니라 "같은 이유"임을 대조하기 위해 위 시나리오와 나란히 둔다.
+// ---------------------------------------------------------------------------
+async function scenarioMaxCycleExhaustionWithDeterministicRepeatEscalatesToWaitingHuman(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildManifest(repo, statePath, [taskDef]);
+  // 매 attempt마다 완전히 동일한 실패(name/command/exitCode/stderrTail 전부 동일)를 반환한다
+  // — computeFailureFingerprint가 매번 같은 값이 되어 stagnationTracker의 repeatCount가
+  // 계속 증가한다(다양한 실패가 아니라 "같은" 실패).
+  const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt", [
+    { name: "proj:check", pass: false, failureEvidence: { command: "node proj/check.mjs", exitCode: 1, stderrTail: "AssertionError: 항상 동일하게 실패" } },
+  ]);
+  const gptReviewer = fakeReviewer({ decision: "PASS" }); // REVISE는 오직 requiredTestsFailed override로만 발생.
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+
+  check("결정론적 반복: developer가 MAX_REVIEW_CYCLES(5)를 넘어 무제한 재시도되지 않음", callCount() === 5);
+  check("결정론적 반복: outcome이 APPROVED_AND_CHECKPOINTED가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("결정론적 반복: state.status=WAITING_HUMAN(무제한 backoff-and-retry로 새지 않음)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "결정론적 반복: deferredHumanTasks에 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
+  );
+  check(
+    "결정론적 반복: reviewStagnationWaitCount는 증가하지 않음(backoff 경로를 타지 않았으므로)",
+    (finalState.reviewStagnationWaitCount ?? 0) === 0
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +914,7 @@ async function main(): Promise<void> {
     await scenarioRequiredTestFailureBlocksCompletion();
     await scenarioCriticalHighBlocksApproval();
     await scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman();
+    await scenarioMaxCycleExhaustionWithDeterministicRepeatEscalatesToWaitingHuman();
     await scenarioReviewerErrorNotFailOpen();
     await scenarioApprovedRunRecordsRealEvents();
     await scenarioProductionEntrypointInjectsEventStoreByDefault();

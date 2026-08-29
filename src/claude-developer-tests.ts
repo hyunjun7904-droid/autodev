@@ -387,6 +387,82 @@ async function scenarioTrim_taskHeaderAndFileSnapshotSurviveTrimming(): Promise<
   }
 }
 
+// AutoDev Core Maintenance(2026-08-30) — fileSnapshots 총 크기 상한(§ MAX_FILE_SNAPSHOTS_
+// TOTAL_CHARS=400,000). safe-executor.ts의 MAX_READ_CHARS_PER_FILE(8,000)이 파일당 READ_FILES
+// 결과를 이미 잘라내므로, 이 상한을 실제로 넘기려면 서로 다른 파일이 최소 51개 필요하다 —
+// discovery round 예산(DISCOVERY_BUDGET_ROUNDS=6, 그 이후 READ_FILES 자체가 잠긴다) 안에서
+// 이만큼 읽으려면 한 round에 여러 파일을 한 번에(paths 배열) 읽어야 한다. round1에서
+// batch1(30개, ~240,000자)을 읽고, round2에서 batch2(30개, ~240,000자)를 추가로 읽으면
+// 합계(~480,000자)가 상한을 넘어 batch1(더 먼저 읽힌 쪽)부터 evict돼야 한다.
+async function scenarioFileSnapshotsCap_evictsOnlyLeastRecentlyReadFiles(): Promise<void> {
+  const BATCH_SIZE = 30;
+  const makeBatch = (batchTag: string) =>
+    Array.from({ length: BATCH_SIZE }, (_, i) => {
+      const tag = `${batchTag}-${String(i).padStart(2, "0")}`;
+      const rel = `automation/tmp-claude-developer-snapshot-cap-${tag}.txt`;
+      const abs = resolve(PROJECT_ROOT, rel);
+      writeFileSync(abs, `SNAPSHOT_CAP_MARKER_${tag}\n` + "X".repeat(9_000), "utf-8");
+      return { tag, rel, abs };
+    });
+  const batch1 = makeBatch("B1");
+  const batch2 = makeBatch("B2");
+  const allFiles = [...batch1, ...batch2];
+
+  const readBatch = (files: { rel: string }[]) =>
+    JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "READ_FILES", paths: files.map((f) => f.rel) }] });
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "snapshot cap 검증 완료", changedFiles: [], testsRequested: [] });
+
+  const scripts = [readBatch(batch1), readBatch(batch2), taskComplete];
+  const scripted = makeScriptedClaudeCaller(scripts);
+
+  try {
+    const result = await runDeveloperTaskViaSafeExecutor("fileSnapshots 상한 검증 시나리오", 1, { claudeCaller: scripted.call });
+    check("SnapshotCap: success=true", result.success === true);
+    check("SnapshotCap: 정확히 3라운드(batch1 read + batch2 read + 완료)", scripted.callCount() === 3);
+
+    const finalInput = scripted.receivedInputs[scripted.receivedInputs.length - 1];
+    check(
+      "SnapshotCap: 더 먼저(1라운드) 읽힌 batch1은 evict됨(상한 초과로 제거)",
+      !finalInput.includes(`SNAPSHOT_CAP_MARKER_${batch1[0].tag}`)
+    );
+    check(
+      "SnapshotCap: 더 나중(2라운드)에 읽힌 batch2는 살아남음",
+      finalInput.includes(`SNAPSHOT_CAP_MARKER_${batch2[0].tag}`)
+    );
+  } finally {
+    for (const f of allFiles) if (existsSync(f.abs)) unlinkSync(f.abs);
+    check("SnapshotCap: fixture 정리 완료", allFiles.every((f) => !existsSync(f.abs)));
+  }
+}
+
+// AutoDev Core Maintenance(2026-08-30) — DeveloperTaskOptions.onContextMetrics가 매 round
+// 실제로 호출되고, 그 값이 buildDeveloperContextMetrics()가 계산하는 것과 동일한 필드를
+// 담는지 검증한다(§ autodev.ts가 이 콜백을 event-store.ts에 배선하는 것과 별개로, 이
+// 콜백 자체가 claude-developer.ts 쪽에서 정확히 동작하는지). 콜백이 예외를 던져도 실제
+// 개발 흐름에 영향을 주지 않아야 한다(no-op 안전성).
+async function scenarioOnContextMetricsCalledEveryRoundAndThrowIsSafe(): Promise<void> {
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "완료", changedFiles: [], testsRequested: [] });
+  const scripts = [
+    JSON.stringify({ type: "PLAN", summary: "계획" }),
+    taskComplete,
+  ];
+  const scripted = makeScriptedClaudeCaller(scripts);
+
+  const observed: { attempt: number; round: number }[] = [];
+  const result = await runDeveloperTaskViaSafeExecutor("onContextMetrics 검증 시나리오", 7, {
+    claudeCaller: scripted.call,
+    onContextMetrics: (m) => {
+      observed.push({ attempt: m.attempt, round: m.round });
+      throw new Error("의도적 콜백 예외 — 실제 개발 흐름에 영향 없어야 함");
+    },
+  });
+
+  check("onContextMetrics: success=true(콜백 예외에도 개발 흐름 정상 진행)", result.success === true);
+  check("onContextMetrics: 정확히 2회(라운드마다 1회) 호출됨", observed.length === 2);
+  check("onContextMetrics: attempt 값이 전달한 그대로(7) 담김", observed.every((o) => o.attempt === 7));
+  check("onContextMetrics: round 값이 1,2 순서로 담김", observed[0]?.round === 1 && observed[1]?.round === 2);
+}
+
 async function scenarioE_planCannotResetDiscoveryBudgetIndefinitely(): Promise<void> {
   // E(REVISE) — 이전 버전은 PLAN이 무진척 카운터를 매번 0으로 리셋해, PLAN만 반복하면
   // 20라운드 전부를 소모한 뒤에야 TASK_ACTION_LIMIT으로 끝났다. 이제 PLAN도 discovery-only
@@ -904,12 +980,14 @@ async function scenarioO_manyConsecutiveUsageLimitRetriesStillRecoverWithoutCons
   const scripted = makeUsageLimitAwareScriptedCaller([writeRound, ...manyUsageLimits, taskComplete]);
   const fastSleep = makeFastSleep();
 
+  const usageLimitWaitEvents: { phase: "START" | "END" }[] = [];
   try {
     const result = await runDeveloperTaskViaSafeExecutor("USAGE_LIMIT 22회 연속 시나리오", 1, {
       claudeCaller: scripted.call,
       sleep: fastSleep.sleep,
       usageLimitWaitMs: 1,
       usageLimitMaxRetries: 25,
+      onUsageLimitWait: (info) => usageLimitWaitEvents.push({ phase: info.phase }),
     });
 
     check("O: MAX_INTERNAL_ROUNDS(20)보다 많은 USAGE_LIMIT(22회)을 겪고도 정상 복구", result.success === true);
@@ -917,6 +995,12 @@ async function scenarioO_manyConsecutiveUsageLimitRetriesStillRecoverWithoutCons
     check("O: 총 24회 Claude 호출(write1 + usageLimit 22회 + complete) — round 20 제한과 무관하게 성공", scripted.callCount() === 24);
     check("O: sleep이 정확히 22회 호출됨(매 USAGE_LIMIT마다 대기)", fastSleep.callCount() === 22);
     check("O: errorCode가 TASK_ACTION_LIMIT이 아님(round budget이 소비되지 않았다는 직접 증거)", result.errorCode !== "TASK_ACTION_LIMIT");
+    check(
+      "O: onUsageLimitWait이 매 재시도마다 START/END 쌍으로 정확히 44회(22*2) 호출됨(§ work-time.ts computeUsageLimitWaitMs)",
+      usageLimitWaitEvents.length === 44 &&
+        usageLimitWaitEvents.filter((e) => e.phase === "START").length === 22 &&
+        usageLimitWaitEvents.filter((e) => e.phase === "END").length === 22
+    );
   } finally {
     if (existsSync(fixtureAbs)) unlinkSync(fixtureAbs);
   }
@@ -1231,6 +1315,8 @@ async function main(): Promise<void> {
     await scenarioD_writeFirstThenRepeatedReadNeverStagnates();
     await scenarioDedup_repeatedReadOfSameFileDoesNotDuplicateOldSnapshots();
     await scenarioTrim_taskHeaderAndFileSnapshotSurviveTrimming();
+    await scenarioFileSnapshotsCap_evictsOnlyLeastRecentlyReadFiles();
+    await scenarioOnContextMetricsCalledEveryRoundAndThrowIsSafe();
     await scenarioE_planCannotResetDiscoveryBudgetIndefinitely();
     await scenarioF_planThenWriteSucceeds();
     await scenarioG_requiredTestsExecutedForReal();

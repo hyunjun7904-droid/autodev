@@ -2,7 +2,11 @@ import { classifyWaitingHumanReason, isTechnicalAutoRecoverableWaitingHuman, ext
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
-import { MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX, CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX } from "./orchestrator";
+import {
+  MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
+  CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
+  DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX,
+} from "./orchestrator";
 import type { CoreState } from "./types";
 
 // human-gate-policy.ts 전용 회귀 테스트 — Canonical Human Gate Policy Evaluator가 순수
@@ -187,6 +191,23 @@ function scenarioClaudeStructuralFailureIsGenuine(): void {
   );
 }
 
+// AutoDev Core Maintenance(2026-08-30) — 같은 cycle에 STAGNATION_DETECTED가 먼저 push되고
+// (repeatCount===2 시점) 그 후 이 마커가 MAX_REVIEW_CYCLES 소진 시점에 함께 push되는 실제
+// 순서를 그대로 재현한다. § 위 두 시나리오와 동일한 co-occurrence 안전장치 패턴.
+function scenarioStagnationDetectedWithDeterministicReviewCycleExhaustedStaysGenuine(): void {
+  const s = state({
+    deferredHumanTasks: [
+      `${STAGNATION_DETECTED_MARKER_PREFIX}IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨`,
+      `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX} reviewCycle=5에서 동일 required test 실패가 4회 반복된 채 MAX_REVIEW_CYCLES(5) 도달`,
+    ],
+  });
+  check(
+    "STAGNATION_DETECTED와 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED가 함께 있으면 GENUINE 유지(무제한 backoff로 조용히 새지 않음)",
+    classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT"
+  );
+  check("isTechnicalAutoRecoverableWaitingHuman()도 동일하게 false", !isTechnicalAutoRecoverableWaitingHuman(s));
+}
+
 function scenarioUnknownReasonDefaultsToGenuine(): void {
   const s = state({ deferredHumanTasks: [] });
   check("알려진 기술 마커가 전혀 없으면(예: HIGH_RISK_ACTION_PREGATE/사용량 제한) fail-closed로 GENUINE", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
@@ -226,6 +247,7 @@ function main(): void {
   scenarioStagnationDetectedAloneIsTechnical();
   scenarioStagnationDetectedWithGenuineMarkerStaysGenuine();
   scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine();
+  scenarioStagnationDetectedWithDeterministicReviewCycleExhaustedStaysGenuine();
   scenarioClaudeStructuralFailureIsGenuine();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();

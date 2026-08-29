@@ -49,6 +49,7 @@ import type { LockCheckResult } from "./dashboard-supervisor";
 export const DEFAULT_RUNNER_BACKOFF_SCHEDULE_MS = [5_000, 15_000, 30_000];
 export const DEFAULT_RUNNER_COOLDOWN_MS = 60_000;
 export const DEFAULT_RUNNER_SUSTAINED_UPTIME_RESET_MS = 5 * 60_000;
+export const DEFAULT_MAINTENANCE_POLL_INTERVAL_MS = 2_000;
 const OUTPUT_TAIL_MAX_CHARS = 4_000;
 
 export interface RunnerSupervisorConfig {
@@ -62,6 +63,9 @@ export interface RunnerSupervisorConfig {
   backoffScheduleMs: number[];
   cooldownMs: number;
   sustainedUptimeResetMs: number;
+  /** Maintenance Pause(§ 아래 "Maintenance Pause — spawn-only 일시정지") 마커가 감지된
+   *  동안, 다음 spawn 시도 전에 이 간격으로 재확인한다. */
+  maintenancePollMs: number;
 }
 
 export interface SupervisedRunnerChild {
@@ -74,11 +78,32 @@ export interface RunnerSupervisorDeps {
   sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   now: () => number;
   log: (fields: DashboardLogFields) => void;
+  /** Maintenance Pause(§ 아래) 마커가 현재 세워져 있는지 확인한다 — supervisor 자신은 이
+   *  판정 자체를 갖지 않고 순수하게 이 dep에 위임한다(project-lock.ts와 역할을 섞지 않기
+   *  위해 별도 primitive로 분리, § runner-supervisor.ts 상단 주석 "Maintenance Pause" 절). */
+  isMaintenancePaused: () => boolean;
 }
 
 /** dashboard-supervisor.ts의 runSupervisorLoop와 동일한 구조(순수 함수, 실제 OS spawn 없이
  *  테스트 가능) — 포트 확인 단계가 없다(러너는 서버가 아니다): "child가 살아있는 동안은
- *  아무것도 하지 않고 exit을 기다린다 → 죽으면 backoff 후 재시작"만 반복한다. */
+ *  아무것도 하지 않고 exit을 기다린다 → 죽으면 backoff 후 재시작"만 반복한다.
+ *
+ * Maintenance Pause — spawn-only 일시정지(2026-08-30, controlled resume 실측 후속 조치) —
+ * 실제 production incident: 이전 controlled resume 시도에서 "controlled run 종료 →
+ * project-lock 재획득" 사이에 이 supervisor가 새 child를 spawn해 의도하지 않은 추가 Developer
+ * 호출이 발생했다(hold-jarvis-lock.js가 project-lock을 놓는 순간과, 사람이 그것을 다시 잡는
+ * 순간 사이의 TOCTOU). project-lock.ts는 "누가 지금 이 project의 유일한 writer인가"만
+ * 판정할 뿐 "supervisor가 지금 새 writer를 만들어도 되는가"는 전혀 모른다(project-lock을
+ * spawn 이전 검사에 섞으면 이미 spawn된 child 스스로도 같은 lock을 잡으려 하므로 역할이
+ * 겹친다) — 그래서 이 둘은 의도적으로 분리된 별도 판정이다: project-lock은 "이미 시작된
+ * writer들 사이의 상호배제", Maintenance Pause는 "애초에 새 writer를 시작할지 여부".
+ *
+ * 이 supervisor 프로세스 자체를 죽이지 않고 spawn 판단 지점 단 한 곳(다음 child를 spawn하기
+ * 직전, backoff wait가 끝난 뒤)에 게이트를 하나 추가한다 — 이미 살아있는 child를 강제 종료하지
+ * 않고(자연 종료를 기다린다), consecutiveFailures/backoff 스케줄은 전혀 건드리지 않는다(그냥
+ * spawn 직전에 추가로 한 번 더 기다릴 뿐이다). isMaintenancePaused()가 참인 동안은
+ * maintenancePollMs 간격으로 재확인하며 spawn을 미룬다 — abort되면 그 대기도 즉시 끝난다.
+ * 마커가 사라진 뒤에야 정상 backoff/spawn 흐름으로 복귀한다. */
 export async function runRunnerSupervisorLoop(config: RunnerSupervisorConfig, deps: RunnerSupervisorDeps, signal: AbortSignal): Promise<void> {
   let consecutiveFailures = 0;
   while (!signal.aborted) {
@@ -87,6 +112,14 @@ export async function runRunnerSupervisorLoop(config: RunnerSupervisorConfig, de
       deps.log({ event: "RESTART_SCHEDULED", consecutiveFailures, delayMs });
       await deps.sleep(delayMs, signal);
       if (signal.aborted) break;
+    }
+    if (deps.isMaintenancePaused()) {
+      deps.log({ event: "MAINTENANCE_PAUSE_ACTIVE" });
+      while (deps.isMaintenancePaused() && !signal.aborted) {
+        await deps.sleep(config.maintenancePollMs, signal);
+      }
+      if (signal.aborted) break;
+      deps.log({ event: "MAINTENANCE_PAUSE_CLEARED" });
     }
     const child = deps.spawnChild();
     const startedAt = deps.now();
@@ -117,6 +150,38 @@ function realSleep(ms: number, signal: AbortSignal): Promise<void> {
  *  원칙 — 파일 경로 escape 방지). */
 export function sanitizeForFilename(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_.-]/g, "_");
+}
+
+/** Maintenance Pause 마커 파일 경로를 project별로 결정한다 — lock 파일과 동일한
+ *  sanitizeForFilename()을 재사용해 project adapter 경로를 안전한 파일명으로 바꾼다(§ 요구사항
+ *  "project-lock과 역할을 섞지 않음" — 그래서 lock 파일과는 다른 확장자/접두사의 완전히 별도
+ *  파일이다). 이 파일이 "존재하는가"만이 유일한 상태다 — 내용은 사람이 읽을 수 있는 진단
+ *  메타데이터일 뿐 판정에 쓰이지 않는다(§ engageMaintenancePause). 외부 제어 스크립트와
+ *  runner-supervisor.js 본체, 그리고 테스트가 모두 이 함수 하나로만 경로를 계산해 서로 다른
+ *  경로를 가리키는 실수를 구조적으로 방지한다. */
+export function maintenancePauseMarkerPath(adapterPath: string, logsDir: string): string {
+  return join(logsDir, `runner-supervisor-maintenance-${sanitizeForFilename(adapterPath)}.pause`);
+}
+
+/** 마커 파일을 생성해 Maintenance Pause를 켠다(§ isMaintenancePaused는 이 파일의 존재 여부만
+ *  본다). 이미 마커가 있으면(중복 engage) 그대로 둔다 — 여러 제어 스크립트가 겹쳐 호출해도
+ *  안전하다. */
+export function engageMaintenancePause(adapterPath: string, logsDir: string, reason: string): void {
+  if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
+  const markerPath = maintenancePauseMarkerPath(adapterPath, logsDir);
+  writeFileSync(markerPath, `${JSON.stringify({ engagedAt: new Date().toISOString(), reason }, null, 2)}\n`, "utf-8");
+}
+
+/** 마커 파일을 지워 Maintenance Pause를 해제한다. 이미 없으면(중복 clear) 조용히 성공으로
+ *  본다 — release/clear 계열 함수가 idempotent해야 한다는 이 저장소 전반의 관례(§
+ *  releaseProjectLock의 "이미 없음"과 동일한 원칙)를 그대로 따른다. */
+export function clearMaintenancePause(adapterPath: string, logsDir: string): void {
+  const markerPath = maintenancePauseMarkerPath(adapterPath, logsDir);
+  try {
+    unlinkSync(markerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
 }
 
 function resolveAdapterPath(): string | undefined {
@@ -176,9 +241,12 @@ function main(): void {
     backoffScheduleMs: DEFAULT_RUNNER_BACKOFF_SCHEDULE_MS,
     cooldownMs: DEFAULT_RUNNER_COOLDOWN_MS,
     sustainedUptimeResetMs: DEFAULT_RUNNER_SUSTAINED_UPTIME_RESET_MS,
+    maintenancePollMs: DEFAULT_MAINTENANCE_POLL_INTERVAL_MS,
   };
+  const maintenanceMarkerPath = maintenancePauseMarkerPath(adapterPath, logsDir);
 
   const deps: RunnerSupervisorDeps = {
+    isMaintenancePaused: () => existsSync(maintenanceMarkerPath),
     spawnChild: () => {
       // shell:false(기본값) — 커맨드라인 문자열 조립/quote 파싱이 전혀 없다(§ 파일 상단
       // 주석 2). detached:false로 충분하다 — 이 supervisor 프로세스 자신이 이미 harness의

@@ -19,6 +19,20 @@ export interface ClaudeResult {
       stderrTail?: string;
       stdoutTail?: string;
     };
+    /**
+     * AutoDev Core Maintenance(2026-08-30) — 명령이 spawn조차 되지 못하고 Safe Executor(Core
+     * Command Safety Gate/Trusted Executable Resolution/policy.commandCwdAliases 등)에 의해
+     * 거부됐을 때(§ failureEvidence가 없는 바로 그 경우)의 실제 거부 사유. 이 필드를
+     * failureEvidence 안에 넣지 않는다 — failure-stagnation.ts classifyFailureCategory()의
+     * `!t.failureEvidence` 판정("명령이 실제로 spawn됐는가")이 이미 이 두 상태를 구분하는
+     * 기존 신호이므로, failureEvidence를 항상 채우게 바꾸면 그 판정이 조용히 깨진다(§ 요구사항
+     * "기존 신호를 약화하지 않는다"). 실제 JARVIS Task 5.2 관측 — denyReason(예:
+     * "TRUSTED_EXECUTABLE_NOT_FOUND: .../gradlew.bat가 존재하지 않습니다")이 지금까지는
+     * automation.log에만 남고 Developer/Reviewer 어느 쪽에도 전달되지 않아, 실제로는
+     * 정확히 인프라 설정 문제로 이미 분류됐음에도(errorType: INFRASTRUCTURE_CONFIGURATION)
+     * 그 구체적 원인을 아무도 볼 수 없었다 — Developer는 매 attempt마다 이유를 추측했다.
+     */
+    denyReason?: string;
   }[];
   /**
    * AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 8 —

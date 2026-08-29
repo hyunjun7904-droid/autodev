@@ -1,9 +1,13 @@
 import { readFileSync, writeFileSync, renameSync, mkdtempSync, rmSync, lstatSync, readdirSync, openSync, fsyncSync, closeSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
-import type { RequiredTestCommand } from "./task-registry";
+import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
+import { findTaskById } from "./task-registry";
 import { log } from "./logger";
 import { scanContentForSecrets } from "./secret-scanner";
+import { resolveTrustedGradleWrapper } from "./gradle-capability";
+import type { GradleWrapperResolveTestDeps } from "./gradle-capability";
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening — Phase 3/4.
 //
@@ -117,6 +121,138 @@ export function checkRequiredTestScriptRegistration(
   return { ok: issues.length === 0, issues, skippedUnsupportedCwd };
 }
 
+// AutoDev Core Maintenance(2026-08-30) — Deterministic Execution-Environment Preflight.
+//
+// § JARVIS Task 5.2 실측 근본원인: checkRequiredTestScriptRegistration()은 "npm run X" 형태의
+// requiredTest만 검증한다 — cwd 별칭이 가리키는 디렉터리가 실제로 존재하는지, gradlew류
+// wrapper-style executable이 그 디렉터리 안에 실제로 있는지는 어디서도(execution-contract.ts는
+// 별칭 "키"가 정의됐는지만 확인하고 fs 접근을 하지 않는다, trusted-executable-resolver.ts/
+// gradle-capability.ts는 실제 RUN_COMMAND 실행 시점에만 호출된다) 사전에 확인하지 않는다.
+// 그 결과 JARVIS의 wakeword-unit(cwd:"root", 실제 gradlew.bat은 android/wakeword/에 존재)
+// 같은 순수 설정 오류가 Developer를 5회 호출한 뒤에야 TRUSTED_EXECUTABLE_NOT_FOUND로만
+// 관측됐다 — Developer는 그 실패를 command allow-list 문제로 오인하고 gradlew/build.gradle.kts
+// bootstrap 로직을 반복해서 다시 작성했다(§ logs/problem-memory/JARVIS.json).
+//
+// 이 함수는 Developer/Reviewer를 부르기 전에(§ autodev.ts, checkRequiredTestScriptRegistration과
+// 같은 자리) requiredTest마다 cwd가 실제로 존재하는 디렉터리로 resolve되는지, 그리고
+// gradlew류 wrapper-style executable이면 그 wrapper 파일 자체가 실제로 있는지를 순수 fs
+// 판정으로 확인한다. Android/Node/Python/단일 파일 scope 어디에도 특정 프로젝트를 하드코딩하지
+// 않는다 — "resolved cwd가 디렉터리로 존재하는가"는 어떤 project type에도 적용되는 일반
+// 검사이고, wrapper 파일 존재 확인은 WRAPPER_STYLE_EXECUTABLE_BASE_NAMES에 등록된 executable
+// family에만 적용된다(현재 gradlew — mvnw 등 다른 wrapper family를 추가할 여지는 남겨둔다).
+//
+// 자동 복구(self-heal)는 만들지 않는다 — checkRequiredTestScriptRegistration의 self-heal은
+// 이미 디스크에 존재하는 테스트 파일 경로 하나를 package.json에 추가하는 것뿐이지만, 이 문제의
+// 실제 수정(commandCwdAliases 추가 + requiredTest.cwd 변경)은 project adapter config
+// (manifest.json의 inline executionPolicy, 그리고 taskRegistryPath가 가리키는 task-registry
+// 데이터 파일)를 바꿔야 한다 — 이 두 파일은 이 프로젝트의 실행 신뢰 경계(어떤 디렉터리에서
+// 명령을 실행할 수 있는지) 자체를 정의하는 데이터이므로, package.json script 등록보다 훨씬
+// 민감하다. AutoDev Core는 지금까지 이 파일들에 전혀 쓰지 않았고(project-adapter-loader.ts는
+// 오직 read-only), 이 Task 범위에서 그 새 쓰기 경로를 만들지 않는다 — 사람이 직접 고치거나,
+// 별도로 명시적으로 승인된 Task에서 다뤄야 한다. 이 함수는 감지와 차단만 한다.
+
+export type RequiredTestExecutionEnvironmentIssueKind = "CWD_NOT_FOUND" | "WRAPPER_NOT_FOUND";
+
+export interface RequiredTestExecutionEnvironmentIssue {
+  requiredTestName: string;
+  kind: RequiredTestExecutionEnvironmentIssueKind;
+  /** requiredTest.cwd 원본 값("root" 또는 별칭 이름) — 실제 별칭 매핑 값 자체는 아니다. */
+  cwd: string;
+  resolvedPath: string;
+  reason?: string;
+}
+
+export interface RequiredTestExecutionEnvironmentResult {
+  ok: boolean;
+  issues: RequiredTestExecutionEnvironmentIssue[];
+}
+
+/** execution-contract.ts의 validateRequiredTestExecutionContract()가 이미 검증한 것과
+ *  독립적으로, 이 함수는 fs 접근이 필요한 부분만 담당한다(§ 파일 상단 — 그 파일은
+ *  의도적으로 fs-free로 유지된다). */
+export interface RequiredTestExecutionEnvironmentExecutor {
+  projectRoot: string;
+  projectRootReal: string;
+  policy: { commandCwdAliases?: Record<string, string> };
+}
+
+// gradlew.exe/.bat/.cmd 등은 safe-executor.ts normalizeExecutableBase()와 동일한 규칙으로
+// 정규화된다 — 여기서도 그 규칙을 재사용하지 않고 최소한으로 재구현한다(이 파일은
+// safe-executor.ts를 import하지 않는다, § 순환 의존성 회피 — safe-executor.ts는 이미 이
+// 파일의 상위 계층인 autodev.ts에서만 함께 쓰인다).
+function normalizeWrapperExecutableBase(command: string): string {
+  return command.trim().toLowerCase().replace(/\.(exe|cmd|bat|com)$/, "");
+}
+
+/** wrapper 파일 자체의 존재를 별도로 확인해야 하는 executable family. gradlew만 등록돼
+ *  있다 — 다른 wrapper family(예: mvnw)를 추가하려면 대응하는 resolveTrusted*Wrapper()
+ *  함수가 먼저 필요하다(이 목록에 이름만 추가한다고 검증이 생기지 않는다). */
+const WRAPPER_STYLE_EXECUTABLE_BASE_NAMES: ReadonlySet<string> = new Set(["gradlew"]);
+
+/**
+ * Claude Developer를 부르기 전에 호출한다. requiredTests 각각에 대해 cwd가 resolve하는
+ * 절대경로가 실제로 존재하는 디렉터리인지 확인하고, wrapper-style executable이면 그
+ * wrapper 파일 자체의 존재/신뢰도까지 확인한다(resolveTrustedGradleWrapper 재사용 — 로직
+ * 복제 없음). alias 키 자체가 정의되지 않은 경우는 이 함수의 대상이 아니다(그 구조적 오류는
+ * execution-contract.ts가 spec-planning 시점에 이미 차단한다) — 조용히 skip한다.
+ */
+export function checkRequiredTestExecutionEnvironment(
+  requiredTests: RequiredTestCommand[] | undefined,
+  executor: RequiredTestExecutionEnvironmentExecutor,
+  /** 테스트 전용 — 지정하지 않으면 production과 완전히 동일(process.platform, 실제 fs/env)하게
+   *  동작한다. resolveTrustedGradleWrapper()로 그대로 전달한다(로직 복제 없음) — Windows에서
+   *  회귀 테스트가 JAVA_HOME 없이도 결정론적으로 동작하도록 platform을 고정할 수 있게 한다. */
+  gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps }
+): RequiredTestExecutionEnvironmentResult {
+  if (!requiredTests || requiredTests.length === 0) return { ok: true, issues: [] };
+  const issues: RequiredTestExecutionEnvironmentIssue[] = [];
+
+  for (const rt of requiredTests) {
+    let resolvedPath: string;
+    if (rt.cwd === "root") {
+      resolvedPath = executor.projectRoot;
+    } else {
+      const alias = executor.policy.commandCwdAliases?.[rt.cwd];
+      if (alias === undefined) continue; // § 위 주석 — execution-contract.ts의 대상.
+      resolvedPath = join(executor.projectRoot, alias);
+    }
+
+    let st;
+    try {
+      st = lstatSync(resolvedPath);
+    } catch {
+      issues.push({ requiredTestName: rt.name, kind: "CWD_NOT_FOUND", cwd: rt.cwd, resolvedPath, reason: "디렉터리가 존재하지 않습니다." });
+      continue;
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) {
+      issues.push({
+        requiredTestName: rt.name,
+        kind: "CWD_NOT_FOUND",
+        cwd: rt.cwd,
+        resolvedPath,
+        reason: st.isSymbolicLink() ? "경로가 symlink입니다(허용되지 않음)." : "경로가 디렉터리가 아닙니다.",
+      });
+      continue;
+    }
+
+    const base = normalizeWrapperExecutableBase(rt.command);
+    if (!WRAPPER_STYLE_EXECUTABLE_BASE_NAMES.has(base)) continue;
+
+    const wrapperResult = resolveTrustedGradleWrapper({
+      moduleAbs: resolvedPath,
+      projectRootReal: executor.projectRootReal,
+      excludedRootsForJava: [executor.projectRoot, executor.projectRootReal, resolvedPath, tmpdir()],
+      platform: gradleTestOverrides?.platform,
+      testDeps: gradleTestOverrides?.gradleTestDeps,
+    });
+    if (!wrapperResult.ok) {
+      issues.push({ requiredTestName: rt.name, kind: "WRAPPER_NOT_FOUND", cwd: rt.cwd, resolvedPath, reason: wrapperResult.reason });
+    }
+  }
+
+  return { ok: issues.length === 0, issues };
+}
+
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
 // Stale REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN Reconciliation.
 //
@@ -155,6 +291,58 @@ export function reconcileStaleRequiredTestConfigurationTasks(
   if (!pkg.ok) return { resolved: false };
   const allRegistered = scripts.every((s) => Object.prototype.hasOwnProperty.call(pkg.scripts, s));
   return { resolved: allRegistered };
+}
+
+// AutoDev / JARVIS Unattended Continuous Development Reliability Hardening(2026-08-30,
+// JARVIS Task 5.2 실측) — Stale REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN
+// Reconciliation. checkRequiredTestExecutionEnvironment()가 WRAPPER_NOT_FOUND 등을 이유로
+// state.deferredHumanTasks에 남긴 고정 템플릿 문자열(§ autodev.ts BLOCKED_REQUIRED_TEST_
+// EXECUTION_ENVIRONMENT 분기)을 다시 파싱해, 그 실행 환경 결함이 *지금도* 재현되는지
+// 동일한 checkRequiredTestExecutionEnvironment()로 재확인한다 — 이 파일이 만드는 것은 그
+// 하나뿐이다: "같은 원인으로 남은 WAITING_HUMAN을 같은 deterministic 검사로 다시 확인"이지,
+// WRAPPER_NOT_FOUND류 결함을 스스로 고치는 어떤 자동복구도 아니다(그런 로직은 이 함수에
+// 없다). reconcileStaleRequiredTestConfigurationTasks()(§ 위)와 완전히 동일한 fail-closed
+// 설계를 그대로 재사용한다 — 배열 안에 이 마커 형식이 아닌 항목이 하나라도 섞여 있거나,
+// 서로 다른 taskId를 가리키는 마커가 섞여 있으면 절대 resolved로 판정하지 않는다(어떤
+// genuine 사람 판단 필요 상태도, 그리고 다른 task의 상태도 이 재검사로 조용히 해제되지
+// 않는다). taskRegistry에서 taskId를 찾지 못해도(레지스트리가 그 사이 바뀐 경우 등) 추측하지
+// 않고 resolved:false로 fail-closed한다.
+const REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN =
+  /^REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=(\S+) requiredTest=\S+ kind=\S+ cwd=\S+ resolvedPath=.+$/;
+
+export interface StaleRequiredTestExecutionEnvironmentReconciliation {
+  /** true면 deferredHumanTasks 전체가 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 형태였고
+   *  전부 같은 taskId를 가리켰으며, 그 task의 required tests에 대해
+   *  checkRequiredTestExecutionEnvironment()를 다시 실행한 결과 더 이상 어떤 issue도 없다
+   *  — 호출부가 안전하게 WAITING_HUMAN을 해제하고 이 배열을 비울 수 있다. */
+  resolved: boolean;
+}
+
+/** state.status==="WAITING_HUMAN"이고 state.humanFinalReview가 없을 때만 호출한다(§
+ *  reconcileStaleRequiredTestConfigurationTasks와 동일한 호출 전제). Developer/Claude/GPT
+ *  어떤 프로세스도 spawn하지 않는다 — checkRequiredTestExecutionEnvironment()와 동일하게
+ *  순수 fs/실행파일 resolve 판정만 수행한다. */
+export function reconcileStaleRequiredTestExecutionEnvironmentTasks(
+  deferredHumanTasks: readonly string[],
+  taskRegistry: readonly TaskDefinition[],
+  executor: RequiredTestExecutionEnvironmentExecutor,
+  /** 테스트 전용 — checkRequiredTestExecutionEnvironment()로 그대로 전달한다(§ 그 함수의
+   *  동일 파라미터 주석). production 호출부(autodev.ts)는 이 값을 지정하지 않는다. */
+  gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps }
+): StaleRequiredTestExecutionEnvironmentReconciliation {
+  if (deferredHumanTasks.length === 0) return { resolved: false };
+  let taskId: string | undefined;
+  for (const entry of deferredHumanTasks) {
+    const m = REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN.exec(entry);
+    if (!m) return { resolved: false };
+    if (taskId === undefined) taskId = m[1];
+    else if (taskId !== m[1]) return { resolved: false };
+  }
+  if (taskId === undefined) return { resolved: false };
+  const taskDef = findTaskById(taskRegistry, taskId);
+  if (!taskDef) return { resolved: false };
+  const recheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executor, gradleTestOverrides);
+  return { resolved: recheck.ok };
 }
 
 const IGNORED_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build"]);

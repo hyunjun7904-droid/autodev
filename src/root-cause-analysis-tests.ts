@@ -29,6 +29,9 @@ function failingTest(name: string, command: string, exitCode: number, stderrTail
 function neverExecutedFailingTest(name: string): ClaudeResult["tests"] {
   return [{ name, pass: false }];
 }
+function deniedFailingTest(name: string, denyReason: string): ClaudeResult["tests"] {
+  return [{ name, pass: false, denyReason }];
+}
 
 function fakeResult(overrides: Partial<ClaudeResult> = {}): ClaudeResult {
   return {
@@ -102,6 +105,26 @@ function scenario10_SecurityBlockedClassifiedAsSecurityOrPolicy(): void {
 function scenario11_ProviderRateLimitNotMisclassifiedAsImplementation(): void {
   const category = classifyRootCause({ claudeErrorCode: "TIMEOUT", tests: [] });
   check("11) Provider rate limit/timeout은 PROVIDER_ERROR로 분류되고 IMPLEMENTATION_ERROR로 오분류되지 않음", category === "PROVIDER_ERROR");
+}
+
+// AutoDev Core Maintenance(2026-08-30) — 새 RootCauseCategory additive 확장.
+function scenario12_UsageLimitClassifiedDedicated(): void {
+  const category = classifyRootCause({ claudeErrorCode: "USAGE_LIMIT", tests: [] });
+  check("12) USAGE_LIMIT은 이제 PROVIDER_ERROR로 뭉뚱그려지지 않고 전용 카테고리로 분류됨", category === "USAGE_LIMIT");
+}
+
+function scenario13_TrustedExecutableDenyReasonClassifiedAsPathResolution(): void {
+  const category = classifyRootCause({
+    tests: deniedFailingTest("wakeword-unit", "Executable Identity Trust(TRUSTED_EXECUTABLE_NOT_FOUND): gradlew.bat가 존재하지 않습니다."),
+  });
+  check("13) denyReason에 TRUSTED_EXECUTABLE_NOT_FOUND 코드가 그대로 있으면 PATH_RESOLUTION으로 분류됨(§ JARVIS Task 5.2)", category === "PATH_RESOLUTION");
+}
+
+function scenario14_DenyReasonWithoutTrustCodeStaysInfrastructure(): void {
+  // denyReason은 있지만 ExecutableTrustErrorCode 토큰이 없는 경우(예: 다른 종류의 거부) —
+  // 추측하지 않고 기존 INFRASTRUCTURE_CONFIGURATION 기본 분류로 안전하게 fall through한다.
+  const category = classifyRootCause({ tests: deniedFailingTest("x", "Core Command Safety Gate: 허용되지 않는 인자입니다.") });
+  check("14) denyReason이 있어도 ExecutableTrustErrorCode 토큰이 없으면 PATH_RESOLUTION으로 오분류하지 않음(INFRASTRUCTURE_CONFIGURATION 유지)", category === "INFRASTRUCTURE_CONFIGURATION");
 }
 
 function scenarioRegistrationDriftClassified(): void {
@@ -347,6 +370,9 @@ async function main(): Promise<void> {
   scenario9_MissingScriptClassifiedAsInfrastructure();
   scenario10_SecurityBlockedClassifiedAsSecurityOrPolicy();
   scenario11_ProviderRateLimitNotMisclassifiedAsImplementation();
+  scenario12_UsageLimitClassifiedDedicated();
+  scenario13_TrustedExecutableDenyReasonClassifiedAsPathResolution();
+  scenario14_DenyReasonWithoutTrustCodeStaysInfrastructure();
   scenarioRegistrationDriftClassified();
   scenarioPlainImplementationDefault();
   scenario4_FailingRequiredTestBlocksLocalVerification();

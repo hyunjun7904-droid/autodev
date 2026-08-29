@@ -319,6 +319,68 @@ export function lookupSolution(ctx: LookupContext): MemoryLookupResult | undefin
   return candidateFrom(commonEntries, "COMMON");
 }
 
+export interface RootCauseClassLookupContext {
+  errorType: FailureCategory;
+  projectStore: ProblemMemoryStore;
+  commonStore: ProblemMemoryStore;
+  /** 이 project 안에서, 이미 이 정확한 해결책을 시도해 실패로 기록한 것은 제외한다(§
+   *  lookupSolution의 alreadyFailedDescriptionsInThisTask와 동일한 원칙 — projectId 전체
+   *  기준, taskId 무관: 다른 task에서 이미 실패로 확인된 해결책을 그대로 다시 추천하지
+   *  않는다). */
+  projectId: string;
+  /** 결과 개수 상한(advisory 힌트 크기를 bounded로 유지) — 기본 3건. */
+  limit?: number;
+}
+
+/**
+ * AutoDev Core Maintenance(2026-08-30) — LOCAL_ROOT_CAUSE_MODE 전용 advisory lookup.
+ * lookupSolution()의 정확한 fingerprint 일치 원칙(§ 위 "느슨한 유사도 매칭은 하지 않는다")은
+ * 절대 바꾸지 않는다 — 이 함수는 그 원칙과 별개로, "정확히 같은 문제"가 아니라 "같은
+ * 종류(errorType)의 문제"였던 과거 확정 해결 사례를 여러 건 advisory로 반환한다. 정확도가
+ * 낮으므로(같은 종류일 뿐 같은 근본원인이라는 보장이 없다) 호출부는 반드시 "검증된 정답이
+ * 아니라 우선 검토할 후보"로만 제시해야 한다(§ lookupSolution의 기존 힌트 문구 관례를
+ * 그대로 따른다). PROJECT tier를 COMMON tier보다 우선한다(같은 프로젝트 사례가 더
+ * 관련성이 높다) — 두 tier를 섞어 정렬하지 않는다.
+ */
+export function lookupSolutionsByRootCauseClass(ctx: RootCauseClassLookupContext): MemoryLookupResult[] {
+  const limit = ctx.limit ?? 3;
+  if (limit <= 0) return [];
+
+  const alreadyFailedDescriptionsByFingerprint = new Map<string, string[]>();
+  const collectAlreadyFailed = (entries: ProblemMemoryEntry[]): string[] => {
+    const key = entries.map((e) => e.fingerprint).sort().join("|");
+    const cached = alreadyFailedDescriptionsByFingerprint.get(key);
+    if (cached) return cached;
+    const descriptions = entries.flatMap((e) => e.attemptedSolutions.filter((s) => s.outcome === "FAILURE").map((s) => s.description));
+    alreadyFailedDescriptionsByFingerprint.set(key, descriptions);
+    return descriptions;
+  };
+
+  const collect = (entries: ProblemMemoryEntry[], tier: MemoryTier, alreadyFailedDescriptionsInThisTask: string[]): MemoryLookupResult[] => {
+    const results: MemoryLookupResult[] = [];
+    // 가장 최근에 관측된 해결책을 우선한다(오래된 해결책보다 최신 코드베이스와 맞을
+    // 가능성이 더 높다) — lastSeenAt 내림차순.
+    const sorted = [...entries]
+      .filter((e) => e.errorType === ctx.errorType && e.finalSuccessfulSolution && !e.pendingConfirmation)
+      .sort((a, b) => (b.lastSeenAt ?? "").localeCompare(a.lastSeenAt ?? ""));
+    for (const entry of sorted) {
+      if (results.length >= limit) break;
+      if (alreadyFailedDescriptionsInThisTask.includes(entry.finalSuccessfulSolution!)) continue;
+      results.push({ tier, entry, alreadyFailedDescriptionsInThisTask });
+    }
+    return results;
+  };
+
+  const projectEntries = ctx.projectStore.load().filter((e) => e.projectId === ctx.projectId);
+  const projectAlreadyFailed = collectAlreadyFailed(projectEntries);
+  const projectHits = collect(projectEntries, "PROJECT", projectAlreadyFailed);
+  if (projectHits.length >= limit) return projectHits.slice(0, limit);
+
+  const commonEntries = ctx.commonStore.load();
+  const commonHits = collect(commonEntries, "COMMON", []);
+  return [...projectHits, ...commonHits].slice(0, limit);
+}
+
 // AutoDev 공통 기억으로 승격할 수 있는 "프로젝트와 무관한 일반 문제" 패턴(§ 요구사항 7 예시:
 // TypeScript 빌드 오류/Windows 경로 처리/Git 잠금 문제/npm 의존성 문제/Claude 응답 형식
 // 문제/외부 제공자 사용량 제한/일시적 네트워크 오류/상태 파일-Git 불일치/필수 테스트 명령

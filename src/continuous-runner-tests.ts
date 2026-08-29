@@ -255,16 +255,20 @@ async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(
 
 // ---------------------------------------------------------------------------
 // F — AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
-// Hardening(2026-08-28)로 갱신 — Required Test 실패가 REVISE 반복 → REVIEW_CYCLE_EXHAUSTED로
-// 끝나는 것도 기술적 자동 복구 대상이다. 예전에는 이 복구가 "runAutodevOnce가
-// RAN_TASK_NOT_APPROVED로 끝난 뒤 continuous-runner의 다음 iteration이 재시도"하는 형태로
-// 관찰됐다. 지금은 REVIEW_CYCLE_EXHAUSTED 자체가 orchestrator.ts 안에서(§ root-cause-
-// analysis.ts/orchestrator.ts) durable하게 재시도되므로, 이 정확히 같은 시나리오(5회
-// 실패 후 통과 시작)는 outer continuous-runner의 두 번째 iteration을 기다리지 않고 "첫
-// 번째" runAutodevOnce 호출 자체가 내부적으로 재시도해 성공한다 — Telegram 승인이
-// 필요 없다는 결과는 동일하지만, 그 결과에 도달하는 iteration 개수가 달라졌다.
+// Hardening(2026-08-28), AutoDev Core Maintenance(2026-08-30)로 갱신.
+//
+// 2026-08-30 변경 — 동일한 required-test 실패 fingerprint가 결정론적으로 반복되는 경우(이
+// 시나리오처럼 매 attempt마다 완전히 동일하게 실패)는 더 이상 무제한 durable
+// backoff-and-retry로 흡수되지 않는다(§ orchestrator.ts DETERMINISTIC_REVIEW_CYCLE_
+// EXHAUSTED_MARKER_PREFIX, stagnationTracker의 repeatCount 기반 판정). MAX_REVIEW_CYCLES(5)
+// 소진 시점에 이미 이 반복이 확정돼 있으므로(2회차에 이미 STAGNATION_DETECTED), 6번째
+// Developer 호출(=이 fixture가 "고쳐졌다"고 가정하는 시점) 자체가 발생하지 않고 genuine
+// WAITING_HUMAN으로 즉시 승격한다 — "동일 실패를 반복 재시도하지 않는다"는 이번 Core
+// Maintenance의 핵심 목표를 정확히 이 시나리오가 검증한다. 이 반복이 매번 "다양한 이유"였다면
+// (예: 매번 다른 stderr) 기존 무제한 backoff-and-retry가 여전히 적용된다 — 이 시나리오는
+// 의도적으로 "동일한 이유"를 반복하므로 새 경로를 탄다.
 // ---------------------------------------------------------------------------
-async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion(): Promise<void> {
+async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetry(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
@@ -274,16 +278,9 @@ async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion()
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
     callCount += 1;
     calls.push(task);
-    // 처음 5회(REVISE 반복 5 cycle 전부, durable retry 발동 전까지)는 계속 실패한다.
-    // reviewer가 PASS라고 해도 실패한 required test는 orchestrator.ts의 기존 강제 REVISE
-    // 안전장치(hasFailedRequiredTest)가 덮어쓴다(§ 기존 F 시나리오와 동일 원리).
-    if (callCount <= 5) {
-      return { success: true, summary: "테스트: required test 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
-    }
-    // 6번째 호출부터(=durable retry로 리셋된 새 REVISE 예산의 첫 라운드)는 실제로 통과한다.
-    const fileName = `proj/marker-${callCount}.txt`;
-    writeRepoFile(repo, fileName, task);
-    return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+    // 매 호출마다 완전히 동일하게 실패한다(다양한 이유가 아니라 같은 이유) — 6번째 호출은
+    // 절대 일어나지 않아야 한다(genuine WAITING_HUMAN으로 이미 승격했으므로).
+    return { success: true, summary: "테스트: required test 항상 동일하게 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
   };
 
   const result = await runAutodevContinuous({
@@ -292,20 +289,24 @@ async function scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion()
   });
 
   check(
-    "F) T1이 첫 번째 runOnce 호출 안에서 durable retry로 자동 복구되어 checkpoint까지 도달(Telegram 승인 없이)",
-    result.iterations[0].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[0].result.taskId === "T1"
+    "F) T1이 첫 번째 runOnce 호출 안에서 무제한 재시도 대신 genuine WAITING_HUMAN으로 조기 승격됨(RAN_TASK_NOT_APPROVED)",
+    result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED" && result.iterations[0].result.taskId === "T1"
   );
   check(
-    "F) developer가 실패 5회(REVISE 소진) + 성공 1회 = 최소 6회 호출됨, 전부 T1",
-    // claudeRunner는 T1/T2/T3 전체 continuous 실행에 걸쳐 공유되므로(callCount가 task 경계를
-    // 넘어 계속 증가) 앞의 6회(실패 5 + 성공 1)만 T1에 대한 호출이고 그 뒤(T2/T3)는 다른
-    // task의 정상 호출이다 — 앞 6개만 범위로 검사한다(§ 원래 calls.slice(0,5) 검사와 동일한
-    // 원칙, durable retry로 늘어난 만큼만 6개로 확장).
-    calls.length >= 6 && calls.slice(0, 6).every((c) => c === "Task1 prompt")
+    "F) developer가 MAX_REVIEW_CYCLES(5)에서 멈추고 6번째(가상의 '고쳐짐') 호출은 발생하지 않음",
+    callCount === 5 && calls.every((c) => c === "Task1 prompt")
   );
-  check("F) 자동 복구 이후 project complete로 종료", result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "STOPPED");
+  check(
+    "F) genuine WAITING_HUMAN이므로 continuous-runner 자신도 더 진행하지 않고 즉시 STOP(T2/T3 시도 안 함, 재시도 없이 단 1회 iteration)",
+    result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "RAN_TASK_NOT_APPROVED" && result.iterations.length === 1
+  );
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("F) 최종 completedTasks=[T1,T2,T3]", JSON.stringify(finalState.completedTasks) === JSON.stringify(["T1", "T2", "T3"]));
+  check("F) status=WAITING_HUMAN(사람 승인 없이 자동으로 넘어가지 않음)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check(
+    "F) deferredHumanTasks에 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록됨",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
+  );
+  check("F) T1은 아직 완료되지 않음(completedTasks가 비어있음)", JSON.stringify(finalState.completedTasks) === JSON.stringify([]));
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +531,7 @@ async function main(): Promise<void> {
     await scenarioWaitingHumanStopsImmediately();
     await scenarioHumanFinalReviewPendingStopsImmediately();
     await scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval();
-    await scenarioRequiredTestFailureAutoRecoversViaReviewCycleExhaustion();
+    await scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetry();
     await scenarioTechnicalRecoveryLimitStopsRunawayRetries();
     await scenarioSecretScannerBlockStopsImmediately();
     await scenarioLivelockAndMaxIterationsProtection();

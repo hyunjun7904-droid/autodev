@@ -1,9 +1,15 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkSupervisorLock, defaultIsPidAlive } from "./dashboard-supervisor";
-import { runRunnerSupervisorLoop, sanitizeForFilename } from "./runner-supervisor";
+import {
+  clearMaintenancePause,
+  engageMaintenancePause,
+  maintenancePauseMarkerPath,
+  runRunnerSupervisorLoop,
+  sanitizeForFilename,
+} from "./runner-supervisor";
 import type { RunnerSupervisorConfig, RunnerSupervisorDeps, SupervisedRunnerChild } from "./runner-supervisor";
 
 // AutoDev Continuous Runner Lifecycle Independence 테스트(2026-08-28 Maintenance) —
@@ -42,8 +48,13 @@ function baseConfig(overrides: Partial<RunnerSupervisorConfig> = {}): RunnerSupe
     backoffScheduleMs: [30, 60, 90],
     cooldownMs: 150,
     sustainedUptimeResetMs: 250,
+    maintenancePollMs: 20,
     ...overrides,
   };
+}
+
+function neverPaused(): boolean {
+  return false;
 }
 
 function fakeSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -99,6 +110,7 @@ async function scenarioRealKillTriggersRealRespawn(): Promise<void> {
     sleep: fakeSleep,
     now: () => Date.now(),
     log: (f) => logs.push(f),
+    isMaintenancePaused: neverPaused,
   };
 
   const loopPromise = runRunnerSupervisorLoop(baseConfig(), deps, controller.signal);
@@ -136,6 +148,7 @@ async function scenarioBoundedBackoffOnRepeatedCrash(): Promise<void> {
     sleep: fakeSleep,
     now: () => Date.now(),
     log: (f) => logs.push(f),
+    isMaintenancePaused: neverPaused,
   };
 
   const config = baseConfig({ backoffScheduleMs: [30, 60, 90], cooldownMs: 150, sustainedUptimeResetMs: 10_000 });
@@ -161,6 +174,7 @@ async function scenarioSustainedUptimeResetsRealStreak(): Promise<void> {
     sleep: fakeSleep,
     now: () => Date.now(),
     log: (f) => logs.push(f),
+    isMaintenancePaused: neverPaused,
   };
 
   const config = baseConfig({ sustainedUptimeResetMs: 60, backoffScheduleMs: [30, 60, 90], cooldownMs: 150 });
@@ -195,6 +209,173 @@ function scenarioDifferentProjectsDoNotBlockEachOther(): void {
   check("서로 다른 project는 서로의 supervisor를 막지 않음(AutoDev는 project-agnostic Core)", forOther.action === "PROCEED");
 }
 
+// Maintenance Pause(2026-08-30, controlled resume 실측 후속 조치) — supervisor 프로세스는
+// 살려둔 채 "다음 child spawn"만 일시정지하는 별도 primitive(§ runner-supervisor.ts
+// runRunnerSupervisorLoop 상단 주석). project-lock.ts와는 완전히 분리된 마커 파일 하나로만
+// 판정한다 — 아래 시나리오들은 (1) 마커 파일 자체의 round-trip(존재 여부만이 유일한 상태,
+// idempotent), (2) 처음부터 paused면 spawn이 전혀 일어나지 않음, (3) 이미 떠 있는 child는
+// 강제 종료하지 않고 자연 종료를 기다린 뒤에만 게이트가 적용됨, (4) pause/clear가 기존
+// backoff 스케줄/카운터를 전혀 훼손하지 않음을 실제 OS child process로 검증한다.
+
+function scenarioMaintenancePauseMarkerRoundTrip(): void {
+  const dir = makeTempDir();
+  const adapterPath = "C:/fake/jarvis/.autodev/manifest.json";
+  const markerPath = maintenancePauseMarkerPath(adapterPath, dir);
+  check("초기 상태: 마커 파일 없음", !existsSync(markerPath));
+
+  engageMaintenancePause(adapterPath, dir, "test-engage");
+  check("engageMaintenancePause 후 마커 파일 생성됨", existsSync(markerPath));
+
+  engageMaintenancePause(adapterPath, dir, "test-engage-again");
+  check("이미 켜진 상태에서 다시 engage해도 안전(idempotent)", existsSync(markerPath));
+
+  clearMaintenancePause(adapterPath, dir);
+  check("clearMaintenancePause 후 마커 파일 삭제됨", !existsSync(markerPath));
+
+  clearMaintenancePause(adapterPath, dir);
+  check("이미 꺼진 상태에서 다시 clear해도 예외 없이 안전(idempotent)", !existsSync(markerPath));
+
+  const otherAdapterPath = "C:/fake/other-project/.autodev/manifest.json";
+  const otherMarkerPath = maintenancePauseMarkerPath(otherAdapterPath, dir);
+  check("서로 다른 project adapter는 서로 다른 마커 파일을 가리킴(project-lock과 동일 원칙)", markerPath !== otherMarkerPath);
+}
+
+async function scenarioMaintenancePauseBlocksSpawnFromStart(): Promise<void> {
+  const dir = makeTempDir();
+  const scriptPath = makeChildScript(dir, "idle.js", "setInterval(() => {}, 1000);\n");
+  const adapterPath = "C:/fake/jarvis/.autodev/manifest.json";
+  const logs: Record<string, unknown>[] = [];
+  const controller = new AbortController();
+  let lastChild: SupervisedRunnerChild | undefined;
+
+  engageMaintenancePause(adapterPath, dir, "before-start");
+
+  const deps: RunnerSupervisorDeps = {
+    spawnChild: () => {
+      const child = spawn(process.execPath, [scriptPath]);
+      lastChild = child;
+      return child;
+    },
+    sleep: fakeSleep,
+    now: () => Date.now(),
+    log: (f) => logs.push(f),
+    isMaintenancePaused: () => existsSync(maintenancePauseMarkerPath(adapterPath, dir)),
+  };
+
+  const loopPromise = runRunnerSupervisorLoop(baseConfig({ maintenancePollMs: 20 }), deps, controller.signal);
+
+  await waitUntil(() => logs.some((l) => l.event === "MAINTENANCE_PAUSE_ACTIVE"), 2000);
+  check("paused 상태로 시작하면 MAINTENANCE_PAUSE_ACTIVE가 기록됨", logs.some((l) => l.event === "MAINTENANCE_PAUSE_ACTIVE"));
+
+  await new Promise((r) => setTimeout(r, 200));
+  check("마커가 켜진 동안은 spawn이 전혀 일어나지 않음(SPAWNED 0건)", !logs.some((l) => l.event === "SPAWNED"));
+
+  clearMaintenancePause(adapterPath, dir);
+  await waitUntil(() => logs.some((l) => l.event === "SPAWNED"), 2000);
+  check("마커 해제 후에는 정상적으로 spawn됨", logs.some((l) => l.event === "SPAWNED"));
+  check("마커 해제가 기록됨(MAINTENANCE_PAUSE_CLEARED)", logs.some((l) => l.event === "MAINTENANCE_PAUSE_CLEARED"));
+
+  controller.abort();
+  try {
+    (lastChild as unknown as { kill(): boolean })?.kill();
+  } catch {
+    // 이미 죽어있으면 무시.
+  }
+  await loopPromise;
+}
+
+async function scenarioMaintenancePauseWaitsForActiveChildThenBlocksRespawn(): Promise<void> {
+  const dir = makeTempDir();
+  const scriptPath = makeChildScript(dir, "idle.js", "setInterval(() => {}, 1000);\n");
+  const adapterPath = "C:/fake/jarvis/.autodev/manifest.json";
+  const logs: Record<string, unknown>[] = [];
+  const controller = new AbortController();
+  let lastChild: SupervisedRunnerChild | undefined;
+
+  const deps: RunnerSupervisorDeps = {
+    spawnChild: () => {
+      const child = spawn(process.execPath, [scriptPath]);
+      lastChild = child;
+      return child;
+    },
+    sleep: fakeSleep,
+    now: () => Date.now(),
+    log: (f) => logs.push(f),
+    isMaintenancePaused: () => existsSync(maintenancePauseMarkerPath(adapterPath, dir)),
+  };
+
+  const loopPromise = runRunnerSupervisorLoop(baseConfig({ maintenancePollMs: 20 }), deps, controller.signal);
+
+  await waitUntil(() => logs.some((l) => l.event === "SPAWNED"), 2000);
+  const firstChild = lastChild;
+  check("unpaused 상태에서는 정상적으로 첫 child가 spawn됨", typeof firstChild?.pid === "number");
+
+  // 이미 떠 있는 child가 살아있는 동안 maintenance pause를 켠다 — 강제 종료 대상이 아니어야 한다.
+  engageMaintenancePause(adapterPath, dir, "mid-run");
+  await new Promise((r) => setTimeout(r, 100));
+  check(
+    "이미 떠 있는 child는 maintenance pause로 강제 종료되지 않음(자연 종료를 기다림 — CHILD_EXITED 아직 없음)",
+    !logs.some((l) => l.event === "CHILD_EXITED")
+  );
+
+  (firstChild as unknown as { kill(): boolean })?.kill();
+  await waitUntil(() => logs.some((l) => l.event === "CHILD_EXITED"), 2000);
+  check("떠 있던 child가 자연 종료됨(kill에 의한 CHILD_EXITED)", logs.some((l) => l.event === "CHILD_EXITED"));
+
+  await new Promise((r) => setTimeout(r, 200));
+  check("child 종료 후에도 paused 상태면 재spawn되지 않음(SPAWNED는 여전히 1건)", logs.filter((l) => l.event === "SPAWNED").length === 1);
+
+  clearMaintenancePause(adapterPath, dir);
+  await waitUntil(() => logs.filter((l) => l.event === "SPAWNED").length >= 2, 2000);
+  check("pause 해제 후에는 다시 정상 spawn됨(SPAWNED 2건째)", logs.filter((l) => l.event === "SPAWNED").length >= 2);
+
+  controller.abort();
+  try {
+    (lastChild as unknown as { kill(): boolean })?.kill();
+  } catch {
+    // 이미 죽어있으면 무시.
+  }
+  await loopPromise;
+}
+
+async function scenarioMaintenancePauseDoesNotDisturbBackoff(): Promise<void> {
+  const dir = makeTempDir();
+  const scriptPath = makeChildScript(dir, "fastcrash.js", "process.exit(7);\n");
+  const adapterPath = "C:/fake/jarvis/.autodev/manifest.json";
+  const logs: Record<string, unknown>[] = [];
+  const controller = new AbortController();
+
+  const deps: RunnerSupervisorDeps = {
+    spawnChild: () => spawn(process.execPath, [scriptPath]),
+    sleep: fakeSleep,
+    now: () => Date.now(),
+    log: (f) => logs.push(f),
+    isMaintenancePaused: () => existsSync(maintenancePauseMarkerPath(adapterPath, dir)),
+  };
+
+  const config = baseConfig({ backoffScheduleMs: [30, 60, 90], cooldownMs: 150, sustainedUptimeResetMs: 10_000, maintenancePollMs: 20 });
+  const loopPromise = runRunnerSupervisorLoop(config, deps, controller.signal);
+
+  // 두 번 crash가 쌓이도록 둔 뒤(backoff schedule 진행 중) maintenance pause를 켰다가 곧바로
+  // 끈다 — RESTART_SCHEDULED 순서/delay 자체가 이 토글로 바뀌면 안 된다(§ "backoff/restart
+  // 상태 훼손 없음").
+  await waitUntil(() => logs.filter((l) => l.event === "RESTART_SCHEDULED").length >= 2, 3000);
+  engageMaintenancePause(adapterPath, dir, "mid-backoff");
+  await new Promise((r) => setTimeout(r, 100));
+  clearMaintenancePause(adapterPath, dir);
+
+  await waitUntil(() => logs.filter((l) => l.event === "RESTART_SCHEDULED").length >= 4, 5000);
+  controller.abort();
+  await loopPromise;
+
+  const delays = logs.filter((l) => l.event === "RESTART_SCHEDULED").map((l) => l.delayMs as number);
+  check(
+    "backoff 도중 maintenance pause를 껐다 켜도 schedule은 그대로(첫 3번 30/60/90, 이후 cooldown 150)",
+    delays[0] === 30 && delays[1] === 60 && delays[2] === 90 && delays[3] === 150
+  );
+  check("crash 횟수(RESTART_SCHEDULED)가 pause 토글로 인해 부풀려지지 않음", delays.length === 4);
+}
+
 async function main(): Promise<void> {
   try {
     scenarioSanitizeForFilename();
@@ -204,6 +385,10 @@ async function main(): Promise<void> {
     await scenarioRealKillTriggersRealRespawn();
     await scenarioBoundedBackoffOnRepeatedCrash();
     await scenarioSustainedUptimeResetsRealStreak();
+    scenarioMaintenancePauseMarkerRoundTrip();
+    await scenarioMaintenancePauseBlocksSpawnFromStart();
+    await scenarioMaintenancePauseWaitsForActiveChildThenBlocksRespawn();
+    await scenarioMaintenancePauseDoesNotDisturbBackoff();
   } finally {
     for (const d of tempDirs) {
       try {

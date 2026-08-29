@@ -128,7 +128,19 @@ export type AutoDevEventType =
   //     다르다.
   | "PROJECT_COMPLETED"
   | "DEPLOYMENT_WAITING_HUMAN"
-  | "SELF_DEV_TASK_FAILED";
+  | "SELF_DEV_TASK_FAILED"
+  // AutoDev Core Maintenance(2026-08-30) — claude-developer.ts가 매 round 직전 이미 계산하던
+  // DeveloperContextMetrics(§ buildDeveloperContextMetrics)를 durable하게 남긴다. 이전에는
+  // log()로만 남아 grep 없이는 조회할 수 없었다 — 이 event로 실측(Developer 호출 수/round당
+  // context 크기/duplicateReadCount/trim 여부)을 프로그램적으로 조회할 수 있게 한다. 순수
+  // observability다 — 실패해도 실제 개발 흐름/checkpoint에 영향을 주지 않는다.
+  | "DEVELOPER_CONTEXT_METRICS"
+  // AutoDev Core Maintenance(2026-08-30) — § work-time.ts 파일 상단 주석이 문서화한 한계(단일
+  // Developer attempt 안의 USAGE_LIMIT 내부 재시도 대기가 event로 기록되지 않아 실제
+  // 작업시간에 잘못 포함됨)를 메운다. START~ENDED 사이 구간을 work-time.ts
+  // computeUsageLimitWaitMs()가 계산해 computeActiveWorkMs 결과에서 제외할 수 있게 한다.
+  | "DEVELOPER_USAGE_LIMIT_WAIT_STARTED"
+  | "DEVELOPER_USAGE_LIMIT_WAIT_ENDED";
 
 export type AutoDevEventCategory = "observability" | "audit";
 
@@ -185,6 +197,9 @@ const EVENT_CATEGORIES: Record<AutoDevEventType, readonly AutoDevEventCategory[]
   PROJECT_COMPLETED: ["observability", "audit"],
   DEPLOYMENT_WAITING_HUMAN: ["observability", "audit"],
   SELF_DEV_TASK_FAILED: ["observability", "audit"],
+  DEVELOPER_CONTEXT_METRICS: ["observability"],
+  DEVELOPER_USAGE_LIMIT_WAIT_STARTED: ["observability"],
+  DEVELOPER_USAGE_LIMIT_WAIT_ENDED: ["observability"],
 };
 
 /** 이 event type이 어떤 카테고리에 속하는지 — 순수 조회, 어떤 policy로도 바뀌지 않는다
