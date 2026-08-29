@@ -2,7 +2,7 @@ import "dotenv/config";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClaudeResult, GptReviewResult, GptErrorCode } from "./types";
-import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, isPathInScope } from "./git-changes";
+import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, isPathInScope, readFileSmartly } from "./git-changes";
 import type { WorkingTreeChanges } from "./git-changes";
 import { PROJECT_ROOT } from "./safe-executor";
 import { validateReadPath } from "./safe-executor";
@@ -132,6 +132,11 @@ export interface GptReviewApiResult extends GptReviewResult {
    *  이미 계산한 값을 그대로 옮긴 것) — Usage Ledger의 payloadChars에 그대로 반영되어
    *  FULL/INCREMENTAL round 간 payload 절감을 증거로 보여준다. */
   payloadChars?: number;
+  /** AutoDev Core Maintenance — Reviewer Failure Telemetry(Category D). errorCode가 있을 때만
+   *  의미가 있다 — provider가 실제로 받은 HTTP status code(§ review-provider.ts
+   *  ReviewProviderFailure.httpStatus를 그대로 옮긴 값). 순수 timeout/네트워크 오류는
+   *  undefined로 남는다. */
+  httpStatus?: number;
 }
 export interface GptReviewRetryResult extends GptReviewApiResult {
   /** 실제로 수행된 API 통신 재시도 횟수(최초 시도 제외) — reviewCycle과 별개로 집계. */
@@ -245,6 +250,14 @@ function buildChangeSection(
 // 이미 Safe Executor read-prefix 제한 없이 scopeDirs 전체 diff를 노출하는 것과 동일한 노출
 // 수준 — 새 정보 노출이 아니다). untracked file은 기존과 동일하게 access.validateReadPath로
 // 게이트한다(§ readUntrackedFiles와 동일한 보안 경계 유지).
+// AutoDev Core Maintenance — Reviewer Payload Binary Safety(Category D). git-changes.ts의
+// readFileSmartly()(단일 구현, readUntrackedFiles와 공유)를 그대로 재사용한다 — binary로
+// 판정된 파일은 원문 대신 path/size/hash metadata 한 줄만 content로 반환된다(§ 그 함수
+// 상단 주석). 이 reader의 결과는 baseline content hash 계산(review-baseline.ts
+// buildFileStateSnapshot)과 실제 diff payload 조립(buildIncrementalText) 둘 다에 쓰이는데,
+// 두 경우 모두 "원문을 그대로 노출하지 않는다"는 목표에 부합한다 — hash는 metadata 문자열
+// (실제 파일의 sha256을 담고 있어 내용이 바뀌면 여전히 달라짐)로 계산되고, payload에도 원문
+// 대신 그 metadata만 들어간다.
 function makeFileStateReader(access: ReviewFileAccess): FileContentReader {
   return {
     read(path, status) {
@@ -252,13 +265,13 @@ function makeFileStateReader(access: ReviewFileAccess): FileContentReader {
         const v = access.validateReadPath(path);
         if (!v.ok) return { ok: false };
         try {
-          return { ok: true, content: readFileSync(v.abs, "utf-8") };
+          return { ok: true, content: readFileSmartly(v.abs, path, status).content };
         } catch {
           return { ok: false };
         }
       }
       try {
-        return { ok: true, content: readFileSync(join(access.projectRoot, ...path.split("/")), "utf-8") };
+        return { ok: true, content: readFileSmartly(join(access.projectRoot, ...path.split("/")), path, status).content };
       } catch {
         return { ok: false };
       }
@@ -710,12 +723,16 @@ export async function reviewClaudeResultOnce(
     if (providerResult.requestAttempted === false) {
       log(`GPT 리뷰 클라이언트 생성 실패(${providerResult.errorCode}) — 실제 요청은 전송되지 않음`, { reviewCycle });
     } else {
-      log(`GPT 리뷰 API 오류(${providerResult.errorCode})`, { reviewCycle, transient: providerResult.transient });
+      log(`GPT 리뷰 API 오류(${providerResult.errorCode})`, { reviewCycle, transient: providerResult.transient, httpStatus: providerResult.httpStatus });
     }
     return {
       decision: "HUMAN_REQUIRED",
       severity: { critical: 0, high: 0, medium: 0 },
-      feedback: `GPT API 오류: ${providerResult.errorCode}`,
+      // AutoDev Core Maintenance — Reviewer Failure Telemetry(Category D). httpStatus가 있으면
+      // feedback 문자열에도 그대로 남긴다 — 이 값은 orchestrator.ts가 그대로
+      // state.deferredHumanTasks에 push하므로(`${errorCode}: ${feedback}`), 별도 배선 없이
+      // project-state.json/대시보드에서 바로 "4xx였는지 5xx였는지"를 구분할 수 있게 된다.
+      feedback: `GPT API 오류: ${providerResult.errorCode}${providerResult.httpStatus !== undefined ? ` (HTTP ${providerResult.httpStatus})` : ""}`,
       nextTask: null,
       errorCode: providerResult.errorCode,
       transient: providerResult.transient,
@@ -724,6 +741,7 @@ export async function reviewClaudeResultOnce(
       reviewMode,
       reviewBaseline: newBaseline,
       payloadChars: budgetGuardResult.payloadChars,
+      httpStatus: providerResult.httpStatus,
     };
   }
 

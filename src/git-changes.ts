@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { PROJECT_ROOT, DENY_PATH_PATTERNS, SECRET_NAME_PATTERNS, validateReadPath } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
 
@@ -160,6 +161,53 @@ export interface UntrackedFileContent {
   path: string;
   content: string;
   truncated: boolean;
+  /** AutoDev Core Maintenance — Reviewer Payload Binary Safety. true면 content는 실제 파일
+   *  내용이 아니라 § readFileSmartly()가 만든 metadata 요약이다(원문은 payload에 전혀
+   *  들어가지 않았다). */
+  binary?: boolean;
+}
+
+const BINARY_SNIFF_SAMPLE_BYTES = 8_000;
+
+/** git 자신의 binary 판정 휴리스틱(xdiff buffer_is_binary — 앞부분 표본에 NUL 바이트가
+ *  있으면 binary)과 동일한 원칙을 그대로 쓴다 — 확장자 blacklist가 아니라 실제 바이트
+ *  내용을 본다(§ 요구사항 — "정상 source-controlled binary도 존재할 수 있다"). */
+export function isBinaryContent(buf: Buffer): boolean {
+  const len = Math.min(buf.length, BINARY_SNIFF_SAMPLE_BYTES);
+  for (let i = 0; i < len; i++) {
+    if (buf[i] === 0) return true;
+  }
+  return false;
+}
+
+export interface SmartFileRead {
+  content: string;
+  binary: boolean;
+  sizeBytes: number;
+  sha256?: string;
+}
+
+/**
+ * AutoDev Core Maintenance — Reviewer Payload Binary Safety(Category D). 파일을 항상
+ * utf-8로 강제 디코딩하지 않는다 — 먼저 Buffer로 읽어 실제 바이트 내용으로 binary 여부를
+ * 판정하고(§ isBinaryContent), binary로 판정되면 raw content 대신 path/size/hash만 담은
+ * 사람이 읽을 수 있는 metadata 한 줄을 반환한다(원문은 어디에도 포함되지 않는다). text
+ * 파일은 기존과 100% 동일하게 그대로 utf-8 문자열을 반환한다 — 이 함수는 이 저장소 전체에서
+ * "파일을 읽어 review/commit payload에 넣는" 두 지점(이 파일의 readUntrackedFiles,
+ * gpt-reviewer.ts의 makeFileStateReader)이 공유하는 단일 구현이다(로직 복제 없음).
+ */
+export function readFileSmartly(absPath: string, relPathForMetadata: string, changeType: string): SmartFileRead {
+  const buf = readFileSync(absPath);
+  if (isBinaryContent(buf)) {
+    const sha256 = createHash("sha256").update(buf).digest("hex");
+    return {
+      content: `[AUTODEV BINARY FILE — raw content not included] path=${relPathForMetadata} changeType=${changeType} sizeBytes=${buf.length} sha256=${sha256}`,
+      binary: true,
+      sizeBytes: buf.length,
+      sha256,
+    };
+  }
+  return { content: buf.toString("utf-8"), binary: false, sizeBytes: buf.length };
 }
 
 // AutoDev Reviewer Snapshot Truncation Fix(2026-08-26, JARVIS Task 1.3 — Fireworks가 20,235자
@@ -228,16 +276,23 @@ export function readUntrackedFiles(
       skipped.push(`${change.path} (읽기 거부: ${v.reason})`);
       continue;
     }
-    let raw: string;
+    let smartRead: SmartFileRead;
     try {
-      raw = readFileSync(v.abs, "utf-8");
+      smartRead = readFileSmartly(v.abs, change.path, change.status);
     } catch {
       skipped.push(`${change.path} (읽기 실패)`);
       continue;
     }
+    if (smartRead.binary) {
+      // binary metadata 요약은 이미 짧고 고정된 형태다 — buildBoundedFileSnapshot의 truncation
+      // 로직을 적용할 대상이 아니다(원문 자체가 없으므로 "잘릴 원본"이 없다).
+      used += smartRead.content.length;
+      files.push({ path: change.path, content: smartRead.content, truncated: false, binary: true });
+      continue;
+    }
     const remaining = totalBudgetChars - used;
     const cap = Math.min(perFileMaxChars, remaining);
-    const { content, truncated } = buildBoundedFileSnapshot(raw, cap);
+    const { content, truncated } = buildBoundedFileSnapshot(smartRead.content, cap);
     used += content.length;
     files.push({ path: change.path, content, truncated });
   }

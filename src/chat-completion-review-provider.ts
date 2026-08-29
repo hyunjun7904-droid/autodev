@@ -243,14 +243,16 @@ export function createChatCompletionReviewProvider(
       const outcome = await httpFetch({ url: config.baseUrl, apiKey, body, timeoutMs: config.timeoutMs ?? 120_000 });
       if (!outcome.ok) {
         const { code, transient } = classifyHttpFailure(outcome);
-        return { ok: false, errorCode: code, transient, requestAttempted: true, rateLimitHeaders: outcome.rateLimitHeaders };
+        return { ok: false, errorCode: code, transient, requestAttempted: true, rateLimitHeaders: outcome.rateLimitHeaders, httpStatus: outcome.status };
       }
 
       const parsed = parseChatCompletionEnvelope(config.id, outcome.response.bodyText);
       if (!parsed.ok) {
         // envelope 자체가 기대한 형태가 아님(review JSON schema 문제가 아니라 transport 문제) —
-        // Reviewer Core의 INVALID_OUTPUT과 의미를 겹치지 않게 API_ERROR로 분류한다.
-        return { ok: false, errorCode: "API_ERROR", transient: false, requestAttempted: true };
+        // Reviewer Core의 INVALID_OUTPUT과 의미를 겹치지 않게 API_ERROR로 분류한다. HTTP
+        // 자체는 성공(2xx)했으므로 그 status를 그대로 보존한다(응답 body가 기대와 다른 것과
+        // "요청 자체가 실패한 것"을 사후에 구분할 수 있게).
+        return { ok: false, errorCode: "API_ERROR", transient: false, requestAttempted: true, httpStatus: outcome.response.status };
       }
 
       return { ok: true, outputText: parsed.data.outputText, model: parsed.data.model, tokenUsage: parsed.data.tokenUsage };

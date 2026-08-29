@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, unlinkSync }
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, buildBoundedFileSnapshot } from "./git-changes";
+import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, buildBoundedFileSnapshot, isBinaryContent, readFileSmartly } from "./git-changes";
 import { PROJECT_ROOT, configureSafeExecutor } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 
@@ -140,6 +140,50 @@ function scenarioReadUntrackedFilesContentAndTruncation(): void {
   }
 }
 
+// AutoDev Core Maintenance — Reviewer Payload Binary Safety(Category D). 실제 바이트 내용으로
+// binary를 판정한다(확장자 blacklist가 아니다) — 이 시나리오는 .ts 확장자를 가진 파일이라도
+// NUL 바이트가 있으면 binary로 판정되고, 반대로 확장자가 없어도 순수 텍스트면 그대로
+// 읽힌다는 것을 함께 증명한다.
+function scenarioBinaryContentDetection(): void {
+  const textBuf = Buffer.from("export const x = 1;\n", "utf-8");
+  check("isBinaryContent: 순수 텍스트는 binary가 아님", isBinaryContent(textBuf) === false);
+
+  const binaryBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02, 0x03]); // PNG 헤더류 + NUL
+  check("isBinaryContent: NUL 바이트가 포함되면 binary로 판정", isBinaryContent(binaryBuf) === true);
+
+  const extensionLiesBuf = Buffer.concat([Buffer.from("looks like text but has a "), Buffer.from([0x00]), Buffer.from("nul byte")]);
+  check("isBinaryContent: 확장자와 무관하게 실제 바이트 내용만으로 판정(확장자 blacklist 아님)", isBinaryContent(extensionLiesBuf) === true);
+}
+
+// readFileSmartly()/readUntrackedFiles()가 실제로 binary 파일의 원문을 payload에 절대
+// 포함하지 않고 path/size/hash metadata로만 대체하는지 실제 fs 경계(Safe Executor)까지
+// 포함해 검증한다.
+function scenarioReadUntrackedFilesNeverLeaksRawBinaryContent(): void {
+  const fixtureRel = "automation/git-changes-binary-fixture.bin";
+  const fixtureAbs = resolve(PROJECT_ROOT, fixtureRel);
+  try {
+    const binaryContent = Buffer.concat([Buffer.from("PNG-ish header "), Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe])]);
+    writeFileSync(fixtureAbs, binaryContent);
+
+    const direct = readFileSmartly(fixtureAbs, fixtureRel, "untracked");
+    check("readFileSmartly: binary 파일은 binary=true로 판정됨", direct.binary === true);
+    check("readFileSmartly: content에 원문 바이트가 그대로 노출되지 않음(원문 문자열이 아님)", !direct.content.includes("PNG-ish header "));
+    check("readFileSmartly: content에 sizeBytes metadata 포함", direct.content.includes(`sizeBytes=${binaryContent.length}`));
+    check("readFileSmartly: content에 sha256 metadata 포함", typeof direct.sha256 === "string" && direct.content.includes(direct.sha256!));
+    check("readFileSmartly: content에 BINARY FILE 표시 포함", direct.content.includes("BINARY FILE"));
+
+    const { files } = readUntrackedFiles([{ path: fixtureRel, status: "untracked" }]);
+    const entry = files.find((f) => f.path === fixtureRel);
+    check("readUntrackedFiles: binary 파일이 결과에 포함됨", entry !== undefined);
+    check("readUntrackedFiles: binary=true로 표시됨", entry?.binary === true);
+    check("readUntrackedFiles: content가 metadata 요약이고 원문 바이트를 포함하지 않음", !(entry?.content ?? "").includes("PNG-ish header "));
+    check("readUntrackedFiles: truncated=false(metadata는 truncation 대상이 아님)", entry?.truncated === false);
+  } finally {
+    if (existsSync(fixtureAbs)) unlinkSync(fixtureAbs);
+    check("binary fixture 정리 완료", !existsSync(fixtureAbs));
+  }
+}
+
 // AutoDev Reviewer Snapshot Truncation Fix(2026-08-26, JARVIS Task 1.3) — buildBoundedFileSnapshot()는
 // 순수 함수라 git/Safe Executor 없이 직접 검증한다. 실제 사고 재현: 20,235자 test 파일이
 // perFileMaxChars=20_000 head-only truncation으로 잘려 Fireworks가 "파일이 물리적으로 손상/
@@ -201,6 +245,7 @@ function scenarioBoundedFileSnapshotTruncation(): void {
 function main(): void {
   // 순수 함수 시나리오 — git/Safe Executor 불필요, 격리된 root 설정 이전에 바로 실행한다.
   scenarioBoundedFileSnapshotTruncation();
+  scenarioBinaryContentDetection();
 
   // scenarioReadUntrackedFilesContentAndTruncation()이 readUntrackedFiles()를 통해 실제
   // Safe Executor(validateReadPath)를 호출한다 — configureSafeExecutor()로 명시적으로
@@ -215,6 +260,7 @@ function main(): void {
     scenarioSecretAndBuildArtifactsExcluded();
     scenarioTempFixtureFilesExcludedFromReview();
     scenarioReadUntrackedFilesContentAndTruncation();
+    scenarioReadUntrackedFilesNeverLeaksRawBinaryContent();
   } finally {
     rmSync(isolatedRoot, { recursive: true, force: true });
   }

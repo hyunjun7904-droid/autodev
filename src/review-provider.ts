@@ -77,6 +77,12 @@ export interface ReviewProviderFailure {
    *  provider(Groq/OpenRouter/NVIDIA/Fireworks 단독 호출 등)는 이 필드를 읽지 않으므로 기존
    *  동작에 영향이 없다. */
   rateLimitHeaders?: Record<string, string>;
+  /** AutoDev Core Maintenance — Reviewer Failure Telemetry(Category D). 실제 HTTP status
+   *  code(예: 400/404/422/500/503) — errorCode만으로는 일반 4xx/5xx/네트워크 오류가 모두
+   *  API_ERROR 하나로 뭉쳐 보이므로, 원인을 사후에 구분할 수 있도록 실제 status를 그대로
+   *  보존한다. 순수 네트워크/timeout 오류(응답 자체가 없음)는 undefined로 남는다 — 추측하지
+   *  않는다. Authorization 등 credential이 담긴 정보가 아니므로 그대로 노출해도 안전하다. */
+  httpStatus?: number;
 }
 
 export type ReviewProviderResult = ReviewProviderSuccess | ReviewProviderFailure;

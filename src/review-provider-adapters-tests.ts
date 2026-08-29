@@ -109,6 +109,13 @@ async function scenarioA_factoryBasics(): Promise<void> {
       check(`A3) ${c.reason} → errorCode=${c.expectedCode}`, errResult.errorCode === c.expectedCode);
       check(`A3) ${c.reason} → transient=${c.expectedTransient}`, errResult.transient === c.expectedTransient);
       check(`A3) ${c.reason} → requestAttempted=true(실제로 요청은 나감)`, errResult.requestAttempted === true);
+      // AutoDev Core Maintenance — Reviewer Failure Telemetry(Category D). errorCode만으로는
+      // 일반 4xx/5xx가 전부 API_ERROR 하나로 뭉개지지만, httpStatus는 실제 status를 그대로
+      // 보존해 사후에 구분할 수 있게 한다. timeout(응답 자체가 없음)만 undefined로 남는다.
+      check(
+        `A3) ${c.reason} → httpStatus=${c.status ?? "undefined"}(실제 status가 유실되지 않음)`,
+        errResult.httpStatus === c.status
+      );
     }
   }
 
@@ -120,6 +127,7 @@ async function scenarioA_factoryBasics(): Promise<void> {
   if (!malformedResult.ok) {
     check("A4) errorCode=API_ERROR(Reviewer Core의 INVALID_OUTPUT과 의미가 겹치지 않음)", malformedResult.errorCode === "API_ERROR");
     check("A4) transient=false", malformedResult.transient === false);
+    check("A4) HTTP 자체는 성공(200)했다는 사실이 httpStatus로 보존됨", malformedResult.httpStatus === 200);
   }
 
   // A5) Secret 비노출 — 성공/실패 어떤 결과에도 API key 값이 나타나지 않음(#23).
