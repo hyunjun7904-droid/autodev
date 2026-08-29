@@ -388,6 +388,47 @@ ${ctx.instructions}
 필요하다고 명시하세요.`;
 }
 
+// AutoDev Claude Developer context/token 소비 계측(Stage 4, 2026-08-29) — 매 round
+// claudeCall() 직전 context 규모를 안전하게(원문 코드/Secret 없이 문자 수·개수만) 기록해
+// 향후 다시 추측하지 않고 실측으로 확인할 수 있게 한다. 순수 함수라 실제 Claude 호출 없이
+// 단위 테스트로 검증 가능하다.
+export interface DeveloperContextMetrics {
+  attempt: number;
+  round: number;
+  systemPromptChars: number;
+  transcriptChars: number;
+  transcriptEntryCount: number;
+  fileSnapshotChars: number;
+  fileSnapshotCount: number;
+  duplicateReadCount: number;
+  trimmedThisRound: boolean;
+}
+
+export function buildDeveloperContextMetrics(input: {
+  attempt: number;
+  round: number;
+  systemPromptChars: number;
+  transcriptInput: string;
+  transcriptEntryCount: number;
+  fileSnapshots: ReadonlyMap<string, string>;
+  duplicateReadCount: number;
+  trimmedThisRound: boolean;
+}): DeveloperContextMetrics {
+  let fileSnapshotChars = 0;
+  for (const content of input.fileSnapshots.values()) fileSnapshotChars += content.length;
+  return {
+    attempt: input.attempt,
+    round: input.round,
+    systemPromptChars: input.systemPromptChars,
+    transcriptChars: input.transcriptInput.length,
+    transcriptEntryCount: input.transcriptEntryCount,
+    fileSnapshotChars,
+    fileSnapshotCount: input.fileSnapshots.size,
+    duplicateReadCount: input.duplicateReadCount,
+    trimmedThisRound: input.trimmedThisRound,
+  };
+}
+
 // getActualChangedFiles/reviewer가 같은 기준(git-changes.ts)을 쓰도록 통일한다 — 이전에는
 // "git diff --name-only"만 써서 신규(untracked) 파일이 changedFiles에서 누락됐다. scopeDirs는
 // 호출부(runDeveloperTaskViaSafeExecutor)가 opts.changeScopeDirs로 넘긴다 — 이 함수는 어떤
@@ -466,7 +507,14 @@ async function callClaude(input: string, timeoutMs: number, systemPrompt: string
   // 넘겨 project-local 가짜 claude 실행 파일도 PATH 탐색 후보에서 제외한다.
   const trusted = resolveTrustedClaudeCommand(projectRoot ? [projectRoot] : []);
   if (!trusted.ok) return trusted.result;
-  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input);
+  // 2026-08-29 — 개발 대상 프로젝트 root를 이 claude subprocess의 cwd로 명시적으로 넘긴다.
+  // 지정하지 않으면 이 Node 프로세스(runner) 자신의 cwd를 그대로 물려받는데, production
+  // 운용에서 그건 AutoDev Core 저장소 자신이다(runner-supervisor.ts가 continuous runner를
+  // 그 cwd로 spawn한다) — Claude Code CLI가 spawn 시점 cwd 기준으로 자체 환경 컨텍스트를
+  // 읽어들이므로, 실제 개발 대상(JARVIS 등)과 무관한 AutoDev Core 자신의 CLAUDE.md/rules가
+  // 매 호출마다 섞여 들어갈 수 있다(§ 실측: JARVIS Task 5.2). projectRoot가 없으면(테스트 등
+  // 기존 호출부) 기존과 동일하게 상속된 cwd를 그대로 쓴다.
+  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input, projectRoot);
   return classifySubprocessOutcome(outcome, timeoutMs);
 }
 
@@ -559,7 +607,6 @@ export async function runDeveloperTaskViaSafeExecutor(
   attempt: number,
   opts: DeveloperTaskOptions = {}
 ): Promise<DeveloperResult> {
-  void attempt;
   const timeoutMs = opts.timeoutPerRoundMs ?? 300_000;
   const changeScopeDirs = opts.changeScopeDirs ?? NO_SCOPE_CONFIGURED;
   const projectContext = opts.projectContext ?? DEFAULT_PROJECT_CONTEXT;
@@ -663,6 +710,21 @@ export async function runDeveloperTaskViaSafeExecutor(
     }
   }
 
+  // AutoDev Claude Developer context/token 소비 근본 조사(2026-08-29) — 같은 파일을 여러
+  // round에 걸쳐 READ_FILES하면 그 전체 내용이 매번 별도 "# Round N 결과" transcript
+  // 항목으로 영구히 쌓였다(실측: JARVIS Task 5.2). path별 "가장 최근에 읽은 내용"만
+  // fileSnapshots에 보관하고, 그 내용 전체는 transcript 안의 단 하나의 전용 항목
+  // (fileSnapshotEntryIndex가 가리키는 위치)에만 매번 덮어써서 유지한다 — 개별 round의
+  // "결과" 항목에는 READ_FILES의 실제 content 대신 어떤 경로를 읽었는지와 이 전용 항목을
+  // 참고하라는 짧은 안내만 남긴다(§ 아래 ACTION_REQUEST 처리 부분). WRITE_FILE/APPLY_PATCH
+  // 자체는 건드리지 않는다 — 그 이후 다시 READ_FILES하면 Safe Executor가 항상 디스크의
+  // 최신 내용을 그대로 반환하므로 "최신 내용 사용"은 자연히 보장된다.
+  const fileSnapshots = new Map<string, string>();
+  let fileSnapshotEntryIndex: number | undefined;
+  // 계측 전용(§ Stage 4) — 같은 경로가 이미 fileSnapshots에 있던 상태에서 다시 읽힌
+  // 횟수(=dedup이 실제로 몇 번 작동했는지). fileSnapshots.size(고유 파일 수)와는 다른 값이다.
+  let duplicateReadCount = 0;
+
   const forbiddenRepeatCount = new Map<string, number>();
   const deferredHumanTasks: string[] = [];
   let codeChangeHappened = false;
@@ -717,11 +779,25 @@ export async function runDeveloperTaskViaSafeExecutor(
     };
   }
 
+  // 2026-08-29(Prompt Cache 안정성) — trim이 배열 "중간"의 임의 항목을 제거하면 그 시점부터
+  // 이후 모든 호출의 prefix가 이전 호출들과 완전히 달라져 prompt cache가 통째로 무효화된다
+  // (실측: JARVIS Task 5.2에서 대규모 re-cache 관찰). Task 본문(index 0)과 현재 파일
+  // snapshot 항목(fileSnapshotEntryIndex — 이미 위 dedup으로 각 파일당 최신 내용 하나만
+  // 담고 있어 그 자체로 크기가 억제됨)은 절대 제거 대상에서 제외해, 실제로 제거되는 것은
+  // 항상 "오래된 round 서술" 쪽이 되게 한다 — trim이 일어나는 빈도 자체를 줄이지는 않지만,
+  // Developer가 여전히 필요로 하는 최신 파일 내용을 trim이 지워버리는 일은 없앤다.
   const capTranscript = () => {
     let joined = transcript.join("\n\n---\n\n");
     while (joined.length > MAX_TRANSCRIPT_CHARS && transcript.length > 1) {
-      // 가장 오래된 라운드부터 버린다 — Task 본문(index 0)은 항상 유지한다.
-      transcript.splice(1, 1);
+      let removeAt = -1;
+      for (let i = 1; i < transcript.length; i++) {
+        if (i === fileSnapshotEntryIndex) continue;
+        removeAt = i;
+        break;
+      }
+      if (removeAt === -1) break; // Task 본문 + snapshot뿐 — 더 이상 안전하게 제거할 항목이 없음.
+      transcript.splice(removeAt, 1);
+      if (fileSnapshotEntryIndex !== undefined && fileSnapshotEntryIndex > removeAt) fileSnapshotEntryIndex -= 1;
       joined = transcript.join("\n\n---\n\n");
     }
     return joined;
@@ -759,7 +835,22 @@ export async function runDeveloperTaskViaSafeExecutor(
 
   for (let round = 1; round <= MAX_INTERNAL_ROUNDS; round++) {
     reportRoundStart(round, implementationLocked ? "LOCKED" : "DISCOVERY");
+    const transcriptEntryCountBeforeCap = transcript.length;
     const input = capTranscript();
+    const trimmedThisRound = transcript.length < transcriptEntryCountBeforeCap;
+    log(
+      "developer context 계측(round 직전)",
+      buildDeveloperContextMetrics({
+        attempt,
+        round,
+        systemPromptChars: systemPrompt.length,
+        transcriptInput: input,
+        transcriptEntryCount: transcript.length,
+        fileSnapshots,
+        duplicateReadCount,
+        trimmedThisRound,
+      }) as unknown as Record<string, unknown>
+    );
     let claudeRaw = await claudeCall(input, timeoutMs);
 
     // USAGE_LIMIT은 일시정지다 — 같은 라운드/같은 input(transcript)으로 재시도한다. round
@@ -1085,10 +1176,48 @@ export async function runDeveloperTaskViaSafeExecutor(
         } else if (rawAction.type === "WRITE_FILE" || rawAction.type === "APPLY_PATCH") {
           codeChangeHappened = true;
         }
+        // 2026-08-29(transcript 중복 제거) — READ_FILES가 성공하면 실제 파일 내용은
+        // fileSnapshots에만 최신 상태로 보관하고, 이 round 자신의 "결과" 항목에는 어떤
+        // 경로를 읽었는지와 전용 snapshot 항목을 보라는 안내만 남긴다. 다른 action
+        // 타입(WRITE_FILE/APPLY_PATCH/SEARCH/RUN_COMMAND)의 result는 기존과 완전히 동일하게
+        // 그대로 담는다 — 이 dedup은 READ_FILES 전용이다.
+        if (result.ok && rawAction.type === "READ_FILES" && (result as { action?: string }).action === "READ_FILES") {
+          const data = (result as { data?: unknown }).data;
+          if (data && typeof data === "object" && !Array.isArray(data)) {
+            const dataMap = data as Record<string, string>;
+            for (const [relPath, content] of Object.entries(dataMap)) {
+              if (typeof content !== "string") continue;
+              if (fileSnapshots.has(relPath)) duplicateReadCount += 1;
+              fileSnapshots.set(relPath, content);
+            }
+            roundResults.push({
+              ok: true,
+              action: "READ_FILES",
+              paths: Object.keys(dataMap),
+              note: "전체 내용은 이 transcript의 '# 현재 파일 snapshot' 섹션에서 항상 최신 상태로 확인하세요(중복 방지를 위해 여기서는 생략됨).",
+            });
+            continue;
+          }
+        }
         roundResults.push(result);
       }
       transcript.push(`# Round ${round} 요청\n${JSON.stringify(parsed)}`);
       transcript.push(`# Round ${round} 결과\n${sanitizeForLog(JSON.stringify(roundResults))}`);
+
+      if (fileSnapshots.size > 0) {
+        // 파일 경로 오름차순 정렬 — 매번 같은 순서라 diff/캐시 안정성에도 도움이 된다.
+        const sortedPaths = [...fileSnapshots.keys()].sort();
+        const snapshotText = sanitizeForLog(
+          `# 현재 파일 snapshot(각 파일당 가장 최근에 읽은 내용 하나만 — 과거 read 중복 없음)\n\n` +
+            sortedPaths.map((p) => `## ${p}\n${fileSnapshots.get(p)}`).join("\n\n")
+        );
+        if (fileSnapshotEntryIndex === undefined) {
+          transcript.push(snapshotText);
+          fileSnapshotEntryIndex = transcript.length - 1;
+        } else {
+          transcript[fileSnapshotEntryIndex] = snapshotText;
+        }
+      }
 
       if (!codeChangeHappened && !implementationLocked && isDiscoveryOnlyRound) {
         advanceDiscoveryBudget(round);

@@ -1,6 +1,9 @@
 import { classifyFailureText, parseClaudeJsonOutput, classifySubprocessOutcome, detectUsageLimitSignal } from "./claude-runner";
 import { runSubprocessWithTimeout } from "./subprocess-runner";
 import { sanitizeForLog } from "./logger";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // SI-3.6(Executable Identity Trust) bounded review(chunk1 HIGH, 4라운드) 지적 반영 — 이
 // 파일은 더 이상 claude-runner.ts의 exported "임의 command를 spawn하는" 함수를 쓰지 않는다
@@ -163,6 +166,33 @@ async function main(): Promise<void> {
     "정상 응답은 큰 timeout(Planner 기본값 300000ms) 안에서도 즉시 성공 처리됨",
     fastOkWithLargeTimeout.success === true && fastOkWithLargeTimeout.summary === "ok-fast"
   );
+
+  // AutoDev Claude Developer context/token 소비 근본 조사(2026-08-29, Stage 1) —
+  // runSubprocessWithTimeout()의 새 cwd 옵션이 실제로 spawn되는 프로세스의 작업 디렉터리를
+  // 바꾸는지, process.execPath(현재 실행 중인 node 자신)로 실제 subprocess를 띄워 그
+  // 프로세스가 보고하는 process.cwd()로 직접 검증한다(claude CLI 실제 호출 없음).
+  const cwdProbeDir = realpathSync(mkdtempSync(join(tmpdir(), "autodev-cwd-probe-")));
+  try {
+    const withExplicitCwd = await runSubprocessWithTimeout(
+      process.execPath,
+      ["-e", "process.stdout.write(process.cwd())"],
+      5000,
+      undefined,
+      cwdProbeDir
+    );
+    check(
+      "cwd 옵션을 지정하면 실제 spawn된 프로세스의 cwd가 그 경로가 됨(AutoDev Core cwd 상속 회귀 방지)",
+      withExplicitCwd.code === 0 && realpathSync(withExplicitCwd.stdout.trim()) === cwdProbeDir
+    );
+
+    const withoutCwd = await runSubprocessWithTimeout(process.execPath, ["-e", "process.stdout.write(process.cwd())"], 5000);
+    check(
+      "cwd 옵션을 지정하지 않으면 기존과 동일하게 이 테스트 프로세스 자신의 cwd를 그대로 물려받음(기존 호출부 회귀 없음)",
+      withoutCwd.code === 0 && realpathSync(withoutCwd.stdout.trim()) === realpathSync(process.cwd())
+    );
+  } finally {
+    rmSync(cwdProbeDir, { recursive: true, force: true });
+  }
 
   console.log("\n=== runner 단위 테스트 결과 ===");
   for (const r of results) console.log(r);

@@ -32,17 +32,27 @@ const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // stdout/stderr 각각 2MB로 제한
  * command/args를 shell:false로 직접 spawn하고, timeout/출력/spawn 실패를 관측해 반환한다.
  * 이 함수는 command의 신뢰 여부를 전혀 판단하지 않는다 — 호출부가 이미 검증한 값만 넘겨야
  * 한다(§ 파일 상단 설명).
+ *
+ * cwd(2026-08-29, AutoDev Claude Developer context/token 소비 근본 조사) — 지정하지 않으면
+ * 기존과 완전히 동일하게 이 Node 프로세스 자신의 process.cwd()를 그대로 물려받는다(기존
+ * 모든 호출부의 동작을 전혀 바꾸지 않는다). claude-developer.ts의 callClaude()만 실제
+ * 대상 프로젝트 root를 명시적으로 넘긴다 — Claude Code CLI가 spawn 시점의 cwd를 기준으로
+ * 자체적으로 환경 컨텍스트(CLAUDE.md 등)를 읽어들이므로, 지정하지 않으면 이 함수를 호출한
+ * AutoDev Core 프로세스 자신의 cwd(예: runner-supervisor.ts가 continuous runner를 spawn할
+ * 때 쓰는 AutoDev Core 저장소 root)가 그대로 상속되어 개발 대상 프로젝트와 무관한 큰
+ * context가 매 호출마다 섞여 들어갈 수 있다(실측: JARVIS Task 5.2에서 관찰됨).
  */
 export function runSubprocessWithTimeout(
   command: string,
   args: string[],
   timeoutMs: number,
-  stdinInput?: string
+  stdinInput?: string,
+  cwd?: string
 ): Promise<SubprocessOutcome> {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(command, args, { shell: false });
+      child = spawn(command, args, { shell: false, ...(cwd ? { cwd } : {}) });
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       resolve({ timedOut: false, code: null, stdout: "", stderr: "", spawnErrorCode: err?.code, spawnErrorMessage: String(e) });

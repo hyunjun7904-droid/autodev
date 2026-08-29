@@ -2,7 +2,7 @@ import { existsSync, unlinkSync, readFileSync, writeFileSync, mkdtempSync, mkdir
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { runDeveloperTaskViaSafeExecutor, isPathWithinAllowedPrefixes } from "./claude-developer";
+import { runDeveloperTaskViaSafeExecutor, isPathWithinAllowedPrefixes, buildDeveloperContextMetrics } from "./claude-developer";
 import { PROJECT_ROOT, configureSafeExecutor, createSafeExecutorContext } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { RealClaudeResult, ClaudeErrorCode } from "./claude-runner";
@@ -276,6 +276,114 @@ async function scenarioD_writeFirstThenRepeatedReadNeverStagnates(): Promise<voi
   } finally {
     if (existsSync(fixtureAbs)) unlinkSync(fixtureAbs);
     check("D: fixture 정리 완료", !existsSync(fixtureAbs));
+  }
+}
+
+// AutoDev Claude Developer context/token 소비 근본 조사(2026-08-29, Stage 2) — 같은 파일을
+// 여러 round에 걸쳐 READ_FILES해도 오래된 전체 snapshot이 transcript에 반복 누적되지
+// 않고, 각 경로당 "가장 최근 내용" 하나만 남아야 한다. WRITE_FILE 이후 다시 READ하면 최신
+// 내용이 쓰여야 하고, 서로 다른 파일은 서로 영향을 주지 않아야 한다.
+async function scenarioDedup_repeatedReadOfSameFileDoesNotDuplicateOldSnapshots(): Promise<void> {
+  const markerRel = "automation/tmp-claude-developer-dedup-marker.txt";
+  const otherRel = "automation/tmp-claude-developer-dedup-other.txt";
+  const markerAbs = resolve(PROJECT_ROOT, markerRel);
+  const otherAbs = resolve(PROJECT_ROOT, otherRel);
+  const V1 = "DEDUP_MARKER_CONTENT_V1_OLD_SHOULD_DISAPPEAR";
+  const V2 = "DEDUP_MARKER_CONTENT_V2_LATEST";
+  const OTHER = "DEDUP_OTHER_FILE_CONTENT_PRESERVED";
+  writeFileSync(markerAbs, `${V1}\n`, "utf-8");
+  writeFileSync(otherAbs, `${OTHER}\n`, "utf-8");
+
+  const readMarker = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "READ_FILES", paths: [markerRel] }] });
+  const writeMarkerV2 = JSON.stringify({
+    type: "ACTION_REQUEST",
+    actions: [{ type: "WRITE_FILE", path: markerRel, content: `${V2}\n` }],
+  });
+  const readOther = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "READ_FILES", paths: [otherRel] }] });
+  const taskComplete = JSON.stringify({
+    type: "TASK_COMPLETE",
+    summary: "dedup 검증 완료",
+    changedFiles: [markerRel],
+    testsRequested: [],
+  });
+
+  // round1: read(V1) → round2: read again(중복1) → round3: write(V2) → round4: read again
+  // (write 이후 최신값) → round5: 다른 파일 read(보존 확인) → round6: read marker again(중복2)
+  // → round7: 완료.
+  const scripts = [readMarker, readMarker, writeMarkerV2, readMarker, readOther, readMarker, taskComplete];
+  const scripted = makeScriptedClaudeCaller(scripts);
+
+  try {
+    const result = await runDeveloperTaskViaSafeExecutor("동일 파일 반복 read 중복 제거 시나리오", 1, {
+      claudeCaller: scripted.call,
+    });
+
+    check("Dedup: success=true", result.success === true);
+    check("Dedup: 정확히 7라운드(예산/무진척 조기 종료 없음)", scripted.callCount() === 7);
+
+    const finalInput = scripted.receivedInputs[scripted.receivedInputs.length - 1];
+    check("Dedup: 최신 내용(V2)이 최종 transcript에 존재", finalInput.includes(V2));
+    check("Dedup: 오래된 내용(V1)은 최종 transcript에서 완전히 사라짐(중복 snapshot 제거)", !finalInput.includes(V1));
+    check("Dedup: 서로 다른 파일(OTHER)의 내용은 보존됨", finalInput.includes(OTHER));
+    // V2는 정확히 2곳에서만 등장해야 한다: (1) round3의 WRITE_FILE "요청" 자체(Claude가 쓰라고
+    // 보낸 content — dedup 대상이 아니다, 그대로 유지되는 게 맞다), (2) 파일 snapshot 섹션
+    // 1곳. round4/round6에서 같은 파일을 두 번 더 READ했는데도 세 번째·네 번째 등장이
+    // 생기지 않아야 dedup이 실제로 작동한 것이다.
+    check(
+      "Dedup: 최신 내용(V2)이 정확히 2곳(WRITE 요청 1 + snapshot 1)에서만 등장 — round4/6의 재읽기가 추가 복사본을 만들지 않음",
+      finalInput.split(V2).length - 1 === 2
+    );
+    check("Dedup: 전용 '현재 파일 snapshot' 섹션이 존재", finalInput.includes("현재 파일 snapshot"));
+  } finally {
+    if (existsSync(markerAbs)) unlinkSync(markerAbs);
+    if (existsSync(otherAbs)) unlinkSync(otherAbs);
+    check("Dedup: fixture 정리 완료", !existsSync(markerAbs) && !existsSync(otherAbs));
+  }
+}
+
+// AutoDev Claude Developer context/token 소비 근본 조사(2026-08-29, Stage 3) — trim이
+// 실제로 발생할 만큼 큰 transcript를 만들어도, Task 헤더와 파일 snapshot(현재 dedup된 최신
+// 파일 내용)은 절대 제거되지 않고 살아남아야 한다 — 제거되는 것은 항상 오래된 round
+// 서술이어야 한다(prompt cache prefix 안정성의 전제 조건).
+async function scenarioTrim_taskHeaderAndFileSnapshotSurviveTrimming(): Promise<void> {
+  const markerRel = "automation/tmp-claude-developer-trim-marker.txt";
+  const markerAbs = resolve(PROJECT_ROOT, markerRel);
+  const padRel = "automation/tmp-claude-developer-trim-pad.txt";
+  const padAbs = resolve(PROJECT_ROOT, padRel);
+  const MARKER_CONTENT = "TRIM_TEST_SNAPSHOT_MUST_SURVIVE_MARKER";
+  const LARGE_CHUNK = "PAD".repeat(10_000); // 약 30,000자
+  writeFileSync(markerAbs, `${MARKER_CONTENT}\n`, "utf-8");
+
+  const readMarker = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "READ_FILES", paths: [markerRel] }] });
+  const writePad = (tag: string): string =>
+    JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: padRel, content: `${tag}-${LARGE_CHUNK}` }] });
+  const taskComplete = JSON.stringify({
+    type: "TASK_COMPLETE",
+    summary: "trim 보호 검증 완료",
+    changedFiles: [markerRel, padRel],
+    testsRequested: [],
+  });
+
+  // round1: 작은 marker read(끝까지 살아남아야 함) → round2~6: 대용량 write 반복(약
+  // 5*30,000자=150,000자 — 120,000자 상한을 실제로 넘겨 trim이 발생하도록) → round7: 완료.
+  const scripts = [readMarker, writePad("A"), writePad("B"), writePad("C"), writePad("D"), writePad("E"), taskComplete];
+  const scripted = makeScriptedClaudeCaller(scripts);
+
+  try {
+    const result = await runDeveloperTaskViaSafeExecutor("trim 보호 검증 시나리오", 1, { claudeCaller: scripted.call });
+    check("Trim: success=true", result.success === true);
+    check("Trim: 정확히 7라운드", scripted.callCount() === 7);
+
+    const finalInput = scripted.receivedInputs[scripted.receivedInputs.length - 1];
+    check("Trim: 파일 snapshot(작은 marker 내용)이 trim 이후에도 살아남음", finalInput.includes(MARKER_CONTENT));
+    check("Trim: Task 헤더가 여전히 존재함", finalInput.startsWith("# Task"));
+    check("Trim: 실제로 trim이 발생해 총 길이가 누적 원본(약 15만자+)보다 훨씬 작음", finalInput.length < 200_000);
+    check("Trim: 가장 오래된 round(A)의 요청 내용은 trim으로 제거됨", !finalInput.includes("A-PAD"));
+    check("Trim: 가장 최근 round(E)의 요청 내용은 남아있음", finalInput.includes("E-PAD"));
+  } finally {
+    if (existsSync(markerAbs)) unlinkSync(markerAbs);
+    if (existsSync(padAbs)) unlinkSync(padAbs);
+    check("Trim: fixture 정리 완료", !existsSync(markerAbs) && !existsSync(padAbs));
   }
 }
 
@@ -1068,6 +1176,37 @@ async function main(): Promise<void> {
   // 검사라 격리 root 준비 이전에 먼저 실행한다.
   scenarioS_sourceRegressionProductionPathCannotBypassSafeExecutor();
 
+  // AutoDev Claude Developer context/token 소비 근본 조사(2026-08-29, Stage 4) —
+  // buildDeveloperContextMetrics()는 순수 함수라 실제 Claude 호출/격리 root 없이 검증한다.
+  {
+    const snapshots = new Map<string, string>([
+      ["a.ts", "x".repeat(100)],
+      ["b.ts", "y".repeat(50)],
+    ]);
+    const metrics = buildDeveloperContextMetrics({
+      attempt: 3,
+      round: 5,
+      systemPromptChars: 1234,
+      transcriptInput: "z".repeat(2000),
+      transcriptEntryCount: 7,
+      fileSnapshots: snapshots,
+      duplicateReadCount: 2,
+      trimmedThisRound: true,
+    });
+    check("계측: attempt/round가 그대로 반영됨", metrics.attempt === 3 && metrics.round === 5);
+    check("계측: systemPromptChars가 그대로 반영됨", metrics.systemPromptChars === 1234);
+    check("계측: transcriptChars가 실제 입력 길이와 일치", metrics.transcriptChars === 2000);
+    check("계측: transcriptEntryCount가 그대로 반영됨", metrics.transcriptEntryCount === 7);
+    check("계측: fileSnapshotChars가 각 파일 길이 합과 일치(100+50)", metrics.fileSnapshotChars === 150);
+    check("계측: fileSnapshotCount가 고유 파일 수와 일치", metrics.fileSnapshotCount === 2);
+    check("계측: duplicateReadCount가 그대로 반영됨", metrics.duplicateReadCount === 2);
+    check("계측: trimmedThisRound가 그대로 반영됨", metrics.trimmedThisRound === true);
+    check(
+      "계측: 실제 파일 내용/Secret 원문은 반환값 어디에도 포함되지 않음(문자 수만)",
+      !JSON.stringify(metrics).includes("x".repeat(10)) && !JSON.stringify(metrics).includes("y".repeat(10))
+    );
+  }
+
   // isPathWithinAllowedPrefixes는 순수 함수라 격리 root 없이 먼저 실행한다.
   scenarioPathScope_normalSubpathAllowed();
   scenarioPathScope_similarSiblingPrefixRejected();
@@ -1090,6 +1229,8 @@ async function main(): Promise<void> {
     await scenarioC3_novelDiscoveryThenNudgeThenWriteSucceeds();
     await scenarioC4_normalShortDiscoveryThenWriteSucceeds();
     await scenarioD_writeFirstThenRepeatedReadNeverStagnates();
+    await scenarioDedup_repeatedReadOfSameFileDoesNotDuplicateOldSnapshots();
+    await scenarioTrim_taskHeaderAndFileSnapshotSurviveTrimming();
     await scenarioE_planCannotResetDiscoveryBudgetIndefinitely();
     await scenarioF_planThenWriteSucceeds();
     await scenarioG_requiredTestsExecutedForReal();
