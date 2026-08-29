@@ -35,7 +35,9 @@ import {
   classifyFailureCategory,
   createStagnationTracker,
   buildEscalationGuidance,
+  computeSecretFindingFingerprint,
 } from "./failure-stagnation";
+import { scanChangesForSecrets } from "./secret-scanner";
 import {
   selectDefaultProblemMemoryStore,
   lookupSolution,
@@ -974,6 +976,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 위(if/else 밖)에서 이미 만들었다 — checkpoint 확정 코드도 같은 인스턴스를 참조해야
     // 하기 때문이다.
     const memoryStagnationTracker = createStagnationTracker();
+    // Secret Scanner 사전검사(§ defaultClaudeRunner 아래) 전용 stagnation tracker — 별도
+    // 인스턴스를 쓴다(memoryStagnationTracker와 fingerprint 도메인이 다르므로 하나를 같이
+    // 쓰면 "번갈아 관찰"에 의해 repeatCount가 절대 2에 도달하지 못하는 버그가 생긴다).
+    const secretPrecheckTracker = createStagnationTracker();
     let previousAttemptResult: ClaudeResult | undefined;
     // AutoDev / JARVIS 최종 무인개발 하드닝 — Fireworks Same-Finding Call Limiting & Root
     // Cause Analysis(§ root-cause-analysis.ts)가 RCA를 트리거하면(동일 reviewer finding이
@@ -1155,7 +1161,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         if (hintParts.length > 0) memoryHint = hintParts.join("\n\n");
       }
 
-      const result = await runDeveloperTaskWithRetry(task, attempt, {
+      let result = await runDeveloperTaskWithRetry(task, attempt, {
         requiredTests: taskDef.requiredTests,
         allowedPathPrefixes: taskDef.allowedPathPrefixes,
         projectContext: developerContext,
@@ -1173,6 +1179,62 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         claudeCaller: opts.developerClaudeCaller,
         onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
       });
+
+      // Secret Scanner 사전검사(2026-08-29, Task 4.2 SECURITY_BLOCKED 재발 방지) — Developer
+      // 산출물이 checkpoint 직전(performTaskCheckpoint, checkpoint.ts)에야 처음 Secret Scanner에
+      // 걸려 매번 사람 승인까지 도달하는 것을 줄인다. 새 Scanner/정규식을 두지 않고 checkpoint.ts와
+      // 정확히 동일한 scanChangesForSecrets()를 그대로 재사용한다 — 이 사전검사가 clean이어도
+      // 최종 checkpoint의 authoritative Secret Scanner Gate는 절대 건너뛰지 않고 항상 다시
+      // 실행된다(§ 아래, 이 블록은 그 Gate 호출부를 전혀 건드리지 않는다). AUTOMATION_DRY_RUN이
+      // 아닐 때만 실제 working tree를 스캔한다(selectDefaultClaudeRunner/selectDefaultGptReviewer와
+      // 동일한 조건 — dry-run/테스트에서는 fake claudeCaller가 실제 파일을 쓰지 않는 한 no-op).
+      if (result.success && process.env.AUTOMATION_DRY_RUN === "false") {
+        const changes = getWorkingTreeChanges(manifest.reviewScopeDirs, executorContext.projectRoot);
+        const scan = scanChangesForSecrets(changes.all, executorContext.projectRoot);
+        if (!scan.clean) {
+          const fingerprint = computeSecretFindingFingerprint(taskDef.id, scan.findings);
+          const repeatCount = secretPrecheckTracker.observe(fingerprint);
+          // 실제 값은 findings에 애초에 담기지 않는다(secret-scanner.ts) — 로그에도 file/
+          // line/kind만 남는다.
+          log("Secret 사전검사 finding — checkpoint 이전에 자체 점검합니다", {
+            taskId: taskDef.id,
+            findings: scan.findings,
+            repeatCount,
+          });
+          if (repeatCount === 1) {
+            // 같은 finding이 처음 관찰된 경우에만 Developer를 한 번 더 부른다(§ 요구사항
+            // "같은 finding 반복 시 Developer/외부 AI 호출 반복 금지" — repeatCount가 2 이상이면
+            // 이 분기에 들어오지 않으므로 아래 재호출은 발생하지 않는다). GPT Reviewer는 전혀
+            // 호출하지 않는다 — 이 판정은 결정론적이라 AI 판단/비용이 필요 없다.
+            const findingList = scan.findings.map((f) => `- ${f.file}:${f.line} (${f.kind})`).join("\n");
+            const secretHint =
+              "# AutoDev 안내(Secret 사전검사 — checkpoint 전 자체 점검)\n" +
+              "방금 만든 변경에서 Secret Scanner가 완성형 secret-shape 패턴을 발견했습니다(실제 값은 " +
+              "표시하지 않습니다 — 파일/줄/탐지 종류만):\n" +
+              findingList +
+              "\n\n실제 credential이든 secret 차단 기능 자체를 검증하는 테스트 fixture든 동일하게 " +
+              "적용됩니다: 소스/테스트에 Secret Scanner와 매칭되는 완성형 secret-shaped raw literal을 " +
+              "저장하지 마세요. 보안 탐지 기능을 테스트해야 한다면 런타임 문자열 조합(예: 여러 리터럴을 " +
+              "이어붙이기)으로 테스트 의미를 유지하면서 저장소에는 완성형 패턴이 남지 않게 하세요. " +
+              "whitelist 추가나 Scanner 완화는 허용되지 않습니다.";
+            result = await runDeveloperTaskWithRetry(task, attempt, {
+              requiredTests: taskDef.requiredTests,
+              allowedPathPrefixes: taskDef.allowedPathPrefixes,
+              projectContext: developerContext,
+              changeScopeDirs: manifest.reviewScopeDirs,
+              executor: executorContext,
+              memoryHint: memoryHint ? `${memoryHint}\n\n${secretHint}` : secretHint,
+              claudeCaller: opts.developerClaudeCaller,
+              onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
+            });
+          }
+          // repeatCount >= 2(같은 finding이 사전검사 수정 시도 이후에도 반복됨) 또는 방금 재시도한
+          // 결과는 다시 스캔하지 않는다 — 이 result를 그대로 기존 REVISE/checkpoint 흐름으로
+          // 넘긴다. 최종 checkpoint의 scanChangesForSecrets가 여전히 authoritative gate로 다시
+          // 검사해, 필요하면 기존과 동일하게 SECURITY_BLOCKED(WAITING_HUMAN)로 멈춘다 — 이
+          // 사전검사는 그 판정을 대신하거나 완화하지 않는다.
+        }
+      }
 
       // Section 2/6/9 — 이 cycle의 결과를 problem-memory에 기록한다. GPT 리뷰 판단이 아니라
       // required test 통과 여부라는 객관적 신호만 근거로 삼는다(§ agent-orchestrator.ts의

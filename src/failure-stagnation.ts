@@ -1,4 +1,5 @@
 import type { ClaudeResult } from "./types";
+import type { SecretFinding } from "./secret-scanner";
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening — Phase 6.
 //
@@ -66,6 +67,19 @@ export function computeProblemFingerprint(tests: ClaudeResult["tests"]): string 
  *  computeProblemFingerprint()를 직접 써야 한다(§ problem-memory.ts). */
 export function computeFailureFingerprint(taskId: string, tests: ClaudeResult["tests"]): string {
   return `${taskId}::${computeProblemFingerprint(tests)}`;
+}
+
+/**
+ * Secret Scanner 사전검사(§ autodev.ts defaultClaudeRunner, checkpoint 이전 조기 검사)
+ * 전용 결정론적 fingerprint — computeProblemFingerprint()/computeFailureFingerprint()와
+ * 동일한 목적("같은 원인이면 항상 같은 fingerprint")이되, 데이터 모양이 근본적으로 다르다
+ * (실패한 test가 아니라 SecretFinding[] — 실제 secret 값은 SecretFinding 자체에 담기지
+ * 않으므로 이 fingerprint도 file/line/kind만으로 계산된다, 원문 노출 없음). taskId를
+ * 반드시 포함해 다른 task의 우연히 같은 finding과 섞이지 않게 한다.
+ */
+export function computeSecretFindingFingerprint(taskId: string, findings: SecretFinding[]): string {
+  const parts = findings.map((f) => `${f.file}:${f.line}:${f.kind}`).sort();
+  return `${taskId}::SECRET::${parts.join(";;")}`;
 }
 
 // orchestrator.ts가 state.deferredHumanTasks에 남기는 STAGNATION_DETECTED 마커의 고정

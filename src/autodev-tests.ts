@@ -1472,6 +1472,199 @@ async function scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWa
   check("Secret Scanner 보호: status가 여전히 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
 }
 
+// Secret Scanner 사전검사(2026-08-29, Task 4.2 SECURITY_BLOCKED 재발 방지) — Developer가
+// 만든 변경에 완성형 secret-shape 리터럴이 있으면, 최종 checkpoint의 authoritative Secret
+// Scanner Gate에 처음 걸리기 전에 defaultClaudeRunner(autodev.ts)가 같은 scanChangesForSecrets()
+// 로 먼저 검사해 Developer에게 file/line/kind만(원문 값 제외) 안내하고 한 번 더 기회를 준다.
+// AUTOMATION_DRY_RUN을 이 시나리오 안에서만 명시적으로 "false"로 두어 실제 이 경로가
+// 실행되게 한다(다른 시나리오는 이 값을 건드리지 않으므로 서로 영향이 없다 — 이 파일은
+// 시나리오를 순차 실행하는 단일 프로세스이므로 finally로 반드시 원복한다).
+//
+// checkpoint.ts의 requiredTestsAllPassed는 Claude/GPT 자체 보고를 신뢰하지 않고 항상 실제
+// requiredTests 실행 결과(claude-developer.ts runRequiredTests)만 본다 — taskDef.requiredTests
+// 가 비어 있으면 그 결과도 항상 빈 배열이라 checkpoint가 "필수 테스트 미통과"로 막힌다(§
+// autodev.ts requiredTestsAllPassed = tests.length > 0 && ...). 이 두 시나리오는 secret
+// 사전검사만 독립적으로 검증해야 하므로, 항상 exit 0인 최소 check.js를 실제 requiredTests로
+// 등록해 이 무관한 gate를 우회한다(scope는 buildPlannerManifest와 동일하게 proj/만 허용).
+const SECRET_PRECHECK_REGISTRY: TaskDefinition[] = [
+  {
+    id: "SP1",
+    phase: 1,
+    taskNumber: 1,
+    title: "Secret Precheck Fixture Task",
+    prompt: "Secret precheck fixture task prompt",
+    requiredTests: [{ name: "check-always-pass", command: "node", args: ["check.js"], cwd: "root" }],
+    allowedPathPrefixes: ["proj/"],
+    prohibitedOperations: [],
+  },
+];
+
+function buildSecretPrecheckManifest(root: string, statePath: string): ProjectManifest {
+  return {
+    projectId: "secret-precheck-fixture-project",
+    projectName: "Secret Precheck Fixture Project",
+    targetProjectRoot: root,
+    statePath,
+    taskRegistry: SECRET_PRECHECK_REGISTRY,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: [{ cwd: "root", command: "node", args: ["check.js"] }],
+    },
+  };
+}
+
+function writeAlwaysPassCheckScript(repo: string): void {
+  // proj/** 밖의 인프라 파일이라 checkpoint의 "허용 경로 밖 예상치 못한 변경" 방어에 걸리지
+  // 않도록 초기 커밋에 포함시킨다(§ writeCheckScript와 동일한 관례) — marker.txt(secret
+  // 유무 검사 대상)만 이 Task의 실제 산출물이다. 내용과 무관하게 항상 exit 0이라 secret
+  // 사전검사/최종 Secret Scanner 판정과 완전히 독립적이다.
+  writeFileSync(join(repo, "check.js"), "process.exit(0);\n", "utf-8");
+  spawnSync("git", ["add", "--", "check.js"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "add check.js"], { cwd: repo });
+}
+
+async function scenarioSecretPrecheckAutoFixesFindingWithoutHumanGate(): Promise<void> {
+  const repo = makeTempGitRepo();
+  writeAlwaysPassCheckScript(repo);
+  const statePath = makeTempStateFile(repo, { completedTasks: [] }); // 다음 task = SP1
+  const manifest = buildSecretPrecheckManifest(repo, statePath);
+
+  const RAW_SECRET = "sk-abcdefghijklmnopqrstuvwx";
+  let call = 0;
+  const receivedInputs: string[] = [];
+  const developerClaudeCaller = async (input: string): Promise<RealClaudeResult> => {
+    call += 1;
+    receivedInputs.push(input);
+    if (call === 1) {
+      const content = `const key = '${RAW_SECRET}';\n`;
+      const protocolJson = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: "proj/marker.txt", content }] });
+      return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
+    }
+    if (call === 2) {
+      const protocolJson = JSON.stringify({
+        type: "TASK_COMPLETE",
+        summary: "1차 시도: marker.txt에 fake key 상수를 그대로 넣어 완료",
+        changedFiles: ["proj/marker.txt"],
+        testsRequested: [],
+      });
+      // requiredTests=[]인 fixture 관례상, 실제 command가 없어도 checkpoint의
+      // requiredTestsAllPassed(autodev.ts) 판정이 "tests.length > 0 && 전부 pass"를 요구한다
+      // (§ scenarioRunAutodevOnceHappyPath와 동일한 관례) — 이 시나리오의 목적은 required test
+      // 판정이 아니라 secret 사전검사이므로 더미 PASS 항목으로 그 판정을 항상 통과시킨다.
+      return { success: true, summary: protocolJson, changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: protocolJson };
+    }
+    if (call === 3) {
+      const content = "const key = safeConcat();\n"; // 사전검사 안내를 반영해 완성형 리터럴 제거
+      const protocolJson = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: "proj/marker.txt", content }] });
+      return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
+    }
+    const protocolJson = JSON.stringify({
+      type: "TASK_COMPLETE",
+      summary: "2차 시도: 사전검사 안내에 따라 secret-shape 리터럴 제거",
+      changedFiles: ["proj/marker.txt"],
+      testsRequested: [],
+    });
+    return { success: true, summary: protocolJson, changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: protocolJson };
+  };
+
+  const originalDryRun = process.env.AUTOMATION_DRY_RUN;
+  process.env.AUTOMATION_DRY_RUN = "false";
+  try {
+    const result = await runAutodevOnce({
+      manifest,
+      developerClaudeCaller,
+      orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    });
+
+    check("Secret 사전검사: Developer가 정확히 2회(원본 시도 + 사전검사 재시도 1회) 호출됨", call === 4);
+    check(
+      "Secret 사전검사: 재시도 라운드 프롬프트에 file/line/kind 안내가 실제로 포함됨",
+      !!receivedInputs[2]?.includes("proj/marker.txt") && !!receivedInputs[2]?.includes("generic-api-key")
+    );
+    check(
+      "Secret 사전검사: 재시도 프롬프트에 탐지된 secret의 실제 원문 값은 노출되지 않음",
+      !receivedInputs[2]?.includes(RAW_SECRET)
+    );
+    check(
+      "Secret 사전검사: 사람 승인 없이 정상적으로 checkpoint까지 도달(WAITING_HUMAN으로 멈추지 않음)",
+      result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+    );
+    const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+    check("Secret 사전검사: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+    const committedContent = readFileSync(join(repo, "proj", "marker.txt"), "utf-8");
+    check("Secret 사전검사: 최종 commit된 파일 내용에 secret-shape 리터럴이 남지 않음", !committedContent.includes(RAW_SECRET));
+  } finally {
+    if (originalDryRun === undefined) delete process.env.AUTOMATION_DRY_RUN;
+    else process.env.AUTOMATION_DRY_RUN = originalDryRun;
+  }
+}
+
+// Secret 사전검사가 Developer를 한 번 되돌려도 같은 secret-shape finding이 그대로 남으면
+// (§ 요구사항 "같은 finding 반복 시 Developer/외부 AI 호출 반복 금지") 더 이상 Developer를
+// 부르지 않고 기존 흐름(GPT Review → checkpoint)으로 그대로 넘긴다는 것, 그리고 이 사전검사가
+// 최종 authoritative Secret Scanner Gate(checkpoint.ts)의 SECURITY_BLOCKED 판정을 절대
+// 대신하거나 완화하지 않는다는 것을 함께 증명한다.
+async function scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersists(): Promise<void> {
+  const repo = makeTempGitRepo();
+  writeAlwaysPassCheckScript(repo);
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  const manifest = buildSecretPrecheckManifest(repo, statePath);
+
+  const RAW_SECRET = "sk-abcdefghijklmnopqrstuvwx";
+  let call = 0;
+  const developerClaudeCaller = async (): Promise<RealClaudeResult> => {
+    call += 1;
+    // 매 시도(WRITE_FILE 라운드)마다 항상 같은 secret-shape 리터럴을 그대로 남긴다 —
+    // 사전검사가 한 번 재시도를 줘도 문제를 고치지 못하는 Developer를 시뮬레이션한다.
+    if (call % 2 === 1) {
+      const content = `const key = '${RAW_SECRET}';\n`;
+      const protocolJson = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: "proj/marker.txt", content }] });
+      return { success: true, summary: protocolJson, changedFiles: [], tests: [], rawOutput: protocolJson };
+    }
+    const protocolJson = JSON.stringify({
+      type: "TASK_COMPLETE",
+      summary: `시도 ${Math.ceil(call / 2)}: marker.txt 완료(여전히 secret-shape 값 포함)`,
+      changedFiles: ["proj/marker.txt"],
+      testsRequested: [],
+    });
+    // requiredTestsAllPassed(autodev.ts)가 이 checkpoint 시도를 required test 미달이 아니라
+    // 오직 secret 사전검사/최종 Secret Scanner 사유로만 막게 하기 위한 더미 PASS(§ 위와 동일).
+    return { success: true, summary: protocolJson, changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: protocolJson };
+  };
+
+  const originalDryRun = process.env.AUTOMATION_DRY_RUN;
+  process.env.AUTOMATION_DRY_RUN = "false";
+  try {
+    const result = await runAutodevOnce({
+      manifest,
+      developerClaudeCaller,
+      orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    });
+
+    check(
+      "Secret 사전검사(미해결): Developer가 정확히 2회만 호출됨(원본 + 재시도 1회, 그 이상 반복 호출 없음)",
+      call === 4
+    );
+    check(
+      "Secret 사전검사(미해결): 최종 checkpoint가 실제 Secret Scanner Gate에 의해 BLOCK됨(authoritative gate 그대로 유지)",
+      result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED"
+    );
+    const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+    check("Secret 사전검사(미해결): 최종 status가 WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+    check(
+      "Secret 사전검사(미해결): deferredHumanTasks에 실제 CHECKPOINT_BLOCKED 마커가 기록됨(사전검사가 이 판정을 대신하지 않음)",
+      finalState.deferredHumanTasks.some((t) => t.startsWith("CHECKPOINT_BLOCKED(SP1)"))
+    );
+  } finally {
+    if (originalDryRun === undefined) delete process.env.AUTOMATION_DRY_RUN;
+    else process.env.AUTOMATION_DRY_RUN = originalDryRun;
+  }
+}
+
 // AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
 // Hardening(2026-08-28)로 갱신 — REVIEW_CYCLE_EXHAUSTED 자신은 canonical Human Gate
 // Policy상 기술적 자동 복구 대상이라 그 자체로는 genuine WAITING_HUMAN을 만들지 않는다(§
@@ -1831,6 +2024,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();
+    await scenarioSecretPrecheckAutoFixesFindingWithoutHumanGate();
+    await scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersists();
     await scenarioRunAutodevOnceReviewCycleExhaustedDoesNotEmitGenericApprovalRequiredEvent();
     await scenarioRunAutodevOnceAutoRepairsRequiredTestScriptAndContinues();
     await scenarioCrossTaskMemoryReuseEndToEnd();
