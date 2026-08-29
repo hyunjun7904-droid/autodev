@@ -7,6 +7,7 @@ import type { AutoDevEventInput } from "./observability-event";
 import { getDashboardSnapshot, resetDashboardSnapshotCacheForTests, computeDashboardRuntimeTruth } from "./dashboard-snapshot-provider";
 import { createRoundStatusReporterForTests } from "./round-status";
 import type { ProjectRuntimeLiveness } from "./project-lock";
+import type { ProblemMemoryStore } from "./problem-memory";
 
 // Local Operations Dashboard — Read Service / Cache Seam 테스트(Phase G Task G4.1). 실제
 // Claude/GPT 유료 API를 호출하지 않는다 — 이 파일은 파일 기반 EventStore에 직접 event를
@@ -157,12 +158,26 @@ function scenarioProjectProgressUndefinedWithoutAdapterEnv(): void {
   }
 }
 
+// § 요구사항 4 project-state 격리와 동일한 원칙 — buildProblemSolvingSnapshot()의 COMMON
+// tier lookup은 항상 실제 logs/problem-memory/ 파일을 읽으므로(§ dashboard-problem-solving.ts
+// 상단 주석 "대시보드는 production 여부와 무관하게 항상 실제 파일을 본다"), 이 저장소가
+// 실제 개발에 쓰이며 이미 COMMON tier 기록이 쌓여 있으면 이 project는 그 기록과 무관한데도
+// problemSolving이 undefined가 아니게 된다(§ 실제 재현됨). 이 시나리오는 "problem-memory
+// 자료가 전혀 없을 때"를 검증하려는 것이므로, 반드시 격리된 빈 in-memory store를 명시적으로
+// 주입한다(getDashboardSnapshot()의 problemMemoryStores 테스트 seam).
+function makeEmptyProblemMemoryStore(): ProblemMemoryStore {
+  return { load: () => [], save: () => {} };
+}
+
 function scenarioProblemSolvingUndefinedWithoutMemoryData(): void {
   resetDashboardSnapshotCacheForTests();
   const filePath = makeEventFilePath();
   const store = createFileEventStore(filePath);
   appendAll(store, [ev({ eventType: "TASK_STARTED", runId: "run-noproblem", taskId: "T1", projectId: "proj-with-no-problem-history-xyz" })]);
-  const snapshot = getDashboardSnapshot(filePath);
+  const snapshot = getDashboardSnapshot(filePath, makeRoundStatusFilePath(), {
+    project: makeEmptyProblemMemoryStore(),
+    common: makeEmptyProblemMemoryStore(),
+  });
   check("problem-memory 기록이 전혀 없는 project는 problemSolving이 undefined", snapshot.problemSolving === undefined);
 }
 

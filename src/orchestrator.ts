@@ -8,7 +8,7 @@ import type { ReviewBaseline } from "./review-baseline";
 import type { SafeExecutorContext } from "./safe-executor";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
-import { computeFailureFingerprint, classifyFailureCategory, createStagnationTracker } from "./failure-stagnation";
+import { computeFailureFingerprint, classifyFailureCategory, createStagnationTracker, STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
 import { buildTestSummary, isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import type { EventStore } from "./event-store";
@@ -19,6 +19,22 @@ import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, C
 export const MAX_GPT_CALLS = 10; // review "cycle" 단위 상한(REVISE 루프 횟수)
 export const MAX_GPT_RAW_CALLS = 30; // gptTransportRetry 포함 실제 API 호출 총합의 hard cap(사용자 미지정 — 무한호출 방지용 보수적 기본값)
 export const CLAUDE_LIMIT_WAIT_MS = 30 * 60 * 1000; // 30분
+
+// STAGNATION_DETECTED 마커 재분류(§ human-gate-policy.ts) 도입에 따른 안전장치 — MAX_GPT_CALLS/
+// Claude 구조적 실패는 지금까지 deferredHumanTasks에 아무 마커도 남기지 않고 순수
+// fail-closed 기본값(GENUINE_HUMAN_JUDGMENT)에만 의존해 genuine으로 남았다(§ production-
+// agent-integration-tests.ts scenarioAdvisoryCannotOverrideCoreTestFailure 등이 이 설계를
+// 명시적으로 검증한다 — "GPT 호출 횟수 상한은 의도적으로 TECHNICAL_AUTO_RECOVERABLE 목록에
+// 넣지 않고 fail-closed GENUINE으로 남긴다"). 이 REVISE 루프는 같은 required test 실패가
+// 반복되면 도중에(§ 아래 stagnationTracker) STAGNATION_DETECTED 마커를 이미 deferredHumanTasks에
+// 남겨둔 채로 이 genuine 종료 지점에 도달할 수 있다 — "마커가 없으면 genuine"이라는 암묵적
+// 판정과 "STAGNATION_DETECTED만 있으면 기술적 자동 복구 대상"이라는 새 규칙이 동시에 참이면,
+// 실제로는 비용/구조적 실패로 멈춘 WAITING_HUMAN이 조용히 자동 복구될 위험이 생긴다. 그래서
+// GPT_RAW_CALL_LIMIT_EXCEEDED/BUDGET_EXCEEDED 등 기존 genuine 마커와 동일한 패턴으로 이
+// 두 지점도 명시적 마커를 남긴다 — "genuine으로 남는다"는 기존 설계 의도 자체는 바뀌지
+// 않고, 그 판정 근거만 암묵적 부재(marker 없음)에서 명시적 마커로 바뀐다.
+export const MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX = "MAX_GPT_CALLS_EXCEEDED:";
+export const CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX = "CLAUDE_STRUCTURAL_FAILURE(";
 
 // AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry(2026-08-28 정책
 // 수정). Developer가 일시적 오류(TIMEOUT/CLI_NOT_FOUND)로 attempt 내 재시도(claude-
@@ -392,6 +408,9 @@ export async function runOrchestrator(
       }
 
       log("Claude 결과가 실패(success=false) — GPT 리뷰 생략, WAITING_HUMAN", { errorCode });
+      state.deferredHumanTasks.push(
+        `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}${errorCode ?? "UNKNOWN"}): Claude 결과가 구조적으로 실패(success=false)해 GPT 리뷰 없이 WAITING_HUMAN으로 전환됨`
+      );
       setStatus("WAITING_HUMAN");
       break;
     }
@@ -430,6 +449,7 @@ export async function runOrchestrator(
     gptCallCount += 1;
     if (gptCallCount > MAX_GPT_CALLS) {
       log(`GPT 호출 ${MAX_GPT_CALLS}회 초과 — WAITING_HUMAN`);
+      state.deferredHumanTasks.push(`${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 ${gptCallCount}회`);
       setStatus("WAITING_HUMAN");
       break;
     }
@@ -528,7 +548,7 @@ export async function runOrchestrator(
         const category = classifyFailureCategory(claudeErrorCode, gptResult.errorCode, claudeResult.tests);
         log("STAGNATION_DETECTED — 동일한 required test 실패가 반복됨", { category, reviewCycle: state.reviewCycle });
         state.deferredHumanTasks.push(
-          `STAGNATION_DETECTED(${category}): reviewCycle=${state.reviewCycle}에서 동일한 required test 실패가 2회 연속 반복됨`
+          `${STAGNATION_DETECTED_MARKER_PREFIX}${category}): reviewCycle=${state.reviewCycle}에서 동일한 required test 실패가 2회 연속 반복됨`
         );
       }
     }

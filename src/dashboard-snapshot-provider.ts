@@ -10,6 +10,7 @@ import { loadProjectProgress } from "./dashboard-project-progress";
 import type { ProjectProgress } from "./dashboard-project-progress";
 import { buildProblemSolvingSnapshot } from "./dashboard-problem-solving";
 import type { ProblemSolvingSnapshot } from "./dashboard-problem-solving";
+import type { ProblemMemoryStore } from "./problem-memory";
 import { createFileUsageLedger, resolveUsageLedgerFilePath, RUNTIME_USAGE_LEDGER_DIR } from "./usage-ledger";
 import { readRoundStatus, isRoundStatusLive, RUNTIME_ROUND_STATUS_PATH } from "./round-status";
 import type { RoundStatusSnapshot } from "./round-status";
@@ -240,7 +241,15 @@ function buildActualWorkTime(
  * run이 한 번도 없었음) "NO_RUN_YET"을 반환한다 — UNKNOWN이나 임의 기본값으로 채우지
  * 않는다.
  */
-export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, roundStatusFilePath: string = RUNTIME_ROUND_STATUS_PATH): DashboardSnapshot {
+export function getDashboardSnapshot(
+  filePath: string = RUNTIME_EVENT_LOG_PATH,
+  roundStatusFilePath: string = RUNTIME_ROUND_STATUS_PATH,
+  /** 테스트 전용 seam(§ autodev.ts AutodevRunOptions.problemMemoryStores와 동일한 관례) —
+   *  지정하지 않으면 buildProblemSolvingSnapshot()이 기존과 동일하게 실제 problem-memory
+   *  파일(logs/problem-memory/)을 읽는다. production 호출부(dashboard-server.ts)는 이 값을
+   *  지정하지 않는다(동작 변화 없음). */
+  problemMemoryStores?: { project: ProblemMemoryStore; common: ProblemMemoryStore }
+): DashboardSnapshot {
   const result = readQueryResult(filePath);
   const runId = latestRunId(result);
   const now = Date.now();
@@ -288,7 +297,7 @@ export function getDashboardSnapshot(filePath: string = RUNTIME_EVENT_LOG_PATH, 
     ),
     usageOverview: buildUsageOverview(result.events, snapshot.projectId, snapshot.taskId),
     recentCalls: buildRecentCalls(result.events, RECENT_CALLS_LIMIT),
-    problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId),
+    problemSolving: buildProblemSolvingSnapshot(snapshot.projectId, snapshot.taskId, problemMemoryStores),
     callEfficiency: aggregateCallEfficiency(snapshot.taskId ? result.events.filter((e) => e.taskId === snapshot.taskId) : result.events),
     roundStatus,
     attemptOutcomes: buildAttemptOutcomes(result.events, snapshot.projectId),

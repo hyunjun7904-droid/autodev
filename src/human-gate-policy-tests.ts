@@ -1,6 +1,8 @@
 import { classifyWaitingHumanReason, isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles } from "./human-gate-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
+import { STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
+import { MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX, CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX } from "./orchestrator";
 import type { CoreState } from "./types";
 
 // human-gate-policy.ts 전용 회귀 테스트 — Canonical Human Gate Policy Evaluator가 순수
@@ -110,6 +112,81 @@ function scenarioStaleGptReviewUnavailableMarkerStaysGenuineByDefault(): void {
   );
 }
 
+// Task 4.1 조사에서 재현된 실제 stale 사례 — STAGNATION_DETECTED 마커만 있고 다른 genuine
+// 신호가 전혀 없는 WAITING_HUMAN(§ human-gate-policy.ts 상단 주석 "STAGNATION_DETECTED_MARKER_
+// PREFIX 마커" 항목). 이 마커는 관측용 표시일 뿐 사람 판단이 필요하다는 신호가 아니므로,
+// 어떤 FailureCategory가 붙어 있든(INFRASTRUCTURE_CONFIGURATION/IMPLEMENTATION/PROVIDER/
+// UNKNOWN) TECHNICAL_AUTO_RECOVERABLE로 분류돼야 한다.
+function scenarioStagnationDetectedAloneIsTechnical(): void {
+  for (const category of ["INFRASTRUCTURE_CONFIGURATION", "IMPLEMENTATION", "PROVIDER", "UNKNOWN"]) {
+    const s = state({
+      deferredHumanTasks: [`${STAGNATION_DETECTED_MARKER_PREFIX}${category}): reviewCycle=3에서 동일한 required test 실패가 2회 연속 반복됨`],
+    });
+    check(
+      `STAGNATION_DETECTED(${category}) 마커만 있으면 → TECHNICAL_AUTO_RECOVERABLE(사람 판단 신호 아님)`,
+      classifyWaitingHumanReason(s) === "TECHNICAL_AUTO_RECOVERABLE"
+    );
+    check("isTechnicalAutoRecoverableWaitingHuman()도 동일하게 true", isTechnicalAutoRecoverableWaitingHuman(s));
+  }
+}
+
+// STAGNATION_DETECTED가 실제 genuine 마커와 함께 섞여 있으면(예: 반복되던 required test
+// 실패가 결국 SECURITY_BLOCKED류의 CHECKPOINT_BLOCKED로 이어진 경우) 여전히 GENUINE으로
+// 남아야 한다 — "섞여 있으면 보수적으로 사람 판단 유지" 원칙(§
+// scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal과 동일한 원칙을
+// STAGNATION_DETECTED에도 적용).
+function scenarioStagnationDetectedWithGenuineMarkerStaysGenuine(): void {
+  const s = state({
+    deferredHumanTasks: [
+      `${STAGNATION_DETECTED_MARKER_PREFIX}IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨`,
+      "CHECKPOINT_BLOCKED(T1): secret으로 의심되는 패턴이 발견되었습니다.",
+    ],
+  });
+  check(
+    "STAGNATION_DETECTED와 genuine 마커(SECURITY_BLOCKED류 CHECKPOINT_BLOCKED)가 함께 있으면 GENUINE 유지",
+    classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT"
+  );
+}
+
+// 실제 회귀에서 발견된 사례(§ production-agent-integration-tests.ts
+// scenarioAdvisoryCannotOverrideCoreTestFailure) — 같은 required test 실패가 반복되는
+// REVISE 루프가 도중에 STAGNATION_DETECTED 마커를 남긴 뒤에도 계속 진행되다가, 결국
+// MAX_GPT_CALLS(비용 상한)에 도달해 genuine WAITING_HUMAN이 될 수 있다. STAGNATION_DETECTED
+// 마커 하나만 보고 자동 복구하면 이 비용 신호를 조용히 무시하게 되므로, orchestrator.ts가
+// 이 시점에 남기는 MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX 마커가 반드시 GENUINE으로 이겨야
+// 한다.
+function scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine(): void {
+  const s = state({
+    deferredHumanTasks: [
+      `${STAGNATION_DETECTED_MARKER_PREFIX}INFRASTRUCTURE_CONFIGURATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨`,
+      `${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 11회`,
+    ],
+  });
+  check(
+    "STAGNATION_DETECTED와 MAX_GPT_CALLS_EXCEEDED가 함께 있으면 GENUINE 유지(비용 신호를 조용히 무시하지 않음)",
+    classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT"
+  );
+}
+
+// CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX 단독도, STAGNATION_DETECTED와 섞여도 GENUINE을
+// 유지해야 한다 — provider가 응답을 아예 못 준 것(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX)
+// 과 달리 파싱/권한 게이트 실패 등은 여전히 사람이 봐야 할 진짜 문제일 수 있다.
+function scenarioClaudeStructuralFailureIsGenuine(): void {
+  const s = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR): Claude 결과가 구조적으로 실패`] });
+  check("CLAUDE_STRUCTURAL_FAILURE 마커 단독 → GENUINE_HUMAN_JUDGMENT", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
+
+  const s2 = state({
+    deferredHumanTasks: [
+      `${STAGNATION_DETECTED_MARKER_PREFIX}IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨`,
+      `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR): Claude 결과가 구조적으로 실패`,
+    ],
+  });
+  check(
+    "STAGNATION_DETECTED와 CLAUDE_STRUCTURAL_FAILURE가 함께 있으면 GENUINE 유지",
+    classifyWaitingHumanReason(s2) === "GENUINE_HUMAN_JUDGMENT"
+  );
+}
+
 function scenarioUnknownReasonDefaultsToGenuine(): void {
   const s = state({ deferredHumanTasks: [] });
   check("알려진 기술 마커가 전혀 없으면(예: HIGH_RISK_ACTION_PREGATE/사용량 제한) fail-closed로 GENUINE", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
@@ -146,6 +223,10 @@ function main(): void {
   scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal();
   scenarioDeveloperTransientRetryExhaustedIsTechnical();
   scenarioStaleGptReviewUnavailableMarkerStaysGenuineByDefault();
+  scenarioStagnationDetectedAloneIsTechnical();
+  scenarioStagnationDetectedWithGenuineMarkerStaysGenuine();
+  scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine();
+  scenarioClaudeStructuralFailureIsGenuine();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();
 

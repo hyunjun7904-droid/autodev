@@ -2,6 +2,8 @@ import type { CoreState } from "./types";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
+import { STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
+import { MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX, CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX } from "./orchestrator";
 
 // Canonical Human Gate Policy Evaluator — AutoDev / JARVIS 지능형 오류 복구 하드닝 §
 // 신뢰성 보완(2026-08-27).
@@ -38,6 +40,21 @@ import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 //     더 이상 생성되지 않는다.
 //   - CHECKPOINT_BLOCKED이지만 이유가 CHECKPOINT_SCOPE_VIOLATION_REASON이 아닌 경우(Secret/
 //     Dependency Scanner Gate — SECURITY_BLOCKED) — 민감 보안 판단.
+//   - MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX 마커(orchestrator.ts MAX_GPT_CALLS) — REVISE
+//     "cycle" 수(코드 수정 후 재리뷰 횟수)가 10회를 넘었다는 뜻으로, 실제 GPT 호출 비용이
+//     이미 상당히 발생했다는 신호다("실제 비용 발생" 범주, GPT_RAW_CALL_LIMIT_EXCEEDED와
+//     같은 성격이지만 별도 카운터). 2026-08-28 이전에는 이 마커 없이 fail-closed 기본값에만
+//     의존해 genuine으로 남았다(§ production-agent-integration-tests.ts
+//     scenarioAdvisoryCannotOverrideCoreTestFailure가 이 설계를 직접 검증) — STAGNATION_DETECTED
+//     마커가 기술적 자동 복구 대상에 추가되면서(§ 아래) "마커가 없으면 genuine"이라는 암묵적
+//     판정에만 의존할 경우 STAGNATION_DETECTED 마커가 남아있는 상태로 이 비용 상한에 도달해도
+//     조용히 자동 복구될 위험이 생겨, 이 마커를 명시적으로 추가했다(판정 결과 자체는 바뀌지
+//     않는다 — 근거만 암묵적 부재에서 명시적 마커로 바뀔 뿐이다).
+//   - CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX 마커(orchestrator.ts — Claude 결과가
+//     success=false이고 DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX(TIMEOUT/CLI_NOT_FOUND류
+//     provider 일시 장애)가 아닌 경우, 예: 파싱/권한 게이트 실패) — provider가 응답을 아예
+//     못 준 것과 다른 범주로, 여전히 사람이 봐야 할 진짜 문제일 수 있다. 위와 동일한 이유로
+//     STAGNATION_DETECTED 마커 도입에 맞춰 명시적 마커를 추가했다.
 //
 // 기술적 자동 복구 대상(사람 승인 없이 다음 시도로 이어감):
 //   - CHECKPOINT_BLOCKED이고 이유가 정확히 CHECKPOINT_SCOPE_VIOLATION_REASON인 경우 —
@@ -56,6 +73,29 @@ import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 //     critical)와 실패 원인 위험도(provider timeout)를 분리한다는 원칙에 따라 자동 복구
 //     대상으로 취급해, 다음 실행에서 자동으로 READY로 되돌리고 durable wait 경로로 넘어가게
 //     한다.
+//   - STAGNATION_DETECTED_MARKER_PREFIX 마커(failure-stagnation.ts — orchestrator.ts가
+//     같은 required test 실패가 2회 연속 반복될 때 남긴다, § orchestrator.ts stagnationTracker)
+//     — 이 마커는 그 자체로 "무엇이 반복됐는지"를 기록하는 관측용 표시일 뿐, 실제 비용/보안/
+//     권한/요구사항 충돌 판단이 필요하다는 신호가 아니다(어떤 FailureCategory든 동일 —
+//     INFRASTRUCTURE_CONFIGURATION/IMPLEMENTATION/PROVIDER/UNKNOWN 전부 이 마커 하나만으로는
+//     genuine이 되지 않는다). 이미 REVIEW_CYCLE_EXHAUSTED_REASON이 "required test가 계속
+//     실패해 REVISE가 소진돼도 genuine이 아니다"라고 정한 것과 동일한 원칙을 그보다 이른
+//     시점(2회 연속 반복 시점)에 적용할 뿐이다. 주의: 이 마커는 REVIEW_CYCLE_EXHAUSTED_REASON/
+//     DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX와 달리 "이 WAITING_HUMAN이 왜 발생했는지"의
+//     terminal 사유가 아니라 루프 중간에 한 번만 찍히는 관측용 breadcrumb다 — 그 뒤로도 같은
+//     runOrchestrator() 실행이 계속돼 결국 MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX/
+//     CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX 같은 실제 genuine 사유로 WAITING_HUMAN에
+//     도달할 수 있다. hasGenuineMarker 검사가 이 함수에서 항상 먼저 실행되므로 그 경우
+//     이 마커는 결과를 바꾸지 못하고 GENUINE으로 남는다(§ 위 두 마커 항목) — 이 마커 혼자
+//     남아있을 때만(다른 genuine 마커가 전혀 없을 때만) 기술적 자동 복구 대상이 된다. 자동
+//     복구는 "이 task를 완료로 선언"하지 않는다, decideNextAction()이 이 task를 다시 선택해
+//     Developer/Reviewer/Required Test/
+//     Security Gate를 처음부터 다시 통과시키므로 실제 원인이 아직 해결되지 않았다면 그대로
+//     다시 실패해 관측 가능한 상태(대시보드/로그)로 계속 남는다. 무한 재시도 방지는 이미
+//     별도 계층(continuous-runner.ts의 technicalRecoveryCount 상한,
+//     computeDeveloperProviderWaitDelayMs의 점증 backoff, failure-stagnation.ts
+//     buildEscalationGuidance/problem-memory.ts의 반복 전략 차단 안내)이 담당한다 — 이
+//     함수는 "사람 승인이 필요한가"만 판정하고 "얼마나 재시도할지"는 판정하지 않는다.
 
 export type WaitingHumanClassification = "GENUINE_HUMAN_JUDGMENT" | "TECHNICAL_AUTO_RECOVERABLE";
 
@@ -69,6 +109,8 @@ const GENUINE_MARKER_PREFIXES: readonly string[] = [
   "AUTH_ERROR:",
   "QUOTA_EXCEEDED:",
   "PROVIDER_SECURITY_BLOCKED:",
+  MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
+  CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
 ];
 
 function isCheckpointScopeViolationMarker(marker: string): boolean {
@@ -101,8 +143,15 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const decision = state.lastGptDecision?.decision;
   const hasReviewBlocked = decision === "BLOCK" || decision === "HUMAN_REQUIRED";
   const hasDeveloperTransientRetryExhausted = markers.some((m) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
+  const hasStagnationDetected = markers.some((m) => m.startsWith(STAGNATION_DETECTED_MARKER_PREFIX));
 
-  if (hasCheckpointScopeViolation || hasReviewCycleExhausted || hasReviewBlocked || hasDeveloperTransientRetryExhausted) {
+  if (
+    hasCheckpointScopeViolation ||
+    hasReviewCycleExhausted ||
+    hasReviewBlocked ||
+    hasDeveloperTransientRetryExhausted ||
+    hasStagnationDetected
+  ) {
     return "TECHNICAL_AUTO_RECOVERABLE";
   }
 

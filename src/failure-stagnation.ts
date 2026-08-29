@@ -68,6 +68,12 @@ export function computeFailureFingerprint(taskId: string, tests: ClaudeResult["t
   return `${taskId}::${computeProblemFingerprint(tests)}`;
 }
 
+// orchestrator.ts가 state.deferredHumanTasks에 남기는 STAGNATION_DETECTED 마커의 고정
+// prefix — human-gate-policy.ts가 이 값을 그대로 import해서 재분류한다(REVIEW_CYCLE_EXHAUSTED_REASON/
+// DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX와 동일한 "마커 문자열의 단일 출처" 관례, 두
+// 파일에 같은 리터럴을 복제하지 않는다).
+export const STAGNATION_DETECTED_MARKER_PREFIX = "STAGNATION_DETECTED(";
+
 export function classifyFailureCategory(
   claudeErrorCode: string | undefined,
   gptErrorCode: string | undefined,
