@@ -150,6 +150,27 @@ export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformChec
     return { ok: false, reason: CHECKPOINT_SCOPE_VIOLATION_REASON, unexpectedFiles };
   }
   if (plan.allowed.length === 0) {
+    // AutoDev Core Maintenance — Crash-safe Checkpoint Idempotency(Category B). 이 checkpoint가
+    // (예: autodev.ts RESUME_APPROVED_CHECKPOINT 경로로) 재시도되는 경우, product commit은
+    // 직전 실행에서 이미 성공했지만 그 직후(§ autodev.ts saveState) 프로세스가 죽어 그 사실이
+    // project-state.json에 반영되지 못했을 수 있다 — 이 경우 working tree는 이미 clean하므로
+    // "commit할 변경 파일이 없다"는 사실만으로 실패 처리하면 이미 완료된 작업이 불필요하게
+    // WAITING_HUMAN으로 막힌다. HEAD commit의 제목이 이 task의 기대 commit 메시지 헤더와
+    // 정확히 일치하면(buildCommitMessage()의 header는 phase+taskNumber+title로 구성되어 이
+    // 저장소 전체에서 사실상 유일하다 — 다른 task의 우연한 동일 diff가 아니라 바로 이 task가
+    // 이미 commit했다는 뜻) 새로 commit하지 않고 이미 존재하는 HEAD를 그대로 idempotent
+    // success로 반환한다. 일치하지 않으면(다른 이유로 우연히 clean한 경우 — 예: 실제로 아무
+    // 변경도 만들지 않은 Developer 응답) 기존과 동일하게 실패로 처리한다(추측하지 않는다).
+    const expectedHeader = buildCommitMessage(taskDef).split("\n")[0];
+    const headSubjectRes = runGit(["log", "-1", "--format=%s"], cwd);
+    if (headSubjectRes.ok && headSubjectRes.stdout === expectedHeader) {
+      const hashRes = runGit(["rev-parse", "HEAD"], cwd);
+      log("checkpoint idempotent — 이 task의 product commit이 이미 HEAD에 존재함(직전 크래시 재시도로 판단, 새로 commit하지 않음)", {
+        taskId: taskDef.id,
+        commitHash: hashRes.ok ? hashRes.stdout : undefined,
+      });
+      return hashRes.ok ? { ok: true, commitHash: hashRes.stdout, filesCommitted: [] } : { ok: true, filesCommitted: [] };
+    }
     return { ok: false, reason: "commit할 변경 파일이 없습니다." };
   }
 

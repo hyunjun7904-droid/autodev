@@ -179,6 +179,64 @@ function scenarioNoChangesToCommit(): void {
   }
 }
 
+// AutoDev Core Maintenance — Crash-safe Checkpoint Idempotency(Category B). 실제 production
+// 재시작 시나리오를 재현한다: product commit이 이미 성공한 뒤(예: autodev.ts
+// RESUME_APPROVED_CHECKPOINT 경로로 재시도되는 crash 직후) 같은 taskDef로 performTaskCheckpoint를
+// 다시 호출하면 working tree는 이미 clean하다 — 이때 새 commit을 만들지 않고 기존 HEAD를
+// idempotent success로 반환해야 한다(§ checkpoint.ts plan.allowed.length===0 분기).
+function scenarioPerformCheckpointIdempotentResume(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const task = fakeTask({ id: "77.1", phase: 77, taskNumber: 1, title: "재시작 재현용 task" });
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    const first = performTaskCheckpoint(task, {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+    });
+    check("idempotent resume: 최초 commit ok=true", first.ok === true);
+    const afterFirst = gitLogCount(repo);
+
+    // 같은 task를 같은 옵션으로 다시 호출한다 — working tree는 이미 clean(직전 commit으로
+    // 아무 변경도 남지 않음). 실제로는 이 두 번째 호출 사이에 프로세스가 죽고 재시작됐다는
+    // 뜻이다.
+    const second = performTaskCheckpoint(task, {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+    });
+    check("idempotent resume: 재시도 ok=true(WAITING_HUMAN으로 잘못 막히지 않음)", second.ok === true);
+    check(
+      "idempotent resume: 재시도 commitHash가 최초 commit과 정확히 동일함(새 commit 아님)",
+      second.commitHash !== undefined && second.commitHash === first.commitHash
+    );
+    check("idempotent resume: 새 commit이 실제로 생성되지 않음(commit 개수 불변)", gitLogCount(repo) === afterFirst);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// 대조군 — HEAD가 우연히 clean하더라도 이 task의 commit이 아니면(다른 task/무관한 이유로
+// clean한 경우) idempotent success로 오판하지 않고 기존과 동일하게 실패해야 한다.
+function scenarioPerformCheckpointNoFalseIdempotentMatch(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const before = gitLogCount(repo);
+    const outcome = performTaskCheckpoint(fakeTask({ id: "77.2", phase: 77, taskNumber: 2, title: "다른 task" }), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+    });
+    check("idempotent 오판 방지: HEAD가 이 task의 commit이 아니면 여전히 ok=false", outcome.ok === false);
+    check("idempotent 오판 방지: commit이 생성되지 않음", gitLogCount(repo) === before);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
 function scenarioCommitProjectStateOnly(): void {
   const repo = makeTempGitRepo();
   try {
@@ -223,6 +281,8 @@ function main(): void {
   scenarioPerformCheckpointUnexpectedBlocks();
   scenarioPerformCheckpointRejectedApproval();
   scenarioNoChangesToCommit();
+  scenarioPerformCheckpointIdempotentResume();
+  scenarioPerformCheckpointNoFalseIdempotentMatch();
   scenarioCommitProjectStateOnly();
   scenarioCommitProjectStateOnlyBlocksOnPollutedIndex();
 

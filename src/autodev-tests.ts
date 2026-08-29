@@ -131,6 +131,52 @@ function scenarioPlannerWaitingHumanStaysStopped(): void {
   );
 }
 
+// AutoDev Core Maintenance — Crash-safe Checkpoint Resume(Category B). Reviewer가 PASS해
+// runOrchestrator()가 setStatus("APPROVED") 후 저장한 직후 프로세스가 죽었다가 재시작되는
+// 시나리오를 decideNextAction() 단독으로(순수 함수, 부수효과 없음) 검증한다 — 이 상태는
+// Human Final Review와 무관하게(gate 없이도) 발생할 수 있다.
+function scenarioPlannerApprovedStatusResumesCheckpointWithoutHumanFinalReview(): void {
+  const target = PLANNER_FIXTURE_REGISTRY.find((t) => t.id === "P1.2")!;
+  const state = baseState({
+    status: "APPROVED",
+    completedTasks: ["P1.1"],
+    currentTask: target.prompt,
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트", nextTask: null },
+  });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: status=APPROVED(HFR 게이트 없음) → RESUME_APPROVED_CHECKPOINT", decision.kind === "RESUME_APPROVED_CHECKPOINT");
+  check(
+    "planner: resume 대상이 정확히 P1.2",
+    decision.kind === "RESUME_APPROVED_CHECKPOINT" && decision.task.id === "P1.2"
+  );
+}
+
+function scenarioPlannerApprovedStatusWithoutPassDecisionDoesNotResume(): void {
+  // lastGptDecision이 PASS가 아니면(예: 손상/불일치) 모호하므로 resume하지 않고 기존 경로
+  // (RUN_TASK — Developer/Reviewer 재실행)로 fail-closed한다.
+  const state = baseState({
+    status: "APPROVED",
+    completedTasks: ["P1.1"],
+    currentTask: "Phase1 Task2 prompt",
+    lastGptDecision: { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트", nextTask: null },
+  });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: status=APPROVED이지만 lastGptDecision!=PASS → resume하지 않음(RUN_TASK)", decision.kind === "RUN_TASK");
+}
+
+function scenarioPlannerApprovedStatusWithMismatchedCurrentTaskDoesNotResume(): void {
+  // currentTask(taskDef.prompt 원문)가 getNextTask()가 지금 반환하는 task의 prompt와 다르면
+  // (예: 다른 task의 stale APPROVED) 모호하므로 resume하지 않는다.
+  const state = baseState({
+    status: "APPROVED",
+    completedTasks: ["P1.1"],
+    currentTask: "이 registry의 어떤 task와도 일치하지 않는 임의 문자열",
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트", nextTask: null },
+  });
+  const decision = decideNextAction(state, PLANNER_FIXTURE_REGISTRY);
+  check("planner: status=APPROVED이지만 currentTask 불일치 → resume하지 않음(RUN_TASK)", decision.kind === "RUN_TASK");
+}
+
 // ---------------------------------------------------------------------------
 // B) runAutodevOnce — orchestrator/checkpoint까지 포함한 통합 시나리오
 // ---------------------------------------------------------------------------
@@ -614,6 +660,102 @@ async function scenarioRunAutodevOnceNoTaskStops(): Promise<void> {
   });
   check("runAutodevOnce 모든 task 완료: outcome=STOPPED", result.outcome === "STOPPED");
   check("runAutodevOnce 모든 task 완료: Claude worker 호출 0회", claudeCalls === 0);
+}
+
+// AutoDev Core Maintenance — Crash-safe Checkpoint Resume(Category B) 통합 시나리오. Human
+// Final Review 없이도(§ 위 planner 단위 테스트와 동일한 상태) reviewer가 이미 APPROVED한
+// 실제 code 변경 위에서, 재시작이 Developer/Reviewer를 다시 부르지 않고 곧바로 checkpoint로
+// 이어지는지 실제 runAutodevOnce()/checkpoint 배선까지 포함해 검증한다.
+async function scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper(): Promise<void> {
+  const target = PLANNER_FIXTURE_REGISTRY.find((t) => t.id === "P1.2")!;
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "APPROVED",
+    completedTasks: ["P1.1"],
+    currentTask: target.prompt,
+    reviewCycle: 1,
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제없음", nextTask: null },
+    lastClaudeResult: {
+      success: true,
+      summary: "테스트: 이미 승인된 직전 시도",
+      changedFiles: ["proj/p12-marker.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    },
+  });
+  // reviewer가 이미 APPROVED한 실제 코드 변경 — product commit 직전에 프로세스가 죽었다는
+  // 뜻으로 working tree에 그대로 uncommitted 상태로 남아있다.
+  writeRepoFile(repo, "proj/p12-marker.txt", "marker\n");
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨 — 이미 APPROVED된 작업을 재실행함", changedFiles: [], tests: [], rawOutput: "" };
+  };
+  let reviewerCalls = 0;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => {
+    reviewerCalls += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨", nextTask: null };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+
+  check("APPROVED crash resume: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("APPROVED crash resume: taskId=P1.2", result.taskId === "P1.2");
+  check("APPROVED crash resume: Developer가 다시 호출되지 않음(claudeCalls=0)", claudeCalls === 0);
+  check("APPROVED crash resume: Reviewer도 다시 호출되지 않음(reviewerCalls=0)", reviewerCalls === 0);
+
+  const stateAfter = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("APPROVED crash resume: completedTasks에 P1.2 추가됨", stateAfter.completedTasks.includes("P1.2"));
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("APPROVED crash resume: product+admin commit 2건 생성됨(+init 1건=3건)", log.split("\n").length === 3);
+}
+
+// AutoDev Core Maintenance — Crash-safe Checkpoint Reconciliation(Category B, 마지막 task
+// 전용 gap) 통합 시나리오. 마지막 task의 completedTasks 갱신은 이미 저장됐지만(§ decideNextAction
+// 관점에서는 "더 이상 실행할 task 없음") admin commit(commitProjectStateOnly)이 아직 git에
+// 반영되지 않은 상태를 재현한다.
+async function scenarioDanglingProjectStateReconciledWhenNoMoreTasks(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: idsUpTo("P2.1") });
+  // 실제 운용에서는 project-state.json이 이미 git에 커밋된 tracked 파일이다 — 이 검증이
+  // 다루는 것은 "tracked 파일의 admin commit이 아직 안 된 상태"이지 untracked 신규 파일이
+  // 아니므로, 최초 버전을 먼저 commit해 tracked로 만든다.
+  spawnSync("git", ["add", "--", ".autodev/project-state.json"], { cwd: repo });
+  spawnSync("git", ["commit", "-q", "-m", "chore: initial state"], { cwd: repo });
+  const beforeReconcile = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "")
+    .trim()
+    .split("\n").length;
+
+  // "마지막 task까지 완료했지만 admin commit 직전에 죽음"을 재현한다 — completedTasks는 이미
+  // 전부(allTaskIds()) disk에 반영됐지만(§ autodev.ts saveState), 그 git commit
+  // (commitProjectStateOnly)은 아직 일어나지 않았다.
+  const stateAfterCrash = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  stateAfterCrash.completedTasks = allTaskIds();
+  stateAfterCrash.status = "READY";
+  writeFileSync(statePath, JSON.stringify(stateAfterCrash, null, 2) + "\n", "utf-8");
+
+  const manifest = buildPlannerManifest(repo, statePath);
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner } });
+  check("dangling state 재조정: outcome=STOPPED", result.outcome === "STOPPED");
+  check("dangling state 재조정: Claude worker 호출 0회(재실행 없음)", claudeCalls === 0);
+
+  const statusAfter = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf-8" });
+  check("dangling state 재조정: working tree가 다시 clean해짐(잔여 diff commit됨)", (statusAfter.stdout || "").trim() === "");
+
+  const logAfter = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim().split("\n").length;
+  check("dangling state 재조정: admin commit이 정확히 1건 추가됨", logAfter === beforeReconcile + 1);
+
+  const lastSubject = (spawnSync("git", ["log", "-1", "--format=%s"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("dangling state 재조정: commit 메시지가 재조정 사유를 명시함", lastSubject.includes("reconcile"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2128,6 +2270,9 @@ async function main(): Promise<void> {
   scenarioPlannerFinalGateIsSelected();
   scenarioPlannerAllTasksDoneIsFinalGateStop();
   scenarioPlannerWaitingHumanStaysStopped();
+  scenarioPlannerApprovedStatusResumesCheckpointWithoutHumanFinalReview();
+  scenarioPlannerApprovedStatusWithoutPassDecisionDoesNotResume();
+  scenarioPlannerApprovedStatusWithMismatchedCurrentTaskDoesNotResume();
 
   try {
     await scenarioRunAutodevOnceHappyPath();
@@ -2160,6 +2305,9 @@ async function main(): Promise<void> {
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();
     await scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt();
+
+    await scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper();
+    await scenarioDanglingProjectStateReconciledWhenNoMoreTasks();
 
     await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();
     await scenarioHumanFinalReviewRerunWithoutApprovalStaysBlocked();

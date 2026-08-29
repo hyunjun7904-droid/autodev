@@ -165,6 +165,37 @@ export function decideNextAction(
 ): AutodevDecision {
   const status = state.status as unknown as string;
 
+  // AutoDev Core Maintenance — Crash-safe Checkpoint Resume(Category B). runOrchestrator()가
+  // Reviewer PASS를 확인하고 setStatus("APPROVED") 직후 saveCurrentState(state)로 이미
+  // 디스크에 저장한 뒤(§ orchestrator.ts 619-626,738) — 즉 이 task의 Developer/Reviewer
+  // 작업은 이미 완전히 끝났고 남은 것은 checkpoint(git commit)뿐인 시점에 — 프로세스가 죽으면,
+  // 이 사실을 모르는 재시작은 아래 일반 경로(getNextTask → RUN_TASK)를 타 같은 task를 다시
+  // 고르고, runOrchestrator()가 state.lastClaudeResult/lastGptDecision을 null로 리셋한 뒤
+  // Developer를 처음부터 다시 호출한다 — 이미 승인된 작업 위에 새 Developer 세션이 다시
+  // 손대게 되어 중복 작업/(product commit이 이미 만들어졌다면) 중복 commit 위험이 생긴다.
+  //
+  // 기존 RESUME_APPROVED_CHECKPOINT 경로(원래 Human Final Review 전용으로 만들어짐, §
+  // autodev.ts isResumingApprovedCheckpoint)를 그대로 재사용한다 — 새 checkpoint 로직을
+  // 추가하지 않는다. HFR 게이트(state.humanFinalReview.taskId)와 달리 이 상태는 taskId를
+  // 명시적으로 담은 필드가 없다(state.currentTask는 taskDef.prompt 원문이다, § orchestrator.ts
+  // state.currentTask = task — 순수 id가 아니다) — 그래서 completedTasks가 이 checkpoint
+  // 전까지는 절대 바뀌지 않는다는 기존 불변조건에 의존해 getNextTask()가 지금 이 순간
+  // 결정론적으로 반환하는 task를 후보로 삼되, state.currentTask가 그 task의 prompt와 정확히
+  // 일치하는지까지 함께 확인한다(모호하면 진행하지 않는다 — HFR 분기와 동일한 fail-closed
+  // 원칙). 조건이 하나라도 어긋나면 아래 일반 경로로 그대로 진행한다 — 그 경로는 이미 오늘
+  // 실제로 벌어지는 기존 동작이므로 새로운 위험을 추가하지 않는다.
+  if (status === "APPROVED") {
+    const completedForApprovedResume = state.completedTasks ?? [];
+    const candidateForApprovedResume = getNextTask(taskRegistry, completedForApprovedResume);
+    if (
+      candidateForApprovedResume &&
+      state.lastGptDecision?.decision === "PASS" &&
+      state.currentTask === candidateForApprovedResume.prompt
+    ) {
+      return { kind: "RESUME_APPROVED_CHECKPOINT", task: candidateForApprovedResume };
+    }
+  }
+
   if (status === "WAITING_HUMAN") {
     // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — 사람이 이미 이 정확한 task/
     // reviewCycle/reviewer 승인에 대해 명시적으로 APPROVE했는지 확인한다(§
@@ -870,6 +901,40 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       if (decision.setWaitingHuman && (state.status as unknown as string) !== "WAITING_HUMAN") {
         state.status = "WAITING_HUMAN";
         saveState(state, statePath);
+      }
+      // AutoDev Core Maintenance — Crash-safe Checkpoint Reconciliation(Category B, 마지막
+      // task 전용 gap). "더 이상 실행할 task가 없다"는 이 지점은, 정상 종료라면 이미 마지막
+      // task의 admin commit(commitProjectStateOnly, § 아래 completedTasks push 직후)까지 끝나
+      // project-state.json이 clean해야 한다 — 그 admin commit 직전에 프로세스가 죽었다가
+      // 재시작된 경우라면 completedTasks는 이미 저장돼 있으므로(§ decideNextAction — task 재
+      // 실행 위험은 없다) 오직 project-state.json 자체만 dirty한 채로 남을 수 있다. working
+      // tree 전체에서 딱 이 파일 하나만 변경돼 있을 때만(다른 unexpected 변경이 하나라도
+      // 섞여 있으면 추측하지 않고 그대로 둔다 — 사람이 확인해야 한다) 안전하게 admin commit을
+      // 대신 완료해 "state와 Git이 최종적으로 일치"하도록 마무리한다.
+      const stateRelPathForReconcile = computeStateRelPath(statePath, cwd);
+      const wtChangesForReconcile = getWorkingTreeChanges([], cwd).all;
+      const onlyStateFileDirty =
+        wtChangesForReconcile.length === 1 &&
+        wtChangesForReconcile[0].path === stateRelPathForReconcile &&
+        wtChangesForReconcile[0].status !== "untracked";
+      if (onlyStateFileDirty) {
+        const reconcileCommit = commitProjectStateOnly(
+          stateRelPathForReconcile,
+          "chore: reconcile dangling project-state.json (crash recovery — admin checkpoint had not completed)",
+          cwd
+        );
+        if (reconcileCommit.ok) {
+          console.log(
+            `[autodev] project-state.json 잔여 uncommitted 변경을 안전하게 재조정 commit했습니다(${reconcileCommit.commitHash ?? "no-op"}).`
+          );
+          log("STATE_RECONCILED_ON_STOP — 마지막 task 이후 남아있던 project-state.json 변경을 commit함", {
+            commitHash: reconcileCommit.commitHash,
+          });
+        } else {
+          log("STATE_RECONCILE_ON_STOP_FAILED — project-state.json 재조정 commit 실패(uncommitted로 남음)", {
+            reason: reconcileCommit.reason,
+          });
+        }
       }
       emitEvent(events, { eventType: "RUN_COMPLETED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "SKIPPED", reason: decision.reason });
       // 이 분기는 어떤 developer/checkpoint 작업도 하지 않았다 — working tree에 아무 위험도
