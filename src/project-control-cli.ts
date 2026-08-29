@@ -1,0 +1,157 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { loadProjectAdapter } from "./project-adapter-loader";
+import { inspectProjectRuntimeLiveness } from "./project-lock";
+import type { ProjectRuntimeLiveness } from "./project-lock";
+import {
+  maintenancePauseMarkerPath,
+  engageMaintenancePause,
+  clearMaintenancePause,
+  runnerSupervisorLockFilePath,
+} from "./runner-supervisor";
+import { checkSupervisorLock, defaultIsPidAlive } from "./dashboard-supervisor";
+import type { LockCheckResult } from "./dashboard-supervisor";
+
+// AutoDev Core Maintenance — Canonical Project Control CLI(Category C, AutoDev 1.0
+// 하드닝). 목적: 운영 제어(개발 일시정지/재개/현재 상태 조회)가 taskkill/process.kill/수동
+// PID 입력/임시 checkpoint script(예: 이전 세션이 즉석으로 만든 hold-jarvis-lock.js류
+// throwaway 스크립트)에 의존하지 않게 한다 — 이런 즉석 스크립트는 검토 없는 프로세스 종료를
+// 요구해 Auto Mode classifier가 정당하게 차단하고, project lock을 "떠 있는 프로세스"로
+// 점유하는 방식 자체가 오래 지속되면 사람이 그 프로세스를 직접 찾아 죽여야만 재개할 수 있는
+// 취약한 운영 패턴이다.
+//
+// 이 파일은 새로운 판정/안전 로직을 전혀 추가하지 않는다 — project-lock.ts/
+// runner-supervisor.ts/dashboard-supervisor.ts에 이미 존재하고 각자 테스트된 순수 함수만
+// 얇게 배선한다. 특히 project-lock.ts의 기존 설계 원칙("release는 owner만, live lock 강제
+// 탈취 금지, TTL만으로 stale 판정하지 않음")을 이 CLI가 우회할 방법을 만들지 않는다 — 그래서
+// 이 CLI에는 "강제 lock 해제"(force-release) 명령이 의도적으로 없다.
+//
+// 실제로 project 개발을 일시정지하고 싶으면 pause(Maintenance Pause — 마커 파일 하나의
+// 존재 여부만으로 판정된다, § runner-supervisor.ts)를 쓴다. 이 메커니즘은 살아있는 프로세스가
+// 전혀 필요 없다 — pause 명령을 실행한 프로세스가 끝나도 마커 파일은 그대로 남아 계속
+// 유효하고, resume 명령이 그 마커 파일을 지울 때까지 supervisor는 새 child를 spawn하지
+// 않는다(이미 떠 있는 child는 강제 종료하지 않고 자연 종료를 기다린다, § runner-supervisor.ts
+// runRunnerSupervisorLoop). 이 CLI가 도입된 뒤로는 project lock을 "계속 살아있는 프로세스"로
+// 점유해 일시정지를 흉내내는 패턴이 더 이상 필요하지 않다.
+
+export interface ProjectControlStatusDeps {
+  loadProjectAdapter?: typeof loadProjectAdapter;
+  inspectProjectRuntimeLiveness?: typeof inspectProjectRuntimeLiveness;
+  isPidAlive?: (pid: number) => boolean;
+}
+
+export type ProjectLockStatus = ProjectRuntimeLiveness | { present: false; error: string };
+
+export interface ProjectControlStatus {
+  maintenancePaused: boolean;
+  supervisor: LockCheckResult;
+  projectLock: ProjectLockStatus;
+}
+
+/**
+ * 사람이 명시적으로 실행하는 상태 조회 — 어떤 상태도 바꾸지 않는다(읽기 전용). 세 가지를
+ * 조합해 보여준다: (1) Maintenance Pause 마커 존재 여부, (2) supervisor 자신의 lock(살아있는
+ * supervisor가 있는지), (3) project lock(어떤 writer가 지금 이 project를 점유하고 있는지) —
+ * 이 세 값을 하나로 뭉개지 않는다(§ CLAUDE.md — "project-lock은 이미 시작된 writer들 사이의
+ * 상호배제, Maintenance Pause는 애초에 새 writer를 시작할지 여부"라는 서로 다른 질문).
+ */
+export function getProjectControlStatus(
+  adapterPath: string,
+  logsDir: string,
+  deps: ProjectControlStatusDeps = {}
+): ProjectControlStatus {
+  const maintenancePaused = existsSync(maintenancePauseMarkerPath(adapterPath, logsDir));
+
+  const supervisorLockPath = runnerSupervisorLockFilePath(adapterPath, logsDir);
+  const supervisor = checkSupervisorLock(supervisorLockPath, deps.isPidAlive ?? defaultIsPidAlive);
+
+  const loadAdapter = deps.loadProjectAdapter ?? loadProjectAdapter;
+  let manifest;
+  try {
+    manifest = loadAdapter(adapterPath);
+  } catch (e) {
+    return { maintenancePaused, supervisor, projectLock: { present: false, error: e instanceof Error ? e.message : String(e) } };
+  }
+
+  const inspectLiveness = deps.inspectProjectRuntimeLiveness ?? inspectProjectRuntimeLiveness;
+  const projectLock = inspectLiveness(manifest.projectId, manifest.targetProjectRoot);
+  return { maintenancePaused, supervisor, projectLock };
+}
+
+/** getProjectControlStatus()의 결과를 사람이 읽을 수 있는 여러 줄 텍스트로 렌더링한다(순수
+ *  함수, 부수효과 없음) — CLI(main())와 테스트가 이 함수 하나로만 출력 형식을 공유한다. */
+export function formatProjectControlStatus(status: ProjectControlStatus): string {
+  const lines: string[] = [
+    `Maintenance Pause: ${status.maintenancePaused ? "ACTIVE" : "inactive"}`,
+    `Supervisor: ${status.supervisor.action === "ALREADY_RUNNING" ? "RUNNING" : "not running"} (${status.supervisor.reason})`,
+  ];
+  const pl = status.projectLock;
+  if ("error" in pl) {
+    lines.push(`Project Lock: 확인 불가 — project adapter를 읽을 수 없습니다(${pl.error})`);
+  } else if (!pl.present) {
+    lines.push("Project Lock: 없음(어떤 writer도 이 project를 점유하고 있지 않습니다)");
+  } else {
+    lines.push(
+      `Project Lock: pid=${pl.pid} ownerKind=${pl.ownerKind}${pl.taskId ? ` taskId=${pl.taskId}` : ""} liveness=${pl.liveness.verdict}`
+    );
+  }
+  return lines.join("\n");
+}
+
+export function parseArg(args: readonly string[], name: string): string | undefined {
+  const idx = args.indexOf(name);
+  if (idx === -1 || typeof args[idx + 1] !== "string") return undefined;
+  return args[idx + 1];
+}
+
+function repoLogsDir(): string {
+  return join(__dirname, "..", "logs");
+}
+
+function usageAndExit(): never {
+  console.error(
+    [
+      "사용법:",
+      "  node dist/project-control-cli.js pause --project <adapterPath> [--reason <text>]",
+      "  node dist/project-control-cli.js resume --project <adapterPath>",
+      "  node dist/project-control-cli.js status --project <adapterPath>",
+    ].join("\n")
+  );
+  process.exit(1);
+}
+
+function main(): void {
+  const [, , command, ...rest] = process.argv;
+  const adapterPath = parseArg(rest, "--project");
+  if (!command || !adapterPath) usageAndExit();
+
+  const logsDir = repoLogsDir();
+  switch (command) {
+    case "pause": {
+      const reason = parseArg(rest, "--reason") ?? "(사유 미지정)";
+      engageMaintenancePause(adapterPath, logsDir, reason);
+      console.log(`[project-control] Maintenance Pause 활성화됨 — adapter=${adapterPath}, reason=${reason}`);
+      console.log(
+        "[project-control] 이미 살아있는 child는 강제 종료되지 않습니다(자연 종료를 기다립니다) — 다음 spawn만 resume 전까지 미뤄집니다."
+      );
+      return;
+    }
+    case "resume": {
+      clearMaintenancePause(adapterPath, logsDir);
+      console.log(`[project-control] Maintenance Pause 해제됨 — adapter=${adapterPath}`);
+      return;
+    }
+    case "status": {
+      console.log(formatProjectControlStatus(getProjectControlStatus(adapterPath, logsDir)));
+      return;
+    }
+    default:
+      usageAndExit();
+  }
+}
+
+// require.main===module 가드 — 테스트가 이 파일을 import해도 실제 CLI가 자동으로 실행되지
+// 않는다(§ runner-supervisor.ts와 동일 관례).
+if (require.main === module) {
+  main();
+}

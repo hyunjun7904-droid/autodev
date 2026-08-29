@@ -184,6 +184,14 @@ export function clearMaintenancePause(adapterPath: string, logsDir: string): voi
   }
 }
 
+/** supervisor 자신의 중복 실행 방지 lock 파일 경로 — main()과 § project-control-cli.ts(사람이
+ *  supervisor 상태를 조회하는 canonical 진입점)가 이 함수 하나로만 경로를 계산해 서로 다른
+ *  경로를 가리키는 실수를 구조적으로 방지한다(§ maintenancePauseMarkerPath와 동일한 관례,
+ *  순수 리팩터 — 동작 변화 없음). */
+export function runnerSupervisorLockFilePath(adapterPath: string, logsDir: string): string {
+  return join(logsDir, `runner-supervisor-${sanitizeForFilename(adapterPath)}.lock`);
+}
+
 function resolveAdapterPath(): string | undefined {
   const idx = process.argv.indexOf("--project");
   if (idx !== -1 && typeof process.argv[idx + 1] === "string" && process.argv[idx + 1].length > 0) {
@@ -206,7 +214,7 @@ function main(): void {
   const runJsPath = join(__dirname, "run.js");
   const logsDir = join(repoRoot, "logs");
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
-  const lockFilePath = join(logsDir, `runner-supervisor-${sanitizeForFilename(adapterPath)}.lock`);
+  const lockFilePath = runnerSupervisorLockFilePath(adapterPath, logsDir);
   const logFilePath = join(logsDir, "runner-supervisor.log");
 
   const lockCheck: LockCheckResult = checkSupervisorLock(lockFilePath, defaultIsPidAlive);
