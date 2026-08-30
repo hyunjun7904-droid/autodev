@@ -255,18 +255,18 @@ async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(
 
 // ---------------------------------------------------------------------------
 // F — AutoDev / JARVIS 신뢰성 보완(2026-08-27), AutoDev Efficiency / Review Stagnation
-// Hardening(2026-08-28), AutoDev Core Maintenance(2026-08-30)로 갱신.
+// Hardening(2026-08-28), P0-4/P1-2 하드닝(2026-08-30, 독립 감사)로 갱신.
 //
-// 2026-08-30 변경 — 동일한 required-test 실패 fingerprint가 결정론적으로 반복되는 경우(이
-// 시나리오처럼 매 attempt마다 완전히 동일하게 실패)는 더 이상 무제한 durable
-// backoff-and-retry로 흡수되지 않는다(§ orchestrator.ts DETERMINISTIC_REVIEW_CYCLE_
-// EXHAUSTED_MARKER_PREFIX, stagnationTracker의 repeatCount 기반 판정). MAX_REVIEW_CYCLES(5)
-// 소진 시점에 이미 이 반복이 확정돼 있으므로(2회차에 이미 STAGNATION_DETECTED), 6번째
-// Developer 호출(=이 fixture가 "고쳐졌다"고 가정하는 시점) 자체가 발생하지 않고 genuine
-// WAITING_HUMAN으로 즉시 승격한다 — "동일 실패를 반복 재시도하지 않는다"는 이번 Core
-// Maintenance의 핵심 목표를 정확히 이 시나리오가 검증한다. 이 반복이 매번 "다양한 이유"였다면
-// (예: 매번 다른 stderr) 기존 무제한 backoff-and-retry가 여전히 적용된다 — 이 시나리오는
-// 의도적으로 "동일한 이유"를 반복하므로 새 경로를 탄다.
+// P0-4 하드닝(2026-08-30, 독립 감사) — 이전 정책(2026-08-30 이전 버전)은 동일한
+// required-test 실패 fingerprint가 결정론적으로 반복되면 genuine WAITING_HUMAN으로
+// 승격했다. 독립 감사에서 "test failure/deterministic blocker는 Human Gate가 아니다"라는
+// 정책 위반으로 확인됐다(deterministic-simulation.ts Run B로 재현) — 이제 이 반복은 항상
+// 기술적 durable wait-then-retry(§ orchestrator.ts REVIEW_CYCLE_EXHAUSTED)로 처리된다.
+// P1-2 하드닝 — 그 durable wait에도 이제 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT=5)이
+// 있다 — 상한을 넘으면 genuine이 아니라 terminal 기술적 BLOCKED로 전환한다(§
+// blockOnDurableWaitRetryExhausted). 이 시나리오는 매 attempt마다 완전히 동일하게
+// 실패하는 required test가 결국 "genuine Human Gate 0"를 지키면서도 무한 반복되지 않고
+// terminal BLOCKED로 수렴하는지 검증한다.
 // ---------------------------------------------------------------------------
 async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetry(): Promise<void> {
   const repo = makeTempGitRepo();
@@ -278,8 +278,9 @@ async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetr
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
     callCount += 1;
     calls.push(task);
-    // 매 호출마다 완전히 동일하게 실패한다(다양한 이유가 아니라 같은 이유) — 6번째 호출은
-    // 절대 일어나지 않아야 한다(genuine WAITING_HUMAN으로 이미 승격했으므로).
+    // 매 호출마다 완전히 동일하게 실패한다(다양한 이유가 아니라 같은 이유) — durable wait
+    // 상한(5회 exhaustion, 매 exhaustion마다 MAX_REVIEW_CYCLES=5 round)을 넘어서는 호출은
+    // 절대 일어나지 않아야 한다(terminal 기술적 BLOCKED로 이미 전환했으므로).
     return { success: true, summary: "테스트: required test 항상 동일하게 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
   };
 
@@ -289,22 +290,22 @@ async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetr
   });
 
   check(
-    "F) T1이 첫 번째 runOnce 호출 안에서 무제한 재시도 대신 genuine WAITING_HUMAN으로 조기 승격됨(RAN_TASK_NOT_APPROVED)",
+    "F) T1이 첫 번째 runOnce 호출(=단일 orchestrator() 실행) 안에서 terminal 기술적 BLOCKED로 수렴함(RAN_TASK_NOT_APPROVED)",
     result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED" && result.iterations[0].result.taskId === "T1"
   );
   check(
-    "F) developer가 MAX_REVIEW_CYCLES(5)에서 멈추고 6번째(가상의 '고쳐짐') 호출은 발생하지 않음",
-    callCount === 5 && calls.every((c) => c === "Task1 prompt")
+    "F) developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES=5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회, 무한 반복 아님)",
+    callCount === 30 && calls.every((c) => c === "Task1 prompt")
   );
   check(
-    "F) genuine WAITING_HUMAN이므로 continuous-runner 자신도 더 진행하지 않고 즉시 STOP(T2/T3 시도 안 함, 재시도 없이 단 1회 iteration)",
+    "F) terminal 기술적 BLOCKED이므로 continuous-runner 자신도 재시도하지 않고 즉시 STOP(T2/T3 시도 안 함, 단 1회 iteration)",
     result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "RAN_TASK_NOT_APPROVED" && result.iterations.length === 1
   );
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("F) status=WAITING_HUMAN(사람 승인 없이 자동으로 넘어가지 않음)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check("F) status=BLOCKED(WAITING_HUMAN 아님 — genuine Human Gate 0)", (finalState.status as unknown as string) === "BLOCKED");
   check(
-    "F) deferredHumanTasks에 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록됨",
-    finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
+    "F) deferredHumanTasks에 더 이상 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록되지 않음(genuine 마커 아님)",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
   );
   check("F) T1은 아직 완료되지 않음(completedTasks가 비어있음)", JSON.stringify(finalState.completedTasks) === JSON.stringify([]));
 }

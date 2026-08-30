@@ -9,6 +9,7 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
+import { MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
 import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
@@ -410,6 +411,108 @@ async function scenarioRunAutodevOnceHappyPath(): Promise<void> {
   check("runAutodevOnce happy path: 최종적으로 working tree clean", statusAfter === "");
 }
 
+// ---------------------------------------------------------------------------
+// P0-5 하드닝(독립 감사) — local GREEN(required test 통과) 이전에는 Reviewer(GPT/Fireworks)
+// network call을 절대 하지 않는다. changedFiles 존재 여부와 무관하다(§ orchestrator.ts
+// skipReviewerLocalNotGreen).
+// ---------------------------------------------------------------------------
+async function scenarioRunAutodevOnceChangedFilesWithFailedRequiredTestNeverCallsReviewer(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo); // completedTasks=["P1.1"] → 다음은 P1.2
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    // 매 attempt마다 실제로 파일을 변경하지만(changedFiles 존재), required test는 계속
+    // 실패한다 — 독립 감사가 실제로 재현한 반례(changedFiles가 있어도 required test 실패면
+    // Reviewer가 호출되던 경로)와 정확히 같은 모양이다.
+    writeRepoFile(repo, "proj/p12-marker.txt", `attempt-${claudeCalls}\n`);
+    return {
+      success: true,
+      summary: `테스트: attempt ${claudeCalls} — required test 계속 실패`,
+      changedFiles: ["proj/p12-marker.txt"],
+      tests: [{ name: "proj:check", pass: false }],
+      rawOutput: "",
+    };
+  };
+  let reviewerCalls = 0;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => {
+    reviewerCalls += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨 — local GREEN 아님", nextTask: null };
+  };
+
+  // sleep을 fake로 주입한다 — P1-2 하드닝(orchestrator.ts durable wait-then-retry, §
+  // MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT)이 실제 backoff(최대 300000ms)를 여러 차례
+  // 거치므로, 실제 대기를 쓰면 이 테스트가 실제로 수십 분 걸린다(§ 요구사항 4 — 실제
+  // Claude/OpenAI/Telegram 호출만이 아니라 실제 wall-clock 대기도 fake로 격리한다).
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() } });
+
+  check("P0-5) changedFiles 존재 + required test 실패 반복 — Developer는 최소 1회 호출됨", claudeCalls >= 1);
+  check("P0-5) changedFiles 존재 + required test 실패 — Reviewer는 단 한 번도 호출되지 않음(reviewerCalls=0)", reviewerCalls === 0);
+}
+
+async function scenarioRunAutodevOnceChangedFilesWithPassedRequiredTestCallsReviewer(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/p12-marker.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: P1.2 구현 완료(required test 통과)",
+      changedFiles: ["proj/p12-marker.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+  let reviewerCalls = 0;
+  const gptReviewer = async (result: ClaudeResult, reviewCycle: number, task: string, allowedPathPrefixes?: string[]): Promise<GptReviewerReturn> => {
+    reviewerCalls += 1;
+    return fakePassReviewer()(result, reviewCycle, task, allowedPathPrefixes);
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer } });
+
+  check("P0-5) changedFiles 존재 + required test 통과(local GREEN) — Reviewer가 정상 호출됨(reviewerCalls=1)", reviewerCalls === 1);
+  check("P0-5) local GREEN 경로는 정상적으로 checkpoint까지 완료됨", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  void claudeCalls;
+}
+
+async function scenarioRunAutodevOnceNoChangedFilesWithFailedRequiredTestNeverCallsReviewer(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    // 이번 attempt에서 파일을 전혀 바꾸지 않았는데도(changedFiles:[]) required test는
+    // 여전히 실패한다(예: LOCAL_ROOT_CAUSE_MODE가 합성한 결과와 동일한 모양).
+    return {
+      success: true,
+      summary: `테스트: attempt ${claudeCalls} — 변경 없음, required test 여전히 실패`,
+      changedFiles: [],
+      tests: [{ name: "proj:check", pass: false }],
+      rawOutput: "",
+    };
+  };
+  let reviewerCalls = 0;
+  const gptReviewer = async (): Promise<GptReviewerReturn> => {
+    reviewerCalls += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨", nextTask: null };
+  };
+
+  // sleep을 fake로 주입한다(§ 위 scenarioRunAutodevOnceChangedFilesWithFailedRequiredTestNeverCallsReviewer
+  // 와 동일한 이유 — P1-2 durable wait의 실제 backoff를 이 테스트에서 실제로 기다리지 않는다).
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() } });
+
+  check("P0-5) changedFiles 없음 + required test 실패 — Reviewer는 단 한 번도 호출되지 않음(reviewerCalls=0)", reviewerCalls === 0);
+}
+
 async function scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo);
@@ -711,6 +814,57 @@ async function scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDevel
 
   const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
   check("APPROVED crash resume: product+admin commit 2건 생성됨(+init 1건=3건)", log.split("\n").length === 3);
+}
+
+// ---------------------------------------------------------------------------
+// P1-1 하드닝(2026-08-30, 독립 감사) — "재시작이 retry budget reset 버튼이 되면 안 된다".
+// reviewStagnationWaitCount(§ orchestrator.ts blockOnDurableWaitRetryExhausted의 durable
+// wait 예산)를 이미 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT)까지 소진한 상태로 미리
+// project-state.json에 저장해두고(= "process가 재시작 직전까지 N-1번 소진했다"를 흉내낸다),
+// 완전히 새로운(fresh) runAutodevOnce() 호출(= 실제 process 재시작과 동일하게 loadState()로
+// 디스크에서 다시 읽는다) 하나만으로 그 다음 한 번의 소진이 즉시 상한을 초과해 terminal
+// 기술적 BLOCKED로 끝나는지 검증한다 — 0부터 다시 시작(무한 반복)하지 않는다는 직접 증거다.
+// ---------------------------------------------------------------------------
+async function scenarioReviewStagnationBudgetPersistsAcrossRestart(): Promise<void> {
+  const target = PLANNER_FIXTURE_REGISTRY.find((t) => t.id === "P1.2")!;
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_PROVIDER_RETRY",
+    completedTasks: ["P1.1"],
+    currentTask: target.prompt,
+    reviewCycle: 0,
+    reviewStagnationWaitCount: MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT,
+  });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "테스트: 재시작 이후에도 여전히 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
+  };
+  const gptReviewer = async (): Promise<GptReviewerReturn> => ({
+    decision: "PASS",
+    severity: { critical: 0, high: 0, medium: 0 },
+    feedback: "호출되면 안 됨",
+    nextTask: null,
+  });
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
+
+  check(
+    "P1-1) 재시작(fresh runAutodevOnce 호출) 직후 예산이 0으로 리셋되지 않고 단 5회(MAX_REVIEW_CYCLES) 재시도 후 즉시 BLOCKED",
+    claudeCalls === 5
+  );
+  check("P1-1) outcome이 APPROVED_AND_CHECKPOINTED가 아님(수렴하지 않았으므로)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("P1-1) 최종 status=BLOCKED(terminal 기술적 안전정지 — 재시작이 예산을 초기화하지 않음)", (finalState.status as unknown as string) === "BLOCKED");
+  check(
+    `P1-1) reviewStagnationWaitCount가 seed(${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT})에서 이어져 상한을 초과함(=${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1}, 0부터 재시작 아님)`,
+    (finalState.reviewStagnationWaitCount ?? 0) === MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1
+  );
 }
 
 // AutoDev Core Maintenance — Crash-safe Checkpoint Reconciliation(Category B, 마지막 task
@@ -1424,6 +1578,7 @@ async function scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironm
     reviewScopeDirs: ["android/wakeword/"],
     executionPolicy: EXECUTION_ENVIRONMENT_POLICY,
   };
+  const events = createInMemoryEventStore();
 
   let developerCallCount = 0;
   const developerClaudeCaller = async (): Promise<RealClaudeResult> => {
@@ -1431,7 +1586,7 @@ async function scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironm
     return { success: true, summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "x", changedFiles: [], testsRequested: [] }), changedFiles: [], tests: [], rawOutput: "" };
   };
 
-  const result = await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+  const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
 
   check(
     "실행 환경 preflight 차단: outcome=BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT",
@@ -1439,10 +1594,93 @@ async function scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironm
   );
   check("실행 환경 preflight 차단: Developer가 단 한 번도 호출되지 않음", developerCallCount === 0);
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("실행 환경 preflight 차단: status=WAITING_HUMAN", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  // P0-4 하드닝(독립 감사) — 이 결함은 실제 사람의 판단이 필요한 게 아니라 순수 config
+  // 문제다. status는 이제 WAITING_HUMAN이 아니라 기술적 BLOCKED다(§ autodev.ts P0-4 주석).
+  check("P0-4) 실행 환경 preflight 차단: status=BLOCKED(WAITING_HUMAN 아님)", (finalState.status as unknown as string) === "BLOCKED");
   check(
     "실행 환경 preflight 차단: deferredHumanTasks에 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 마커가 기록됨",
     finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:") && t.includes("wakeword-unit"))
+  );
+  const all = events.query().events;
+  check(
+    "P0-4) 실행 환경 preflight 차단: HUMAN_APPROVAL_REQUIRED event가 생성되지 않음(genuine Human Gate 아님)",
+    !all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED")
+  );
+  check(
+    "P0-4) 실행 환경 preflight 차단: humanInterventionRequired=true인 event가 하나도 없음",
+    !all.some((e) => e.humanInterventionRequired === true)
+  );
+  check("P0-4) 실행 환경 preflight 차단: RUN_BLOCKED event가 대신 기록됨(대시보드 집계는 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
+}
+
+// P0-4 하드닝(독립 감사) — REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR로 BLOCKED된 상태도
+// (WAITING_HUMAN과 마찬가지로) 원인이 해소되면 사람의 명시적 승인 없이 자동으로 READY로
+// 복구되어야 한다(§ autodev.ts reconcileStaleRequiredTestExecutionEnvironmentTasks 호출부의
+// status==="BLOCKED" 확장). CWD_NOT_FOUND(디렉터리 자체가 없음)를 쓴다 — WRAPPER_NOT_FOUND와
+// 달리 실제 gradle/Java trust 판정 없이 디렉터리 생성만으로 결정론적으로 재현/해소할 수 있다.
+async function scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnvironmentBlocked(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const registry: TaskDefinition[] = [
+    {
+      id: "G2",
+      phase: 1,
+      taskNumber: 1,
+      title: "fixture task",
+      prompt: "fixture",
+      requiredTests: [{ name: "fixture-check", command: "node", args: ["--version"], cwd: "sub" }],
+      allowedPathPrefixes: ["proj/"],
+      prohibitedOperations: [],
+    },
+  ];
+  const statePath = makeTempStateFile(repo, {
+    status: "BLOCKED",
+    completedTasks: [],
+    deferredHumanTasks: [
+      `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=G2 requiredTest=fixture-check kind=CWD_NOT_FOUND cwd=sub resolvedPath=${join(repo, "sub")}`,
+    ],
+  });
+  const manifest: ProjectManifest = {
+    projectId: "execution-env-reconcile-project",
+    projectName: "Execution Env Reconcile Project",
+    targetProjectRoot: repo,
+    statePath,
+    taskRegistry: registry,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: { allowedReadPrefixes: ["proj/"], allowedWritePrefixes: ["proj/"], allowedCommands: [], commandCwdAliases: { sub: "sub" } },
+  };
+
+  // 원인 해소: 그 사이(예: 사람이 project adapter 밖에서) "sub/" 디렉터리가 실제로 생겼다.
+  const subDir = join(repo, "sub");
+  if (!existsSync(subDir)) mkdirSync(subDir, { recursive: true });
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-g2.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: 오래된 BLOCKED 자동복구 이후 정상 진행",
+      changedFiles: ["proj/marker-g2.txt"],
+      tests: [{ name: "fixture-check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check(
+    "P0-4) 오래된 BLOCKED(실행환경) 자동복구: 사람이 직접 고치지 않아도 같은 task가 자동으로 재개됨(checkpoint까지 도달)",
+    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+  check("P0-4) 오래된 BLOCKED(실행환경) 자동복구: Claude Developer가 정상적으로 1회 호출됨", claudeCalls === 1);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("P0-4) 오래된 BLOCKED(실행환경) 자동복구: 최종 status가 BLOCKED가 아님", (finalState.status as unknown as string) !== "BLOCKED");
+  check(
+    "P0-4) 오래된 BLOCKED(실행환경) 자동복구: deferredHumanTasks에서 마커가 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"))
   );
 }
 
@@ -1603,15 +1841,16 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
 
 // AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart Circuit Breaker(§ 요구사항
 // 20/21). status가 종결값이 아닌 mid-flight 값("CLAUDE_WORKING")으로 남아있다는 것은 직전
-// 프로세스가 그 상태를 종결하지 못한 채 죽었다는 뜻이다. durable
-// technicalRecoveryState.unexpectedExitCount가 이미 1(직전 1회는 제한적으로 재시작을
-// 허용했음을 의미)인 상태에서 또 mid-flight로 발견되면(2회째) 자동 재시작을 멈추고
-// genuine WAITING_HUMAN으로 전환해야 한다 — Developer는 전혀 호출되지 않는다.
-// 2026-08-28 정책 수정 — "process crash"는 아무리 반복돼도 Human Gate로 승격하지 않는다.
-// 옛 임계치(2회)를 훨씬 넘는 unexpectedExitCount=5로 시작해도 여전히 Developer를 정상
-// 호출해 진행을 계속해야 한다(더 이상 WAITING_HUMAN으로 차단되지 않음) — durable
-// unexpectedExitCount는 계속 증가하며 진단용으로만 남는다.
-async function scenarioRunAutodevOnceProcessRestartNeverEscalatesRegardlessOfRepeatCount(): Promise<void> {
+// 프로세스가 그 상태를 종결하지 못한 채 죽었다는 뜻이다.
+//
+// AutoDev Core Maintenance(2026-08-30, Category A/C) — 2026-08-28 정책은 "process crash는
+// 아무리 반복돼도 Human Gate로 승격하지 않는다"였으나, 그 전제("이 프로세스를 빠르게 자동
+// 재시작시키는 supervisor가 없다")가 runner-supervisor.ts(및 그 crash watchdog)의 등장으로
+// 깨졌다 — deterministic-simulation.ts Run C가 실제로 재현: 동일 task가 매 attempt마다
+// 프로세스를 죽이면 supervisor가 이를 영원히 재시작하며 "동일 deterministic 실패에 무제한
+// 재시도 금지" 원칙을 위반한다. 이제는 MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT(5)를 넘으면
+// Developer를 다시 호출하지 않고 즉시 genuine WAITING_HUMAN으로 승격한다.
+async function scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, {
     status: "CLAUDE_WORKING",
@@ -1629,34 +1868,37 @@ async function scenarioRunAutodevOnceProcessRestartNeverEscalatesRegardlessOfRep
   let claudeCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
     claudeCalls += 1;
-    writeRepoFile(repo, "proj/marker-restart-recovery-6.txt", "marker\n");
-    return {
-      success: true,
-      summary: "테스트: 6번째 mid-flight 재발견에도 정상 진행",
-      changedFiles: ["proj/marker-restart-recovery-6.txt"],
-      tests: [{ name: "proj:check", pass: true }],
-      rawOutput: "",
-    };
+    return { success: true, summary: "호출되면 안 됨 — 상한 초과", changedFiles: [], tests: [], rawOutput: "" };
   };
 
   const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
-  check("정책: 옛 임계치(2회)를 넘는 6번째 mid-flight 재발견도 Developer를 정상 호출함(차단 없음)", claudeCalls === 1);
-  check("정책: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED(WAITING_HUMAN으로 STOP되지 않음)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("상한 초과: Developer가 호출되지 않음(claudeCalls=0)", claudeCalls === 0);
+  check("상한 초과: outcome=BLOCKED_MID_FLIGHT_CRASH_LOOP", result.outcome === "BLOCKED_MID_FLIGHT_CRASH_LOOP");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("정책: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+  // AutoDev Core Maintenance(2026-08-30) — WAITING_HUMAN이 아니라 BLOCKED다: 이 상태는
+  // 사람이 "승인"해서 풀리는 genuine Human Gate가 아니라(run.ts는 정확히
+  // status==="WAITING_HUMAN" 문자열만 보고 Telegram controller를 살려 승인을 기다린다 —
+  // BLOCKED는 그 조건에 해당하지 않으므로 Human Gate/알림이 켜지지 않는다) 기술적
+  // 안전정지다.
+  check("상한 초과: 최종 status=BLOCKED(WAITING_HUMAN 아님 — Human Gate 활성화 안 함)", (finalState.status as unknown as string) === "BLOCKED");
   check(
-    "정책: PROCESS_RESTART_CIRCUIT_BREAKER 마커가 더 이상 생성되지 않음",
-    !finalState.deferredHumanTasks.some((t) => t.includes("PROCESS_RESTART_CIRCUIT_BREAKER"))
+    "상한 초과: MID_FLIGHT_CRASH_LOOP_DETECTED 마커가 기록됨(evidence 보존)",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("MID_FLIGHT_CRASH_LOOP_DETECTED:"))
   );
-  // task가 실제로 완료되면 durable failure state는 의도적으로 clear된다(§
-  // clearDurableFailureState, 다음 task로 이력이 새어나가지 않게 하는 기존 설계) — 그래서
-  // 여기서는 완료 "이전"에 durable count가 실제로 6까지 올라갔었다는 것만(§ 위 로그/
-  // saveState 호출 경로) 코드로 보장되고, 완료 후 값은 null로 되돌아가는 게 정상이다.
-  check(
-    "정책: task 완료 후 durable failure state는 기존 설계대로 clear됨(다음 task로 이력이 새지 않음)",
-    finalState.technicalRecoveryState === null || finalState.technicalRecoveryState === undefined
-  );
+  check("상한 초과: task P1.2는 completedTasks에 없음(자동 승인 아님)", !finalState.completedTasks.includes("P1.2"));
+  check("상한 초과: durable unexpectedExitCount가 6으로 계속 기록됨(진단 가능)", finalState.technicalRecoveryState?.unexpectedExitCount === 6);
+
+  // 재시작(같은 task, 같은 project) 이후에도 상한이 계속 지켜지는지 확인한다 — decideNextAction의
+  // status==="BLOCKED" STOP 분기가 없으면 여기서 Developer가 다시 호출된다.
+  let claudeCallsAfterRestart = 0;
+  const claudeRunnerAfterRestart = async (): Promise<ClaudeResult> => {
+    claudeCallsAfterRestart += 1;
+    return { success: true, summary: "호출되면 안 됨 — BLOCKED 유지되어야 함", changedFiles: [], tests: [], rawOutput: "" };
+  };
+  const resultAfterRestart = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner: claudeRunnerAfterRestart, gptReviewer: fakePassReviewer() } });
+  check("상한 초과 후 재시작: Developer가 다시 호출되지 않음(claudeCallsAfterRestart=0)", claudeCallsAfterRestart === 0);
+  check("상한 초과 후 재시작: outcome=STOPPED(BLOCKED 유지)", resultAfterRestart.outcome === "STOPPED");
 }
 
 // 첫 번째 mid-flight 재발견(unexpectedExitCount 0 → 1)은 아직 임계치 미만이므로 정상적으로
@@ -1962,18 +2204,27 @@ async function scenarioRunAutodevOnceDeterministicReviewCycleExhaustionEscalates
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
   });
 
+  // P0-4/P1-2 하드닝(2026-08-30, 독립 감사) — 동일 required test 실패 반복이 확정돼도 더
+  // 이상 genuine WAITING_HUMAN으로 조기 승격하지 않는다(§ orchestrator.ts
+  // blockOnDurableWaitRetryExhausted) — 대신 durable wait이 MAX_DURABLE_PROVIDER_WAIT_
+  // RETRY_COUNT(5)회까지 기술적으로 반복된 뒤 terminal 기술적 BLOCKED로 수렴한다(genuine
+  // Human Gate 0을 유지하면서도 무한 반복은 아니다).
   check("결정론적 반복 조기 승격: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
-  check("결정론적 반복 조기 승격: developer가 MAX_REVIEW_CYCLES(5)에서 멈추고 MAX_GPT_CALLS(10)까지 반복하지 않음", claudeCallCount === 5);
-  const all = events.query().events;
-  const exhaustedEvents = all.filter((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED");
-  check("결정론적 반복 조기 승격: REVIEW_CYCLE_EXHAUSTED event가 정확히 1회만 기록됨(무제한 반복 아님)", exhaustedEvents.length === 1);
   check(
-    "결정론적 반복 조기 승격: REVIEW_CYCLE_EXHAUSTED event 자신이 이제 humanInterventionRequired=true(동일 반복이 확정됐으므로 genuine)",
-    exhaustedEvents.every((e) => e.humanInterventionRequired === true)
+    "결정론적 반복 조기 승격: developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES=5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=30, 무제한 아님)",
+    claudeCallCount === 30
+  );
+  const all = events.query().events;
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("결정론적 반복 조기 승격: 최종 status=BLOCKED(WAITING_HUMAN 아님 — genuine Human Gate 0)", (finalState.status as unknown as string) === "BLOCKED");
+  const exhaustedEvents = all.filter((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED");
+  check(
+    "결정론적 반복 조기 승격: REVIEW_CYCLE_EXHAUSTED event 자체는 항상 humanInterventionRequired=false(genuine 아님, 기술적 durable wait)",
+    exhaustedEvents.length > 0 && exhaustedEvents.every((e) => e.humanInterventionRequired === false)
   );
   check(
-    "결정론적 반복 조기 승격: generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event가 정상적으로 기록됨(Telegram APPROVE 버튼 유지)",
-    all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
+    "결정론적 반복 조기 승격: generic 'orchestrator status=' HUMAN_APPROVAL_REQUIRED event는 생성되지 않음(기술적 자동 복구 대상이므로)",
+    !all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && (e.reason ?? "").startsWith("orchestrator status="))
   );
   check("결정론적 반복 조기 승격: RUN_BLOCKED event는 그대로 기록됨(대시보드 실패 집계 유지)", all.some((e) => e.eventType === "RUN_BLOCKED"));
   check("결정론적 반복 조기 승격: orchestrator의 REVIEW_CYCLE_EXHAUSTED event는 그대로 기록됨(감사 기록 유지)", all.some((e) => e.eventType === "REVIEW_CYCLE_EXHAUSTED"));
@@ -2276,6 +2527,9 @@ async function main(): Promise<void> {
 
   try {
     await scenarioRunAutodevOnceHappyPath();
+    await scenarioRunAutodevOnceChangedFilesWithFailedRequiredTestNeverCallsReviewer();
+    await scenarioRunAutodevOnceChangedFilesWithPassedRequiredTestCallsReviewer();
+    await scenarioRunAutodevOnceNoChangedFilesWithFailedRequiredTestNeverCallsReviewer();
     await scenarioRunAutodevOnceCheckpointBlockedOnUnexpectedFile();
     await scenarioRunAutodevOnceNotApprovedSkipsCheckpoint();
     await scenarioRunAutodevOnceNoTaskStops();
@@ -2291,10 +2545,11 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOncePassesPreviousScopeViolationContextToNextDeveloper();
     await scenarioRunAutodevOncePassesPreviousFailureEvidenceToNextDeveloper();
     await scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment();
+    await scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnvironmentBlocked();
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
-    await scenarioRunAutodevOnceProcessRestartNeverEscalatesRegardlessOfRepeatCount();
+    await scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap();
     await scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();
@@ -2307,6 +2562,7 @@ async function main(): Promise<void> {
     await scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt();
 
     await scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper();
+    await scenarioReviewStagnationBudgetPersistsAcrossRestart();
     await scenarioDanglingProjectStateReconciledWhenNoMoreTasks();
 
     await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();

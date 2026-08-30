@@ -92,6 +92,11 @@ async function scenarioA_factoryBasics(): Promise<void> {
 
   // A3) HTTP 오류 분류 — 401/413/429/500/timeout.
   const cases: { status?: number; reason: string; transient: boolean; expectedCode: string; expectedTransient: boolean }[] = [
+    // AutoDev Core Maintenance(2026-08-30, Category D) — 400(Bad Request)은 401/413/429/500
+    // 어느 특수 분기에도 걸리지 않아 기존 코드에서도 이미 API_ERROR(transient:false)로
+    // 올바르게 처리되고 있었지만, 그 사실을 확인하는 전용 테스트가 없었다(재시도해도 같은
+    // 요청이 다시 실패할 뿐이므로 non-transient가 맞다 — genuine 실패로 승격되어야 함).
+    { status: 400, reason: "HTTP 400", transient: false, expectedCode: "API_ERROR", expectedTransient: false },
     { status: 401, reason: "HTTP 401", transient: false, expectedCode: "AUTH_ERROR", expectedTransient: false },
     { status: 429, reason: "HTTP 429", transient: true, expectedCode: "RATE_LIMIT", expectedTransient: true },
     // Groq의 tokens-per-minute capacity 초과는 429가 아니라 413로 온다(2026-08-26, JARVIS

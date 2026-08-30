@@ -180,7 +180,16 @@ export async function runAutodevContinuous(
     if (WAITING_HUMAN_OUTCOMES.has(result.outcome)) {
       let recoverable = false;
       try {
-        recoverable = isTechnicalAutoRecoverableWaitingHuman(loadState(statePathForRecoveryCheck));
+        // P1-2 하드닝(독립 감사) — orchestrator.ts의 durable wait retry가 상한을 넘으면
+        // 이제 WAITING_HUMAN이 아니라 terminal 기술적 BLOCKED로 끝날 수 있다(§
+        // blockOnDurableWaitRetryExhausted). BLOCKED는 "재시도해도 되는 기술적 자동
+        // 복구 대상"이 아니라 "근본 원인이 해소될 때까지 이 프로세스는 멈춘다"는 뜻이므로
+        // (§ decideNextAction의 status==="BLOCKED" STOP 분기) status가 정확히
+        // "WAITING_HUMAN"일 때만 canonical Human Gate Policy 재검사를 적용한다 — BLOCKED는
+        // classifyWaitingHumanReason()의 마커 판정과 무관하게 이 loop가 즉시 멈춰야 한다
+        // (그렇지 않으면 이미 BLOCKED로 끝난 orchestrator를 헛되이 다시 호출하게 된다).
+        const stateForRecoveryCheck = loadState(statePathForRecoveryCheck);
+        recoverable = (stateForRecoveryCheck.status as unknown as string) === "WAITING_HUMAN" && isTechnicalAutoRecoverableWaitingHuman(stateForRecoveryCheck);
       } catch {
         // state.json을 읽을 수 없으면(손상/삭제 등) fail-closed로 사람 판단이 필요한
         // 것으로 취급한다 — 확인하지 못한 상태를 자동 복구 대상으로 추측하지 않는다.

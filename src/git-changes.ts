@@ -46,25 +46,50 @@ function isExcludedPath(relPath: string): boolean {
   );
 }
 
-function parsePorcelainLine(line: string): WorkingTreeChange | null {
-  if (line.length < 4) return null;
-  const x = line[0];
-  const y = line[1];
-  const rest = line.slice(3);
-  if (x === "?" && y === "?") return { path: rest, status: "untracked" };
-  if (x === "R" || y === "R") {
-    // "R  old -> new" — 커밋 대상은 new만 취급하되, old 경로도 renamedFrom으로 보존한다
-    // (SI-3.8D Incremental GPT Reviewer가 rename을 modification/deletion과 구분해 정확히
-    // 표현하는 데 쓴다 — § 요구사항 7).
-    const arrowIdx = rest.indexOf(" -> ");
-    if (arrowIdx === -1) return { path: rest, status: "renamed" };
-    const oldPath = rest.slice(0, arrowIdx);
-    const newPath = rest.slice(arrowIdx + 4);
-    return { path: newPath, status: "renamed", renamedFrom: oldPath };
+// AutoDev Core Maintenance(2026-08-30, Category B/D — Git Path Parsing Safety) — git은
+// core.quotepath 기본값(true)에서 공백만 있어도(특수/비ASCII 문자가 전혀 없어도 아니지만,
+// 실측 결과 공백 포함 경로도) 경로를 큰따옴표로 감싸고, 비ASCII 바이트는 8진수
+// 이스케이프(`\NNN`)로 바꿔 사람이 읽는 "git status --porcelain" 줄글 출력에 넣는다(실측:
+// `?? "with space.txt"`, `?? "\355\225\234\352\270\200.txt"`). 예전 `parsePorcelainLine`는
+// 이 quoting을 전혀 벗기지 않아, 공백/유니코드 파일명은 큰따옴표와 8진수 이스케이프가 그대로
+// 섞인 가짜 경로로 파싱됐다(allowedPathPrefixes 매칭·secret/dependency scanner 경로 매칭·
+// `git add -- <path>`가 전부 그 가짜 경로를 대상으로 동작해 조용히 깨짐). `-z`(NUL 종결,
+// quoting을 전혀 하지 않는 raw byte 출력, git 공식 문서 권장 기계 판독 모드)로 전환해 이
+// class의 문제를 구조적으로 없앤다(이스케이프를 직접 파싱하는 대신 애초에 이스케이프가
+// 생기지 않는 모드를 쓴다). `-z` 포맷에서 rename/copy는 "XY newPath\0origPath\0"로 두 개의
+// NUL 필드를 쓴다(실측 확인 — 화살표 문자열이 없다).
+function parsePorcelainRecords(raw: string): WorkingTreeChange[] {
+  const fields = raw.split("\0");
+  const results: WorkingTreeChange[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const record = fields[i];
+    if (record.length === 0) continue; // 마지막 NUL 뒤에 남는 빈 필드
+    if (record.length < 4) continue; // 방어적 가드 — 정상 포맷이면 발생하지 않음
+    const x = record[0];
+    const y = record[1];
+    const path = record.slice(3);
+    if (x === "?" && y === "?") {
+      results.push({ path, status: "untracked" });
+      continue;
+    }
+    if (x === "R" || y === "R") {
+      // 이 레코드가 new path, 바로 다음 NUL 필드가 orig path다(§ 위 주석 실측 근거).
+      i += 1;
+      const origPath = fields[i] ?? "";
+      results.push({ path, status: "renamed", renamedFrom: origPath });
+      continue;
+    }
+    if (x === "D" || y === "D") {
+      results.push({ path, status: "deleted" });
+      continue;
+    }
+    if (x === "A" || y === "A") {
+      results.push({ path, status: "added" });
+      continue;
+    }
+    results.push({ path, status: "modified" });
   }
-  if (x === "D" || y === "D") return { path: rest, status: "deleted" };
-  if (x === "A" || y === "A") return { path: rest, status: "added" };
-  return { path: rest, status: "modified" };
+  return results;
 }
 
 /**
@@ -78,7 +103,9 @@ export function getWorkingTreeChanges(scopeDirs: string[], cwd: string = PROJECT
   // allowedPathPrefixes 판정이 모두 깨진다. .gitignore된 node_modules/.next/dist/logs는
   // 이 옵션과 무관하게(--ignored를 별도로 주지 않는 한) 여전히 제외되므로, 대형 디렉터리를
   // 전부 훑는 성능 문제는 발생하지 않는다.
-  const res = spawnSync("git", ["status", "--porcelain", "--untracked-files=all", "--", ...scopeDirs], {
+  // -z: 공백/따옴표/유니코드 파일명이 quoting/8진수 이스케이프 없이 raw byte로 나온다(§ 위
+  // parsePorcelainRecords 주석). NUL로 레코드가 구분되므로 줄바꿈이 포함된 파일명도 안전하다.
+  const res = spawnSync("git", ["status", "--porcelain", "-z", "--untracked-files=all", "--", ...scopeDirs], {
     cwd,
     shell: false,
     encoding: "utf-8",
@@ -86,10 +113,7 @@ export function getWorkingTreeChanges(scopeDirs: string[], cwd: string = PROJECT
   const all: WorkingTreeChange[] = [];
   const excluded: string[] = [];
   if (res.status === 0) {
-    for (const rawLine of (res.stdout || "").split("\n")) {
-      if (!rawLine) continue;
-      const parsed = parsePorcelainLine(rawLine);
-      if (!parsed) continue;
+    for (const parsed of parsePorcelainRecords(res.stdout || "")) {
       if (isExcludedPath(parsed.path)) {
         excluded.push(parsed.path);
         continue;
@@ -165,6 +189,10 @@ export interface UntrackedFileContent {
    *  내용이 아니라 § readFileSmartly()가 만든 metadata 요약이다(원문은 payload에 전혀
    *  들어가지 않았다). */
   binary?: boolean;
+  /** AutoDev Core Maintenance(2026-08-30, Category D) — true면 binary가 아니라 생성/cache
+   *  artifact 구조적 증거(§ classifyGeneratedCacheArtifact)로 content가 metadata로
+   *  대체됐다는 뜻이다. */
+  generatedCache?: boolean;
 }
 
 const BINARY_SNIFF_SAMPLE_BYTES = 8_000;
@@ -185,6 +213,72 @@ export interface SmartFileRead {
   binary: boolean;
   sizeBytes: number;
   sha256?: string;
+  /** AutoDev Core Maintenance(2026-08-30, Category D — Generated/Cache Artifact Exclusion).
+   *  true면 binary가 아니라 이 파일이 § classifyGeneratedCacheArtifact()의 구조적 증거로
+   *  생성/cache artifact로 판정되어 content가 metadata 요약으로 대체됐다는 뜻이다. */
+  generatedCache?: boolean;
+}
+
+// AutoDev Core Maintenance(2026-08-30, Category D — Generated/Cache Artifact Exclusion) —
+// 실제 JARVIS Task 5.2 운영에서 확인된 문제: Gradle 최초 빌드가 만든 .gradle/ 캐시 및
+// build/ 산출물(수십 개 파일, 상당수가 텍스트 형식의 내부 북키핑 — checksums.lock,
+// fileHashes.bin, source-to-output.tab 등)이 전부 "신규 untracked 파일"로 잡혀 Reviewer
+// payload에 원문 그대로 흘러들어갔다(lastGptDecision.payloadChars=91,718로 실측 확인).
+// binary 판정(§ isBinaryContent, e07ee57)은 .bin류만 막을 뿐 텍스트 형식 캐시 파일은
+// 여전히 통과시킨다.
+//
+// 단순 디렉터리명/확장자 blacklist는 쓰지 않는다 — "build/"는 실제 소스 디렉터리 이름일
+// 수 있고, ".properties"/".lock" 확장자는 정상 설정/lockfile(예: yarn.lock,
+// Gemfile.lock — 이런 파일은 Reviewer가 반드시 봐야 하는 실제 의존성 변경이다)일 수
+// 있다. 대신 두 단계 구조적 증거만 인정한다:
+//
+//   (1) 예약된 도구 전용 캐시 디렉터리 — 이미 DENY_PATH_PATTERNS에 있는 .git/.next/
+//       node_modules와 정확히 같은 성격(마침표/밑줄로 시작해 그 빌드 도구가 배타적으로
+//       소유하는, 사람이 그 이름 그대로 실제 소스 디렉터리를 만들 일이 사실상 없는
+//       이름)이다. ".gradle"이 정확히 이 부류다(주의: 사람이 커밋하는 실제 wrapper
+//       디렉터리 "gradle/wrapper/gradle-wrapper.jar"는 점 없는 "gradle"이라 이 집합에
+//       속하지 않는다 — 그 파일은 대신 binary 판정으로 이미 안전하게 처리된다).
+//   (2) 모호한 산출물 디렉터리 이름("build"/"target"/"out" 등, 실제 소스 디렉터리
+//       이름일 수 있음)은 그 이름 하나만으로는 절대 증거로 인정하지 않는다 — 그 아래
+//       실제 빌드 도구 내부 구조에서만 쓰이는 두 번째 세그먼트(generated/intermediates/
+//       kotlin/classes/caches-jvm 등)가 함께 있을 때만("build" 단독이 아니라
+//       "build/kotlin/..." 처럼 중첩 확인) 증거로 인정한다 — 이 이중 확인이 "실제
+//       소스 디렉터리 이름이 build인 경우"를 오탐하지 않게 하는 핵심이다.
+const RESERVED_TOOL_CACHE_DIR_SEGMENTS = new Set([".gradle", "__pycache__", ".pytest_cache", ".turbo", ".parcel-cache", ".mypy_cache"]);
+const AMBIGUOUS_OUTPUT_DIR_SEGMENTS = new Set(["build", "target", "out"]);
+const BUILD_INTERNAL_STRUCTURE_SEGMENTS = new Set([
+  "generated",
+  "intermediates",
+  "tmp",
+  "classes",
+  "kotlin",
+  "caches-jvm",
+  "cacheable",
+  "compileKotlin",
+  "compileTestKotlin",
+  "buildOutputCleanup",
+  "executionHistory",
+  "fileHashes",
+  "checksums",
+  "dependencies-accessors",
+]);
+
+/** relPath(POSIX 상대경로)가 구조적 증거로 생성/cache artifact로 보이는지 판정한다 —
+ *  순수 함수, 파일 내용/git 상태와 무관하게 경로 문자열만 본다(§ 위 설계 근거 주석). */
+export function classifyGeneratedCacheArtifact(relPath: string): boolean {
+  const segments = relPath.split("/");
+  for (let i = 0; i < segments.length; i++) {
+    if (RESERVED_TOOL_CACHE_DIR_SEGMENTS.has(segments[i])) return true;
+  }
+  for (let i = 0; i < segments.length; i++) {
+    if (!AMBIGUOUS_OUTPUT_DIR_SEGMENTS.has(segments[i])) continue;
+    // 이 세그먼트 "다음부터"(그 디렉터리 안쪽) 실제 빌드 도구 내부 구조 세그먼트가
+    // 하나라도 있어야만 증거로 인정한다 — "build" 단독으로는 절대 충분하지 않다.
+    for (let j = i + 1; j < segments.length; j++) {
+      if (BUILD_INTERNAL_STRUCTURE_SEGMENTS.has(segments[j])) return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -195,9 +289,23 @@ export interface SmartFileRead {
  * 파일은 기존과 100% 동일하게 그대로 utf-8 문자열을 반환한다 — 이 함수는 이 저장소 전체에서
  * "파일을 읽어 review/commit payload에 넣는" 두 지점(이 파일의 readUntrackedFiles,
  * gpt-reviewer.ts의 makeFileStateReader)이 공유하는 단일 구현이다(로직 복제 없음).
+ *
+ * generated/cache artifact(§ classifyGeneratedCacheArtifact) 판정은 binary 판정과
+ * 독립적이며 먼저 확인한다 — 텍스트 형식의 캐시 파일(예: checksums.lock)도 원문 대신
+ * metadata로 대체돼야 하기 때문이다.
  */
 export function readFileSmartly(absPath: string, relPathForMetadata: string, changeType: string): SmartFileRead {
   const buf = readFileSync(absPath);
+  if (classifyGeneratedCacheArtifact(relPathForMetadata)) {
+    const sha256 = createHash("sha256").update(buf).digest("hex");
+    return {
+      content: `[AUTODEV GENERATED/CACHE ARTIFACT — raw content not included] path=${relPathForMetadata} changeType=${changeType} sizeBytes=${buf.length} sha256=${sha256}`,
+      binary: false,
+      generatedCache: true,
+      sizeBytes: buf.length,
+      sha256,
+    };
+  }
   if (isBinaryContent(buf)) {
     const sha256 = createHash("sha256").update(buf).digest("hex");
     return {
@@ -283,11 +391,19 @@ export function readUntrackedFiles(
       skipped.push(`${change.path} (읽기 실패)`);
       continue;
     }
-    if (smartRead.binary) {
-      // binary metadata 요약은 이미 짧고 고정된 형태다 — buildBoundedFileSnapshot의 truncation
-      // 로직을 적용할 대상이 아니다(원문 자체가 없으므로 "잘릴 원본"이 없다).
+    if (smartRead.binary || smartRead.generatedCache) {
+      // binary/generated-cache metadata 요약은 이미 짧고 고정된 형태다 —
+      // buildBoundedFileSnapshot의 truncation 로직을 적용할 대상이 아니다(원문 자체가
+      // 없으므로 "잘릴 원본"이 없다 — 원본이 아무리 크더라도(§ "oversized generated
+      // artifact") 이 metadata 크기만 소비한다).
       used += smartRead.content.length;
-      files.push({ path: change.path, content: smartRead.content, truncated: false, binary: true });
+      files.push({
+        path: change.path,
+        content: smartRead.content,
+        truncated: false,
+        binary: smartRead.binary,
+        generatedCache: smartRead.generatedCache,
+      });
       continue;
     }
     const remaining = totalBudgetChars - used;

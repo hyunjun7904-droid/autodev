@@ -5,6 +5,8 @@ import { loadProjectAdapter } from "./project-adapter-loader";
 import { loadState } from "./state";
 import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
 import { assertProductionRuntimeForContinuousLaunch } from "./runtime-origin";
+import { defaultIsPidAlive } from "./dashboard-supervisor";
+import { startParentLivenessWatchdog, resolveSupervisorParentPidFromEnv } from "./parent-liveness-watchdog";
 import { log } from "./logger";
 
 // AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체, Phase C Task C1 — project adapter
@@ -123,6 +125,21 @@ async function main(): Promise<void> {
   installShutdownHandlers();
   const controllerSupervisor = await ensureTelegramControllerStarted(manifest);
 
+  // P0-3 하드닝(§ parent-liveness-watchdog.ts) — runner-supervisor.ts가 spawn한 child일
+  // 때만(AUTODEV_SUPERVISOR_PID) 켜진다. supervisor가 비정상 종료되면 이 프로세스가 orphan으로
+  // 무기한 계속 실행되지 않고 스스로 종료한다 — crash-safe checkpoint resume이 이미 이
+  // 종류의 예기치 않은 종료를 안전하게 재개한다.
+  const supervisorParentPid = resolveSupervisorParentPidFromEnv();
+  const parentWatchdog = supervisorParentPid
+    ? startParentLivenessWatchdog(supervisorParentPid, {
+        isPidAlive: defaultIsPidAlive,
+        onParentDead: () => {
+          console.error(`[run] supervisor(pid=${supervisorParentPid})가 더 이상 살아있지 않습니다 — orphan으로 남지 않도록 즉시 종료합니다.`);
+          process.exit(1);
+        },
+      })
+    : undefined;
+
   try {
     let result: AutodevRunResult;
     if (continuous) {
@@ -163,6 +180,7 @@ async function main(): Promise<void> {
       await controllerSupervisor.flushOnce();
     }
   } finally {
+    parentWatchdog?.stop();
     await controllerSupervisor.stop();
   }
 

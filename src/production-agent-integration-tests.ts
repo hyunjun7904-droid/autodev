@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { runAutodevOnce, runPreDevelopmentAdvisory, runPostDevelopmentAdvisory } from "./autodev";
-import { runOrchestrator } from "./orchestrator";
+import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -471,22 +471,24 @@ async function scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman(): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// AutoDev Core Maintenance(2026-08-30) — 위 7/8과 정반대 대조군: MAX_REVIEW_CYCLES 소진이
-// "다양한 이유로 계속 REVISE"가 아니라 "동일한 required test 실패가 결정론적으로 반복"되어
-// 발생하면(§ orchestrator.ts DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX), 무제한
-// backoff-and-retry 대신 genuine WAITING_HUMAN으로 승격해야 한다. 위 시나리오와 마찬가지로
-// GPT reviewer는 항상 PASS를 반환하지만(REVISE는 오직 requiredTestsFailed 강제 override로만
-// 발생), required test 자체가 매 attempt마다 완전히 동일하게 실패한다 — "다양한 이유"가
-// 아니라 "같은 이유"임을 대조하기 위해 위 시나리오와 나란히 둔다.
+// P0-4/P1-2 하드닝(2026-08-30, 독립 감사) — 이전 정책(2026-08-30 이전 버전)은 이 시나리오를
+// 위 7/8과 정반대 대조군으로 써서 "동일한 required test 실패가 결정론적으로 반복"되면
+// genuine WAITING_HUMAN으로 승격해야 한다고 검증했다. 독립 감사에서 이것이 정책 위반으로
+// 확인됐다 — "test failure/deterministic blocker"는 아무리 반복돼도 실제 사업적/보안적
+// 판단이 필요한 게 아니다(§ CLAUDE.md P0-4, deterministic-simulation.ts Run B가 실제
+// 재현). 이제 "다양한 이유"든 "같은 이유"든 REVIEW_CYCLE_EXHAUSTED는 항상 동일한 기술적
+// durable wait-then-retry 경로를 타고(§ orchestrator.ts blockOnDurableWaitRetryExhausted),
+// 그 durable wait 자체에 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT=5)이 있어 terminal
+// 기술적 BLOCKED로 수렴한다(무한 반복은 아니되 genuine Human Gate도 아니다).
 // ---------------------------------------------------------------------------
-async function scenarioMaxCycleExhaustionWithDeterministicRepeatEscalatesToWaitingHuman(): Promise<void> {
+async function scenarioMaxCycleExhaustionWithDeterministicRepeatStaysTechnicalBlocked(): Promise<void> {
   const repo = makeTempGitRepo();
   const taskDef = makeTaskDef({ requiredTests: [{ name: "proj:check", command: "node", args: [], cwd: "root" }] });
   const statePath = makeTempStateFile(repo);
   const manifest = buildManifest(repo, statePath, [taskDef]);
   // 매 attempt마다 완전히 동일한 실패(name/command/exitCode/stderrTail 전부 동일)를 반환한다
   // — computeFailureFingerprint가 매번 같은 값이 되어 stagnationTracker의 repeatCount가
-  // 계속 증가한다(다양한 실패가 아니라 "같은" 실패).
+  // 계속 증가한다(다양한 실패가 아니라 "같은" 실패) — 그래도 genuine으로 승격되지 않아야 한다.
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt", [
     { name: "proj:check", pass: false, failureEvidence: { command: "node proj/check.mjs", exitCode: 1, stderrTail: "AssertionError: 항상 동일하게 실패" } },
   ]);
@@ -498,16 +500,22 @@ async function scenarioMaxCycleExhaustionWithDeterministicRepeatEscalatesToWaiti
   });
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
 
-  check("결정론적 반복: developer가 MAX_REVIEW_CYCLES(5)를 넘어 무제한 재시도되지 않음", callCount() === 5);
-  check("결정론적 반복: outcome이 APPROVED_AND_CHECKPOINTED가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
-  check("결정론적 반복: state.status=WAITING_HUMAN(무제한 backoff-and-retry로 새지 않음)", (finalState.status as unknown as string) === "WAITING_HUMAN");
   check(
-    "결정론적 반복: deferredHumanTasks에 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록됨",
-    finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
+    "결정론적 반복: developer 호출이 bounded됨(exhaustion마다 5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=30, 무한 반복 아님)",
+    callCount() === 30
+  );
+  check("결정론적 반복: outcome이 APPROVED_AND_CHECKPOINTED가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check(
+    "결정론적 반복: state.status=BLOCKED(genuine WAITING_HUMAN 아님 — Human Gate 0, 무한 반복도 아님)",
+    (finalState.status as unknown as string) === "BLOCKED"
   );
   check(
-    "결정론적 반복: reviewStagnationWaitCount는 증가하지 않음(backoff 경로를 타지 않았으므로)",
-    (finalState.reviewStagnationWaitCount ?? 0) === 0
+    "결정론적 반복: deferredHumanTasks에 더 이상 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 마커가 기록되지 않음(genuine 아님)",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:"))
+  );
+  check(
+    "결정론적 반복: reviewStagnationWaitCount가 durable하게 증가함(기술적 backoff 경로를 탔으므로, 상한 초과로 BLOCKED)",
+    (finalState.reviewStagnationWaitCount ?? 0) === MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1
   );
 }
 
@@ -914,7 +922,7 @@ async function main(): Promise<void> {
     await scenarioRequiredTestFailureBlocksCompletion();
     await scenarioCriticalHighBlocksApproval();
     await scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman();
-    await scenarioMaxCycleExhaustionWithDeterministicRepeatEscalatesToWaitingHuman();
+    await scenarioMaxCycleExhaustionWithDeterministicRepeatStaysTechnicalBlocked();
     await scenarioReviewerErrorNotFailOpen();
     await scenarioApprovedRunRecordsRealEvents();
     await scenarioProductionEntrypointInjectsEventStoreByDefault();

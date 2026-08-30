@@ -3,8 +3,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { join } from "node:path";
 import { appendDashboardLog } from "./dashboard-log";
 import type { DashboardLogFields } from "./dashboard-log";
-import { checkSupervisorLock, defaultIsPidAlive, computeBackoffDelayMs, shouldResetFailureStreak } from "./dashboard-supervisor";
-import type { LockCheckResult } from "./dashboard-supervisor";
+import { acquireSupervisorLockAtomic, defaultIsPidAlive, computeBackoffDelayMs, shouldResetFailureStreak } from "./dashboard-supervisor";
 
 // AutoDev Continuous Runner Lifecycle Independence(2026-08-28 Maintenance) — 이번 세션의
 // 실제 production incident: run.ts(--continuous)를 Claude Code harness가 추적하는 background
@@ -217,12 +216,11 @@ function main(): void {
   const lockFilePath = runnerSupervisorLockFilePath(adapterPath, logsDir);
   const logFilePath = join(logsDir, "runner-supervisor.log");
 
-  const lockCheck: LockCheckResult = checkSupervisorLock(lockFilePath, defaultIsPidAlive);
-  if (lockCheck.action === "ALREADY_RUNNING") {
-    appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: lockCheck.reason });
+  const acquireResult = acquireSupervisorLockAtomic(lockFilePath, defaultIsPidAlive, { adapterPath });
+  if (!acquireResult.ok) {
+    appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: acquireResult.reason });
     return;
   }
-  writeFileSync(lockFilePath, JSON.stringify({ pid: process.pid, adapterPath, startedAt: new Date().toISOString() }), "utf-8");
 
   const controller = new AbortController();
   let shuttingDown = false;
@@ -263,7 +261,10 @@ function main(): void {
       // 방향으로만 전파된다).
       const child = spawn(config.spawnCommand, config.spawnArgs, {
         cwd: config.cwd,
-        env: { ...process.env, ...config.env },
+        // P0-3 하드닝(§ parent-liveness-watchdog.ts) — child가 자기 자신의 supervisor PID를
+        // 알 수 있게 넘긴다. supervisor가 비정상 종료되면 child가 스스로 감지하고 종료해
+        // orphan으로 무기한 남지 않는다.
+        env: { ...process.env, ...config.env, AUTODEV_SUPERVISOR_PID: String(process.pid) },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let outputTail = "";

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { checkExistingServer } from "./dashboard";
 import type { PortCheckResult } from "./dashboard";
@@ -81,6 +82,77 @@ export function checkSupervisorLock(lockFilePath: string, isPidAlive: (pid: numb
   if (pid === undefined) return { action: "PROCEED", reason: "LOCK_FILE_MALFORMED_TREAT_AS_STALE" };
   if (isPidAlive(pid)) return { action: "ALREADY_RUNNING", reason: `OWNER_PID_${pid}_ALIVE` };
   return { action: "PROCEED", reason: `OWNER_PID_${pid}_DEAD_STALE_LOCK` };
+}
+
+const MAX_SUPERVISOR_LOCK_ACQUIRE_ATTEMPTS = 5;
+
+export type AcquireSupervisorLockResult = { ok: true } | { ok: false; reason: string };
+
+/** § P0-2 하드닝 — Supervisor singleton ownership을 원자적으로 얻는다. 기존
+ *  checkSupervisorLock()은 순수 read-only 판정(§ project-control-cli.ts의 상태 조회 용도로는
+ *  그대로 남겨둔다)일 뿐이라, main()이 그 결과를 보고 별도로 writeFileSync(...)하는 방식은
+ *  check-then-create다 — 두 supervisor가 동시에 "잠겨있지 않음"을 보고 각자 write하면 마지막
+ *  write가 조용히 이기고 둘 다 이미 child를 spawn하는 race가 있었다. project-lock.ts의
+ *  acquireProjectLock()과 동일한 원칙(`wx` exclusive create만이 실제 승부를 가른다)으로
+ *  대체한다. 기존 lock이 살아있으면(isPidAlive) 절대 덮어쓰지 않고 ALREADY_RUNNING을
+ *  반환하고, 죽었다고 판정되면(stale) CAS-equivalent compare-before-delete(§
+ *  tryRemoveStaleSupervisorLock — project-lock.ts의 tryRemoveStaleLock과 동일한 원칙)로
+ *  밀어내고 재시도한다 — 그 사이 다른 supervisor가 이미 살아있는 fresh lock으로 교체했다면
+ *  그 lock은 절대 지우지 않는다. */
+export function acquireSupervisorLockAtomic(
+  lockFilePath: string,
+  isPidAlive: (pid: number) => boolean,
+  extraMetadata: Record<string, unknown> = {},
+  pid: number = process.pid
+): AcquireSupervisorLockResult {
+  for (let attempt = 0; attempt < MAX_SUPERVISOR_LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+    const lockId = randomUUID();
+    try {
+      writeFileSync(lockFilePath, JSON.stringify({ pid, lockId, startedAt: new Date().toISOString(), ...extraMetadata }), {
+        encoding: "utf-8",
+        flag: "wx",
+      });
+      return { ok: true };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        return { ok: false, reason: `supervisor lock 파일 생성 실패: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+
+    let existing: { pid?: number; lockId?: string } | undefined;
+    try {
+      existing = JSON.parse(readFileSync(lockFilePath, "utf-8")) as { pid?: number; lockId?: string };
+    } catch {
+      existing = undefined; // 방금 사라졌거나(재시도) 손상됨 — 아래에서 재시도한다.
+    }
+    if (existing === undefined) continue; // 다음 루프의 wx create가 최종 상태를 다시 판정한다.
+    if (typeof existing.pid === "number" && isPidAlive(existing.pid)) {
+      return { ok: false, reason: `OWNER_PID_${existing.pid}_ALIVE` };
+    }
+    // stale(또는 pid 필드가 없는 malformed — 기존 checkSupervisorLock과 동일하게 stale
+    // 취급)로 판정됨 — CAS compare-before-delete로 밀어낸다.
+    tryRemoveStaleSupervisorLock(lockFilePath, existing.lockId);
+  }
+  return { ok: false, reason: `supervisor lock 획득을 ${MAX_SUPERVISOR_LOCK_ACQUIRE_ATTEMPTS}회 시도했지만 확정하지 못했습니다.` };
+}
+
+/** stale로 판정된 supervisor lock을 제거한다 — unlink 직전에 다시 읽어 lockId가 여전히 우리가
+ *  stale로 판정했던 값과 같은지 확인한다(§ project-lock.ts의 tryRemoveStaleLock과 동일한
+ *  원칙). 그 사이 다른 supervisor가 이 자리를 자신의 fresh lock으로 교체했다면(lockId가
+ *  다르다) 절대 지우지 않는다. */
+function tryRemoveStaleSupervisorLock(lockFilePath: string, expectedLockId: string | undefined): void {
+  let current: { lockId?: string } | undefined;
+  try {
+    current = JSON.parse(readFileSync(lockFilePath, "utf-8")) as { lockId?: string };
+  } catch {
+    return; // 이미 없어졌거나(ENOENT) 여전히 파싱 불가 — 확정할 수 있는 삭제 대상이 없다.
+  }
+  if (current.lockId !== expectedLockId) return; // 다른 supervisor가 이미 교체함 — 지우지 않는다.
+  try {
+    unlinkSync(lockFilePath);
+  } catch {
+    /* ENOENT 등 — 이미 없어졌으면 상관없다(다음 loop이 재평가). */
+  }
 }
 
 /** pid==0 신호는 프로세스를 죽이지 않고 존재 여부만 물어본다(Node가 Windows에서도 이 의미를
@@ -174,12 +246,11 @@ function main(): void {
   const lockFilePath = join(logsDir, "dashboard-supervisor.lock");
   const logFilePath = join(logsDir, "dashboard-supervisor.log");
 
-  const lockCheck = checkSupervisorLock(lockFilePath, defaultIsPidAlive);
-  if (lockCheck.action === "ALREADY_RUNNING") {
-    appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: lockCheck.reason });
+  const acquireResult = acquireSupervisorLockAtomic(lockFilePath, defaultIsPidAlive);
+  if (!acquireResult.ok) {
+    appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: acquireResult.reason });
     return;
   }
-  writeFileSync(lockFilePath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }), "utf-8");
 
   const controller = new AbortController();
   let currentChild: SupervisedChild | undefined;

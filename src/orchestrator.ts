@@ -20,6 +20,15 @@ export const MAX_GPT_CALLS = 10; // review "cycle" 단위 상한(REVISE 루프 �
 export const MAX_GPT_RAW_CALLS = 30; // gptTransportRetry 포함 실제 API 호출 총합의 hard cap(사용자 미지정 — 무한호출 방지용 보수적 기본값)
 export const CLAUDE_LIMIT_WAIT_MS = 30 * 60 * 1000; // 30분
 
+// P1-2 하드닝(2026-08-30, 독립 감사) — USAGE_LIMIT/provider transient/review stagnation
+// durable wait-then-retry(WAITING_CLAUDE_LIMIT/WAITING_PROVIDER_RETRY)는 지금까지 재시도
+// "횟수"에 상한이 없었다(간격만 bounded) — "천천히 무한 반복도 무인 연속개발의 정상 복구가
+// 아니다"(§ 요구사항). 이 값은 기존 MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT(§ autodev.ts)와
+// 동일한 5를 재사용한다(새 숫자를 만들지 않는다) — 이 durable wait count가 이 값을 넘으면
+// genuine Human Gate로 보내지 않고(§ P0-4) terminal 기술적 BLOCKED로 전환한다(§
+// blockOnDurableWaitRetryExhausted).
+export const MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT = 5;
+
 // STAGNATION_DETECTED 마커 재분류(§ human-gate-policy.ts) 도입에 따른 안전장치 — MAX_GPT_CALLS/
 // Claude 구조적 실패는 지금까지 deferredHumanTasks에 아무 마커도 남기지 않고 순수
 // fail-closed 기본값(GENUINE_HUMAN_JUDGMENT)에만 의존해 genuine으로 남았다(§ production-
@@ -36,18 +45,18 @@ export const CLAUDE_LIMIT_WAIT_MS = 30 * 60 * 1000; // 30분
 export const MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX = "MAX_GPT_CALLS_EXCEEDED:";
 export const CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX = "CLAUDE_STRUCTURAL_FAILURE(";
 
-// AutoDev Core Maintenance(2026-08-30) — Deterministic Review Cycle Exhaustion. 아래
-// REVIEW_CYCLE_EXHAUSTED 분기(2026-08-28 정책)는 "review가 MAX_REVIEW_CYCLES 안에
-// 수렴하지 못했다는 사실 자체는 순수 기술적 상황"이라는 전제로 항상 backoff-and-retry를
-// 택한다 — 이 전제는 매 cycle 서로 다른 이유로 REVISE가 반복되는 경우(활발히 탐색
-// 중이지만 예산이 부족한 상황)에는 맞다. 하지만 **동일한 required-test 실패
-// fingerprint가 결정론적으로 반복**되는 경우(§ stagnationTracker, 이미 STAGNATION_DETECTED
-// 마커의 근거로 쓰이는 바로 그 신호)는 다르다 — 아무리 기다렸다 재시도해도 같은 입력이
-// 같은 실패를 반복 생산할 뿐이므로, 무제한 backoff-and-retry는 사람 개입 없이 영원히
-// Claude 호출만 반복하게 된다(§ 실제 관측 — Developer 8라운드 반복). 이 마커는 그
-// 구분된 경우에만 genuine WAITING_HUMAN으로 승격한다 — MAX_REVIEW_CYCLES 상수 자체를
-// 낮추거나 위 기존 backoff 경로를 대체하지 않는다(다른 이유로 반복되는 REVISE는 기존
-// 그대로 무제한 backoff-and-retry).
+// P0-4 하드닝(2026-08-30, 독립 감사 — "Technical blocker와 Genuine Human Gate 완전 분리")
+// — 이 marker prefix는 2026-08-30 이전 정책에서 REVIEW_CYCLE_EXHAUSTED 분기가 "동일한
+// required-test 실패 fingerprint가 결정론적으로 반복"되는 경우 genuine WAITING_HUMAN으로
+// 승격하는 데 썼다. 독립 감사에서 이것이 정책 위반으로 확인됐다 — "test failure/deterministic
+// blocker"는 아무리 반복돼도 실제 사업적/보안적 판단이 필요한 게 아니라 순수 기술적
+// 상황이다(deterministic-simulation.ts Run B가 실제로 이 오분류를 재현했다). 이제
+// STAGNATION 반복 여부와 무관하게 REVIEW_CYCLE_EXHAUSTED는 항상 기술적 durable
+// wait-then-retry(WAITING_PROVIDER_RETRY) 경로 하나로 합쳐지고, 그 durable wait
+// count에는 MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT 상한이 적용된다(§ P1-2,
+// blockOnDurableWaitRetryExhausted) — 상한을 넘으면 genuine이 아니라 terminal 기술적
+// BLOCKED로 전환한다. 이 marker prefix 자체는 더 이상 어디에도 push되지 않는다(export만
+// 하위 호환을 위해 유지 — 기존 human-gate-policy.ts 참조/테스트가 있다면 안전하게 무해하다).
 export const DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX = "DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED:";
 
 // AutoDev / JARVIS 신뢰성 보완 — Claude Developer Timeout Durable Retry(2026-08-28 정책
@@ -333,6 +342,24 @@ export async function runOrchestrator(
   // 만들지 않고 이미 있는 신호를 재사용한다.
   let lastRequiredTestRepeatCount = 0;
 
+  // P1-2 하드닝(2026-08-30, 독립 감사) — durable wait-then-retry 카테고리(USAGE_LIMIT/
+  // provider transient/review stagnation) 공통 판정. waitCount(이미 증가된, "이번이 몇
+  // 번째 대기인지")가 MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT를 넘으면 true를 반환하고,
+  // 그 전에 이 task를 genuine Human Gate가 아니라 terminal 기술적 BLOCKED로 전환한다(§
+  // decideNextAction의 status==="BLOCKED" STOP 분기와 동일한 원칙 — humanInterventionRequired
+  // 없음, run.ts가 정상 종료해 runner-supervisor.ts의 backoff 재시작이 이어받는다). false를
+  // 반환하면(아직 상한 이내) 호출부는 기존 durable wait을 그대로 계속한다 — 이 함수는 그
+  // 경우 state/이벤트를 전혀 건드리지 않는다.
+  const blockOnDurableWaitRetryExhausted = (category: string, waitCount: number, detail: string): boolean => {
+    if (waitCount <= MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT) return false;
+    const reason = `DURABLE_WAIT_RETRY_EXHAUSTED(${category}): waitCount=${waitCount} > ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT} — ${detail}`;
+    log(`durable wait 재시도 상한 초과 — 기술적 BLOCKED로 전환(Human Gate 아님, ${category})`, { waitCount, category });
+    state.status = "BLOCKED";
+    emitEvent({ eventType: "RUN_BLOCKED", executionPhase: "review", outcome: "BLOCKED", reason });
+    saveCurrentState(state);
+    return true;
+  };
+
   while (true) {
     // AutoDev / JARVIS 신뢰성 보완(2026-08-28) — 이전 프로세스가 durable provider wait
     // 도중(§ 아래) 죽었다가 재시작된 경우, developerProviderNextRetryAt이 여전히 디스크에
@@ -383,11 +410,20 @@ export async function runOrchestrator(
     if (isUsageLimitResult(claudeResult)) {
       // 2026-08-28 정책 수정 — RATE_LIMIT/USAGE_LIMIT은 아무리 반복돼도 genuine WAITING_HUMAN
       // 으로 승격하지 않는다(Task 위험도와 실패 원인 위험도 분리, § DEVELOPER_PROVIDER_WAIT와
-      // 동일 원칙). claudeLimitWaitCount는 더 이상 상한(구 MAX_CLAUDE_LIMIT_WAITS)이 없고
-      // 순수 진단용 카운터로만 남는다 — 재시도 "횟수"는 무제한, 재시도 "간격"만
-      // claudeLimitWaitMs로 bounded된다(무한 tight-loop 방지).
+      // 동일 원칙). P1-2 하드닝(독립 감사) — 재시도 "횟수"에도 이제 상한이 있다(§
+      // MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT, blockOnDurableWaitRetryExhausted) — 초과하면
+      // genuine이 아니라 terminal 기술적 BLOCKED로 전환한다(무제한 "느린 반복" 금지).
       state.claudeLimitWaitCount += 1;
       state.reviewCycle -= 1; // 사용량 제한은 실제 시도로 소비하지 않는다.
+      if (
+        blockOnDurableWaitRetryExhausted(
+          "USAGE_LIMIT",
+          state.claudeLimitWaitCount,
+          `Claude 사용량 제한 durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다`
+        )
+      ) {
+        break;
+      }
       setStatus("WAITING_CLAUDE_LIMIT");
       saveCurrentState(state);
       log(`Claude 사용량 제한 감지 — ${claudeLimitWaitMs}ms 대기 후 재시도 (${state.claudeLimitWaitCount}회째, Human Gate로 승격하지 않고 계속 재시도합니다)`);
@@ -414,9 +450,20 @@ export async function runOrchestrator(
 
       if (isTransientRetryExhausted) {
         state.developerProviderWaitCount = (state.developerProviderWaitCount ?? 0) + 1;
+        state.reviewCycle -= 1; // durable wait은 실제 시도로 소비하지 않는다(claudeLimitWaitCount와 동일 관례).
+        // P1-2 하드닝(독립 감사) — 재시도 "횟수"에도 이제 상한이 있다(§ 위 claudeLimitWaitCount와
+        // 동일한 원칙) — 초과하면 genuine이 아니라 terminal 기술적 BLOCKED로 전환한다.
+        if (
+          blockOnDurableWaitRetryExhausted(
+            "DEVELOPER_PROVIDER_TRANSIENT",
+            state.developerProviderWaitCount,
+            `Developer provider(${errorCode}) durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다`
+          )
+        ) {
+          break;
+        }
         const delayMs = computeDeveloperProviderWaitDelayMs(state.developerProviderWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
         state.developerProviderNextRetryAt = new Date(now() + delayMs).toISOString();
-        state.reviewCycle -= 1; // durable wait은 실제 시도로 소비하지 않는다(claudeLimitWaitCount와 동일 관례).
         setStatus("WAITING_PROVIDER_RETRY");
         saveCurrentState(state);
         log(
@@ -465,26 +512,26 @@ export async function runOrchestrator(
       });
     }
 
-    // AutoDev Core Maintenance(2026-08-30) — Reviewer Call Gating. required test가
-    // 실패했는데 이번 attempt에서 변경된 파일이 하나도 없다면(§ autodev.ts
-    // LOCAL_ROOT_CAUSE_MODE가 만드는 합성 결과가 정확히 이 모양이다 —
-    // changedFiles:[], tests는 직전 실패 그대로), Reviewer에게 보여줄 새 diff 자체가 없다
-    // — 검토할 대상이 없는 상태에서 실제 GPT/Fireworks 호출을 반복하는 것은 순수 낭비다.
-    // 이 조건은 의도적으로 "required test 실패 시 항상 생략"보다 훨씬 보수적이다: Reviewer는
-    // 테스트 통과 여부와 무관하게 scope violation/critical·high severity 같은 독립적인
-    // 판정(§ review-policy.ts applyReviewDecisionPolicy)도 수행하므로, "테스트 실패"만으로
-    // 무조건 생략하면 새로 도입된 문제를 Reviewer가 한 번도 보지 못한 채 REVISE 루프만 도는
-    // 위험이 생긴다(§ 요구사항 "Security Gate 약화 금지", "Genuine Human Gate 자동 승인
-    // 금지"). changedFiles가 비어있을 때만은 정의상 새로 리뷰할 내용 자체가 없으므로 이
-    // 위험이 구조적으로 존재하지 않는다 — 그래서 이 조건 하나로만 제한한다.
+    // P0-5 하드닝(2026-08-30, 독립 감사 — "local GREEN 이전 Reviewer network call 금지") —
+    // required test가 실패했으면 changedFiles 존재 여부와 무관하게 Reviewer를 절대 호출하지
+    // 않는다. 이전 정책(2026-08-30 이전)은 "changedFiles가 비어있을 때만" 생략했는데, 독립
+    // 감사에서 실제로 changedFiles가 존재하는데도 required test가 실패한 채로 Reviewer가
+    // 호출되는 경로가 확인됐다(정책 위반 — Developer 결과 후 순서는 deterministic
+    // validation → required tests → LOCAL GREEN이 되기 전에는 Reviewer network/API 호출을
+    // 하지 않는다). 이전 정책의 우려("테스트 실패만으로 무조건 생략하면 새로 도입된
+    // scope/security 문제를 Reviewer가 한 번도 못 볼 위험")는 여전히 유효한 diff가 있으면 그
+    // diff는 required test가 통과하는 즉시(다음 성공한 attempt) Reviewer가 보게 되므로
+    // structurally 해소된다 — required test가 계속 실패하는 동안은 STAGNATION_DETECTED(§
+    // 위)/MAX_REVIEW_CYCLES/durable retry가 이미 무한 루프를 막는다.
     const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
-    const skipReviewerNoNewChanges = requiredTestsFailed && claudeResult.changedFiles.length === 0;
+    const skipReviewerLocalNotGreen = requiredTestsFailed;
 
     setStatus("WAITING_GPT_REVIEW");
     let gptResult: GptReviewerReturn;
-    if (skipReviewerNoNewChanges) {
-      log("Reviewer 호출 생략 — required test 실패 + 이번 attempt에 변경된 파일 없음(리뷰할 새 diff가 없음)", {
+    if (skipReviewerLocalNotGreen) {
+      log("Reviewer 호출 생략 — required test 실패(local GREEN 아님) — changedFiles 존재 여부와 무관", {
         reviewCycle: state.reviewCycle,
+        changedFilesCount: claudeResult.changedFiles.length,
       });
       gptResult = {
         // applyReviewDecisionPolicy(아래)가 requiredTestsFailed로 REVISE로 강제한다 — 실제
@@ -492,7 +539,7 @@ export async function runOrchestrator(
         decision: "PASS",
         severity: { critical: 0, high: 0, medium: 0 },
         feedback:
-          "AutoDev — 이번 attempt에서 변경된 파일이 없어(예: LOCAL_ROOT_CAUSE_MODE로 Developer를 다시 호출하지 않음) Reviewer를 호출하지 않았습니다. required test가 여전히 실패해 REVISE로 처리합니다.",
+          "AutoDev — required test가 실패해 local GREEN이 아니므로 Reviewer를 호출하지 않았습니다(§ P0-5 정책 — local GREEN 이전 Reviewer network call 금지). required test가 여전히 실패해 REVISE로 처리합니다.",
         nextTask: null,
         requestAttempted: false,
       };
@@ -673,45 +720,34 @@ export async function runOrchestrator(
       tokenUsage: gptResult.tokenUsage,
     });
     if (state.reviewCycle >= MAX_REVIEW_CYCLES) {
-      // AutoDev Core Maintenance(2026-08-30) — 위 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX
-      // 주석 참고. lastRequiredTestRepeatCount는 stagnationTracker가 이미 추적 중인, 바로 이
-      // task의 마지막으로 관측된 required-test 실패 반복 횟수다 — 2 이상이면(STAGNATION_DETECTED
-      // 마커를 이미 남긴 것과 동일한 기준) 이 exhaustion이 "다양한 이유로 계속 REVISE"가 아니라
-      // "같은 이유로 계속 REVISE"임을 뜻한다. 이 경우만 genuine WAITING_HUMAN으로 승격한다 —
-      // 그 외(반복이 확인되지 않은 경우)는 기존 backoff-and-retry 경로를 byte-for-byte 그대로
-      // 유지한다(§ 2026-08-28 정책의 원래 의도 — 순수 기술적 비수렴은 승격하지 않는다).
-      if (lastRequiredTestRepeatCount >= 2) {
-        log(
-          `연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — 동일 required test 실패가 ${lastRequiredTestRepeatCount}회 반복 확인되어(결정론적 정체) WAITING_HUMAN으로 승격합니다(무제한 backoff-and-retry 대신)`
-        );
-        state.deferredHumanTasks.push(
-          `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX} reviewCycle=${state.reviewCycle}에서 동일 required test 실패가 ${lastRequiredTestRepeatCount}회 반복된 채 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달`
-        );
-        setStatus("WAITING_HUMAN");
-        emitEvent({
-          eventType: "REVIEW_CYCLE_EXHAUSTED",
-          executionPhase: "review",
-          outcome: "BLOCKED",
-          humanInterventionRequired: true,
-          reviseCycle: MAX_REVIEW_CYCLES,
-          reason: `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX} MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES}) 도달 — 동일 required test 실패 ${lastRequiredTestRepeatCount}회 반복(결정론적 정체, backoff 대신 WAITING_HUMAN)`,
-        });
-        saveCurrentState(state);
+      // P0-4 하드닝(2026-08-30, 독립 감사) — 이전 정책은 lastRequiredTestRepeatCount(같은
+      // required test 실패가 결정론적으로 반복됐는지)가 2 이상이면 genuine WAITING_HUMAN으로
+      // 승격했다(§ 위 DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX 주석). 독립 감사
+      // (deterministic-simulation.ts Run B로 실제 재현)에서 이것이 정책 위반으로 확인됐다 —
+      // "test failure/deterministic blocker"는 아무리 반복돼도 실제 사업적/보안적 판단이
+      // 필요한 게 아니다. STAGNATION 반복 여부와 무관하게 항상 아래 기술적 durable
+      // wait-then-retry 경로 하나로 처리한다. lastRequiredTestRepeatCount는 로그/관측
+      // 목적으로만 남긴다.
+      //
+      // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28 정책 수정) — REVIEW_CYCLE_EXHAUSTED
+      // 는 genuine WAITING_HUMAN이 아니다(§ types.ts reviewStagnationWaitCount 상단
+      // 주석). review가 MAX_REVIEW_CYCLES 안에 수렴하지 못했다는 사실 자체는 순수 기술적
+      // 상황이며, Developer provider timeout과 동일한 durable wait-then-retry 원칙을 그대로
+      // 재사용한다. 대기 후 reviewCycle을 0으로 되돌려 이 task에 새 REVISE 예산을 준다(같은
+      // task이므로 developerProviderWaitCount 등 다른 durable counter는 건드리지 않는다).
+      // P1-2 하드닝(독립 감사) — 이 재시도 "횟수"에도 이제 상한이 있다(§
+      // MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT, blockOnDurableWaitRetryExhausted — "천천히
+      // 무한 반복"도 금지) — 초과하면 terminal 기술적 BLOCKED로 전환한다.
+      state.reviewStagnationWaitCount = (state.reviewStagnationWaitCount ?? 0) + 1;
+      if (
+        blockOnDurableWaitRetryExhausted(
+          "REVIEW_STAGNATION",
+          state.reviewStagnationWaitCount,
+          `review stagnation durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다(마지막 관측된 동일 required test 실패 반복 횟수=${lastRequiredTestRepeatCount})`
+        )
+      ) {
         break;
       }
-      // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28 정책 수정) — REVIEW_CYCLE_EXHAUSTED
-      // 는 더 이상 genuine WAITING_HUMAN이 아니다(§ types.ts reviewStagnationWaitCount 상단
-      // 주석). review가 MAX_REVIEW_CYCLES 안에 수렴하지 못했다는 사실 자체는 순수 기술적
-      // 상황이며, Developer provider timeout과 동일한 durable wait-then-retry 원칙(재시도
-      // "횟수"는 무제한, "간격"만 bounded)을 그대로 재사용한다 — 새 스케줄/상수를 만들지
-      // 않는다. 대기 후 reviewCycle을 0으로 되돌려 이 task에 새 REVISE 예산을 준다(같은
-      // task이므로 developerProviderWaitCount 등 다른 durable counter는 건드리지 않는다).
-      // REVIEW_CYCLE_EXHAUSTED event/로그는 계속 남긴다(관측 가능성 유지 — "조용히 멈추지
-      // 않는다") — 다만 humanInterventionRequired/deferredHumanTasks push는 더 이상 하지
-      // 않는다(그 마커가 있으면 human-gate-policy.ts가 기술적 자동 복구 대상으로 판정하긴
-      //하지만, 애초에 이 프로세스 안에서 WAITING_HUMAN 자체가 되지 않으므로 그 판정 경로를
-      // 탈 필요가 없다).
-      state.reviewStagnationWaitCount = (state.reviewStagnationWaitCount ?? 0) + 1;
       const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewStagnationWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
       state.reviewStagnationNextRetryAt = new Date(now() + delayMs).toISOString();
       state.reviewCycle = 0;

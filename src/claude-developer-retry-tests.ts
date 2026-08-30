@@ -205,44 +205,44 @@ async function scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(statePath: s
   );
 }
 
-// 2026-08-28 정책 수정 — 기술적 provider 실패(TIMEOUT/RATE_LIMIT/PROVIDER_UNAVAILABLE류)는
-// 아무리 반복돼도 genuine WAITING_HUMAN으로 승격하지 않는다(재시도 "횟수"는 무한하지만
-// 재시도 "간격"만 bounded). 옛 정책의 bound(6회)를 훨씬 넘는 10 cycle 동안 계속 실패해도
-// WAITING_HUMAN이 전혀 관측되지 않음을 직접 증명한다 — 무한 루프 자체를 테스트가 안전하게
-// 끝내기 위해 fake sleep이 N회 호출되면 sentinel 예외를 던져 강제로 빠져나온다(테스트
-// 기법일 뿐, orchestrator.ts 자체에 그런 예외 처리가 있는 게 아니다).
+// 2026-08-28 정책 수정(기술적 provider 실패는 genuine WAITING_HUMAN으로 승격하지 않는다) +
+// P1-2 하드닝(2026-08-30, 독립 감사 — "천천히 무한 반복도 무인 연속개발의 정상 복구가
+// 아니다"). 재시도 "간격"은 bounded schedule-then-cooldown을 그대로 따르지만, 이제
+// 재시도 "횟수" 자체에도 상한이 있다(§ orchestrator.ts MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT,
+// blockOnDurableWaitRetryExhausted) — 상한을 넘으면 genuine WAITING_HUMAN이 아니라 terminal
+// 기술적 BLOCKED로 수렴해야 한다(무한 반복도 아니고, 사람 승인도 아니다).
 async function scenarioProviderTimeoutNeverEscalatesAndStaysBounded(statePath: string): Promise<void> {
   const seq = makeSequence([TIMEOUT_RESULT]); // 계속 TIMEOUT만 반환(clamp)
   const claudeRunner = (task: string, attempt: number) =>
     runDeveloperTaskWithRetry(task, attempt, {}, { attempt: seq.attempt, sleep: async () => {} }) as Promise<ClaudeResult>;
   const observedStatuses: string[] = [];
   const delays: number[] = [];
-  const STOP_AFTER = 10; // 옛 bound(6)를 넘겨서도 계속 진행됨을 증명
 
-  let stoppedByTestSentinel = false;
-  try {
-    await runOrchestrator("orchestrator: TIMEOUT 영구 지속(정책상 무한 재시도)", {
-      claudeRunner,
-      statePath,
-      developerProviderWaitScheduleMs: [10, 20, 30],
-      developerProviderWaitCooldownMs: 40,
-      onProgress: (info) => observedStatuses.push(info.status),
-      sleep: async (ms) => {
-        delays.push(ms);
-        if (delays.length >= STOP_AFTER) throw new Error("TEST_STOP_INFINITE_LOOP_SENTINEL");
-      },
-    });
-  } catch (e) {
-    stoppedByTestSentinel = e instanceof Error && e.message === "TEST_STOP_INFINITE_LOOP_SENTINEL";
-  }
+  const orchestratorResult = await runOrchestrator("orchestrator: TIMEOUT 영구 지속(bounded durable wait)", {
+    claudeRunner,
+    statePath,
+    developerProviderWaitScheduleMs: [10, 20, 30],
+    developerProviderWaitCooldownMs: 40,
+    onProgress: (info) => observedStatuses.push(info.status),
+    sleep: async (ms) => {
+      delays.push(ms);
+    },
+  });
 
-  check("무한 재시도가 실제로 계속됨(테스트가 인위적으로 멈출 때까지 10회 진행)", stoppedByTestSentinel);
   check(
-    "정책: 기술적 provider 실패는 아무리 반복돼도(10회 > 옛 bound 6) WAITING_HUMAN이 전혀 관측되지 않음",
+    "정책: 기술적 provider 실패는 아무리 반복돼도 WAITING_HUMAN이 전혀 관측되지 않음(genuine Human Gate 0)",
     !observedStatuses.includes("WAITING_HUMAN")
   );
   check("재시도 간격은 처음엔 schedule을 그대로 따름(10, 20, 30)", delays[0] === 10 && delays[1] === 20 && delays[2] === 30);
-  check("schedule 소진 후에는 고정 cooldown(40)으로 bounded됨(무한 가속 없음)", delays[3] === 40 && delays[9] === 40);
+  check("schedule 소진 후에는 고정 cooldown(40)으로 bounded됨(무한 가속 없음)", delays[3] === 40 && delays[4] === 40);
+  check(
+    `durable wait 재시도 "횟수" 자체도 bounded됨(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT=5회만 실제로 대기, 그 이상 반복 없음)`,
+    delays.length === 5
+  );
+  check(
+    "상한 초과 후 terminal 기술적 BLOCKED로 수렴함(genuine 아님, 무한 반복도 아님)",
+    (orchestratorResult.finalState.status as unknown as string) === "BLOCKED"
+  );
 }
 
 // § 요구사항 "retry metadata 영속화 → nextRetryAt 저장 → 프로세스 종료/재시작 → 동일 retry

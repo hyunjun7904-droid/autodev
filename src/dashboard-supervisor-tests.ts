@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   computeBackoffDelayMs,
   checkSupervisorLock,
   defaultIsPidAlive,
+  acquireSupervisorLockAtomic,
   DEFAULT_BACKOFF_SCHEDULE_MS,
   runSupervisorLoop,
   shouldResetFailureStreak,
@@ -83,6 +84,100 @@ async function scenarioLockDeadOwnerProceeds(): Promise<void> {
   writeFileSync(lockPath, JSON.stringify({ pid: dead }), "utf-8");
   const result = checkSupervisorLock(lockPath, defaultIsPidAlive);
   check("실제로 죽은 owner PID(stale lock)면 PROCEED", result.action === "PROCEED");
+}
+
+// ---------------------------------------------------------------------------
+// P0-2 하드닝 — acquireSupervisorLockAtomic()은 check-then-create가 아니라 `wx` exclusive
+// create만으로 승부를 가른다. 살아있는 owner를 절대 덮어쓰지 않고, dead owner는 밀어내되
+// 밀어내는 순간 다른 supervisor가 이미 fresh lock으로 교체했다면 지우지 않는다(§ project-lock
+// P0-1과 동일한 CAS 원칙).
+// ---------------------------------------------------------------------------
+function scenarioAtomicAcquireSucceedsOnEmptyDir(): void {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  const result = acquireSupervisorLockAtomic(lockPath, defaultIsPidAlive);
+  check("P0-2) lock 없는 상태에서 atomic acquire 성공", result.ok === true);
+  check("P0-2) lock 파일이 실제로 생성됨", existsSync(lockPath));
+}
+
+function scenarioAtomicAcquireBlockedByAliveOwner(): void {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  // 실제 살아있는 owner(자기 자신)를 심어둔다 — mock 아님.
+  const alwaysAlive = acquireSupervisorLockAtomic(lockPath, () => true);
+  check("사전조건: 첫 acquire 성공", alwaysAlive.ok === true);
+  const second = acquireSupervisorLockAtomic(lockPath, () => true);
+  check("P0-2) 살아있는 owner가 있으면 두 번째 acquire는 차단됨(덮어쓰지 않음)", second.ok === false);
+  check("P0-2) 원래 lock 파일이 그대로 유지됨", existsSync(lockPath));
+}
+
+/** P0-2 핵심 fault test — "X를 stale로 판정한 프로세스가 삭제 직전 다른 프로세스가 이미
+ *  교체한 fresh Y를 실수로 삭제하지 않는다"를 project-lock.ts의 P0-1 fault test와 동일한
+ *  기법(isPidAlive의 부수효과로 판정~삭제 사이 race를 결정적으로 재현)으로 검증한다. */
+function scenarioAtomicAcquireStaleReplacedByFreshDuringRemoval(): void {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+
+  const deadPid = 5_555_551;
+  writeFileSync(lockPath, JSON.stringify({ pid: deadPid, lockId: "stale-X" }), "utf-8");
+
+  let swapped = false;
+  const raceIsPidAlive = (pid: number): boolean => {
+    if (pid === deadPid && !swapped) {
+      // A가 "X는 죽었다"는 판정을 받는 바로 그 순간, 다른 supervisor(B)가 X를 자신의 fresh
+      // lock(Y)으로 교체했다고 흉내낸다.
+      swapped = true;
+      writeFileSync(lockPath, JSON.stringify({ pid: 9_999_991, lockId: "fresh-Y" }), "utf-8");
+      return false; // X는 실제로 죽었음(stale 판정 그대로 유지)
+    }
+    if (pid === 9_999_991) return true; // Y는 살아있는 진짜 owner
+    return false;
+  };
+
+  const result = acquireSupervisorLockAtomic(lockPath, raceIsPidAlive);
+  check("P0-2) X를 stale로 판정한 프로세스는 교체된 fresh Y를 삭제하지 못함(acquire 실패)", result.ok === false);
+  check(
+    "P0-2) Y의 lock 파일이 실수로 삭제되지 않고 그대로 존재(active writer ≤ 1 유지)",
+    existsSync(lockPath) && (JSON.parse(readFileSync(lockPath, "utf-8")) as { lockId?: string }).lockId === "fresh-Y"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// P0-2 — 실제 concurrency test: 실제 Node child process 2개가 동시에 같은 supervisor lock을
+// acquisition 시도한다(project-lock-tests.ts의 실제 concurrency test와 동일한 원칙 — mock이
+// 아니라 실제 OS 프로세스 두 개).
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentSupervisorAcquisition(): Promise<void> {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  const workerPath = join(__dirname, "supervisor-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("P0-2) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, lockPath]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const [outA, outB] = await Promise.all([runWorker(), runWorker()]);
+  const acquiredCount = [outA, outB].filter((o) => o === "ACQUIRED").length;
+  const blockedCount = [outA, outB].filter((o) => o.startsWith("BLOCKED:")).length;
+  check("P0-2) 동시에 supervisor 2개 시작 시도 중 정확히 하나만 ACQUIRED(active supervisor 정확히 1개)", acquiredCount === 1);
+  check("P0-2) 나머지 하나(loser)는 BLOCKED — writer/runner를 만들지 않음", blockedCount === 1);
+
+  try {
+    if (readdirSync(dir).length > 0) rmSync(lockPath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
 }
 
 function makeChildScript(dir: string, name: string, body: string): string {
@@ -306,6 +401,10 @@ async function main(): Promise<void> {
     scenarioLockMalformed();
     scenarioLockAliveOwnerBlocks();
     await scenarioLockDeadOwnerProceeds();
+    scenarioAtomicAcquireSucceedsOnEmptyDir();
+    scenarioAtomicAcquireBlockedByAliveOwner();
+    scenarioAtomicAcquireStaleReplacedByFreshDuringRemoval();
+    await scenarioRealConcurrentSupervisorAcquisition();
     await scenarioRealKillTriggersRealRespawn();
     await scenarioBoundedBackoffOnRepeatedCrash();
     await scenarioSustainedUptimeResetsRealStreak();

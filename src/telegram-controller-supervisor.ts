@@ -167,6 +167,11 @@ function readOwnership(filePath: string): { kind: "absent" } | { kind: "corrupt"
   return { kind: "valid", metadata: parsed };
 }
 
+/** § P0-1과 동일한 원칙(project-lock.ts의 tryRemoveStaleLock) — 같은 프로세스 재진입(항상
+ *  안전) 정리에는 그대로 unlink한다. stale owner 정리에는 CAS-equivalent
+ *  compare-before-delete를 쓴다: unlink 직전 다시 읽어 supervisorId가 여전히 우리가 stale로
+ *  판정했던 값과 같은지 확인하고, 그 사이 다른 supervisor가 이 자리를 자신의 fresh
+ *  ownership으로 교체했다면(supervisorId가 다르다) 절대 지우지 않는다. */
 function tryRemove(filePath: string): boolean {
   try {
     unlinkSync(filePath);
@@ -175,6 +180,14 @@ function tryRemove(filePath: string): boolean {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
     return false;
   }
+}
+
+function tryRemoveStaleOwnership(filePath: string, expectedSupervisorId: string): boolean {
+  const current = readOwnership(filePath);
+  if (current.kind === "absent") return true;
+  if (current.kind === "corrupt") return false;
+  if (current.metadata.supervisorId !== expectedSupervisorId) return false;
+  return tryRemove(filePath);
 }
 
 function writeStatus(dir: string, status: TelegramControllerStatus): void {
@@ -267,8 +280,10 @@ function acquireControllerOwnership(dir: string, testDeps: TelegramControllerSup
       return { ok: false, code: "STATE_UNCERTAIN", reason: `기존 controller owner(pid=${existing.metadata.pid})의 생존 여부를 확인할 수 없습니다: ${verdict.reason}` };
     }
 
-    // STALE 증명됨 — 밀어내고 재시도.
-    tryRemove(filePath);
+    // STALE 증명됨 — CAS compare-before-delete로 밀어내고 재시도한다. 그 사이 다른
+    // supervisor가 이 자리를 자신의 fresh ownership으로 교체했다면 지우지 않는다 — removal이
+    // 실제로 일어나지 않았어도 다음 루프의 wx create/재평가가 최종 상태를 정확히 재판정한다.
+    tryRemoveStaleOwnership(filePath, existing.metadata.supervisorId);
   }
 
   return { ok: false, code: "STATE_UNCERTAIN", reason: `controller ownership 획득을 ${MAX_ACQUIRE_ATTEMPTS}회 시도했지만 확정하지 못했습니다.` };

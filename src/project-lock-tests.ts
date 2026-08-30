@@ -329,6 +329,84 @@ function scenarioRealLivenessAssessment(): void {
 }
 
 // ---------------------------------------------------------------------------
+// P0-1 하드닝 — stale lock(X) 판정 후, 실제 삭제 직전에 다른 프로세스가 fresh lock(Y)으로
+// 교체했다면 그 삭제 시도는 Y를 지우지 못해야 한다(CAS-equivalent compare-before-delete,
+// § tryRemoveStaleLock). assessLiveness override의 부수효과로 "X를 stale로 판정하는 바로 그
+// 순간 다른 프로세스가 X를 Y로 교체한다"는 race를 결정적으로 재현한다.
+// ---------------------------------------------------------------------------
+function scenarioStaleLockReplacedByFreshLockDuringRemoval(): void {
+  const root = makeProjectRoot("plock-race-swap-");
+  const lockDir = makeLockDir("plock-race-swap-dir-");
+
+  const probe = acquireProjectLock({ projectId: "p1", targetProjectRoot: root, ownerKind: "autodev" }, { lockDir });
+  check("P0-1 사전조건: probe acquire 성공", probe.ok === true);
+  if (!probe.ok) return;
+  const filePath = probe.lock.filePath;
+  releaseProjectLock(probe.lock);
+
+  const staleXMeta: ProjectLockMetadata = {
+    schemaVersion: PROJECT_LOCK_SCHEMA_VERSION,
+    projectId: "p1",
+    canonicalProjectPath: resolveCanonicalProjectPath(root),
+    lockId: "stale-X-lock-id",
+    pid: 5_555_555,
+    processStartedAtMs: Date.now() - 999_000,
+    lockCreatedAt: new Date(Date.now() - 999_000).toISOString(),
+    ownerKind: "autodev",
+  };
+  writeFileSync(filePath, JSON.stringify(staleXMeta), "utf-8");
+
+  // Y(fresh, 실제로 살아있는 owner)로 바꿔치기할 metadata — 이 테스트 프로세스 자신을 owner로
+  // 써서 "진짜 살아있는 lock"임을 실제로 증명 가능하게 한다.
+  const freshYMeta: ProjectLockMetadata = {
+    schemaVersion: PROJECT_LOCK_SCHEMA_VERSION,
+    projectId: "p1",
+    canonicalProjectPath: resolveCanonicalProjectPath(root),
+    lockId: "fresh-Y-lock-id",
+    pid: process.pid,
+    processStartedAtMs: Date.now() - Math.round(process.uptime() * 1000),
+    lockCreatedAt: new Date().toISOString(),
+    ownerKind: "autodev",
+  };
+
+  let swapped = false;
+  const raceAssessor = (pid: number): LivenessVerdict => {
+    if (pid === staleXMeta.pid && !swapped) {
+      // A가 "X는 죽었다"는 판정을 받는 바로 그 순간, 다른 프로세스(B)가 X를 fresh Y로
+      // 교체했다고 흉내낸다 — judge-then-delete 사이의 race window.
+      swapped = true;
+      writeFileSync(filePath, JSON.stringify(freshYMeta), "utf-8");
+      return { verdict: "STALE", evidence: "PID_NOT_RUNNING" };
+    }
+    if (pid === freshYMeta.pid) return { verdict: "ALIVE" };
+    return { verdict: "STALE", evidence: "PID_NOT_RUNNING" };
+  };
+
+  const result = acquireProjectLock(
+    { projectId: "p1", targetProjectRoot: root, ownerKind: "autodev" },
+    { lockDir, pid: 4_444_444, assessLiveness: raceAssessor }
+  );
+
+  check(
+    "P0-1) X를 stale로 판정한 프로세스는 삭제 직전 교체된 fresh Y를 삭제하지 못함(PROJECT_ALREADY_LOCKED)",
+    !result.ok && result.code === "PROJECT_ALREADY_LOCKED"
+  );
+  if (!result.ok && result.code === "PROJECT_ALREADY_LOCKED") {
+    check("P0-1) 최종 active owner는 여전히 Y(active writer ≤ 1 유지)", result.existingOwner?.pid === freshYMeta.pid);
+  }
+  check(
+    "P0-1) Y의 lock 파일이 실수로 삭제되지 않고 그대로 존재",
+    existsSync(filePath) && JSON.parse(readFileSync(filePath, "utf-8")).lockId === "fresh-Y-lock-id"
+  );
+
+  try {
+    rmSync(filePath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // peekProjectLock — 읽기 전용 사전확인(auto-resume.ts가 쓰는 것과 동일한 함수)
 // ---------------------------------------------------------------------------
 function scenarioPeekProjectLock(): void {
@@ -452,6 +530,7 @@ async function main(): Promise<void> {
   scenarioReleaseOwnershipAndReacquire();
   scenarioCorruptLocksFailClosed();
   scenarioRealLivenessAssessment();
+  scenarioStaleLockReplacedByFreshLockDuringRemoval();
   scenarioPeekProjectLock();
   scenarioInspectRuntimeLivenessNoLock();
   scenarioInspectRuntimeLivenessAliveOwner();

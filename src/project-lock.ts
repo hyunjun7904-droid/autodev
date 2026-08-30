@@ -309,21 +309,34 @@ export function acquireProjectLock(input: AcquireProjectLockInput, testDeps: Pro
 
     // STALE이 증명됨 — 밀어내고 재시도한다. 여러 프로세스가 동시에 이 경로를 타도, 실제로
     // 그 자리를 새로 차지하는 것은 다음 루프의 wx create 하나뿐이다(원자성은 그대로 wx가
-    // 보장 — unlink는 그 자체로 원자적 승부를 가르지 않는다).
-    tryRemoveStaleLock(filePath, existingMeta.lockId);
-    // 제거가 실제로는 실패했더라도(사라졌거나 다른 프로세스가 먼저 recover함) 다음 루프의
-    // wx create/재평가가 정확한 최종 상태를 다시 판정한다 — 여기서는 "밀어내려 시도했다"는
-    // 사실만 기록해둔다(실제로 이 프로세스가 승자가 될지는 다음 루프가 결정).
-    staleRecovery = { previousOwnerPid: existingMeta.pid, evidence: verdict.evidence };
+    // 보장한다). tryRemoveStaleLock() 자체가 이제 CAS-equivalent라 우리가 stale로 읽었던
+    // lockId(X)가 그 사이 다른 lock(Y)으로 교체됐으면 지우지 않는다(§ P0-1) — removedByUs가
+    // false면 우리는 아무것도 지우지 않은 것이므로 staleRecovery를 기록하지 않는다(다음
+    // 루프의 재평가가 Y의 실제 owner를 기준으로 정확한 최종 상태를 다시 판정한다).
+    const removedByUs = tryRemoveStaleLock(filePath, existingMeta.lockId);
+    if (removedByUs) {
+      staleRecovery = { previousOwnerPid: existingMeta.pid, evidence: verdict.evidence };
+    }
   }
 
   return { ok: false, code: "LOCK_STATE_UNCERTAIN", reason: `lock 획득을 ${MAX_ACQUIRE_ATTEMPTS}회 시도했지만 확정하지 못했습니다.` };
 }
 
-/** stale로 판정된 lock을 제거한다 — 제거 직전 lockId가 여전히 우리가 읽었던 값과 같은지
- *  다시 확인하지는 않는다(unlink 자체가 원자적 승부를 가르지 않으므로 그 확인은 의미가
- *  없다 — 실제 승부는 이후 wx create가 가른다). ENOENT(이미 없음)는 성공으로 취급한다. */
-function tryRemoveStaleLock(filePath: string, _expectedLockId: string): boolean {
+/** stale로 판정된 lock을 제거한다 — CAS-equivalent compare-before-delete(§ P0-1 하드닝,
+ *  filesystem-trust-model.md의 Option A 원칙과 동일: portable Node.js `fs`로 완전한 원자적
+ *  결합은 만들 수 없지만, 판정~삭제 사이의 창을 최대한 좁힌다). unlink 직전에 파일을 다시
+ *  읽어 lockId가 여전히 우리가 stale로 판정했던 값과 같은지 확인한다 — 그 사이 다른
+ *  프로세스가 이 자리를 fresh lock(Y)으로 교체했다면(우리가 stale로 판정한 건 X였다) 절대
+ *  지우지 않고 false를 반환한다. 파일이 이미 없으면(누군가 먼저 정리함) 지울 대상이 없다는
+ *  뜻이므로 성공으로 취급한다. 재확인 결과가 malformed면(다른 프로세스가 쓰는 도중일 수
+ *  있음) 보수적으로 지우지 않는다. 실제 승부(누가 최종 owner가 되는가)는 여전히 다음
+ *  루프의 wx create가 가른다 — 이 함수는 "우리가 실수로 살아있는 Y를 지우지 않는다"만
+ *  보장한다. */
+function tryRemoveStaleLock(filePath: string, expectedLockId: string): boolean {
+  const current = readLockFile(filePath);
+  if (current.kind === "absent") return true;
+  if (current.kind === "corrupt") return false;
+  if (current.metadata.lockId !== expectedLockId) return false;
   try {
     unlinkSync(filePath);
     return true;

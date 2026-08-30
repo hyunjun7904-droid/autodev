@@ -2,7 +2,15 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, unlinkSync }
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { getWorkingTreeChanges, getTrackedDiff, readUntrackedFiles, buildBoundedFileSnapshot, isBinaryContent, readFileSmartly } from "./git-changes";
+import {
+  getWorkingTreeChanges,
+  getTrackedDiff,
+  readUntrackedFiles,
+  buildBoundedFileSnapshot,
+  isBinaryContent,
+  readFileSmartly,
+  classifyGeneratedCacheArtifact,
+} from "./git-changes";
 import { PROJECT_ROOT, configureSafeExecutor } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
 
@@ -78,6 +86,59 @@ function scenarioTrackedModifiedDetected(): void {
 
     const diff = getTrackedDiff(["web/"], repo);
     check("getTrackedDiff: 실제 diff 내용에 변경된 값(v = 2)이 포함됨", diff.includes("v = 2"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// AutoDev Core Maintenance(2026-08-30, Category B/D — Git Path Parsing Safety). git status
+// --porcelain(quoting 모드)는 실측 결과 공백만 있어도(`?? "with space.txt"`) 큰따옴표로
+// 감싸고, 비ASCII 문자는 8진수로 이스케이프한다(`?? "\355\225\234\352\270\200.txt"`) —
+// -z(NUL 종결, quoting 없음)로 전환해 이 class의 문제를 구조적으로 막는다(§ git-changes.ts
+// parsePorcelainRecords 주석).
+function scenarioUntrackedFileWithSpaceInNameParsedCorrectly(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "web/app/with space.tsx", "export const v = 1;\n");
+    const changes = getWorkingTreeChanges(["web/"], repo);
+    check(
+      "공백 포함 파일명: 경로가 quote 없이 정확히 파싱됨(web/app/with space.tsx)",
+      changes.untracked.some((c) => c.path === "web/app/with space.tsx")
+    );
+    check("공백 포함 파일명: 큰따옴표가 경로에 남아있지 않음", !changes.all.some((c) => c.path.includes('"')));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+function scenarioUntrackedFileWithUnicodeNameParsedCorrectly(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "web/app/한글파일.tsx", "export const v = 1;\n");
+    const changes = getWorkingTreeChanges(["web/"], repo);
+    check(
+      "유니코드 파일명: 8진수 이스케이프 없이 정확히 파싱됨(web/app/한글파일.tsx)",
+      changes.untracked.some((c) => c.path === "web/app/한글파일.tsx")
+    );
+    check("유니코드 파일명: 8진수 이스케이프 시퀀스가 남아있지 않음", !changes.all.some((c) => /\\\d{3}/.test(c.path)));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+function scenarioStagedRenameWithSpaceParsedCorrectly(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "web/app/old name.tsx", "export const v = 1;\n");
+    spawnSync("git", ["add", "--", "web/app/old name.tsx"], { cwd: repo });
+    spawnSync("git", ["commit", "-q", "-m", "add old name"], { cwd: repo });
+    spawnSync("git", ["mv", "web/app/old name.tsx", "web/app/new name.tsx"], { cwd: repo });
+
+    const changes = getWorkingTreeChanges(["web/"], repo);
+    const renamed = changes.all.find((c) => c.status === "renamed");
+    check("공백 포함 rename: renamed 레코드 발견", renamed !== undefined);
+    check("공백 포함 rename: 새 경로가 quote 없이 정확함(web/app/new name.tsx)", renamed?.path === "web/app/new name.tsx");
+    check("공백 포함 rename: renamedFrom이 quote 없이 정확함(web/app/old name.tsx)", renamed?.renamedFrom === "web/app/old name.tsx");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -184,6 +245,109 @@ function scenarioReadUntrackedFilesNeverLeaksRawBinaryContent(): void {
   }
 }
 
+// AutoDev Core Maintenance(2026-08-30, Category D — Generated/Cache Artifact Exclusion).
+// 실제 JARVIS Task 5.2 사고(Gradle 최초 빌드가 만든 .gradle/build 산출물 수십 개가 원문
+// 그대로 Reviewer payload에 흘러들어감, payloadChars=91,718 실측)를 근거로 한 구조적
+// 증거 기반 classification — 단순 디렉터리명/확장자 blacklist가 아님을 각 케이스로 증명한다.
+function scenarioGeneratedCacheArtifactClassification(): void {
+  // 1) 실제 source directory 이름이 "build"인 경우 — 중첩된 빌드 도구 내부 구조 세그먼트가
+  // 없으므로 절대 제외돼서는 안 된다(단순 디렉터리명 blacklist가 아님을 증명).
+  check(
+    "generated/cache 오탐 금지: src/build/README.md(디렉터리 이름만 build)는 제외 대상 아님",
+    classifyGeneratedCacheArtifact("src/build/README.md") === false
+  );
+  check(
+    "generated/cache 오탐 금지: web/build/index.tsx(실제 소스 파일)는 제외 대상 아님",
+    classifyGeneratedCacheArtifact("web/build/index.tsx") === false
+  );
+
+  // 2) 정상 .properties/.lock text — 확장자만으로 제외하지 않는다(yarn.lock/Gemfile.lock류는
+  // Reviewer가 반드시 봐야 하는 실제 의존성 변경일 수 있다).
+  check(
+    "generated/cache 오탐 금지: config/app.properties(일반 설정 파일)는 제외 대상 아님",
+    classifyGeneratedCacheArtifact("config/app.properties") === false
+  );
+  check("generated/cache 오탐 금지: yarn.lock(실제 lockfile)는 제외 대상 아님", classifyGeneratedCacheArtifact("yarn.lock") === false);
+
+  // 3) 실제 Gradle 캐시/빌드 산출물 — (a) 예약된 .gradle 캐시 디렉터리, (b) build/ +
+  // 빌드 도구 내부 구조 세그먼트 중첩. 둘 다 실제 JARVIS 사고의 정확한 경로 형태다.
+  check(
+    "generated/cache 판정: android/wakeword/.gradle/8.7/checksums/checksums.lock 제외 대상",
+    classifyGeneratedCacheArtifact("android/wakeword/.gradle/8.7/checksums/checksums.lock") === true
+  );
+  check(
+    "generated/cache 판정: android/wakeword/build/kotlin/compileKotlin/cacheable/caches-jvm/inputs/x.tab 제외 대상",
+    classifyGeneratedCacheArtifact("android/wakeword/build/kotlin/compileKotlin/cacheable/caches-jvm/inputs/x.tab") === true
+  );
+  check(
+    "generated/cache 판정: android/wakeword/build/classes/kotlin/main/Foo.class 제외 대상",
+    classifyGeneratedCacheArtifact("android/wakeword/build/classes/kotlin/main/Foo.class") === true
+  );
+
+  // 4/5) 정상 source-controlled binary(gradle-wrapper.jar) — "gradle/"(점 없음, 실제
+  // 커밋되는 wrapper 디렉터리)는 예약 캐시 집합(".gradle", 점 있음)과 다르다 — 구조적
+  // classification으로는 제외 대상이 아니고, 대신 기존 binary 판정(isBinaryContent)이
+  // 별도로 이 파일을 안전하게 처리한다(§ 아래 통합 테스트).
+  check(
+    "generated/cache 오탐 금지: gradle/wrapper/gradle-wrapper.jar(실제 커밋되는 wrapper)는 구조적으로 제외 대상 아님",
+    classifyGeneratedCacheArtifact("gradle/wrapper/gradle-wrapper.jar") === false
+  );
+}
+
+// 실제 fs 경계(readFileSmartly/readUntrackedFiles)까지 포함해 generated/cache artifact가
+// metadata로 대체되고, oversized artifact도 원본 크기와 무관하게 짧은 metadata만 소비하며,
+// 정상 source-controlled binary(gradle-wrapper.jar류)는 generatedCache가 아니라 binary
+// 경로로 안전하게 처리됨을 증명한다.
+function scenarioReadUntrackedFilesExcludesGeneratedCacheArtifacts(): void {
+  const cacheFixtureRel = "automation/.gradle/8.7/checksums/checksums.lock";
+  const cacheFixtureAbs = resolve(PROJECT_ROOT, cacheFixtureRel);
+  const oversizedFixtureRel = "automation/build/kotlin/compileKotlin/cacheable/caches-jvm/oversized-source-to-output.tab";
+  const oversizedFixtureAbs = resolve(PROJECT_ROOT, oversizedFixtureRel);
+  const wrapperFixtureRel = "automation/gradle/wrapper/gradle-wrapper.jar";
+  const wrapperFixtureAbs = resolve(PROJECT_ROOT, wrapperFixtureRel);
+  try {
+    mkdirSync(join(cacheFixtureAbs, ".."), { recursive: true });
+    writeFileSync(cacheFixtureAbs, "checksum-entry=abc123\nchecksum-entry=def456\n", "utf-8");
+    const cacheRead = readFileSmartly(cacheFixtureAbs, cacheFixtureRel, "untracked");
+    check("readFileSmartly: 텍스트 형식 캐시 파일도 generatedCache=true로 판정됨", cacheRead.generatedCache === true);
+    check("readFileSmartly: 텍스트 캐시 파일이라도 binary=false(정직한 metadata)", cacheRead.binary === false);
+    check("readFileSmartly: 캐시 파일 원문(checksum-entry)이 content에 노출되지 않음", !cacheRead.content.includes("checksum-entry"));
+    check("readFileSmartly: content에 GENERATED/CACHE ARTIFACT 표시 포함", cacheRead.content.includes("GENERATED/CACHE ARTIFACT"));
+
+    // oversized — 원본이 perFileMaxChars(20,000)보다 훨씬 커도 metadata 크기만 소비해야
+    // 한다(§ "oversized generated artifact → Reviewer 호출 전 차단/축약").
+    mkdirSync(join(oversizedFixtureAbs, ".."), { recursive: true });
+    const oversizedContent = "x".repeat(200_000);
+    writeFileSync(oversizedFixtureAbs, oversizedContent, "utf-8");
+    const { files: oversizedFiles } = readUntrackedFiles([{ path: oversizedFixtureRel, status: "untracked" }], { perFileMaxChars: 20_000, totalBudgetChars: 65_000 });
+    const oversizedEntry = oversizedFiles.find((f) => f.path === oversizedFixtureRel);
+    check("oversized generated artifact: 결과에 포함됨", oversizedEntry !== undefined);
+    check("oversized generated artifact: generatedCache=true", oversizedEntry?.generatedCache === true);
+    check(
+      "oversized generated artifact: content가 200,000자 원문이 아니라 짧은 metadata임(예산을 태우지 않음)",
+      (oversizedEntry?.content.length ?? 0) < 1_000
+    );
+    check("oversized generated artifact: truncated=false(metadata는 truncation 대상 아님)", oversizedEntry?.truncated === false);
+
+    // 정상 source-controlled binary(gradle-wrapper.jar) — generatedCache가 아니라 기존
+    // binary 경로로 처리돼야 한다(§ 위 classify 단위 테스트와 짝을 이루는 통합 검증).
+    mkdirSync(join(wrapperFixtureAbs, ".."), { recursive: true });
+    const fakeJarBytes = Buffer.concat([Buffer.from("PK\x03\x04fake-jar-header"), Buffer.from([0x00, 0x01, 0x02])]);
+    writeFileSync(wrapperFixtureAbs, fakeJarBytes);
+    const wrapperRead = readFileSmartly(wrapperFixtureAbs, wrapperFixtureRel, "untracked");
+    check("정상 source-controlled binary(gradle-wrapper.jar): generatedCache=false", wrapperRead.generatedCache !== true);
+    check("정상 source-controlled binary(gradle-wrapper.jar): binary=true로 안전하게 metadata 처리됨", wrapperRead.binary === true);
+  } finally {
+    rmSync(resolve(PROJECT_ROOT, "automation/.gradle"), { recursive: true, force: true });
+    rmSync(resolve(PROJECT_ROOT, "automation/build"), { recursive: true, force: true });
+    rmSync(resolve(PROJECT_ROOT, "automation/gradle"), { recursive: true, force: true });
+    check(
+      "generated/cache fixture 정리 완료",
+      !existsSync(cacheFixtureAbs) && !existsSync(oversizedFixtureAbs) && !existsSync(wrapperFixtureAbs)
+    );
+  }
+}
+
 // AutoDev Reviewer Snapshot Truncation Fix(2026-08-26, JARVIS Task 1.3) — buildBoundedFileSnapshot()는
 // 순수 함수라 git/Safe Executor 없이 직접 검증한다. 실제 사고 재현: 20,235자 test 파일이
 // perFileMaxChars=20_000 head-only truncation으로 잘려 Fireworks가 "파일이 물리적으로 손상/
@@ -246,6 +410,7 @@ function main(): void {
   // 순수 함수 시나리오 — git/Safe Executor 불필요, 격리된 root 설정 이전에 바로 실행한다.
   scenarioBoundedFileSnapshotTruncation();
   scenarioBinaryContentDetection();
+  scenarioGeneratedCacheArtifactClassification();
 
   // scenarioReadUntrackedFilesContentAndTruncation()이 readUntrackedFiles()를 통해 실제
   // Safe Executor(validateReadPath)를 호출한다 — configureSafeExecutor()로 명시적으로
@@ -257,10 +422,14 @@ function main(): void {
 
     scenarioUntrackedFilesDetected();
     scenarioTrackedModifiedDetected();
+    scenarioUntrackedFileWithSpaceInNameParsedCorrectly();
+    scenarioUntrackedFileWithUnicodeNameParsedCorrectly();
+    scenarioStagedRenameWithSpaceParsedCorrectly();
     scenarioSecretAndBuildArtifactsExcluded();
     scenarioTempFixtureFilesExcludedFromReview();
     scenarioReadUntrackedFilesContentAndTruncation();
     scenarioReadUntrackedFilesNeverLeaksRawBinaryContent();
+    scenarioReadUntrackedFilesExcludesGeneratedCacheArtifacts();
   } finally {
     rmSync(isolatedRoot, { recursive: true, force: true });
   }

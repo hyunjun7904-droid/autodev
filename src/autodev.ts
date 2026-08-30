@@ -225,6 +225,25 @@ export function decideNextAction(
     };
   }
 
+  // AutoDev Core Maintenance(2026-08-30, Category A/C) — MID_FLIGHT_CRASH_LOOP_DETECTED(§
+  // runAutodevOnce의 MID_FLIGHT_ORCHESTRATOR_STATUSES 재조정)는 WAITING_HUMAN이 아니라
+  // "BLOCKED"(OrchestratorStatus에 이미 있었으나 실제로는 쓰이지 않던 값)를 쓴다 — 실제로
+  // genuine judgment가 필요한 게 아니라(사람이 "승인"한다고 문제가 풀리지 않는다 — 환경/코드
+  // 결함을 직접 고쳐야 한다) 기술적 안전정지이기 때문이다. run.ts는 status==="WAITING_HUMAN"
+  // 문자열만으로 Telegram controller를 계속 살려 사람의 APPROVE를 기다리므로, 이 값을
+  // WAITING_HUMAN으로 쓰면 실제 Human Gate(Telegram 알림/승인 대기)가 켜진다 — 그건 이
+  // 상태의 의도가 아니다. 이 STOP 분기가 없으면 재시작마다 이 branch를 건너뛰고 아래 일반
+  // 경로(getNextTask → RUN_TASK)로 빠져 Developer를 다시 호출하게 되어, 이 상한이 존재하는
+  // 이유(§ MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT) 자체가 무의미해진다 — 이 STOP이 그 상한을
+  // 재시작을 넘어서도 실제로 지킨다.
+  if (status === "BLOCKED") {
+    return {
+      kind: "STOP",
+      reason: "이미 BLOCKED 상태(기술적 안전정지) — 근본 원인이 해소되지 않는 한 자동 실행하지 않습니다.",
+      setWaitingHuman: false,
+    };
+  }
+
   const completedTasks = state.completedTasks ?? [];
   const nextTask = getNextTask(taskRegistry, completedTasks);
 
@@ -425,9 +444,20 @@ export type AutodevRunOutcome =
    *  Developer가 스스로 고칠 수 없다(project adapter config — commandCwdAliases/
    *  requiredTest.cwd — 자체가 잘못됐고, Developer의 allowedPathPrefixes 밖이며 AutoDev
    *  Core도 이 파일에 쓰지 않는다) — 그래서 REQUIRED_TEST_CONFIGURATION_ERROR(위, npm
-   *  script 미등록)와 달리 이 경우는 Developer/Reviewer를 전혀 부르지 않고 즉시
-   *  WAITING_HUMAN으로 전환한다. */
-  | "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT";
+   *  script 미등록)와 달리 이 경우는 Developer/Reviewer를 전혀 부르지 않는다. P0-4
+   *  하드닝(독립 감사) — 실제 사람의 사업적/보안적 "판단"이 필요한 게 아니라 순수 config
+   *  결함이므로 WAITING_HUMAN이 아니라 기술적 BLOCKED로 전환한다(§ decideNextAction의
+   *  status==="BLOCKED" STOP 분기와 동일한 원칙 — run.ts가 정상 종료하고 runner-supervisor.ts
+   *  의 bounded backoff 재시작이 retry를 담당, humanInterventionRequired는 설정하지 않음).
+   *  같은 결함이 더 이상 재현되지 않으면 다음 재시작 시 자동으로 READY로 복구된다(§
+   *  reconcileStaleRequiredTestExecutionEnvironmentTasks 호출부). */
+  | "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT"
+  /** AutoDev Core Maintenance(2026-08-30) — 같은 task에서 mid-flight 프로세스 크래시
+   *  재시작(§ MID_FLIGHT_ORCHESTRATOR_STATUSES)이 MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT를
+   *  초과했다. Developer/Reviewer를 다시 호출하지 않고 즉시 기술적 BLOCKED로 전환한다(genuine
+   *  WAITING_HUMAN이 아니다 — § 아래 실제 구현의 status==="BLOCKED" 분기와 그 주석) —
+   *  deterministic-simulation.ts Run C가 실제로 재현한 무제한 재시작 결함을 닫는다. */
+  | "BLOCKED_MID_FLIGHT_CRASH_LOOP";
 
 export interface AutodevRunResult {
   outcome: AutodevRunOutcome;
@@ -771,14 +801,23 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 못한 채(수동 종료/timeout/OS kill 등) 죽었다는 것뿐이다 — 새로운 판정 로직을 만들지
     // 않고 이미 저장된 status 값만 재사용한다. 프로세스가 예상치 못하게 죽는 것 자체는
     // 기술적 사건이지 사람 판단이 필요한 사유가 아니다(§ 정책 수정 — "process crash" 카테고리
-    // 는 Human Gate로 연결하지 않는다) — 이전 버전은 같은 task에서 2회 반복되면 genuine
-    // WAITING_HUMAN으로 전환했으나, 그 escalation 자체를 제거한다: 몇 번이 반복되든 항상
-    // 제한적 재시작을 허용한다. durable unexpectedExitCount는 계속 기록해(§
-    // durable-recovery-state.ts) 사람이 대시보드/로그로 "이번이 몇 번째인지" 확인할 수 있게만
-    // 한다(관측 가능 — 조용히 멈추지 않는다). 이 저장소에는 이 프로세스를 빠르게 자동
-    // 재시작시키는 별도 supervisor가 없으므로(사람 또는 외부 스케줄러가 재시작을 트리거함),
-    // orchestrator.ts의 durable provider wait처럼 자체 sleep 기반 throttle을 추가하지
-    // 않는다 — 그런 supervisor가 도입되면 그때 이 판단을 재검토해야 한다.
+    // 는 Human Gate로 연결하지 않는다).
+    //
+    // AutoDev Core Maintenance(2026-08-30, Category A/C — Deterministic Simulation이 실제로
+    // 재현한 결함) — 2026-08-28 정책은 이 재시작 허용에 상한을 두지 않았다("몇 번이 반복되든
+    // 항상 제한적 재시작을 허용") — 그 근거는 "이 프로세스를 빠르게 자동 재시작시키는 별도
+    // supervisor가 없다"였다. 그 전제가 이제 깨졌다: `runner-supervisor.ts`(및 그 crash
+    // watchdog, Category C)가 정확히 그런 supervisor다. 같은 task가 매 attempt마다 프로세스
+    // 자체를 죽이는 결함(예: 환경 결함으로 인한 uncaught exception)이면, supervisor가 이를
+    // 영원히(수 초~수십 초 간격으로) 재시작하면서 Developer를 매번 처음부터 다시 호출하게
+    // 되어 "동일 deterministic 실패에 무제한 재시도 금지"(§ 이 하드닝의 핵심 원칙)를 정확히
+    // 위반한다 — seed=20260830 deterministic-simulation.ts Run C로 직접 재현 확인(20회
+    // 재시작에도 종결 상태에 도달하지 못함). durable unexpectedExitCount(이미 있던 값, §
+    // durable-recovery-state.ts)에 상한을 추가할 뿐 새 카운터를 만들지 않는다 — 상한을
+    // 넘기면 root-cause-analysis.ts의 MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS/
+    // required-test-preflight.ts의 BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT와 동일한
+    // 원칙으로 Developer를 다시 부르지 않고 즉시 genuine WAITING_HUMAN으로 승격한다.
+    const MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT = 5;
     const MID_FLIGHT_ORCHESTRATOR_STATUSES = new Set([
       "CLAUDE_WORKING",
       "WAITING_GPT_REVIEW",
@@ -793,11 +832,47 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     if (inFlightTaskCandidate && MID_FLIGHT_ORCHESTRATOR_STATUSES.has(state.status as string)) {
       const durable = loadDurableFailureStateForTask(state, inFlightTaskCandidate.id);
       const unexpectedExitCount = durable.unexpectedExitCount + 1;
+      const priorStatus = state.status;
       state.technicalRecoveryState = { ...durable, unexpectedExitCount, updatedAt: new Date().toISOString() };
-      log("AutoDev 프로세스가 mid-flight 상태에서 재시작됨 — 제한적 재시작 허용(§ 요구사항 20, 횟수 무관)", {
+      if (unexpectedExitCount > MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT) {
+        const reason = `MID_FLIGHT_CRASH_LOOP_DETECTED: task=${inFlightTaskCandidate.id} unexpectedExitCount=${unexpectedExitCount} priorStatus=${priorStatus}`;
+        log("MID_FLIGHT_CRASH_LOOP_DETECTED — 동일 task에서 mid-flight 재시작 상한 초과, 기술적 BLOCKED로 전환(Developer 재호출 없음, Human Gate 아님)", {
+          taskId: inFlightTaskCandidate.id,
+          unexpectedExitCount,
+          priorStatus,
+        });
+        // AutoDev Core Maintenance(2026-08-30) — 이 상태는 WAITING_HUMAN이 아니라 BLOCKED다.
+        // "사람이 승인"한다고 풀리는 문제가 아니라(코드/환경 결함을 실제로 고쳐야 한다) —
+        // WAITING_HUMAN을 쓰면 run.ts가 문자열 하나만으로 Telegram controller를 계속 살려
+        // 실제 승인 대기(Genuine Human Gate)를 켠다(§ decideNextAction의 status==="BLOCKED"
+        // STOP 분기 주석). HUMAN_APPROVAL_REQUIRED 대신 RUN_BLOCKED를 쓴다 — 기존
+        // REVIEW_CYCLE_EXHAUSTED 등 다른 genuine 경로도 감사 기록용으로 함께 남기는
+        // 이벤트이지만(§ 위 예시), humanInterventionRequired는 설정하지 않는다("Human
+        // approval 요구 0" — 대시보드/로그로는 관측 가능하되 알림·승인 요청은 아니다).
+        state.status = "BLOCKED";
+        state.deferredHumanTasks.push(reason);
+        saveState(state, statePath);
+        emitEvent(events, {
+          eventType: "RUN_BLOCKED",
+          runId,
+          projectId: manifest.projectId,
+          taskId: inFlightTaskCandidate.id,
+          executionPhase: "task_selection",
+          outcome: "BLOCKED",
+          reason,
+        });
+        // 이 task가 반복적으로 프로세스를 죽이는 원인이 해소될 때까지 다른 writer가 같은
+        // 실패를 다시 반복하지 않도록 lock을 유지한다(§ 대다수 genuine WAITING_HUMAN 경로와
+        // 동일한 원칙 — MAX_GPT_CALLS_EXCEEDED/DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED 등. 이
+        // 상태는 genuine gate는 아니지만, 근본 원인이 사람이 직접 고쳐야 하는 결함이라는 점은
+        // 동일하므로 같은 lock 보존 원칙을 따른다).
+        lockShouldRelease = false;
+        return { outcome: "BLOCKED_MID_FLIGHT_CRASH_LOOP", taskId: inFlightTaskCandidate.id, reason };
+      }
+      log("AutoDev 프로세스가 mid-flight 상태에서 재시작됨 — 제한적 재시작 허용(§ 요구사항 20, 상한 이내)", {
         taskId: inFlightTaskCandidate.id,
         unexpectedExitCount,
-        priorStatus: state.status,
+        priorStatus,
       });
       saveState(state, statePath);
     }
@@ -840,14 +915,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       }
     }
 
-    // AutoDev / JARVIS 신뢰성 보완(2026-08-30, JARVIS Task 5.2 실측) — Stale
-    // REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN Reconciliation. 위
-    // REQUIRED_TEST_CONFIGURATION_ERROR 재검사와 정확히 같은 원칙(같은 deterministic 검사로
-    // "그 결함이 지금도 재현되는가"만 재확인, 다른 사유가 하나라도 섞여 있으면 fail-closed)을
-    // WRAPPER_NOT_FOUND 등 required-test 실행 환경 결함에도 적용한다 — reconciliation.resolved가
-    // true라면 이미 state.status가 "READY"이므로 이 블록은 자연히 아무 것도 하지 않는다(중복
-    // 판정 없음, 위와 동일한 관례).
-    if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
+    // AutoDev / JARVIS 신뢰성 보완(2026-08-30, JARVIS Task 5.2 실측; P0-4 하드닝으로
+    // status를 BLOCKED로 변경) — Stale REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR
+    // Reconciliation. 위 REQUIRED_TEST_CONFIGURATION_ERROR 재검사와 정확히 같은 원칙(같은
+    // deterministic 검사로 "그 결함이 지금도 재현되는가"만 재확인, 다른 사유가 하나라도
+    // 섞여 있으면 fail-closed)을 WRAPPER_NOT_FOUND 등 required-test 실행 환경 결함에도
+    // 적용한다 — reconciliation.resolved가 true라면 이미 state.status가 "READY"이므로 이
+    // 블록은 자연히 아무 것도 하지 않는다(중복 판정 없음, 위와 동일한 관례). status가
+    // "BLOCKED"인 경우도 함께 확인한다(§ P0-4 — 이 결함은 이제 WAITING_HUMAN이 아니라
+    // BLOCKED로 저장된다) — reconcileStaleRequiredTestExecutionEnvironmentTasks() 자신이
+    // deferredHumanTasks 내용을 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 마커로만 엄격히
+    // 제한하므로, MID_FLIGHT_CRASH_LOOP_DETECTED 등 다른 이유로 BLOCKED된 상태를 실수로
+    // 되돌릴 위험은 없다(마커 형식이 다르면 fail-closed로 resolved:false).
+    if (
+      ((state.status as unknown as string) === "WAITING_HUMAN" || (state.status as unknown as string) === "BLOCKED") &&
+      !state.humanFinalReview
+    ) {
       const envReconciliation = reconcileStaleRequiredTestExecutionEnvironmentTasks(
         state.deferredHumanTasks,
         manifest.taskRegistry,
@@ -855,9 +938,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       );
       if (envReconciliation.resolved) {
         console.log(
-          `[autodev] 오래된 WAITING_HUMAN(REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR)을 재검사했습니다 — required test 실행 환경 결함이 더 이상 재현되지 않음을 확인, 정상 실행 상태로 자동 복구합니다.`
+          `[autodev] 오래된 BLOCKED(REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR)를 재검사했습니다 — required test 실행 환경 결함이 더 이상 재현되지 않음을 확인, 정상 실행 상태로 자동 복구합니다.`
         );
-        log("오래된 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN 자동 복구", {
+        log("오래된 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR BLOCKED 자동 복구", {
           projectId: manifest.projectId,
           previousDeferredHumanTasks: state.deferredHumanTasks,
         });
@@ -1051,36 +1134,46 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 결함이다 — 그대로 Developer를 부르면 매 attempt마다 동일한
     // TRUSTED_EXECUTABLE_NOT_FOUND(또는 유사한) 실패만 반복하며 Claude 호출을 낭비한다(§
     // 실제 JARVIS Task 5.2 관측 — 이 검사가 도입되기 전 5회 반복). 그래서 이 검사는 npm
-    // script 검사와 달리 실제로 차단한다 — Developer/Reviewer 어느 쪽도 부르지 않고 즉시
-    // WAITING_HUMAN으로 전환한다(자동 복구는 만들지 않는다 — § required-test-preflight.ts
-    // 파일 상단 주석, project adapter config 자체를 고쳐써야 하는 더 민감한 변경이라 이
-    // Task 범위에서 새 쓰기 경로를 만들지 않았다).
+    // script 검사와 달리 실제로 차단한다 — Developer/Reviewer 어느 쪽도 부르지 않는다.
+    //
+    // P0-4 하드닝(2026-08-30, 독립 감사 — "Technical blocker와 Genuine Human Gate 완전
+    // 분리") — 이전 정책은 이 상태를 "WAITING_HUMAN" + HUMAN_APPROVAL_REQUIRED(
+    // humanInterventionRequired:true)로 표시했다. 이 결함은 execution-environment config
+    // 문제일 뿐 실제 사업적/제품적/보안적/법적 "판단"이 필요한 게 아니다 — 그래서
+    // MID_FLIGHT_CRASH_LOOP_DETECTED(§ 위 decideNextAction의 status==="BLOCKED" STOP 분기
+    // 주석)와 동일한 원칙으로 "WAITING_HUMAN이 아니라 BLOCKED"를 쓴다: run.ts는 status===
+    // "WAITING_HUMAN"일 때만 Telegram controller를 계속 살려 승인을 기다리므로(waitWhileWaitingHuman),
+    // BLOCKED를 쓰면 이 프로세스가 정상 종료하고 runner-supervisor.ts의 bounded backoff
+    // 재시작이 "기존 AutoDev의 technical BLOCKED / retry / recovery 구조"를 그대로
+    // 제공한다(§ 요구사항 P0-4). 아래 재검사(§ reconcileStaleRequiredTestExecutionEnvironmentTasks
+    // 호출부, status==="BLOCKED"도 함께 확인하도록 확장)가 매 재시작마다 이 결함이 여전히
+    // 재현되는지 deterministic하게 다시 확인해, 해소되면 사람의 명시적 APPROVE 없이도 자동으로
+    // READY로 되돌린다.
     const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext);
     if (!executionEnvironmentPreflight.ok) {
       const detail = executionEnvironmentPreflight.issues
         .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath} reason=${i.reason ?? ""}`)
         .join("; ");
       console.log(
-        `[autodev] task ${taskDef.id} — required test 실행 환경 결함 감지(${detail}) — Developer를 부르지 않고 WAITING_HUMAN으로 전환합니다(project adapter config의 commandCwdAliases/requiredTest.cwd를 직접 확인/수정해야 합니다).`
+        `[autodev] task ${taskDef.id} — required test 실행 환경 결함 감지(${detail}) — Developer를 부르지 않고 기술적 BLOCKED로 전환합니다(project adapter config의 commandCwdAliases/requiredTest.cwd를 직접 확인/수정해야 합니다 — 사람 승인이 아니라 기술적 안전정지입니다).`
       );
-      log("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR — Developer 호출 전 차단", {
+      log("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR — Developer 호출 전 차단(기술적 BLOCKED, Human Gate 아님)", {
         taskId: taskDef.id,
         issues: executionEnvironmentPreflight.issues,
       });
-      state.status = "WAITING_HUMAN";
+      state.status = "BLOCKED";
       for (const issue of executionEnvironmentPreflight.issues) {
         state.deferredHumanTasks.push(
           `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${taskDef.id} requiredTest=${issue.requiredTestName} kind=${issue.kind} cwd=${issue.cwd} resolvedPath=${issue.resolvedPath}`
         );
       }
       emitEvent(events, {
-        eventType: "HUMAN_APPROVAL_REQUIRED",
+        eventType: "RUN_BLOCKED",
         runId,
         projectId: manifest.projectId,
         taskId: taskDef.id,
         executionPhase: "task_selection",
         outcome: "BLOCKED",
-        humanInterventionRequired: true,
         reason: `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR(${taskDef.id}): ${detail}`,
       });
       saveState(state, statePath);
