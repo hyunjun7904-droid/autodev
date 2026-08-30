@@ -18,6 +18,11 @@ export type ClaudeErrorCode =
   | "TIMEOUT"
   | "NON_ZERO_EXIT"
   | "INVALID_OUTPUT"
+  // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). subprocess-runner.ts의
+  // outcome.aborted=true(호출부가 넘긴 abortSignal 발동)를 그대로 옮긴 값이다. TIMEOUT과
+  // 절대 같은 값으로 합치지 않는다 — DEVELOPER_TRANSIENT_ERROR_CODES/isTransientDeveloperFailure
+  // (§ claude-developer.ts)가 이 값을 재시도 대상으로 절대 취급하지 않도록 분리한다.
+  | "ABORTED"
   // SI-3.6(Executable Identity Trust) — trusted-executable-resolver.ts의 실패 코드를 그대로
   // 재사용한다(목록을 복제하지 않음) — "claude"라는 이름이 허용됐다는 사실과 "실제로 어떤
   // 파일이 실행될지 신뢰할 수 있는가"는 별개 질문이다(§ trusted-executable-resolver.ts).
@@ -174,6 +179,14 @@ export function classifySubprocessOutcome(outcome: SubprocessOutcome, timeoutMs:
     );
   }
 
+  // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). outcome.aborted는 반드시
+  // outcome.timedOut보다 먼저 확인한다 — 호출부가 abortSignal로 child를 SIGKILL했을 때도
+  // 내부적으로는 timedOut이 함께 true일 수 있는 race가 있을 수 있어(§ subprocess-runner.ts
+  // 두 플래그가 독립적으로 set됨), "의도된 정상 중단"을 "진짜 timeout"으로 오분류해
+  // isTransientDeveloperFailure(§ claude-developer.ts)가 재시도하게 만들면 안 된다.
+  if (outcome.aborted) {
+    return makeError("ABORTED", "호출부 요청으로 정상 중단됨(canonical stop)", outcome.stdout, outcome.stderr);
+  }
   if (outcome.timedOut) {
     // stdin은 이미 즉시 닫았으므로 대화형 프롬프트가 떠도 응답할 방법이 없다 — 그대로면
     // timeoutMs까지 hang하다 강제 종료된다. 그 hang의 원인이 usage-limit/대화형 선택 메뉴로

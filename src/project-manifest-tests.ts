@@ -396,8 +396,14 @@ async function main(): Promise<void> {
     /import\s*\{\s*loadProjectAdapter\s*\}\s*from\s*"\.\/project-adapter-loader"/.test(runSource)
   );
   check(
+    // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측). run.ts가
+    // runAutodevOnce/runAutodevContinuous에 abortSignal(§ run.ts runAbortController)도 함께
+    // 넘기게 되면서, "정확히 { manifest }만 전달"이라는 예전 엄격한 패턴은 더 이상 실제
+    // 소스와 맞지 않는다 — 이 검사의 원래 의도(manifest가 loadProjectAdapter()의 반환값 그대로
+    // 전달되는지, 다른 값으로 조용히 대체되지 않는지)는 그대로 유지하면서 manifest가 첫
+    // 필드로 오고 그 뒤에 다른 필드(abortSignal 등)가 와도 통과하도록 넓힌다.
     "소스 회귀(B3): run.ts가 runAutodevOnce에 loadProjectAdapter()의 반환값을 manifest로 전달함",
-    /runAutodevOnce\(\{\s*manifest\s*\}\)/.test(runSource)
+    /runAutodevOnce\(\{\s*manifest\s*(,[^}]*)?\}\)/.test(runSource)
   );
 
   console.log("\n=== project-manifest(Project Manifest 최소 골격) 테스트 결과 ===");

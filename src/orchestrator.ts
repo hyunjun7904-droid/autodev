@@ -183,6 +183,41 @@ export interface OrchestratorDeps {
    * 원칙을 따른다.
    */
   ledger?: UsageLedger;
+  /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+   *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 지정하면
+   *  durable-wait sleep(§ sleepOrAbort) 중 즉시 대기를 끝내고, Developer 호출 결과가
+   *  errorCode="ABORTED"(§ claude-developer.ts)면 즉시 정상 종료한다. 두 경우 모두
+   *  saveCurrentState를 추가로 호출하지 않고(§ 파일 하단 최종 saveCurrentState를 건너뛰는
+   *  이른 return) 마지막으로 이미 저장된 state 그대로 둔다 — project-state.json을 임의로
+   *  바꾸지 않는다. 지정하지 않으면 기존 동작과 완전히 동일(중단 불가). */
+  abortSignal?: AbortSignal;
+}
+
+/** § OrchestratorDeps.abortSignal 주석. abortSignal이 없으면 그냥 sleep(ms)를 기다린다(기존
+ *  동작과 완전히 동일). 있으면 abort event와 경합시켜 먼저 끝나는 쪽을 따른다 — sleep()
+ *  자체는 여전히 실제 ms 그대로 호출된다(기존 deps.sleep 테스트 override의 호출 인자 계약을
+ *  그대로 보존, § claude-developer.ts runDeveloperTaskWithRetry의 동일한 설계). */
+async function sleepOrAbort(ms: number, sleep: (ms: number) => Promise<void>, abortSignal?: AbortSignal): Promise<boolean> {
+  if (!abortSignal) {
+    await sleep(ms);
+    return false;
+  }
+  if (abortSignal.aborted) return true;
+  let aborted = false;
+  await Promise.race([
+    sleep(ms),
+    new Promise<void>((resolve) => {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          aborted = true;
+          resolve();
+        },
+        { once: true }
+      );
+    }),
+  ]);
+  return aborted;
 }
 
 export interface OrchestratorRunResult {
@@ -192,6 +227,10 @@ export interface OrchestratorRunResult {
   // 필드 포함)가 그대로 담겨 있다.
   finalState: CoreState;
   statusHistory: OrchestratorStatus[];
+  /** § OrchestratorDeps.abortSignal 주석. true면 durable-wait 중 또는 Developer 호출
+   *  결과(errorCode="ABORTED")로 정상 중단됐다는 뜻이다 — finalState는 중단 직전 마지막으로
+   *  저장된 내용 그대로다(project-state.json에 새로 쓰인 값 없음). */
+  stopped?: boolean;
 }
 
 function isUsageLimitResult(result: ClaudeResult): boolean {
@@ -252,6 +291,7 @@ export async function runOrchestrator(
   const developerProviderWaitCooldownMs = deps.developerProviderWaitCooldownMs ?? DEVELOPER_PROVIDER_WAIT_COOLDOWN_MS;
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? defaultSleep;
+  const abortSignal = deps.abortSignal;
   // 실제 운영 경로가 기본값이다 — 테스트는 반드시 deps.statePath로 임시 경로를 넘겨야
   // 실제 project-state.json을 건드리지 않는다(§ 요구사항 4).
   const statePath = deps.statePath ?? DEFAULT_STATE_PATH;
@@ -397,7 +437,9 @@ export async function runOrchestrator(
         setStatus("WAITING_PROVIDER_RETRY");
         saveCurrentState(state);
         log(`재시작 후 durable provider wait 재개 — 남은 ${remainingMs}ms만 대기 후 재시도`);
-        await sleep(remainingMs);
+        if (await sleepOrAbort(remainingMs, sleep, abortSignal)) {
+          return { finalState: state, statusHistory, stopped: true };
+        }
       }
     }
 
@@ -412,7 +454,9 @@ export async function runOrchestrator(
         setStatus("WAITING_PROVIDER_RETRY");
         saveCurrentState(state);
         log(`재시작 후 review stagnation durable wait 재개 — 남은 ${remainingMs}ms만 대기 후 재시도`);
-        await sleep(remainingMs);
+        if (await sleepOrAbort(remainingMs, sleep, abortSignal)) {
+          return { finalState: state, statusHistory, stopped: true };
+        }
       }
     }
 
@@ -426,6 +470,16 @@ export async function runOrchestrator(
     saveCurrentState(state);
 
     const claudeResult = await claudeRunner(task, state.reviewCycle);
+    // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). errorCode="ABORTED"(§
+    // claude-developer.ts opts.abortSignal)는 절대 재시도 대상이 아니고, genuine WAITING_HUMAN
+    // 으로도 승격하지 않는다 — state를 전혀 건드리지 않고(lastClaudeResult에도 담지 않는다)
+    // 즉시 반환한다. 이 return은 아래 최종 saveCurrentState(§ 파일 끝)를 건너뛰므로
+    // project-state.json은 이번 attempt 시작 직전(위 saveCurrentState(state)) 상태 그대로
+    // 남는다.
+    if ((claudeResult as ClaudeResult & { errorCode?: string }).errorCode === "ABORTED") {
+      log("developer 중단(ABORTED) 감지 — durable wait/재시도/Reviewer 없이 즉시 정상 종료");
+      return { finalState: state, statusHistory, stopped: true };
+    }
     state.lastClaudeResult = claudeResult;
     const claudeDeferred = (claudeResult as ClaudeResult & { deferredHumanTasks?: string[] }).deferredHumanTasks;
     if (claudeDeferred?.length) state.deferredHumanTasks.push(...claudeDeferred);
@@ -450,7 +504,9 @@ export async function runOrchestrator(
       setStatus("WAITING_CLAUDE_LIMIT");
       saveCurrentState(state);
       log(`Claude 사용량 제한 감지 — ${claudeLimitWaitMs}ms 대기 후 재시도 (${state.claudeLimitWaitCount}회째, Human Gate로 승격하지 않고 계속 재시도합니다)`);
-      await sleep(claudeLimitWaitMs);
+      if (await sleepOrAbort(claudeLimitWaitMs, sleep, abortSignal)) {
+        return { finalState: state, statusHistory, stopped: true };
+      }
       continue;
     }
 
@@ -495,7 +551,9 @@ export async function runOrchestrator(
         log(
           `Developer ${isProtocolError ? "응답 해석 반복 실패(PROTOCOL_ERROR)" : `provider 일시적 오류(${errorCode})`} 감지 — ${delayMs}ms 대기 후 동일 task 재시도 (${state.developerProviderWaitCount}회째, 기술적 실패는 Human Gate로 승격하지 않고 계속 재시도합니다)`
         );
-        await sleep(delayMs);
+        if (await sleepOrAbort(delayMs, sleep, abortSignal)) {
+          return { finalState: state, statusHistory, stopped: true };
+        }
         state.developerProviderNextRetryAt = null;
         continue;
       }
@@ -674,7 +732,9 @@ export async function runOrchestrator(
         log(
           `GPT Reviewer provider 일시적 오류 감지 — ${delayMs}ms 대기 후 같은 diff로 재리뷰 (${state.reviewerProviderWaitCount}회째, gptCallCount 예산은 소비하지 않음, Human Gate로 승격하지 않고 계속 재시도합니다)`
         );
-        await sleep(delayMs);
+        if (await sleepOrAbort(delayMs, sleep, abortSignal)) {
+          return { finalState: state, statusHistory, stopped: true };
+        }
         state.reviewerProviderNextRetryAt = null;
         setStatus("WAITING_GPT_REVIEW");
         // § BLOCKER 3 재하드닝 — 이 재시도 호출도 실제 network call이므로 동일한 write-ahead
@@ -870,7 +930,9 @@ export async function runOrchestrator(
       log(
         `연속 REVISE ${MAX_REVIEW_CYCLES}회 도달 — ${delayMs}ms 대기 후 새 REVISE 예산으로 재시도 (${state.reviewStagnationWaitCount}회째, 기술적 review 정체는 Human Gate로 승격하지 않고 계속 재시도합니다)`
       );
-      await sleep(delayMs);
+      if (await sleepOrAbort(delayMs, sleep, abortSignal)) {
+        return { finalState: state, statusHistory, stopped: true };
+      }
       state.reviewStagnationNextRetryAt = null;
       continue;
     }

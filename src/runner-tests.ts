@@ -194,6 +194,66 @@ async function main(): Promise<void> {
     rmSync(cwdProbeDir, { recursive: true, force: true });
   }
 
+  // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+  // "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 실제
+  // 5초짜리 subprocess를 real AbortController로 중단한다 — claude.exe 대신 동일한 실행
+  // 경로(runSubprocessWithTimeout)를 그대로 쓰므로 실제 Claude child 종료를 정확히 대변한다.
+  {
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    setTimeout(() => controller.abort(), 200);
+    const outcome = await runSubprocessWithTimeout(
+      "powershell",
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 5"],
+      10_000, // timeout을 크게 둬서 "timeout이 아니라 abort로 끝났다"를 명확히 구분
+      undefined,
+      undefined,
+      controller.signal
+    );
+    const elapsedMs = Date.now() - startedAt;
+    check("Canonical Stop: abortSignal 발동 시 실제 child가 종료됨(outcome.aborted=true)", outcome.aborted === true);
+    check("Canonical Stop: timeout이 아니라 abort로 끝남(outcome.timedOut=false)", outcome.timedOut === false);
+    check(
+      "Canonical Stop: 실제 5초 sleep/10초 timeout을 기다리지 않고 abort 시점(약 200ms) 근처에서 종료됨",
+      elapsedMs < 4_000
+    );
+    const classified = classifySubprocessOutcome(outcome, 10_000);
+    check("Canonical Stop: classifySubprocessOutcome이 ABORTED로 분류(TIMEOUT과 구분)", classified.errorCode === "ABORTED");
+  }
+
+  // abortSignal이 이미 발동된 채로 넘어오면(예: 여러 재시도 사이에 stop 요청이 들어온 경우)
+  // subprocess를 새로 spawn만 하고 즉시 종료한다 — hang 없이 빠르게 끝나야 한다.
+  {
+    const controller = new AbortController();
+    controller.abort();
+    const startedAt = Date.now();
+    const outcome = await runSubprocessWithTimeout(
+      "powershell",
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 5"],
+      10_000,
+      undefined,
+      undefined,
+      controller.signal
+    );
+    const elapsedMs = Date.now() - startedAt;
+    check("Canonical Stop: 이미 발동된 abortSignal로 호출해도 aborted=true", outcome.aborted === true);
+    check("Canonical Stop: 이미 발동된 abortSignal이면 거의 즉시 종료됨(2초 미만)", elapsedMs < 2_000);
+  }
+
+  // abortSignal을 지정하지 않으면(기존 모든 호출부) 기존 동작과 완전히 동일 — aborted가
+  // undefined/false이고 정상 timeout/성공 판정에 전혀 영향 없다(회귀 방지).
+  {
+    const withoutAbort = await execAndClassify(
+      "powershell",
+      ["-NoProfile", "-Command", "Write-Output '{\"result\":\"ok-no-abort\"}'"],
+      5_000
+    );
+    check(
+      "Canonical Stop: abortSignal 미지정 시 기존 동작과 완전히 동일(정상 성공)",
+      withoutAbort.success === true && withoutAbort.summary === "ok-no-abort"
+    );
+  }
+
   console.log("\n=== runner 단위 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;

@@ -8,6 +8,7 @@ import {
   engageMaintenancePause,
   clearMaintenancePause,
   runnerSupervisorLockFilePath,
+  requestStop,
 } from "./runner-supervisor";
 import { checkSupervisorLock, defaultIsPidAlive } from "./dashboard-supervisor";
 import type { LockCheckResult } from "./dashboard-supervisor";
@@ -98,6 +99,49 @@ export function formatProjectControlStatus(status: ProjectControlStatus): string
   return lines.join("\n");
 }
 
+// AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+// "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). run.ts는
+// 이미 SIGINT/SIGTERM handler를 갖고 있었고(§ run.ts installShutdownHandlers) 이제 그
+// 신호가 runAbortController를 통해 durable-wait/claude CLI subprocess까지 실제로
+// 전달되지만, 이 CLI에서 process.kill(pid, "SIGTERM")로 보내는 방식은 채택하지 않는다 —
+// 이 Task를 구현하며 직접 3가지 방식(자기 자신에게, 완전히 별도 프로세스에서, 실제 spawn된
+// 자식에게)으로 실측 확인한 결과, 이 플랫폼(Windows)의 Node.js는 process.kill()로 보낸
+// SIGTERM/SIGINT에 대해 대상 프로세스의 등록된 handler를 전혀 호출하지 않고 무조건
+// 종료시킨다(taskkill과 동일한 효과 — 이 Task가 막으려는 바로 그 강제 종료다). 그래서
+// Maintenance Pause와 완전히 동일한 마커 파일 패턴(§ runner-supervisor.ts
+// engageMaintenancePause)을 재사용한다 — run.ts가 이 마커를 능동적으로 polling해서
+// runAbortController.abort()를 직접 호출한다(§ requestStop/readStopRequestForPid). 새
+// IPC 경로가 아니라 이미 있는 파일 마커 메커니즘의 재사용이다.
+export type StopDecision =
+  | { action: "REQUEST_STOP"; pid: number }
+  | { action: "NO_TARGET"; reason: string }
+  | { action: "REFUSED"; reason: string };
+
+/** 순수 함수 — 실제 마커 파일을 쓰지 않는다(§ main()이 그 부수효과를 담당). 대상이
+ *  없거나(present:false) 이미 죽었으면(liveness!=="ALIVE") NO_TARGET — 요청을 보낼 대상
+ *  자체가 없다는 뜻이지 실패가 아니다(그 경우 project-state/lock을 이 명령이 아니라 기존
+ *  stale-PID 판정이 처리한다). ownerKind가 "autodev"가 아니면(예: "local-human-approval"/
+ *  "telegram-resume") REFUSED — 이 명령은 실제 AutoDev continuous writer만 대상으로 한다,
+ *  다른 종류의 owner를 추측해서 건드리지 않는다. */
+export function decideStopAction(liveness: ProjectRuntimeLiveness): StopDecision {
+  if (!liveness.present) {
+    return { action: "NO_TARGET", reason: "이 project를 점유한 writer가 현재 없습니다." };
+  }
+  if (liveness.liveness.verdict !== "ALIVE") {
+    return {
+      action: "NO_TARGET",
+      reason: `project lock owner(pid=${liveness.pid})가 이미 살아있지 않습니다(liveness=${liveness.liveness.verdict}) — 보낼 대상이 없습니다.`,
+    };
+  }
+  if (liveness.ownerKind !== "autodev") {
+    return {
+      action: "REFUSED",
+      reason: `이 project lock의 owner는 ownerKind="${liveness.ownerKind}"입니다(AutoDev continuous writer가 아님) — 이 명령은 ownerKind="autodev"만 대상으로 합니다.`,
+    };
+  }
+  return { action: "REQUEST_STOP", pid: liveness.pid };
+}
+
 export function parseArg(args: readonly string[], name: string): string | undefined {
   const idx = args.indexOf(name);
   if (idx === -1 || typeof args[idx + 1] !== "string") return undefined;
@@ -115,6 +159,7 @@ function usageAndExit(): never {
       "  node dist/project-control-cli.js pause --project <adapterPath> [--reason <text>]",
       "  node dist/project-control-cli.js resume --project <adapterPath>",
       "  node dist/project-control-cli.js status --project <adapterPath>",
+      "  node dist/project-control-cli.js stop --project <adapterPath>",
     ].join("\n")
   );
   process.exit(1);
@@ -143,6 +188,25 @@ function main(): void {
     }
     case "status": {
       console.log(formatProjectControlStatus(getProjectControlStatus(adapterPath, logsDir)));
+      return;
+    }
+    case "stop": {
+      const manifest = loadProjectAdapter(adapterPath);
+      const liveness = inspectProjectRuntimeLiveness(manifest.projectId, manifest.targetProjectRoot);
+      const decision = decideStopAction(liveness);
+      if (decision.action === "NO_TARGET") {
+        console.log(`[project-control] Stop 대상 없음 — ${decision.reason}`);
+        return;
+      }
+      if (decision.action === "REFUSED") {
+        console.log(`[project-control] Stop 거부 — ${decision.reason}`);
+        return;
+      }
+      console.log(`[project-control] Stop 요청 — pid=${decision.pid}를 대상으로 canonical stop marker를 남깁니다(강제 종료 아님).`);
+      requestStop(adapterPath, logsDir, "project-control-cli stop", decision.pid);
+      console.log(
+        `[project-control] Stop 요청 기록 완료 — pid=${decision.pid}가 다음 polling 주기(§ run.ts pollForStopRequest)에서 이를 발견하고 durable-wait/진행 중인 Developer subprocess를 정상적으로 중단한 뒤 스스로 종료할 때까지 기다리세요. project-state.json/lock은 이 명령이 직접 건드리지 않습니다 — 그 프로세스 자신의 canonical stop 경로(run.ts)가 처리합니다.`
+      );
       return;
     }
     default:

@@ -12,7 +12,9 @@ import {
   resolveSupervisorParentPidFromEnv,
   resolveSupervisorParentStartedAtMsFromEnv,
 } from "./parent-liveness-watchdog";
+import { readStopRequestForPid, clearStopRequest } from "./runner-supervisor";
 import { log } from "./logger";
+import { join } from "node:path";
 
 // AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체, Phase C Task C1 — project adapter
 // data-only 전환).
@@ -71,9 +73,24 @@ const shutdownSignal = new Promise<void>((resolve) => {
 });
 let shutdownHandlersInstalled = false;
 
+// AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+// "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 기존
+// interrupted/shutdownSignal은 waitWhileWaitingHuman()(Telegram 승인 대기 단계)에서만
+// 소비됐고, 실제 실행 중인 runAutodevContinuous()/runAutodevOnce()에는 전혀 전달되지 않았다
+// (그 호출들은 `await runAutodevContinuous({ manifest })`처럼 이 신호를 아예 받지 않았다).
+// 이 AbortController가 그 실제 전달 경로다 — runAbortController.signal을 opts.abortSignal로
+// 넘기면 durable-wait sleep(§ orchestrator.ts)과 진행 중인 claude CLI subprocess(§
+// subprocess-runner.ts)까지 실제로 중단된다. 기존 interrupted/shutdownSignal 메커니즘은
+// 그대로 유지한다(waitWhileWaitingHuman의 동작을 바꾸지 않는다) — 같은 SIGINT/SIGTERM
+// handler가 이제 둘 다 함께 트리거할 뿐이다.
+export const runAbortController = new AbortController();
+
 /** SIGINT/SIGTERM 둘 다 같은 shutdownSignal을 한 번만 resolve한다(idempotent — 두 신호가
- *  겹쳐 와도, 또는 같은 신호가 여러 번 와도 안전하다, § 요구사항 10). */
-function installShutdownHandlers(): void {
+ *  겹쳐 와도, 또는 같은 신호가 여러 번 와도 안전하다, § 요구사항 10). export하는 이유는
+ *  run-tests.ts가 실제 process.kill(process.pid, "SIGTERM")로 이 정확한 handler가 실제
+ *  runAbortController를 발동시키는지 검증하기 위함이다(require.main===module 가드가 있어
+ *  이 파일을 import해도 main()이 자동 실행되지 않는다, § 파일 하단). */
+export function installShutdownHandlers(): void {
   if (shutdownHandlersInstalled) return;
   shutdownHandlersInstalled = true;
   let handled = false;
@@ -83,9 +100,46 @@ function installShutdownHandlers(): void {
     interrupted = true;
     console.log(`\n[run] ${signal} 수신 — 종료합니다.`);
     resolveShutdownSignal();
+    runAbortController.abort();
   };
   process.on("SIGINT", () => handler("SIGINT"));
   process.on("SIGTERM", () => handler("SIGTERM"));
+}
+
+// project-control-cli.ts의 repoLogsDir()와 동일한 __dirname 기준 계산(§ 그 파일 주석 — 이
+// 저장소의 기존 관례, dist/ 빌드 결과 기준 상위 logs/) — 마커 파일 경로가 정확히 일치해야
+// 하므로 두 곳이 서로 다른 계산을 하지 않는다.
+function repoLogsDir(): string {
+  return join(__dirname, "..", "logs");
+}
+
+const DEFAULT_STOP_REQUEST_POLL_MS = 1_000;
+
+/** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+ *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). § 위
+ *  runAbortController 주석 — 이 플랫폼의 process.kill()이 SIGTERM/SIGINT handler를 신뢰성
+ *  있게 호출하지 않으므로(직접 실측 확인), project-control-cli.js stop이 남긴 마커 파일(§
+ *  runner-supervisor.ts requestStop)을 이 프로세스가 능동적으로 polling한다 — 발견하면
+ *  handler와 완전히 동일하게 runAbortController.abort()를 호출하고, 마커를 스스로 지운다
+ *  (§ requestStop 주석 — 다음 무관한 writer가 stale 마커를 보고 스스로 중단하는 경쟁 상태를
+ *  막기 위함, 소비한 요청은 소비한 프로세스가 치운다). 반환하는 stop()은 정상 종료 시
+ *  interval을 정리한다(§ main() finally). */
+export function startStopRequestPolling(adapterPath: string, logsDir: string, pollMs: number = DEFAULT_STOP_REQUEST_POLL_MS): { stop: () => void } {
+  let handled = false;
+  const timer = setInterval(() => {
+    if (handled) return;
+    if (!readStopRequestForPid(adapterPath, logsDir, process.pid)) return;
+    handled = true;
+    console.log(`\n[run] canonical stop 요청(project-control-cli stop) 감지 — 종료합니다.`);
+    interrupted = true;
+    resolveShutdownSignal();
+    runAbortController.abort();
+    clearStopRequest(adapterPath, logsDir);
+  }, pollMs);
+  timer.unref?.(); // 이 polling만으로 프로세스가 종료를 못 하게 붙잡고 있지 않는다.
+  return {
+    stop: () => clearInterval(timer),
+  };
 }
 
 function delay(ms: number): Promise<void> {
@@ -112,7 +166,8 @@ async function waitWhileWaitingHuman(statePath: string, pollMs = 5_000): Promise
 }
 
 async function main(): Promise<void> {
-  const manifest = loadProjectAdapter(resolveAdapterPathFromArgs());
+  const adapterPathArg = resolveAdapterPathFromArgs();
+  const manifest = loadProjectAdapter(adapterPathArg);
   log("AutoDev 시작", { project: manifest.projectId, AUTOMATION_DRY_RUN: process.env.AUTOMATION_DRY_RUN ?? "(unset)" });
 
   const continuous = isContinuousModeRequested();
@@ -128,6 +183,11 @@ async function main(): Promise<void> {
   }
 
   installShutdownHandlers();
+  // § startStopRequestPolling 주석 — adapterPathArg는 이 지점에 도달했다는 사실 자체로 이미
+  // loadProjectAdapter()를 통과한 유효한 문자열임이 보장된다(무효/undefined였다면 위에서
+  // 이미 throw했다) — project-control-cli.js stop --project <adapterPath>가 쓰는 값과
+  // 정확히 같은 문자열이어야 마커 경로가 일치한다.
+  const stopRequestPolling = startStopRequestPolling(adapterPathArg as string, repoLogsDir());
   const controllerSupervisor = await ensureTelegramControllerStarted(manifest);
 
   // P0-3 하드닝(§ parent-liveness-watchdog.ts) — runner-supervisor.ts가 spawn한 child일
@@ -163,7 +223,7 @@ async function main(): Promise<void> {
   try {
     let result: AutodevRunResult;
     if (continuous) {
-      const continuousResult = await runAutodevContinuous({ manifest });
+      const continuousResult = await runAutodevContinuous({ manifest, abortSignal: runAbortController.signal });
       const stopDetail =
         continuousResult.stop.kind === "OUTCOME_STOP"
           ? `outcome=${continuousResult.stop.outcome}${continuousResult.stop.reason ? `, reason=${continuousResult.stop.reason}` : ""}`
@@ -177,7 +237,7 @@ async function main(): Promise<void> {
       );
       result = continuousResult.finalResult;
     } else {
-      result = await runAutodevOnce({ manifest });
+      result = await runAutodevOnce({ manifest, abortSignal: runAbortController.signal });
     }
     console.log(`[run] 종료: outcome=${result.outcome}${result.reason ? `, reason=${result.reason}` : ""}`);
 
@@ -201,6 +261,7 @@ async function main(): Promise<void> {
     }
   } finally {
     parentWatchdog?.stop();
+    stopRequestPolling.stop();
     await controllerSupervisor.stop();
   }
 

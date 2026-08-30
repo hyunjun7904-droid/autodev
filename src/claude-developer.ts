@@ -177,6 +177,14 @@ export interface DeveloperTaskOptions {
    *  아니라 이 값에서 이어받는다 — 이미 소진된 discovery budget을 처음부터 다시 반복하지
    *  않기 위함. 지정하지 않으면 기존 동작과 완전히 동일(0/false부터 시작). */
   priorDiscoveryProgress?: DeveloperDiscoveryProgress;
+  /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+   *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 지정하면
+   *  진행 중인 claude CLI subprocess를 즉시 SIGKILL로 종료하고(§ subprocess-runner.ts
+   *  runSubprocessWithTimeout의 timeout과 동일한 기존 종료 수단 재사용), round 시작 전/
+   *  USAGE_LIMIT·transient 재시도 대기 중에도 즉시 중단한다. errorCode="ABORTED"로 반환되며
+   *  절대 재시도 대상이 아니다(§ DEVELOPER_TRANSIENT_ERROR_CODES에 포함 안 함). 지정하지
+   *  않으면 기존 동작과 완전히 동일(중단 불가). */
+  abortSignal?: AbortSignal;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   usageLimitWaitMs?: number;
   /** USAGE_LIMIT 재시도 최대 횟수 — 이 횟수 안에서는 round/discovery budget/lock grace를
@@ -534,7 +542,7 @@ async function runRequiredTests(
   return results;
 }
 
-async function callClaude(input: string, timeoutMs: number, systemPrompt: string, projectRoot?: string) {
+async function callClaude(input: string, timeoutMs: number, systemPrompt: string, projectRoot?: string, abortSignal?: AbortSignal) {
   // 프롬프트를 CLI 인자로 넘기지 않고 stdin으로 전달한다 — 라운드가 쌓여 프롬프트가 커지면
   // OS 명령행 길이 제한(Windows에서 실제로 ENAMETOOLONG 발생 확인)에 걸리기 때문이다.
   // "claude -p"(positional prompt 생략)가 stdin에서 읽는 것은 실제 호출로 직접 검증했다.
@@ -561,7 +569,7 @@ async function callClaude(input: string, timeoutMs: number, systemPrompt: string
   // 읽어들이므로, 실제 개발 대상(JARVIS 등)과 무관한 AutoDev Core 자신의 CLAUDE.md/rules가
   // 매 호출마다 섞여 들어갈 수 있다(§ 실측: JARVIS Task 5.2). projectRoot가 없으면(테스트 등
   // 기존 호출부) 기존과 동일하게 상속된 cwd를 그대로 쓴다.
-  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input, projectRoot);
+  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input, projectRoot, abortSignal);
   return classifySubprocessOutcome(outcome, timeoutMs);
 }
 
@@ -666,8 +674,25 @@ export async function runDeveloperTaskViaSafeExecutor(
   const claudeCall =
     opts.claudeCaller ??
     ((input: string, callTimeoutMs: number) =>
-      callClaude(input, callTimeoutMs, systemPrompt, opts.executor?.projectRoot ?? PROJECT_ROOT));
+      callClaude(input, callTimeoutMs, systemPrompt, opts.executor?.projectRoot ?? PROJECT_ROOT, opts.abortSignal));
   const sleepFn = opts.sleep ?? defaultDeveloperSleep;
+  // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). abortSignal이 이미
+  // 발동된 채로 들어오면(예: 여러 quick retry 사이 abort) claude CLI를 한 번도 더 부르지
+  // 않고 즉시 ABORTED로 반환한다 — round 진입 직전마다 재확인한다(§ 아래 round loop).
+  function abortedResultIfRequested(round: number): DeveloperResult | undefined {
+    if (!opts.abortSignal?.aborted) return undefined;
+    log(`developer 중단 요청(abortSignal) 감지 — 라운드 ${round} 시작 전 즉시 종료`);
+    return {
+      success: false,
+      summary: "중단 요청(canonical stop)으로 종료했습니다.",
+      changedFiles: getActualChangedFiles(changeScopeDirs, executor),
+      tests: [],
+      rawOutput: "",
+      errorCode: "ABORTED",
+      discoveryProgress: captureDiscoveryProgress(round),
+      ...usageFields(),
+    };
+  }
   function reportRoundStart(round: number, stage: "DISCOVERY" | "LOCKED"): void {
     if (!opts.onRoundStart) return;
     try {
@@ -932,6 +957,8 @@ export async function runDeveloperTaskViaSafeExecutor(
   }
 
   for (let round = 1; round <= MAX_INTERNAL_ROUNDS; round++) {
+    const abortedBeforeRound = abortedResultIfRequested(round);
+    if (abortedBeforeRound) return abortedBeforeRound;
     reportRoundStart(round, implementationLocked ? "LOCKED" : "DISCOVERY");
     const transcriptEntryCountBeforeCap = transcript.length;
     const input = capTranscript();
@@ -1411,7 +1438,27 @@ export async function runDeveloperTaskWithRetry(
     last = result;
     if (!isTransientDeveloperFailure(result)) return result;
     log(`developer transient 실패(${result.errorCode}) — 시도 ${i + 1}/${DEVELOPER_TRANSIENT_MAX_ATTEMPTS} 실패, 재시도 예정`);
-    if (i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS - 1) await sleep(DEVELOPER_TRANSIENT_RETRY_WAITS_MS[i]);
+    // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). 이 짧은 재시도 대기
+    // (15s/30s) 중에 abortSignal이 발동하면 남은 대기를 즉시 끝낸다 — 다음 attemptFn() 호출은
+    // opts.abortSignal.aborted를 즉시 확인해(§ runDeveloperTaskViaSafeExecutor
+    // abortedResultIfRequested) ABORTED를 반환하고, isTransientDeveloperFailure가 false라
+    // 더 이상 재시도하지 않는다. sleep()은 여전히 실제 대기시간 그대로 호출한다(§ 기존
+    // retryDeps.sleep 테스트 override의 호출 횟수/인자 계약을 그대로 보존) — abortSignal이
+    // 있으면 그 호출을 abort event와 경합시켜 먼저 끝나는 쪽을 기다릴 뿐이다.
+    if (i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS - 1) {
+      const waitMs = DEVELOPER_TRANSIENT_RETRY_WAITS_MS[i];
+      if (opts.abortSignal) {
+        await Promise.race([
+          sleep(waitMs),
+          new Promise<void>((resolve) => {
+            if (opts.abortSignal!.aborted) resolve();
+            else opts.abortSignal!.addEventListener("abort", () => resolve(), { once: true });
+          }),
+        ]);
+      } else {
+        await sleep(waitMs);
+      }
+    }
   }
 
   const exhausted = last as DeveloperResult;

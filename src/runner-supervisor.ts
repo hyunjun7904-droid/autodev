@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { appendDashboardLog } from "./dashboard-log";
 import type { DashboardLogFields } from "./dashboard-log";
@@ -195,6 +195,60 @@ export function clearMaintenancePause(adapterPath: string, logsDir: string): voi
  *  순수 리팩터 — 동작 변화 없음). */
 export function runnerSupervisorLockFilePath(adapterPath: string, logsDir: string): string {
   return join(logsDir, `runner-supervisor-${sanitizeForFilename(adapterPath)}.lock`);
+}
+
+// AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+// "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 이 파일을
+// 구현하며 직접 실측 확인한 사실: 이 환경(Windows)에서 Node.js process.kill(pid, "SIGTERM"/
+// "SIGINT")는 대상 프로세스의 등록된 handler를 절대 호출하지 않고 무조건 종료시킨다(자기
+// 자신에게 보내도, 완전히 별도 프로세스에서 보내도 동일 — 3가지 방식으로 직접 재현
+// 확인함). 즉 project-control-cli.js가 OS 신호로 "정상 중단"을 요청하면 실제로는
+// runAbortController(§ run.ts)를 전혀 거치지 않고 강제 종료(taskkill과 동일한 효과)가
+// 일어난다 — 이 파일이 닫으려는 결함 그대로다. 그래서 Maintenance Pause와 완전히 동일한
+// 마커 파일 패턴(§ engageMaintenancePause)을 재사용한다 — run.ts가 이 마커를 능동적으로
+// polling(§ run.ts pollForStopRequest)해서 runAbortController.abort()를 직접 호출한다.
+// targetPid로 대상을 명시해, "요청이 이미 소비/무관해진 뒤" 나중에 뜬 완전히 다른 writer가
+// 우연히 같은 마커를 보고 스스로 중단하는 경쟁 상태를 막는다.
+export function stopRequestMarkerPath(adapterPath: string, logsDir: string): string {
+  return join(logsDir, `runner-supervisor-stop-${sanitizeForFilename(adapterPath)}.request`);
+}
+
+/** § stopRequestMarkerPath 주석. targetPid는 project lock owner pid를 그대로 넘긴다(§
+ *  project-control-cli.ts decideStopAction) — 이 마커를 만들 때 이미 project-lock.ts가
+ *  ALIVE로 확인한 값이다. */
+export function requestStop(adapterPath: string, logsDir: string, reason: string, targetPid: number): void {
+  if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
+  const markerPath = stopRequestMarkerPath(adapterPath, logsDir);
+  writeFileSync(markerPath, `${JSON.stringify({ requestedAt: new Date().toISOString(), reason, targetPid }, null, 2)}\n`, "utf-8");
+}
+
+export function clearStopRequest(adapterPath: string, logsDir: string): void {
+  const markerPath = stopRequestMarkerPath(adapterPath, logsDir);
+  try {
+    unlinkSync(markerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
+
+/** run.ts가 자기 자신(selfPid=process.pid)을 대상으로 한 stop 요청이 있는지 능동적으로
+ *  확인한다. 마커가 없거나, 있어도 targetPid가 이 프로세스 것이 아니거나(§ 위 race 방지
+ *  주석), 손상돼 파싱할 수 없으면(fail-closed) 전부 false — "확인 못 함"을 "중단하라"로
+ *  추측해서 처리하지 않는다. */
+export function readStopRequestForPid(adapterPath: string, logsDir: string, selfPid: number): boolean {
+  const markerPath = stopRequestMarkerPath(adapterPath, logsDir);
+  let raw: string;
+  try {
+    raw = readFileSync(markerPath, "utf-8");
+  } catch {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { targetPid?: unknown };
+    return typeof parsed.targetPid === "number" && parsed.targetPid === selfPid;
+  } catch {
+    return false;
+  }
 }
 
 function resolveAdapterPath(): string | undefined {

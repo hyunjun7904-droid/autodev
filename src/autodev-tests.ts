@@ -14,6 +14,7 @@ import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
 import type { RealClaudeResult } from "./claude-runner";
+import { inspectProjectRuntimeLiveness } from "./project-lock";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -2696,6 +2697,124 @@ async function scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt(): Promise<vo
   );
 }
 
+// AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+// "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). K~M
+// 시나리오는 opts.abortSignal이 runAutodevOnce() 전체 파이프라인(lock acquire 전 조기
+// 반환/orchestrator.ts durable-wait/checkpoint·Reviewer 생략)에 실제로 어떻게 반영되는지
+// end-to-end로 검증한다. subprocess-runner.ts 레벨의 실제 claude.exe 종료는 runner-tests.ts가
+// 이미 실측 검증했고, run.ts의 마커 polling 자체는 run-tests.ts가 검증한다 — 이 파일은 그
+// abortSignal이 orchestrator.ts/autodev.ts의 실제 상태 전이(project-state.json/project
+// lock/checkpoint/Reviewer 호출 여부)에 정확히 반영되는지만 담당한다.
+
+async function scenarioAbortBeforeStartSkipsEverything(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  const controller = new AbortController();
+  controller.abort(); // 시작 전에 이미 중단 요청됨.
+
+  const stateBefore = readFileSync(statePath, "utf-8");
+  let developerCalled = false;
+  const result = await runAutodevOnce({
+    manifest,
+    developerClaudeCaller: async () => {
+      developerCalled = true;
+      throw new Error("호출되면 안 됨");
+    },
+    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    abortSignal: controller.signal,
+  });
+  const stateAfter = readFileSync(statePath, "utf-8");
+
+  check("K) 시작 전 abort: outcome=STOPPED", result.outcome === "STOPPED");
+  check("K) 시작 전 abort: Developer가 전혀 호출되지 않음(lock acquire조차 시도 안 함)", developerCalled === false);
+  check("K) 시작 전 abort: project-state.json이 완전히 그대로임(바이트 단위 동일)", stateBefore === stateAfter);
+  check(
+    "K) 시작 전 abort: lock을 acquire조차 하지 않았으므로 project lock이 없음",
+    inspectProjectRuntimeLiveness(manifest.projectId, manifest.targetProjectRoot).present === false
+  );
+}
+
+async function scenarioAbortDuringDurableWaitStopsQuicklyAndPreservesState(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  // PROTOCOL_ERROR(항상 해석 불가한 응답)는 developer attempt 내부에서 3라운드 만에 하드
+  // 중단되고 곧바로 orchestrator.ts의 durable-wait 분기로 들어간다(§
+  // scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt와 동일한 재현 방식) — 짧은 재시도
+  // sleep(15s/30s) 없이 곧장 durable-wait의 real sleep을 경합시킬 수 있다.
+  const caller = makeAlwaysUnrecognizedProtocolCaller();
+  const controller = new AbortController();
+  const abortAfterMs = 200;
+  setTimeout(() => controller.abort(), abortAfterMs);
+
+  const startedAt = Date.now();
+  const result = await runAutodevOnce({
+    manifest,
+    developerClaudeCaller: caller.call,
+    orchestratorDeps: {
+      gptReviewer: fakePassReviewer(),
+      // sleep은 override하지 않는다 — 실제 setTimeout 기반 대기와 abort를 진짜로 경합시킨다.
+      developerProviderWaitScheduleMs: [10_000],
+      developerProviderWaitCooldownMs: 10_000,
+    },
+    abortSignal: controller.signal,
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  check("L) durable-wait 중 abort: outcome=STOPPED", result.outcome === "STOPPED");
+  check(
+    `L) durable-wait 중 abort: 실제 10초 durable-wait을 기다리지 않고 abort 시점(약 ${abortAfterMs}ms) 근처에서 종료됨`,
+    elapsedMs < 5_000
+  );
+
+  const liveness = inspectProjectRuntimeLiveness(manifest.projectId, manifest.targetProjectRoot);
+  check(
+    "L) durable-wait 중 abort: project lock을 release하지 않음(작업 중 상태 보존 — 기존 lockShouldRelease=false 원칙과 동일)",
+    liveness.present === true && liveness.pid === process.pid
+  );
+
+  const stateAfter = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "L) durable-wait 중 abort: project-state.json은 abort 직전 마지막으로 저장된 상태 그대로(WAITING_PROVIDER_RETRY) — 추가 저장 없음",
+    (stateAfter.status as unknown as string) === "WAITING_PROVIDER_RETRY"
+  );
+}
+
+async function scenarioNoAbortSignalBehavesExactlyAsBeforeRegression(): Promise<void> {
+  // TEST8 — abortSignal을 지정하지 않으면(모든 기존 호출부) 기존 동작과 완전히 동일하다.
+  // 이 파일의 나머지 246개 기존 시나리오가 이미 이 회귀를 증명하지만, 이 defect가 만든
+  // 새 코드 경로(previousAttemptResult 확장/hintParts 재구조화/orchestrator.ts
+  // sleepOrAbort)를 겨냥해 명시적으로 하나 더 확인한다 — PROTOCOL_ERROR는 여전히 정상적으로
+  // durable wait-then-retry를 거쳐 MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT에서 terminal
+  // BLOCKED로 끝나야 한다(§ Human Gate=0). TIMEOUT이 아니라 PROTOCOL_ERROR를 쓰는 이유는
+  // scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt와 동일 — TIMEOUT은
+  // runDeveloperTaskWithRetry의 실제 15s/30s quick-retry sleep(orchestratorDeps.sleep으로
+  // override 불가한 별도 계층)을 거쳐 이 테스트를 수 분 단위로 느리게 만든다.
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, { completedTasks: [] });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  const caller = makeAlwaysUnrecognizedProtocolCaller();
+  const result = await runAutodevOnce({
+    manifest,
+    developerClaudeCaller: caller.call,
+    orchestratorDeps: {
+      gptReviewer: fakePassReviewer(),
+      sleep: async () => {},
+      now: () => Date.now(),
+    },
+    // abortSignal 의도적으로 생략.
+  });
+
+  check("M) abortSignal 없음: PROTOCOL_ERROR가 여전히 durable wait 상한 초과로 terminal BLOCKED(회귀 없음)", result.outcome === "RAN_TASK_NOT_APPROVED");
+  const stateAfter = loadState(statePath);
+  check("M) abortSignal 없음: 최종 status=BLOCKED(Human Gate 아님, 기존과 동일)", (stateAfter.status as unknown as string) === "BLOCKED");
+  check("M) abortSignal 없음: Developer가 정상적으로 여러 차례 호출됨(abort로 조기 차단되지 않음)", caller.receivedInputs.length > 1);
+}
+
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -2744,6 +2863,9 @@ async function main(): Promise<void> {
     await scenarioCrossTaskMemoryReuseEndToEnd();
     await scenarioSameTaskDoesNotRepeatFailedStrategy();
     await scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt();
+    await scenarioAbortBeforeStartSkipsEverything();
+    await scenarioAbortDuringDurableWaitStopsQuicklyAndPreservesState();
+    await scenarioNoAbortSignalBehavesExactlyAsBeforeRegression();
 
     await scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper();
     await scenarioReviewStagnationBudgetPersistsAcrossRestart();

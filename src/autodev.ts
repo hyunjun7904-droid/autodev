@@ -404,6 +404,16 @@ export interface AutodevRunOptions {
    * 아니다).
    */
   lockOwnerKind?: ProjectLockOwnerKind;
+  /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+   *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 지정하면
+   *  이미 시작하기 전이면 lock acquire조차 하지 않고, 진행 중이면 durable-wait sleep(§
+   *  orchestrator.ts)과 Developer subprocess(§ subprocess-runner.ts)를 즉시 중단하고
+   *  outcome="STOPPED"로 반환한다. project-state.json은 중단 직전 마지막으로 저장된 내용
+   *  그대로 남고(§ orchestrator.ts stopped 주석), project lock은 release하지 않는다(§ 아래
+   *  lockShouldRelease=false — 기존 "작업 중 상태 보존" 원칙과 동일, 다음 writer는 기존
+   *  stale-PID 판정으로 안전하게 재획득한다). 지정하지 않으면 기존 동작과 완전히 동일(중단
+   *  불가). */
+  abortSignal?: AbortSignal;
 }
 
 export type AutodevRunOutcome =
@@ -622,6 +632,16 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   }
   const manifest = opts.manifest;
   validateProjectManifest(manifest);
+
+  // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+  // "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). lock
+  // acquire조차 시도하기 전에 이미 중단 요청이 들어와 있으면 아무 것도 시작하지 않는다 —
+  // project-state.json/lock 어느 쪽도 건드리지 않는다(§ 위 lock acquire 주석과 동일한 원칙:
+  // "이 경로에서는 아직 아무것도 만지지 않았다").
+  if (opts.abortSignal?.aborted) {
+    log("AutoDev 시작 전 중단 요청(abortSignal) 감지 — lock acquire도 시도하지 않고 즉시 종료");
+    return { outcome: "STOPPED", reason: "ABORTED: 시작 전 중단 요청" };
+  }
 
   const runId = opts.runId ?? randomUUID();
   const events = opts.events ?? selectDefaultEventStore();
@@ -1584,6 +1604,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // previousAttemptResult가 Developer 성공/Reviewer REVISE 결과일 때는 discoveryProgress가
         // 없으므로(undefined) 기존 동작과 동일하게 0/false부터 시작한다.
         priorDiscoveryProgress: previousAttemptResult?.discoveryProgress,
+        // § AutodevRunOptions.abortSignal 주석 — 그대로 전달한다(claude-developer.ts가
+        // subprocess-runner.ts까지 이어서 threading한다).
+        abortSignal: opts.abortSignal,
         // 테스트 전용(§ AutodevRunOptions.developerClaudeCaller) — 지정하지 않으면 undefined라
         // runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)이 그대로 쓰인다.
         claudeCaller: opts.developerClaudeCaller,
@@ -1636,6 +1659,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
               changeScopeDirs: manifest.reviewScopeDirs,
               executor: executorContext,
               memoryHint: memoryHint ? `${memoryHint}\n\n${secretHint}` : secretHint,
+              abortSignal: opts.abortSignal,
               claudeCaller: opts.developerClaudeCaller,
               onRoundStart: (round, maxRounds, stage) => roundStatusReporter.report({ runId, taskId: taskDef.id, round, maxRounds, stage }),
               onContextMetrics: emitDeveloperContextMetrics,
@@ -1740,8 +1764,21 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       runId,
       taskId: taskDef.id,
       projectId: manifest.projectId,
+      abortSignal: opts.abortSignal,
       ...opts.orchestratorDeps,
     });
+    // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). orchestrator.ts가
+    // durable-wait 중 또는 Developer 호출 결과(errorCode="ABORTED")로 중단됐다면, checkpoint/
+    // Reviewer 판정 어느 쪽도 진행하지 않고 즉시 반환한다 — saveState를 호출하지 않으므로
+    // project-state.json은 orchestrator.ts가 마지막으로 이미 저장한 내용 그대로다(§
+    // orchestrator.ts stopped 주석). 작업 중 상태를 보존하는 기존 원칙과 동일하게 lock도
+    // release하지 않는다(§ lockShouldRelease 기본값 true를 명시적으로 false로 뒤집는다 —
+    // 다음 writer는 기존 stale-PID 판정으로 안전하게 재획득한다).
+    if (orchestratorResult.stopped) {
+      log("orchestrator 중단(ABORTED)됨 — checkpoint/Reviewer 판정 생략, lock 유지, project-state 추가 저장 없음", { taskId: taskDef.id });
+      lockShouldRelease = false;
+      return { outcome: "STOPPED", taskId: taskDef.id, reason: "ABORTED: Developer/durable-wait 중 중단 요청으로 정상 종료" };
+    }
     finalState = orchestratorResult.finalState;
   }
 

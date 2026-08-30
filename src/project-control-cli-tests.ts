@@ -5,6 +5,7 @@ import {
   parseArg,
   getProjectControlStatus,
   formatProjectControlStatus,
+  decideStopAction,
 } from "./project-control-cli";
 import { engageMaintenancePause, clearMaintenancePause, runnerSupervisorLockFilePath } from "./runner-supervisor";
 import type { ProjectManifest } from "./project-manifest";
@@ -152,11 +153,45 @@ function scenarioProjectLockStatusVariants(): void {
   }
 }
 
+// AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+// "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). decideStopAction
+// 은 순수 함수라(실제 마커 파일을 쓰지 않는다) 여기서 그 판정 로직 자체만 검증한다 — 실제
+// 마커 write/polling/abort 연쇄는 run-tests.ts가, 그 abort가 orchestrator.ts/autodev.ts에
+// 실제로 반영되는지는 autodev-tests.ts(K/L/M 시나리오)가 각각 담당한다(중복 검증 없음).
+function scenarioDecideStopAction(): void {
+  check(
+    "stop: project lock이 없으면 NO_TARGET",
+    decideStopAction({ present: false }).action === "NO_TARGET"
+  );
+  check(
+    "stop: liveness가 STALE이면 NO_TARGET(보낼 대상 없음, stale-PID 판정에 맡김)",
+    decideStopAction({ present: true, pid: 111, ownerKind: "autodev", liveness: { verdict: "STALE", evidence: "PID_NOT_RUNNING" } }).action ===
+      "NO_TARGET"
+  );
+  check(
+    "stop: liveness가 UNCERTAIN이면 NO_TARGET(확인 못 함을 중단 대상으로 추측하지 않음)",
+    decideStopAction({ present: true, pid: 111, ownerKind: "autodev", liveness: { verdict: "UNCERTAIN", reason: "권한 없음" } }).action ===
+      "NO_TARGET"
+  );
+  check(
+    "stop: ownerKind가 autodev가 아니면(local-human-approval) REFUSED — 추측해서 건드리지 않음",
+    decideStopAction({ present: true, pid: 111, ownerKind: "local-human-approval", liveness: { verdict: "ALIVE" } }).action === "REFUSED"
+  );
+  check(
+    "stop: ownerKind가 autodev가 아니면(telegram-resume) REFUSED",
+    decideStopAction({ present: true, pid: 111, ownerKind: "telegram-resume", liveness: { verdict: "ALIVE" } }).action === "REFUSED"
+  );
+  const ok = decideStopAction({ present: true, pid: 999, ownerKind: "autodev", liveness: { verdict: "ALIVE" } });
+  check("stop: ownerKind=autodev + liveness=ALIVE면 REQUEST_STOP", ok.action === "REQUEST_STOP");
+  check("stop: REQUEST_STOP은 실제 project lock owner pid를 그대로 담음", ok.action === "REQUEST_STOP" && ok.pid === 999);
+}
+
 function main(): void {
   scenarioParseArg();
   scenarioMaintenancePauseReflectedInStatus();
   scenarioSupervisorLockReflectedInStatus();
   scenarioProjectLockStatusVariants();
+  scenarioDecideStopAction();
 
   console.log("\n=== project-control-cli 테스트 결과 ===");
   for (const r of results) console.log(r);

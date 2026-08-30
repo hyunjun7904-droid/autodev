@@ -17,6 +17,12 @@ import { spawn } from "node:child_process";
 // claude-developer.ts(callClaude)는 이 함수를 항상 이미 신뢰가 확인된 command로만 호출한다.
 export interface SubprocessOutcome {
   timedOut: boolean;
+  /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). true면 timeout이 아니라
+   *  호출부가 넘긴 abortSignal이 발동해 child를 종료했다는 뜻이다 — timedOut과 배타적이며
+   *  분류(§ claude-runner.ts classifySubprocessOutcome)에서 반드시 timedOut보다 먼저
+   *  확인해야 한다(둘 다 SIGKILL로 이어지지만 "의도된 정상 중단"과 "진짜 timeout"은 재시도
+   *  정책이 완전히 다르다 — abort는 절대 재시도 대상이 아니다). */
+  aborted?: boolean;
   code: number | null;
   stdout: string;
   stderr: string;
@@ -47,7 +53,13 @@ export function runSubprocessWithTimeout(
   args: string[],
   timeoutMs: number,
   stdinInput?: string,
-  cwd?: string
+  cwd?: string,
+  /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
+   *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 발동되면
+   *  timeout과 동일하게 child를 SIGKILL로 종료하지만(§ 이 파일이 이미 갖고 있던 유일한 종료
+   *  수단을 재사용 — 새 종료 경로를 만들지 않는다), outcome.aborted=true로 timeout과
+   *  구분한다. */
+  abortSignal?: AbortSignal
 ): Promise<SubprocessOutcome> {
   return new Promise((resolve) => {
     let child;
@@ -70,16 +82,28 @@ export function runSubprocessWithTimeout(
     let stderr = "";
     let settled = false;
     let timedOut = false;
+    let aborted = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
 
+    const onAbort = (): void => {
+      if (settled) return;
+      aborted = true;
+      child.kill("SIGKILL");
+    };
+    if (abortSignal) {
+      if (abortSignal.aborted) onAbort();
+      else abortSignal.addEventListener("abort", onAbort, { once: true });
+    }
+
     child.on("error", (err: NodeJS.ErrnoException) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       resolve({ timedOut: false, code: null, stdout, stderr, spawnErrorCode: err.code, spawnErrorMessage: err.message });
     });
 
@@ -94,7 +118,8 @@ export function runSubprocessWithTimeout(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ timedOut, code, stdout, stderr });
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
+      resolve({ timedOut, aborted, code, stdout, stderr });
     });
   });
 }
