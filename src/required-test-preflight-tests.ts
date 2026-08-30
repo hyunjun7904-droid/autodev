@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -8,6 +8,7 @@ import {
   validateRequiredTestRegistrationRequest,
   registerValidatedRequiredTestScripts,
   checkRequiredTestExecutionEnvironment,
+  evaluateGreenfieldDefer,
   reconcileStaleRequiredTestExecutionEnvironmentTasks,
 } from "./required-test-preflight";
 import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
@@ -15,6 +16,9 @@ import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
   results.push(`[${cond ? "PASS" : "FAIL"}] ${label}`);
+}
+function skip(label: string): void {
+  results.push(`[SKIP] ${label}`);
 }
 
 function makeProjectRoot(pkgScripts: Record<string, string>): string {
@@ -632,7 +636,7 @@ function scenarioRootCwdWithNonGradleCommandOk(): void {
   const root = makeExecutionEnvRoot();
   try {
     const rt: RequiredTestCommand = { name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), [], POSIX_OVERRIDE);
     check("L) cwd:root + 비-gradle command는 항상 ok=true(디렉터리는 항상 존재)", result.ok === true && result.issues.length === 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -642,11 +646,19 @@ function scenarioRootCwdWithNonGradleCommandOk(): void {
 function scenarioAliasedCwdDirectoryMissingFlagged(): void {
   const root = makeExecutionEnvRoot();
   try {
+    // greenfield defer(§ evaluateGreenfieldDefer)는 alias 대상이 현재 Task의
+    // allowedPathPrefixes 안에 있을 때만 적용된다 — 여기서는 의도적으로 allowedPathPrefixes를
+    // 다른 경로("frontend/")로 둬서 "backend"가 scope 밖임을 재현한다: 여전히 즉시 BLOCK되어야
+    // 한다(TEST 4 — greenfield scope 밖은 defer하지 않는다).
     const rt: RequiredTestCommand = { name: "backend-unit", command: "npm", args: ["run", "test:backend"], cwd: "backend" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { backend: "backend" }), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { backend: "backend" }), ["frontend/"], POSIX_OVERRIDE);
     check(
-      "L) alias가 가리키는 디렉터리가 실제로 없으면 CWD_NOT_FOUND",
-      result.ok === false && result.issues.length === 1 && result.issues[0].kind === "CWD_NOT_FOUND" && result.issues[0].requiredTestName === "backend-unit"
+      "L) alias가 가리키는 디렉터리가 실제로 없고 Task의 allowedPathPrefixes 밖이면 CWD_NOT_FOUND(defer 안 함)",
+      result.ok === false &&
+        result.issues.length === 1 &&
+        result.issues[0].kind === "CWD_NOT_FOUND" &&
+        result.issues[0].requiredTestName === "backend-unit" &&
+        result.deferredGreenfield.length === 0
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -657,7 +669,7 @@ function scenarioUndefinedAliasKeySkipped(): void {
   const root = makeExecutionEnvRoot();
   try {
     const rt: RequiredTestCommand = { name: "x", command: "npm", args: ["run", "test:x"], cwd: "no-such-alias" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, {}), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, {}), [], POSIX_OVERRIDE);
     check(
       "L) commandCwdAliases에 없는 alias 키는 이 함수의 대상이 아니므로 조용히 skip(ok=true) — execution-contract.ts의 몫",
       result.ok === true && result.issues.length === 0
@@ -673,7 +685,7 @@ function scenarioGradlewAtRootWithoutWrapperFlagged(): void {
   const root = makeExecutionEnvRoot();
   try {
     const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), [], POSIX_OVERRIDE);
     check(
       "L) cwd:root인데 projectRoot에 gradlew wrapper가 없으면 WRAPPER_NOT_FOUND(JARVIS Task 5.2 재현)",
       result.ok === false && result.issues.length === 1 && result.issues[0].kind === "WRAPPER_NOT_FOUND"
@@ -688,8 +700,11 @@ function scenarioGradlewWithCorrectAliasPasses(): void {
   try {
     makeGradleModule(join(root, "android", "wakeword"));
     const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
-    check("L) alias가 실제 wrapper가 있는 디렉터리를 정확히 가리키면 ok=true(올바른 설정 — 회귀 방지)", result.ok === true && result.issues.length === 0);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root, { wakeword: "android/wakeword" }), ["android/wakeword/"], POSIX_OVERRIDE);
+    check(
+      "L/TEST10) 기존 wakeword path 계약 회귀 없음 — alias가 실제 wrapper가 있는 디렉터리를 정확히 가리키면 ok=true(deferredGreenfield도 비어있음)",
+      result.ok === true && result.issues.length === 0 && result.deferredGreenfield.length === 0
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -699,7 +714,7 @@ function scenarioGradlewBatVariantRecognized(): void {
   const root = makeExecutionEnvRoot();
   try {
     const rt: RequiredTestCommand = { name: "wakeword-unit", command: "gradlew.bat", args: ["testDebugUnitTest"], cwd: "root" };
-    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment([rt], makeExecutor(root), [], POSIX_OVERRIDE);
     check(
       "L) command이 gradlew.bat(Windows 표기)이어도 동일하게 wrapper 검증 대상(정규화)",
       result.ok === false && result.issues[0].kind === "WRAPPER_NOT_FOUND"
@@ -717,7 +732,7 @@ function scenarioNonAndroidProjectUnaffected(): void {
       { name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" },
       { name: "typecheck", command: "npx", args: ["tsc", "--noEmit"], cwd: "root" },
     ];
-    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root), [], POSIX_OVERRIDE);
     check("L) gradlew가 없는 일반 Node 프로젝트는 항상 ok=true(회귀 없음)", result.ok === true && result.issues.length === 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -734,10 +749,171 @@ function scenarioJarvisShapedFixtureSanitized(): void {
     const rts: RequiredTestCommand[] = [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" }];
     // 실제 JARVIS execution-policy.json은 backend 별칭만 갖고 있었고 wakeword 별칭이 없었다 —
     // wrapper 자신은 android/wakeword/에 실제로 존재하지만 requiredTest는 그걸 가리키지 않는다.
-    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root, { backend: "backend" }), POSIX_OVERRIDE);
+    const result = checkRequiredTestExecutionEnvironment(rts, makeExecutor(root, { backend: "backend" }), [], POSIX_OVERRIDE);
     check(
       "L) JARVIS Task 5.2 sanitized fixture — Developer를 부르기 전에 결정론적으로 감지됨",
       result.ok === false && result.issues.length === 1 && result.issues[0].kind === "WRAPPER_NOT_FOUND" && result.issues[0].requiredTestName === "wakeword-unit"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// N) Greenfield Required-Test Preflight Deadlock 수정(2026-08-30, JARVIS Task 5.3 실측) —
+//    evaluateGreenfieldDefer()/checkRequiredTestExecutionEnvironment()의 새 allowedPathPrefixes
+//    defer 경계. TEST1/TEST4/TEST10은 위 L 섹션에서 기존 시나리오를 그대로/조정해 재사용한다
+//    (scenarioGradlewWithCorrectAliasPasses=TEST1+TEST10, scenarioAliasedCwdDirectoryMissingFlagged=TEST4).
+// ---------------------------------------------------------------------------
+
+function scenarioExistingModuleWrapperMissingStaysStrictBlock(): void {
+  // TEST2 — 기존 cwd(디렉터리는 실제로 존재)인데 wrapper가 없으면, 그 경로가 현재 Task의
+  // allowedPathPrefixes 안에 있어도(=greenfield defer 조건 나머지를 전부 만족해도) 절대
+  // defer하지 않는다 — greenfield defer는 오직 ENOENT(정말로 아직 없음)에만 적용되고,
+  // "존재하는데 환경이 깨짐"은 항상 즉시 BLOCK이어야 한다(§ 요구사항 4-A).
+  const root = makeExecutionEnvRoot();
+  try {
+    mkdirSync(join(root, "android", "conversation"), { recursive: true }); // wrapper 없이 디렉터리만 존재
+    const rt: RequiredTestCommand = { name: "voice-conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" };
+    const result = checkRequiredTestExecutionEnvironment(
+      [rt],
+      makeExecutor(root, { conversation: "android/conversation" }),
+      ["android/conversation/"],
+      POSIX_OVERRIDE
+    );
+    check(
+      "N/TEST2) 기존 module 디렉터리인데 wrapper가 없으면 allowedPathPrefixes 안에 있어도 항상 WRAPPER_NOT_FOUND(defer 안 함)",
+      result.ok === false &&
+        result.issues.length === 1 &&
+        result.issues[0].kind === "WRAPPER_NOT_FOUND" &&
+        result.deferredGreenfield.length === 0
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioGreenfieldCwdInScopeDefersAndUnblocksDeveloper(): void {
+  // TEST3 — 핵심 수정: 신규 greenfield cwd가 아직 없어도(ENOENT) 현재 Task의
+  // allowedPathPrefixes 안이면 CWD_NOT_FOUND로 차단하지 않는다(ok:true) — Developer 호출이
+  // 실제로 진행될 수 있어야 한다. deferredGreenfield에 정확히 이 항목이 기록된다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "voice-conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" };
+    const result = checkRequiredTestExecutionEnvironment(
+      [rt],
+      makeExecutor(root, { conversation: "android/conversation" }),
+      ["android/conversation/"],
+      POSIX_OVERRIDE
+    );
+    check(
+      "N/TEST3) greenfield cwd 미존재 + allowedPathPrefixes 안 → 차단하지 않음(ok=true), deferredGreenfield에 기록됨",
+      result.ok === true &&
+        result.issues.length === 0 &&
+        result.deferredGreenfield.length === 1 &&
+        result.deferredGreenfield[0].requiredTestName === "voice-conversation-unit" &&
+        result.deferredGreenfield[0].cwd === "conversation"
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioGreenfieldRootCwdNeverDeferred(): void {
+  // TEST3 경계 — "root" 자체는 project root이므로 절대 defer 대상이 아니다(§ evaluateGreenfieldDefer
+  // 조건 1). project root는 executor가 이미 mkdtempSync로 만든 실제 디렉터리라 이 케이스는
+  // 원천적으로 ENOENT가 될 수 없지만, 그 불변식을 evaluateGreenfieldDefer 자체로도 직접 확인한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "x", command: "gradlew", args: ["testDebugUnitTest"], cwd: "root" };
+    const deferred = evaluateGreenfieldDefer(rt, root, "ENOENT", makeExecutor(root), ["anything/"]);
+    check("N/TEST3-경계) cwd:root는 ENOENT가 나더라도 evaluateGreenfieldDefer가 항상 false", deferred === false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioPathTraversalOrSymlinkEscapeBlocked(): void {
+  // TEST5 — greenfield 대상의 조상 경로에 project root 밖을 가리키는 symlink/junction이
+  // 있으면, 그 defer 조건(4/5)이 전부 구조적으로는 충족돼 보여도 항상 BLOCK한다(§
+  // project-bootstrap.ts assertNoSymlinkInChain 재사용). junction 생성이 지원되지 않는
+  // 환경(관리자 권한/개발자 모드 미설정)에서는 SKIP으로 명시한다(§ filesystem-trust-model.md
+  // 동일 원칙).
+  const root = makeExecutionEnvRoot();
+  const outsideDir = makeExecutionEnvRoot();
+  try {
+    const linkPath = join(root, "android");
+    let created = false;
+    try {
+      symlinkSync(outsideDir, linkPath, "junction");
+      created = true;
+    } catch {
+      // 이 Node/OS 조합에서 junction 생성이 지원되지 않을 수 있다.
+    }
+    if (!created) {
+      skip("N/TEST5) path traversal/symlink escape — 이 환경에서 junction 생성이 지원되지 않아 건너뜀");
+      return;
+    }
+    const rt: RequiredTestCommand = { name: "voice-conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" };
+    const result = checkRequiredTestExecutionEnvironment(
+      [rt],
+      makeExecutor(root, { conversation: "android/conversation" }),
+      ["android/conversation/"],
+      POSIX_OVERRIDE
+    );
+    check(
+      "N/TEST5) greenfield 조상 경로가 project root 밖을 가리키는 symlink/junction이면 defer하지 않고 BLOCK",
+      result.ok === false && result.issues.length === 1 && result.issues[0].kind === "CWD_NOT_FOUND" && result.deferredGreenfield.length === 0
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+}
+
+function scenarioDeveloperCreatedGreenfieldArtifactsThenGreen(): void {
+  // TEST6 — Developer가 실제로 greenfield cwd와 wrapper를 만든 뒤 동일한 preflight를 다시
+  // 실행하면(§ autodev.ts는 매 attempt/재시작마다 이 함수를 다시 호출한다) 더 이상 defer가
+  // 아니라 일반 경로로 ok:true다 — GREEN이 실제로 가능해진다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "voice-conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" };
+    const executor = makeExecutor(root, { conversation: "android/conversation" });
+    const before = checkRequiredTestExecutionEnvironment([rt], executor, ["android/conversation/"], POSIX_OVERRIDE);
+    check("N/TEST6-사전) Developer 호출 전에는 defer 상태(ok=true, deferredGreenfield 1건)", before.ok === true && before.deferredGreenfield.length === 1);
+
+    makeGradleModule(join(root, "android", "conversation")); // Developer가 실제로 만든 것을 재현
+    const after = checkRequiredTestExecutionEnvironment([rt], executor, ["android/conversation/"], POSIX_OVERRIDE);
+    check(
+      "N/TEST6) Developer가 greenfield cwd+wrapper를 만든 뒤에는 defer가 아니라 일반 경로로 ok=true(GREEN 가능)",
+      after.ok === true && after.issues.length === 0 && after.deferredGreenfield.length === 0
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioRepeatedCallsPureAndDeterministic(): void {
+  // TEST9 — 이 함수 자신은 Developer/네트워크 어떤 호출도 하지 않는 순수 fs 판정이다(§ 함수
+  // 상단 주석 — checkRequiredTestScriptRegistration과 동일한 설계). process restart로 이
+  // 경로가 반복 실행돼도(§ runner-supervisor.ts backoff) 이 함수 자체가 부수효과로 Developer/
+  // API 호출을 만들 방법이 없다는 것을, "같은 입력 → 같은 결과"(순수성) + "호출 자체가
+  // 디렉터리를 만들지 않음"(부수효과 없음)으로 직접 증명한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const rt: RequiredTestCommand = { name: "voice-conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" };
+    const executor = makeExecutor(root, { conversation: "android/conversation" });
+    const first = checkRequiredTestExecutionEnvironment([rt], executor, ["android/conversation/"], POSIX_OVERRIDE);
+    const second = checkRequiredTestExecutionEnvironment([rt], executor, ["android/conversation/"], POSIX_OVERRIDE);
+    check(
+      "N/TEST9) 반복 호출은 결정론적으로 동일한 결과를 낸다(같은 입력 → 같은 defer 판정)",
+      first.ok === second.ok &&
+        first.deferredGreenfield.length === second.deferredGreenfield.length &&
+        JSON.stringify(first) === JSON.stringify(second)
+    );
+    check(
+      "N/TEST9) defer 판정 자체는 디렉터리를 생성하는 부수효과가 없다(여전히 존재하지 않음)",
+      !existsSync(join(root, "android", "conversation"))
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -929,6 +1105,13 @@ function main(): void {
   scenarioNonAndroidProjectUnaffected();
   scenarioJarvisShapedFixtureSanitized();
 
+  scenarioExistingModuleWrapperMissingStaysStrictBlock();
+  scenarioGreenfieldCwdInScopeDefersAndUnblocksDeveloper();
+  scenarioGreenfieldRootCwdNeverDeferred();
+  scenarioPathTraversalOrSymlinkEscapeBlocked();
+  scenarioDeveloperCreatedGreenfieldArtifactsThenGreen();
+  scenarioRepeatedCallsPureAndDeterministic();
+
   scenarioEnvReconcileResolvedWhenWrapperNowPresent();
   scenarioEnvReconcileNotResolvedWhenStillMissing();
   scenarioEnvReconcileFailClosedOnUnrelatedGenuineReason();
@@ -940,7 +1123,9 @@ function main(): void {
   console.log("\n=== required-test-preflight 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;
-  console.log(`\n총 ${results.length}건, PASS ${passCount}, FAIL ${results.length - passCount}`);
+  const skipCount = results.filter((r) => r.startsWith("[SKIP]")).length;
+  const failCount = results.length - passCount - skipCount;
+  console.log(`\n총 ${results.length}건, PASS ${passCount}, SKIP ${skipCount}, FAIL ${failCount}`);
   if (results.some((r) => r.startsWith("[FAIL]"))) process.exitCode = 1;
 }
 

@@ -1149,7 +1149,13 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 호출부, status==="BLOCKED"도 함께 확인하도록 확장)가 매 재시작마다 이 결함이 여전히
     // 재현되는지 deterministic하게 다시 확인해, 해소되면 사람의 명시적 APPROVE 없이도 자동으로
     // READY로 되돌린다.
-    const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext);
+    const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext, taskDef.allowedPathPrefixes);
+    if (executionEnvironmentPreflight.deferredGreenfield.length > 0) {
+      log("REQUIRED_TEST_EXECUTION_ENVIRONMENT greenfield defer 적용 — Developer 호출 전 차단하지 않음", {
+        taskId: taskDef.id,
+        deferredGreenfield: executionEnvironmentPreflight.deferredGreenfield,
+      });
+    }
     if (!executionEnvironmentPreflight.ok) {
       const detail = executionEnvironmentPreflight.issues
         .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath} reason=${i.reason ?? ""}`)
@@ -1430,7 +1436,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           // LOCAL_ROOT_CAUSE_MODE는 결정론적으로 재확인 가능한 execution-environment
           // 카테고리만 다룬다(§ 요구사항 — 추측으로 "변화 없음"을 판정하지 않는다).
           if (repeatCount >= MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS) {
-            const envRecheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext);
+            const envRecheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext, taskDef.allowedPathPrefixes);
             if (!envRecheck.ok) {
               const detail = envRecheck.issues
                 .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath}`)

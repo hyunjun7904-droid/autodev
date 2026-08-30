@@ -8,6 +8,8 @@ import { log } from "./logger";
 import { scanContentForSecrets } from "./secret-scanner";
 import { resolveTrustedGradleWrapper } from "./gradle-capability";
 import type { GradleWrapperResolveTestDeps } from "./gradle-capability";
+import { isPathInScope } from "./git-changes";
+import { assertNoSymlinkInChain } from "./project-bootstrap";
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening — Phase 3/4.
 //
@@ -162,9 +164,21 @@ export interface RequiredTestExecutionEnvironmentIssue {
   reason?: string;
 }
 
+/** greenfield defer(§ evaluateGreenfieldDefer)가 적용된 required test — 차단하지 않았지만
+ *  Developer 호출 전 시점에는 아직 실제로 존재하지 않는 대상이라는 뜻이다. issues와 달리
+ *  ok:true에 포함되며, 순수 관찰/로그용이다(호출부가 이 값으로 무언가를 추가로 막거나
+ *  허용하지 않는다). */
+export interface GreenfieldDeferredRequiredTest {
+  requiredTestName: string;
+  cwd: string;
+  resolvedPath: string;
+}
+
 export interface RequiredTestExecutionEnvironmentResult {
   ok: boolean;
   issues: RequiredTestExecutionEnvironmentIssue[];
+  /** § GreenfieldDeferredRequiredTest 주석. */
+  deferredGreenfield: GreenfieldDeferredRequiredTest[];
 }
 
 /** execution-contract.ts의 validateRequiredTestExecutionContract()가 이미 검증한 것과
@@ -189,23 +203,73 @@ function normalizeWrapperExecutableBase(command: string): string {
  *  함수가 먼저 필요하다(이 목록에 이름만 추가한다고 검증이 생기지 않는다). */
 const WRAPPER_STYLE_EXECUTABLE_BASE_NAMES: ReadonlySet<string> = new Set(["gradlew"]);
 
+// Greenfield Required-Test Preflight Deadlock 수정(2026-08-30, JARVIS Task 5.3 실측 — §
+// .claude/CLAUDE.md 보안 섹션에 기록). 이 검사는 원래 두 종류를 구분하지 못했다: (A)
+// Developer 호출 전에 반드시 이미 존재해야 하는 실행환경(JDK/신뢰 executable/기존 project
+// root 등 — 계속 엄격히 차단해야 함)과 (B) 바로 이 Task 자신이 새로 만들어야 할 산출물(신규
+// module 디렉터리 등 — 아직 없다는 이유만으로 Developer 자체를 영구 차단하면 그 산출물을
+// 만들 기회 자체가 없다, § reassembleExecutionContract 등 어떤 재실행 경로로도 스스로
+// 해소되지 않는 deadlock). 아래 evaluateGreenfieldDefer()가 (B)를 구조적으로 안전하게
+// 확인된 경우에만 defer한다 — "cwd가 없으면 모두 허용"이 아니다: 5개 조건을 전부 만족해야
+// 하고, 이미 존재하는 대상(디렉터리가 아니거나 symlink인 경우)이나 WRAPPER_NOT_FOUND(디렉터리는
+// 있는데 wrapper가 없는 경우)는 이 defer 대상이 아니며 기존처럼 항상 즉시 BLOCK된다.
+/**
+ * Greenfield CWD_NOT_FOUND defer 자격 판정. 아래 전부를 만족해야 defer한다:
+ *   1) rt.cwd가 "root"가 아니다 — project root 자체는 "아직 안 만들어진 산출물"일 수 없다.
+ *   2) lstat 실패의 실제 원인이 ENOENT(정말로 아직 없음)다 — EACCES/EPERM 등 "확인하지
+ *      못함"은 fail-closed로 defer하지 않는다(§ project-bootstrap.ts assertNoSymlinkInChain과
+ *      동일한 원칙 — 확인 못 함을 "안전하다"로 취급하지 않는다).
+ *   3) alias 값이 정의돼 있다(이미 project-policy.ts validateProjectExecutionPolicy()가
+ *      "../"/절대경로를 거부한 안전한 상대경로임을 보장한다 — 단일 출처, 여기서 다시 파싱하지
+ *      않는다).
+ *   4) 그 alias가 가리키는 경로가 현재 Task의 allowedPathPrefixes(Developer의 실제 write
+ *      scope) 안에 있다 — git-changes.ts isPathInScope()를 그대로 재사용(로직 복제 없음,
+ *      checkpoint.ts/gpt-reviewer.ts와 동일한 구현을 공유).
+ *   5) resolvedPath부터 project root까지 조상 체인에 symlink/junction이 없다 —
+ *      project-bootstrap.ts assertNoSymlinkInChain()을 그대로 재사용(SI-3.5 로직 복제 없음).
+ *      아직 존재하지 않는 leaf 자신은 ENOENT로 통과되고, 실제로 존재하는 조상만 검사된다.
+ */
+export function evaluateGreenfieldDefer(
+  rt: RequiredTestCommand,
+  resolvedPath: string,
+  lstatErrorCode: string | undefined,
+  executor: RequiredTestExecutionEnvironmentExecutor,
+  allowedPathPrefixes: readonly string[]
+): boolean {
+  if (rt.cwd === "root") return false;
+  if (lstatErrorCode !== "ENOENT") return false;
+  const alias = executor.policy.commandCwdAliases?.[rt.cwd];
+  if (alias === undefined) return false;
+  const aliasNormalized = alias.replace(/\\/g, "/").replace(/\/+$/, "");
+  const aliasScopeCheck = `${aliasNormalized}/`;
+  if (!isPathInScope(aliasScopeCheck, [...allowedPathPrefixes])) return false;
+  const symlinkCheck = assertNoSymlinkInChain(resolvedPath, executor.projectRootReal);
+  if (!symlinkCheck.ok) return false;
+  return true;
+}
+
 /**
  * Claude Developer를 부르기 전에 호출한다. requiredTests 각각에 대해 cwd가 resolve하는
  * 절대경로가 실제로 존재하는 디렉터리인지 확인하고, wrapper-style executable이면 그
  * wrapper 파일 자체의 존재/신뢰도까지 확인한다(resolveTrustedGradleWrapper 재사용 — 로직
  * 복제 없음). alias 키 자체가 정의되지 않은 경우는 이 함수의 대상이 아니다(그 구조적 오류는
  * execution-contract.ts가 spec-planning 시점에 이미 차단한다) — 조용히 skip한다.
+ *
+ * allowedPathPrefixes는 이 requiredTests를 소유한 Task의 taskDef.allowedPathPrefixes를
+ * 그대로 넘긴다 — § evaluateGreenfieldDefer 조건 4.
  */
 export function checkRequiredTestExecutionEnvironment(
   requiredTests: RequiredTestCommand[] | undefined,
   executor: RequiredTestExecutionEnvironmentExecutor,
+  allowedPathPrefixes: readonly string[],
   /** 테스트 전용 — 지정하지 않으면 production과 완전히 동일(process.platform, 실제 fs/env)하게
    *  동작한다. resolveTrustedGradleWrapper()로 그대로 전달한다(로직 복제 없음) — Windows에서
    *  회귀 테스트가 JAVA_HOME 없이도 결정론적으로 동작하도록 platform을 고정할 수 있게 한다. */
   gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps }
 ): RequiredTestExecutionEnvironmentResult {
-  if (!requiredTests || requiredTests.length === 0) return { ok: true, issues: [] };
+  if (!requiredTests || requiredTests.length === 0) return { ok: true, issues: [], deferredGreenfield: [] };
   const issues: RequiredTestExecutionEnvironmentIssue[] = [];
+  const deferredGreenfield: GreenfieldDeferredRequiredTest[] = [];
 
   for (const rt of requiredTests) {
     let resolvedPath: string;
@@ -220,7 +284,12 @@ export function checkRequiredTestExecutionEnvironment(
     let st;
     try {
       st = lstatSync(resolvedPath);
-    } catch {
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (evaluateGreenfieldDefer(rt, resolvedPath, code, executor, allowedPathPrefixes)) {
+        deferredGreenfield.push({ requiredTestName: rt.name, cwd: rt.cwd, resolvedPath });
+        continue;
+      }
       issues.push({ requiredTestName: rt.name, kind: "CWD_NOT_FOUND", cwd: rt.cwd, resolvedPath, reason: "디렉터리가 존재하지 않습니다." });
       continue;
     }
@@ -250,7 +319,7 @@ export function checkRequiredTestExecutionEnvironment(
     }
   }
 
-  return { ok: issues.length === 0, issues };
+  return { ok: issues.length === 0, issues, deferredGreenfield };
 }
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
@@ -341,7 +410,7 @@ export function reconcileStaleRequiredTestExecutionEnvironmentTasks(
   if (taskId === undefined) return { resolved: false };
   const taskDef = findTaskById(taskRegistry, taskId);
   if (!taskDef) return { resolved: false };
-  const recheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executor, gradleTestOverrides);
+  const recheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executor, taskDef.allowedPathPrefixes, gradleTestOverrides);
   return { resolved: recheck.ok };
 }
 
