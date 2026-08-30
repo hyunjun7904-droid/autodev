@@ -2,7 +2,7 @@ import { relative, sep, join } from "node:path";
 import { loadState, saveState } from "./state";
 import { runOrchestrator } from "./orchestrator";
 import type { OrchestratorDeps } from "./orchestrator";
-import { runDeveloperTaskWithRetry } from "./claude-developer";
+import { runDeveloperTaskWithRetry, buildDiscoveryProgressRetryHint, buildNoWriteStrategyEscalationHint } from "./claude-developer";
 import type { DeveloperProjectContext, DeveloperTaskOptions, DeveloperContextMetrics } from "./claude-developer";
 import { reviewClaudeResult as realReviewClaudeResult } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
@@ -1568,18 +1568,27 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // discoveryOnlyRoundCount 자체의 이어받기는 claude-developer.ts
         // opts.priorDiscoveryProgress가 기계적으로 처리한다 — 이 hint는 그 기계적 처리를
         // Claude에게 텍스트로 설명해 왜 곧바로 구현으로 넘어가야 하는지 알려주는 역할만 한다.
+        // Progress Transfer Gap 재하드닝 — 이 텍스트는 claude-developer.ts의
+        // buildDiscoveryProgressRetryHint()와 완전히 동일한 단일 출처다(durable retry 간에는
+        // 이 파일이, 같은 durable attempt 안의 내부 transient retry 간에는
+        // runDeveloperTaskWithRetry()가 각각 호출한다 — 텍스트를 복제하지 않는다).
         if (previousAttemptResult.success === false && previousAttemptResult.discoveryProgress) {
-          const dp = previousAttemptResult.discoveryProgress;
-          if (dp.filesRead.length > 0 || dp.implementationLocked) {
-            hintParts.push(
-              `# AutoDev 안내(직전 시도 — discovery 이미 진행됨)\n` +
-                `직전 시도는 실패(${previousAttemptResult.errorCode ?? "알 수 없는 오류"})로 끝났지만, 그 전에 이미 다음 파일을 확인했습니다:\n` +
-                dp.filesRead.map((f) => `- ${f}`).join("\n") +
-                (dp.implementationLocked
-                  ? "\n\ndiscovery 예산이 이미 소진된 상태였습니다 — 다시 조사부터 반복하지 말고 곧바로 구현(WRITE_FILE/APPLY_PATCH)을 시작하세요. 위 파일 내용을 다시 확인해야 한다면 최소한만 다시 읽으세요."
-                  : "\n\n이미 확인한 내용을 바탕으로 불필요한 재조사를 최소화하고 남은 구현으로 빠르게 진행하세요.")
-            );
-          }
+          const discoveryHint = buildDiscoveryProgressRetryHint(
+            previousAttemptResult.discoveryProgress,
+            previousAttemptResult.errorCode
+          );
+          if (discoveryHint) hintParts.push(discoveryHint);
+        }
+
+        // AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝
+        // (2026-08-31, JARVIS Task 5.3 실측). previousAttemptResult.noWriteRepeatCount는
+        // runDeveloperTaskWithRetry()가 durable하게 이어받아 계산한 값을 그대로 담고 있다 —
+        // 이 durable retry가 새로 시작하는 첫 라운드부터(내부 sub-attempt 1이 시작되기
+        // 전부터) 같은 안내를 보여준다. 텍스트 자체는 claude-developer.ts의
+        // buildNoWriteStrategyEscalationHint()와 완전히 동일한 단일 출처다.
+        if (previousAttemptResult.success === false && (previousAttemptResult.noWriteRepeatCount ?? 0) >= 2) {
+          const strategyHint = buildNoWriteStrategyEscalationHint(previousAttemptResult.noWriteRepeatCount ?? 0);
+          if (strategyHint) hintParts.push(strategyHint);
         }
         }
 
@@ -1604,6 +1613,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // previousAttemptResult가 Developer 성공/Reviewer REVISE 결과일 때는 discoveryProgress가
         // 없으므로(undefined) 기존 동작과 동일하게 0/false부터 시작한다.
         priorDiscoveryProgress: previousAttemptResult?.discoveryProgress,
+        // AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝
+        // (2026-08-31, JARVIS Task 5.3 실측). durable하게 이어받은 "WRITE 없이 연속 실패한
+        // 횟수"를 이 durable attempt의 내부 transient retry 루프가 이어서 계산하게 한다(§
+        // claude-developer.ts opts.priorNoWriteRepeatCount).
+        priorNoWriteRepeatCount: previousAttemptResult?.noWriteRepeatCount,
         // § AutodevRunOptions.abortSignal 주석 — 그대로 전달한다(claude-developer.ts가
         // subprocess-runner.ts까지 이어서 threading한다).
         abortSignal: opts.abortSignal,
@@ -1836,13 +1850,31 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     if (failedClaudeResult && failedClaudeResult.success === false && (failedClaudeResult.errorCode === "TIMEOUT" || failedClaudeResult.errorCode === "CLI_NOT_FOUND")) {
       const durable = loadDurableFailureStateForTask(state, taskDef.id);
       const providerTimeoutCount = durable.providerTimeoutCount + 1;
+      // AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31,
+      // JARVIS Task 5.3 실측). runDeveloperTaskWithRetry()가 이미 이 durable attempt 안의
+      // 내부 3회 재시도에 걸쳐 이어서 계산한 noWriteRepeatCount를 그대로 이어받는다(이 값이
+      // 없으면 — 예: 오래된 코드 경로/테스트 — durable.noWriteRepeatCount에 1만 더해
+      // 안전하게 degrade한다). 실제 WRITE가 있었으면(changedFiles.length>0) 즉시 0으로
+      // 리셋한다 — providerTimeoutCount와 달리 이 값은 "몇 번째 실패인지"가 아니라 "지금도
+      // 여전히 진척이 없는지"를 나타내야 하기 때문이다.
+      const noWriteRepeatCount =
+        failedClaudeResult.changedFiles.length > 0
+          ? 0
+          : (failedClaudeResult.noWriteRepeatCount ?? (durable.noWriteRepeatCount ?? 0) + 1);
       const afterProviderTimeout = loadState(statePath);
-      afterProviderTimeout.technicalRecoveryState = { ...durable, providerTimeoutCount, lastRecoveryAction: `PROVIDER_ERROR(${failedClaudeResult.errorCode})`, updatedAt: new Date().toISOString() };
+      afterProviderTimeout.technicalRecoveryState = {
+        ...durable,
+        providerTimeoutCount,
+        noWriteRepeatCount,
+        lastRecoveryAction: `PROVIDER_ERROR(${failedClaudeResult.errorCode})`,
+        updatedAt: new Date().toISOString(),
+      };
       saveState(afterProviderTimeout, statePath);
       log("PROVIDER_ERROR — Developer 호출이 재시도 소진 후에도 실패(durable 카운트 갱신)", {
         taskId: taskDef.id,
         errorCode: failedClaudeResult.errorCode,
         providerTimeoutCount,
+        noWriteRepeatCount,
       });
     }
 

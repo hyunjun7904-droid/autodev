@@ -105,6 +105,55 @@ export interface DeveloperDiscoveryProgress {
   lastRoundReached: number;
 }
 
+/** AutoDev Core Maintenance — Progress Transfer Gap 재하드닝(2026-08-31, JARVIS Task 5.3
+ *  실측: 같은 durable attempt 안의 3회 내부 transient retry가 모두 discovery를 처음부터
+ *  반복한 확정 원인). discoveryProgress를 사람이 읽는 안내 문구로 바꾸는 유일한 변환
+ *  지점이다 — durable retry 간(autodev.ts, cross-process/cross-durable-wait)과 내부
+ *  transient retry 간(이 파일 runDeveloperTaskWithRetry, 같은 durable attempt 안의 최대
+ *  3회 재시도) 둘 다 이 함수 하나만 재사용한다(텍스트를 두 곳에 복제하지 않는다).
+ *  filesRead가 비어있고 아직 잠기지도 않았으면 전달할 내용이 없으므로 undefined를
+ *  반환한다(기존과 동일하게 힌트를 추가하지 않는다). */
+export function buildDiscoveryProgressRetryHint(
+  discoveryProgress: DeveloperDiscoveryProgress,
+  errorCode: string | undefined
+): string | undefined {
+  if (discoveryProgress.filesRead.length === 0 && !discoveryProgress.implementationLocked) return undefined;
+  return (
+    `# AutoDev 안내(직전 시도 — discovery 이미 진행됨)\n` +
+    `직전 시도는 실패(${errorCode ?? "알 수 없는 오류"})로 끝났지만, 그 전에 이미 다음 파일을 확인했습니다:\n` +
+    discoveryProgress.filesRead.map((f) => `- ${f}`).join("\n") +
+    (discoveryProgress.implementationLocked
+      ? "\n\ndiscovery 예산이 이미 소진된 상태였습니다 — 다시 조사부터 반복하지 말고 곧바로 구현(WRITE_FILE/APPLY_PATCH)을 시작하세요. 위 파일 내용을 다시 확인해야 한다면 최소한만 다시 읽으세요."
+      : "\n\n이미 확인한 내용을 바탕으로 불필요한 재조사를 최소화하고 남은 구현으로 빠르게 진행하세요.")
+  );
+}
+
+// AutoDev Core Maintenance — TIMEOUT-only/WRITE-zero 전략 사각지대 재하드닝(2026-08-31,
+// JARVIS Task 5.3 실측 — 3회 연속 TIMEOUT 모두 changedFiles:[] 였는데도 기존
+// problem-memory/failure-stagnation(buildEscalationGuidance)은 required-test fingerprint
+// (tests[])에만 반응해 전혀 관여하지 않았음이 포렌식으로 확정됨). 이 함수는 그 required
+// test 이전 단계 전용 최소 escalation 문구를 만든다 — buildEscalationGuidance()와 동일한
+// "반복할수록 문구가 강해진다"는 원칙을 재사용하되, 판단 기준은 required test fingerprint가
+// 아니라 "WRITE 없이 연속 실패한 횟수"(consecutiveNoWriteFailures) 하나뿐이다(새로운 scoring
+// subsystem 없음). 1회는 정상적인 초기 discovery로 보고 안내하지 않는다.
+export function buildNoWriteStrategyEscalationHint(consecutiveNoWriteFailures: number): string | undefined {
+  if (consecutiveNoWriteFailures < 2) return undefined;
+  if (consecutiveNoWriteFailures === 2) {
+    return (
+      "# AutoDev 안내(WRITE 없이 2회 연속 실패 — 전략 전환)\n" +
+      "이 task는 지난 2번의 시도 모두 실제 코드 변경(WRITE_FILE/APPLY_PATCH) 없이 끝났습니다. " +
+      "같은 범위를 넓게 다시 탐색하지 마세요 — 지금까지 확인한 정보만으로 바로 구현을 시작하거나, " +
+      "정말 필요한 파일 한두 개만 targeted로 확인한 뒤 곧바로 WRITE_FILE/APPLY_PATCH로 진행하세요."
+    );
+  }
+  return (
+    `# AutoDev 안내(WRITE 없이 ${consecutiveNoWriteFailures}회 연속 실패 — 동일 전략 반복 금지)\n` +
+    `이 task는 WRITE 없이 ${consecutiveNoWriteFailures}회 연속 실패했습니다. 넓은 범위의 discovery를 ` +
+    "다시 반복하지 마세요. 이미 확인한 내용만으로 지금 바로 구현을 시작하고, 정말 필요한 경우에만 " +
+    "구체적인 파일 하나를 targeted로 확인하세요."
+  );
+}
+
 export interface DeveloperResult {
   success: boolean;
   summary: string;
@@ -141,6 +190,13 @@ export interface DeveloperResult {
    *  확인된 discovery 진행 상태. Reviewer는 이 값을 보지 않는다 — 오직 같은 task의 다음
    *  developer retry가 opts.priorDiscoveryProgress로만 소비한다. */
   discoveryProgress?: DeveloperDiscoveryProgress;
+  /** AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31,
+   *  JARVIS Task 5.3 실측). runDeveloperTaskWithRetry()가 내부 transient retry(최대 3회)
+   *  전체에 걸쳐 이어받아 갱신한 "WRITE 없이 연속 실패한 횟수"(§
+   *  opts.priorNoWriteRepeatCount에서 시작) — 3회 모두 소진되어 durable wait로 넘어갈 때만
+   *  채워진다. autodev.ts가 이 값을 그대로 project-state.json(technicalRecoveryState.
+   *  noWriteRepeatCount)에 이어 저장해, 다음 durable retry가 0부터 다시 세지 않게 한다. */
+  noWriteRepeatCount?: number;
 }
 
 export interface DeveloperTaskOptions {
@@ -177,6 +233,13 @@ export interface DeveloperTaskOptions {
    *  아니라 이 값에서 이어받는다 — 이미 소진된 discovery budget을 처음부터 다시 반복하지
    *  않기 위함. 지정하지 않으면 기존 동작과 완전히 동일(0/false부터 시작). */
   priorDiscoveryProgress?: DeveloperDiscoveryProgress;
+  /** AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31,
+   *  JARVIS Task 5.3 실측). 같은 task가 durable하게(§ types.ts DurableFailureState.
+   *  noWriteRepeatCount) 연속으로 WRITE 없이 실패한 횟수 — 지정하면 이 attempt의 내부
+   *  transient retry 루프가 이 값에서 이어받아 escalation 문구(§
+   *  buildNoWriteStrategyEscalationHint)를 더 일찍 보여준다. 지정하지 않으면 0부터
+   *  시작(기존 동작과 동일). */
+  priorNoWriteRepeatCount?: number;
   /** AutoDev Core Maintenance — Canonical Stop Path(2026-08-31, JARVIS Task 5.3 실측 —
    *  "실행 중인 Developer/continuous run을 canonical하게 정상 중단할 수 없는 결함"). 지정하면
    *  진행 중인 claude CLI subprocess를 즉시 SIGKILL로 종료하고(§ subprocess-runner.ts
@@ -1433,11 +1496,45 @@ export async function runDeveloperTaskWithRetry(
   const sleep = retryDeps.sleep ?? defaultDeveloperSleep;
 
   let last: DeveloperResult | undefined;
+  // AutoDev Core Maintenance — Progress Transfer Gap 재하드닝(2026-08-31, JARVIS Task 5.3
+  // 실측 — "저장은 됐는데 다음 재시도에 전달 안 됨"이 정확히 이 3회 내부 루프 사이에서
+  // 발생함을 코드+로그로 확정). 이 loop는 원래 매 iteration마다 동일한 opts 객체를 그대로
+  // 재사용해, sub-attempt 1이 남긴 discoveryProgress가 sub-attempt 2에, 2가 남긴 것이
+  // 3에 전혀 전달되지 않았다 — 매번 discoveryOnlyRoundCount가 0부터, transcript가 빈
+  // 상태부터 다시 시작해 동일한 discovery를 반복했다. currentOpts는 실패할 때마다 그
+  // 직전 sub-attempt 자신의 discoveryProgress(TIMEOUT을 포함한 모든 실패 경로에서 이미
+  // captureDiscoveryProgress()로 채워져 있다)로 갱신된다 — durable retry 간에는 이미
+  // autodev.ts가 동일한 원칙(priorDiscoveryProgress 이어받기 + 힌트 텍스트)을 적용하고
+  // 있었다(§ buildDiscoveryProgressRetryHint 주석) — 여기서는 같은 durable attempt 안의
+  // 더 짧은 내부 재시도 사이에도 그 원칙을 그대로 적용할 뿐, 새 저장 구조를 만들지 않는다.
+  let currentOpts = opts;
+  // AutoDev Core Maintenance — TIMEOUT-only/WRITE-zero 전략 사각지대 재하드닝(2026-08-31,
+  // JARVIS Task 5.3 실측). opts.priorNoWriteRepeatCount로 durable(이전 attempt들에 걸친)
+  // 연속 실패 횟수를 이어받아, 같은 durable attempt 안의 내부 재시도까지 하나의 연속된
+  // 카운트로 취급한다 — 실제 WRITE가 성공하면(changedFiles.length>0) 즉시 0으로 리셋된다.
+  let consecutiveNoWriteFailures = opts.priorNoWriteRepeatCount ?? 0;
   for (let i = 0; i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS; i++) {
-    const result = await attemptFn(task, attempt, opts);
+    const result = await attemptFn(task, attempt, currentOpts);
     last = result;
     if (!isTransientDeveloperFailure(result)) return result;
     log(`developer transient 실패(${result.errorCode}) — 시도 ${i + 1}/${DEVELOPER_TRANSIENT_MAX_ATTEMPTS} 실패, 재시도 예정`);
+    consecutiveNoWriteFailures = result.changedFiles.length === 0 ? consecutiveNoWriteFailures + 1 : 0;
+    const strategyHint = buildNoWriteStrategyEscalationHint(consecutiveNoWriteFailures);
+    if (result.discoveryProgress && (result.discoveryProgress.filesRead.length > 0 || result.discoveryProgress.implementationLocked)) {
+      const discoveryHint = buildDiscoveryProgressRetryHint(result.discoveryProgress, result.errorCode);
+      currentOpts = {
+        ...currentOpts,
+        priorDiscoveryProgress: result.discoveryProgress,
+        memoryHint: [currentOpts.memoryHint, discoveryHint, strategyHint]
+          .filter((s): s is string => Boolean(s))
+          .join("\n\n"),
+      };
+    } else if (strategyHint) {
+      currentOpts = {
+        ...currentOpts,
+        memoryHint: [currentOpts.memoryHint, strategyHint].filter((s): s is string => Boolean(s)).join("\n\n"),
+      };
+    }
     // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). 이 짧은 재시도 대기
     // (15s/30s) 중에 abortSignal이 발동하면 남은 대기를 즉시 끝낸다 — 다음 attemptFn() 호출은
     // opts.abortSignal.aborted를 즉시 확인해(§ runDeveloperTaskViaSafeExecutor
@@ -1472,6 +1569,7 @@ export async function runDeveloperTaskWithRetry(
       ...(exhausted.deferredHumanTasks ?? []),
       `${DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX}${exhausted.errorCode}): Claude Developer가 ${DEVELOPER_TRANSIENT_MAX_ATTEMPTS}회 연속 일시적 오류로 응답하지 못했습니다.`,
     ],
+    noWriteRepeatCount: consecutiveNoWriteFailures,
   };
 }
 

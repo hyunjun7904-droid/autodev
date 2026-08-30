@@ -13,7 +13,10 @@ function check(label: string, cond: boolean): void {
 function scenarioFreshStateForNewTask(): void {
   const state = { technicalRecoveryState: undefined };
   const result = loadDurableFailureStateForTask(state, "2.2");
-  check("새 task(저장된 값 없음) → 전부 0으로 초기화된 빈 상태", result.taskId === "2.2" && result.sameFailureCount === 0 && result.unexpectedExitCount === 0);
+  check(
+    "새 task(저장된 값 없음) → 전부 0으로 초기화된 빈 상태",
+    result.taskId === "2.2" && result.sameFailureCount === 0 && result.unexpectedExitCount === 0 && (result.noWriteRepeatCount ?? 0) === 0
+  );
 }
 
 function scenarioTaskIdMismatchResetsState(): void {
@@ -22,6 +25,7 @@ function scenarioTaskIdMismatchResetsState(): void {
     sameFailureCount: 5,
     rootCauseAnalysisCount: 3,
     providerTimeoutCount: 2,
+    noWriteRepeatCount: 4,
     unexpectedExitCount: 1,
     updatedAt: new Date().toISOString(),
   };
@@ -31,6 +35,10 @@ function scenarioTaskIdMismatchResetsState(): void {
     "다른 task의 이전 상태는 새 task로 넘어가지 않음(§ 요구사항 19)",
     result.taskId === "2.2" && result.sameFailureCount === 0 && result.unexpectedExitCount === 0
   );
+  check(
+    "NO-WRITE Stagnation 재하드닝: 다른 task(2.1)의 noWriteRepeatCount도 새 task(2.2)로 새어들어오지 않음",
+    (result.noWriteRepeatCount ?? 0) === 0
+  );
 }
 
 function scenarioSameTaskIdPreservesCounts(): void {
@@ -39,6 +47,7 @@ function scenarioSameTaskIdPreservesCounts(): void {
     sameFailureCount: 2,
     rootCauseAnalysisCount: 1,
     providerTimeoutCount: 1,
+    noWriteRepeatCount: 2,
     unexpectedExitCount: 1,
     updatedAt: new Date().toISOString(),
   };
@@ -47,6 +56,10 @@ function scenarioSameTaskIdPreservesCounts(): void {
   check(
     "동일 task로 다시 조회하면 이전 카운트가 그대로 보존됨(프로세스 재시작에도 0으로 초기화되지 않음)",
     result.sameFailureCount === 2 && result.providerTimeoutCount === 1 && result.unexpectedExitCount === 1
+  );
+  check(
+    "NO-WRITE Stagnation 재하드닝: noWriteRepeatCount도 동일하게 프로세스 재시작에 살아남음(§ types.ts DurableFailureState)",
+    result.noWriteRepeatCount === 2
   );
 }
 

@@ -143,7 +143,7 @@ export interface OrchestratorDeps {
   /** 현재 시각(ms) — 테스트에서만 override, 실제 운용은 항상 Date.now. durable
    *  developerProviderNextRetryAt 계산/재개(process restart resume) 판정에만 쓰인다. */
   now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
   /** 상태 전이마다 호출 — autodev.ts가 콘솔에 task/status/reviewCycle을 표시하는 데 사용. */
   onProgress?: (info: { task: string; status: OrchestratorStatus; reviewCycle: number }) => void;
   /** project-state.json 경로 — 지정하지 않으면 실제 운영 경로(state.ts DEFAULT_STATE_PATH)를
@@ -197,7 +197,7 @@ export interface OrchestratorDeps {
  *  동작과 완전히 동일). 있으면 abort event와 경합시켜 먼저 끝나는 쪽을 따른다 — sleep()
  *  자체는 여전히 실제 ms 그대로 호출된다(기존 deps.sleep 테스트 override의 호출 인자 계약을
  *  그대로 보존, § claude-developer.ts runDeveloperTaskWithRetry의 동일한 설계). */
-async function sleepOrAbort(ms: number, sleep: (ms: number) => Promise<void>, abortSignal?: AbortSignal): Promise<boolean> {
+async function sleepOrAbort(ms: number, sleep: (ms: number, abortSignal?: AbortSignal) => Promise<void>, abortSignal?: AbortSignal): Promise<boolean> {
   if (!abortSignal) {
     await sleep(ms);
     return false;
@@ -205,7 +205,11 @@ async function sleepOrAbort(ms: number, sleep: (ms: number) => Promise<void>, ab
   if (abortSignal.aborted) return true;
   let aborted = false;
   await Promise.race([
-    sleep(ms),
+    // § defaultSleep 주석(Timer Handle Defect) — abortSignal을 함께 넘겨 실제 프로덕션
+    // sleep 구현이 자신의 setTimeout을 스스로 clearTimeout할 수 있게 한다. 테스트가 주입하는
+    // 기존 sleep override(예: `async () => {}`)는 두 번째 인자를 그냥 무시하므로 기존 호출
+    // 계약과 동작에 영향이 없다.
+    sleep(ms, abortSignal),
     new Promise<void>((resolve) => {
       abortSignal.addEventListener(
         "abort",
@@ -267,7 +271,35 @@ function selectDefaultGptReviewer(executor?: SafeExecutorContext): (
     realReviewClaudeResult(result, reviewCycle, task, { allowedPathPrefixes, projectContext, executor, gptCallCount, gptRawCallTotal, baseline });
 }
 
-const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+// AutoDev Core Maintenance — Timer Handle Defect 재하드닝(2026-08-31, JARVIS Task 5.3
+// 실측 — canonical stop이 durable-wait(최대 몇십 분) 도중 논리적으로는 즉시 abort됐는데도
+// 실제 OS 프로세스가 원래 예정된 대기시간까지 계속 살아있던 결함). 기존 defaultSleep은
+// setTimeout의 handle을 아무도 들고 있지 않아 sleepOrAbort()의 Promise.race에서 abort
+// 쪽이 먼저 끝나도 이 setTimeout 자체는 clearTimeout되지 않고 그대로 살아남았다 — Node의
+// 타이머는 기본적으로 ref되어 있으므로, 그 타이머가 스스로 만료될 때까지 프로세스가 정상
+// 종료되지 못했다(실측: 30분 durable-wait 도중 abort했는데 원래 예정 시각에 정확히 맞춰
+// 프로세스가 종료됨 — clearTimeout 누락의 직접 증거). abortSignal을 받으면 스스로
+// clearTimeout까지 책임진다 — sleepOrAbort()의 기존 "abort 쪽 Promise가 별도로 aborted
+// 플래그를 설정한다"는 구조는 그대로 두고(중복 리스너라도 안전, 둘 다 동일 이벤트에서
+// 발동), 이 함수는 오직 "자신이 만든 실제 타이머를 자신이 정리한다"는 책임만 추가로 진다.
+const defaultSleep = (ms: number, abortSignal?: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (!abortSignal) return;
+    if (abortSignal.aborted) {
+      clearTimeout(timer);
+      resolve();
+      return;
+    }
+    abortSignal.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true }
+    );
+  });
 
 // 상태 머신: IDLE → CLAUDE_WORKING → WAITING_GPT_REVIEW → (REVISION_REQUIRED → CLAUDE_WORKING
 // → WAITING_GPT_REVIEW 반복) → APPROVED | WAITING_HUMAN | BLOCKED

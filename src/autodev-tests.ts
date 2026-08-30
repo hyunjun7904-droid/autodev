@@ -2815,6 +2815,65 @@ async function scenarioNoAbortSignalBehavesExactlyAsBeforeRegression(): Promise<
   check("M) abortSignal 없음: Developer가 정상적으로 여러 차례 호출됨(abort로 조기 차단되지 않음)", caller.receivedInputs.length > 1);
 }
 
+// AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31,
+// JARVIS Task 5.3 실측 — 3회 연속 TIMEOUT 모두 WRITE 0건, 포렌식으로 확정).
+//
+// 이 시나리오는 (검증 완료, 이 파일에는 남기지 않음) 실제로 매 round TIMEOUT을 반환하는
+// developerClaudeCaller로 전체 경로(내부 3회 × durable 6회 = 18회 호출)를 직접 실행해
+// 수동으로 1회 확인했다 — 3번째 호출부터 전략 전환 안내가 나타나고 durable retry 경계를
+// 넘어서도 유지됨을 실측 확인(PASS). 다만 runAutodevOnce()는 claude-developer.ts의 내부
+// transient retry(최대 2회, 15s/30s 실제 대기 — orchestratorDeps.sleep으로 override 불가한
+// 별도 계층, § scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt와 동일한 이유)를 그대로
+// 통과시켜, 이 경로 전체를 상시 회귀 테스트로 그대로 남기면 매 test:autodev 실행마다
+// 수 분이 걸린다. 대신 이 스캐폴드는 previousAttemptResult 시딩(§ autodev.ts:1281, 이미
+// 검증된 기존 seed 경로 — J 시나리오와 동일한 "재시작 이후 첫 라운드" 원칙)을 이용해, 실제
+// durable retry가 방금 남겼을 discoveryProgress/noWriteRepeatCount를 state.lastClaudeResult에
+// 직접 심어두고 단 1회의 빠른 성공 라운드만 실행한다 — autodev.ts의 hintParts 생성 코드(§
+// buildDiscoveryProgressRetryHint/buildNoWriteStrategyEscalationHint 호출부)를 정확히 같은
+// 코드 경로로, 실제 대기 없이 검증한다. claude-developer.ts 내부 3회 루프 자체의 escalation
+// 타이밍(2회째부터 등장)은 claude-developer-retry-tests.ts가 sleep을 override할 수 있는
+// 레벨에서 별도로 빠르게 검증한다.
+async function scenarioNoWriteStrategyHintInjectedFromSeededDurableState(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const seededLastClaudeResult: ClaudeResult = {
+    success: false,
+    summary: "Claude Developer가 3회 연속 일시적 오류(TIMEOUT)로 실패했습니다",
+    changedFiles: [],
+    tests: [],
+    rawOutput: "",
+    errorCode: "TIMEOUT",
+    discoveryProgress: { filesRead: ["proj/a.ts", "proj/b.ts"], discoveryOnlyRoundCount: 3, implementationLocked: false, lastRoundReached: 4 },
+    noWriteRepeatCount: 2,
+  };
+  const statePath = makeTempStateFile(repo, { completedTasks: [], lastClaudeResult: seededLastClaudeResult });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  const receivedInputs: string[] = [];
+  const caller = async (input: string) => {
+    receivedInputs.push(input);
+    return {
+      success: true,
+      summary: JSON.stringify({ type: "TASK_COMPLETE", summary: "구현 완료", changedFiles: [], testsRequested: [] }),
+      changedFiles: [],
+      tests: [],
+      rawOutput: "",
+    };
+  };
+
+  await runAutodevOnce({
+    manifest,
+    developerClaudeCaller: caller,
+    orchestratorDeps: { gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
+  });
+
+  check("N) 시딩된 직전 실패의 discoveryProgress 안내가 첫 라운드부터 이미 포함됨(재탐색 억제)", receivedInputs[0]?.includes("proj/a.ts") ?? false);
+  check(
+    "N) 시딩된 noWriteRepeatCount(2)에 따른 전략 전환 안내가 durable retry 시작 즉시(첫 라운드부터) 포함됨",
+    receivedInputs[0]?.includes("WRITE 없이 2회 연속 실패") ?? false
+  );
+  check("N) 두 안내가 같은 입력에 함께 존재해도 정상 성공으로 진행됨(안내가 진행을 방해하지 않음)", receivedInputs.length === 1);
+}
+
 async function main(): Promise<void> {
   const realStateBefore = readFileSync(DEFAULT_STATE_PATH, "utf-8");
 
@@ -2866,6 +2925,7 @@ async function main(): Promise<void> {
     await scenarioAbortBeforeStartSkipsEverything();
     await scenarioAbortDuringDurableWaitStopsQuicklyAndPreservesState();
     await scenarioNoAbortSignalBehavesExactlyAsBeforeRegression();
+    await scenarioNoWriteStrategyHintInjectedFromSeededDurableState();
 
     await scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper();
     await scenarioReviewStagnationBudgetPersistsAcrossRestart();

@@ -72,6 +72,10 @@ export interface ClaudeResult {
     implementationLocked: boolean;
     lastRoundReached: number;
   };
+  /** § claude-developer.ts DeveloperResult.noWriteRepeatCount와 동일한 구조를 맞춘 중복
+   *  선언(순환 의존 없이, 위 discoveryProgress/errorCode와 동일한 기존 관례) — AutoDev Core
+   *  Maintenance, NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31). */
+  noWriteRepeatCount?: number;
 }
 
 export type GptDecision = "PASS" | "REVISE" | "HUMAN_REQUIRED" | "BLOCK";
@@ -363,6 +367,15 @@ export interface DurableFailureState {
   sameFailureCount: number;
   rootCauseAnalysisCount: number;
   providerTimeoutCount: number;
+  /** AutoDev Core Maintenance — NO-WRITE Stagnation / Strategy Repeat 재하드닝(2026-08-31,
+   *  JARVIS Task 5.3 실측 — 3회 연속 TIMEOUT 모두 WRITE 0건). 같은 task가 연속으로
+   *  changedFiles.length===0인 채 provider 실패(TIMEOUT/CLI_NOT_FOUND)로 끝난 durable
+   *  retry 횟수 — 실제 WRITE가 한 번이라도 성공하면(changedFiles.length>0) 즉시 0으로
+   *  리셋된다. providerTimeoutCount와 달리 이 값은 durable retry가 최종 소진(terminal
+   *  BLOCKED)되기를 기다리지 않고 매 attempt마다 갱신되어, 다음 attempt의 전략 전환 안내
+   *  (§ claude-developer.ts buildNoWriteStrategyEscalationHint)가 retry cap 소진 전에도
+   *  이미 반영될 수 있게 한다. */
+  noWriteRepeatCount?: number;
   /** 이 task가 완료되지 않은 채(비정상 종료) 새 프로세스가 다시 이 task를 발견한 횟수. */
   unexpectedExitCount: number;
   lastRecoveryAction?: string;

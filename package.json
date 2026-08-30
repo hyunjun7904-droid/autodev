@@ -12,6 +12,7 @@
     "dry-run": "npm run build && node dist/dry-run.js",
     "test:runner": "npm run build && node dist/runner-tests.js",
     "test:run": "npm run build && node dist/run-tests.js",
+    "test:orchestrator-timer-defect": "npm run build && node dist/orchestrator-timer-defect-tests.js",
     "smoke-test": "npm run build && node dist/smoke-test.js",
     "real-source-catalog-smoke-test": "npm run build && node dist/real-source-catalog-smoke-test.js",
     "final-reviewer-benchmark": "npm run build && node dist/final-reviewer-benchmark.js",

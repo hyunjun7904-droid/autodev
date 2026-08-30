@@ -27,6 +27,7 @@ export function loadDurableFailureStateForTask(
     sameFailureCount: 0,
     rootCauseAnalysisCount: 0,
     providerTimeoutCount: 0,
+    noWriteRepeatCount: 0,
     unexpectedExitCount: 0,
     updatedAt: now().toISOString(),
   };

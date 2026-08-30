@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDeveloperTaskWithRetry, isTransientDeveloperFailure } from "./claude-developer";
-import type { DeveloperResult } from "./claude-developer";
+import type { DeveloperResult, DeveloperTaskOptions } from "./claude-developer";
 import { runOrchestrator } from "./orchestrator";
 import type { GptReviewerReturn } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
@@ -77,6 +77,30 @@ function makeSequence(items: DeveloperResult[]): {
   };
 }
 
+// AutoDev Core Maintenance — Progress Transfer Gap / NO-WRITE Stagnation 재하드닝
+// (2026-08-31, JARVIS Task 5.3 실측). makeSequence()와 동일하지만, runDeveloperTaskWithRetry()의
+// 내부 루프가 매 sub-attempt에 실제로 어떤 opts(priorDiscoveryProgress/memoryHint)를
+// 넘겼는지 그대로 기록한다 — sub-attempt 2/3이 직전 sub-attempt의 실패를 실제로 이어받는지
+// 직접 검증하기 위함.
+function makeSequenceCapturingOpts(items: DeveloperResult[]): {
+  attempt: (task: string, attempt: number, opts?: DeveloperTaskOptions) => Promise<DeveloperResult>;
+  callCount: () => number;
+  receivedOpts: DeveloperTaskOptions[];
+} {
+  let i = 0;
+  const receivedOpts: DeveloperTaskOptions[] = [];
+  return {
+    receivedOpts,
+    attempt: async (_task, _attempt, opts) => {
+      receivedOpts.push(opts ?? {});
+      const item = items[Math.min(i, items.length - 1)];
+      i++;
+      return item;
+    },
+    callCount: () => i,
+  };
+}
+
 const FAKE_PASS_REVIEW: GptReviewResult = {
   decision: "PASS",
   severity: { critical: 0, high: 0, medium: 0 },
@@ -141,6 +165,70 @@ async function scenarioExhaustionNoInfiniteRetry(): Promise<void> {
     "C: deferredHumanTasks에 DEVELOPER_TRANSIENT_RETRY_EXHAUSTED 기록됨(승인 기록/Telegram 알림 경로로 흘러감)",
     (result.deferredHumanTasks ?? []).some((t) => t.startsWith("DEVELOPER_TRANSIENT_RETRY_EXHAUSTED"))
   );
+}
+
+// AutoDev Core Maintenance — Progress Transfer Gap 재하드닝(2026-08-31, JARVIS Task 5.3
+// 실측). sub-attempt 1이 discoveryProgress를 남기고 실패하면, sub-attempt 2로 넘어가는
+// opts에 그 discoveryProgress와 파일 목록 힌트가 실제로 실려 있는지 직접 검증한다 — 이전에는
+// 매 sub-attempt가 동일한(비어있는) opts를 재사용해 discoveryOnlyRoundCount가 0부터 다시
+// 시작됐다(실제 production 관측: 3개 sub-attempt 모두 transcriptChars가 정확히 동일한
+// 값에서 시작).
+async function scenarioProgressTransferBetweenInternalSubAttempts(): Promise<void> {
+  const discoveryProgress = { filesRead: ["proj/wakeword/build.gradle.kts", "proj/wakeword/settings.gradle.kts"], discoveryOnlyRoundCount: 3, implementationLocked: false, lastRoundReached: 4 };
+  const seq = makeSequenceCapturingOpts([
+    developerResult({ errorCode: "TIMEOUT", discoveryProgress }),
+    SUCCESS_RESULT,
+  ]);
+  const result = await runDeveloperTaskWithRetry("task PTG", 1, {}, { attempt: seq.attempt, sleep: async () => {} });
+
+  check("PTG: 최종 success:true(2회째 성공)", result.success === true);
+  check("PTG: sub-attempt 1(최초 호출)은 priorDiscoveryProgress 없이 시작(기존과 동일)", seq.receivedOpts[0]?.priorDiscoveryProgress === undefined);
+  check(
+    "PTG: sub-attempt 2가 sub-attempt 1의 discoveryProgress를 priorDiscoveryProgress로 그대로 이어받음",
+    JSON.stringify(seq.receivedOpts[1]?.priorDiscoveryProgress) === JSON.stringify(discoveryProgress)
+  );
+  check(
+    "PTG: sub-attempt 2의 memoryHint에 sub-attempt 1이 이미 읽은 파일 경로가 실제로 포함됨(재탐색 억제 안내)",
+    (seq.receivedOpts[1]?.memoryHint ?? "").includes("proj/wakeword/build.gradle.kts")
+  );
+}
+
+// AutoDev Core Maintenance — TIMEOUT-only/WRITE-zero 전략 사각지대 재하드닝(2026-08-31,
+// JARVIS Task 5.3 실측 — 3회 연속 TIMEOUT 모두 WRITE 0건이었는데도 기존 problem-memory/
+// failure-stagnation(required-test fingerprint 전용)이 전혀 관여하지 않았음).
+async function scenarioNoWriteStrategyEscalatesOnSecondConsecutiveFailure(): Promise<void> {
+  const seq = makeSequenceCapturingOpts([TIMEOUT_RESULT, TIMEOUT_RESULT, SUCCESS_RESULT]);
+  const result = await runDeveloperTaskWithRetry("task NW1", 1, {}, { attempt: seq.attempt, sleep: async () => {} });
+
+  check("NW1: 최종 success:true(3회째 성공)", result.success === true);
+  check(
+    "NW1: sub-attempt 2(1회 실패 직후)에는 아직 전략 전환 안내 없음(1회는 정상 초기 discovery로 간주, false-positive 없음)",
+    !(seq.receivedOpts[1]?.memoryHint ?? "").includes("WRITE 없이")
+  );
+  check(
+    "NW1: sub-attempt 3(2회 연속 WRITE 없이 실패 직후)부터 전략 전환 안내가 나타남(retry cap 3회를 다 소진하기 전)",
+    (seq.receivedOpts[2]?.memoryHint ?? "").includes("WRITE 없이 2회 연속 실패")
+  );
+}
+
+// AutoDev Core Maintenance — NO-WRITE Stagnation 오탐 방지 재하드닝(2026-08-31, JARVIS Task
+// 5.3 실측). 실제로 WRITE가 성공한 sub-attempt 이후에는(그 attempt 자체는 이후 라운드에서
+// TIMEOUT으로 끝났더라도) 연속 실패 카운트가 즉시 0으로 리셋되어야 한다 — 그렇지 않으면
+// 실제로 진척이 있었는데도 "전략을 바꾸라"는 안내가 계속 나가는 false positive가 된다.
+async function scenarioNoWriteCounterResetsAfterActualWrite(): Promise<void> {
+  const seq = makeSequenceCapturingOpts([
+    TIMEOUT_RESULT, // WRITE 없이 실패 1회째
+    developerResult({ errorCode: "TIMEOUT", changedFiles: ["proj/a.ts"] }), // WRITE는 있었지만 이후 라운드에서 TIMEOUT
+    TIMEOUT_RESULT, // WRITE 없이 실패(리셋 이후 다시 1회째)
+  ]);
+  const result = await runDeveloperTaskWithRetry("task NW2", 1, {}, { attempt: seq.attempt, sleep: async () => {} });
+
+  check("NW2: 3회 모두 실패(마지막이 WRITE 없이 실패) → 최종 success:false", result.success === false);
+  check(
+    "NW2: sub-attempt 3의 opts에는 전략 전환 안내가 없음(직전 sub-attempt 2에서 실제 WRITE가 있었으므로 카운트가 0으로 리셋됨)",
+    !(seq.receivedOpts[2]?.memoryHint ?? "").includes("WRITE 없이")
+  );
+  check("NW2: 최종 결과의 noWriteRepeatCount=1(리셋 이후 새로 1회만 누적, 3이 아님)", result.noWriteRepeatCount === 1);
 }
 
 // B — 사람 승인이 필요한 명시적 오류(AUTH_REQUIRED)는 재시도하지 않는다.
@@ -351,6 +439,9 @@ async function main(): Promise<void> {
     await scenarioFirstTimeoutRetries();
     await scenarioSecondRetryStillRetries();
     await scenarioExhaustionNoInfiniteRetry();
+    await scenarioProgressTransferBetweenInternalSubAttempts();
+    await scenarioNoWriteStrategyEscalatesOnSecondConsecutiveFailure();
+    await scenarioNoWriteCounterResetsAfterActualWrite();
     await scenarioNonTransientNoRetry();
     await scenarioJarvisSecurityCriticalTaskTimeoutAutoResumes(makeTempStatePath());
     await scenarioProviderTimeoutNeverEscalatesAndStaysBounded(makeTempStatePath());
