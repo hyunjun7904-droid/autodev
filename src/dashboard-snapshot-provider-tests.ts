@@ -236,13 +236,25 @@ function scenarioRuntimeTruthNoLockIsStopped(): void {
 }
 
 function scenarioRuntimeTruthAliveAndWaitingHuman(): void {
-  const liveness: ProjectRuntimeLiveness = { present: true, pid: 12345, ownerKind: "autodev", liveness: { verdict: "ALIVE" } };
+  const liveness: ProjectRuntimeLiveness = {
+    present: true,
+    pid: 12345,
+    processStartedAtMs: Date.now(),
+    ownerKind: "autodev",
+    liveness: { verdict: "ALIVE" },
+  };
   const result = computeDashboardRuntimeTruth(liveness, "WAITING_HUMAN");
   check("owner가 살아있고 taskStatus가 WAITING_HUMAN이면 WAITING으로 표시", result.state === "WAITING");
 }
 
 function scenarioRuntimeTruthAliveAndRunning(): void {
-  const liveness: ProjectRuntimeLiveness = { present: true, pid: 12345, ownerKind: "autodev", liveness: { verdict: "ALIVE" } };
+  const liveness: ProjectRuntimeLiveness = {
+    present: true,
+    pid: 12345,
+    processStartedAtMs: Date.now(),
+    ownerKind: "autodev",
+    liveness: { verdict: "ALIVE" },
+  };
   const result = computeDashboardRuntimeTruth(liveness, "RUNNING");
   check("runner PID가 살아있고 정상 상태면 RUNNING으로 표시", result.state === "RUNNING");
 }
@@ -251,6 +263,7 @@ function scenarioRuntimeTruthStaleLockDoesNotClaimRunning(): void {
   const liveness: ProjectRuntimeLiveness = {
     present: true,
     pid: 99999,
+    processStartedAtMs: Date.now(),
     ownerKind: "autodev",
     liveness: { verdict: "STALE", evidence: "PID_NOT_RUNNING" },
   };

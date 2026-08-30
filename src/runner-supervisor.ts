@@ -10,6 +10,7 @@ import {
   computeBackoffDelayMs,
   shouldResetFailureStreak,
 } from "./dashboard-supervisor";
+import { assessOwnerLiveness } from "./project-lock";
 
 // AutoDev Continuous Runner Lifecycle Independence(2026-08-28 Maintenance) — 이번 세션의
 // 실제 production incident: run.ts(--continuous)를 Claude Code harness가 추적하는 background
@@ -209,17 +210,41 @@ export function runnerSupervisorLockFilePath(adapterPath: string, logsDir: strin
 // polling(§ run.ts pollForStopRequest)해서 runAbortController.abort()를 직접 호출한다.
 // targetPid로 대상을 명시해, "요청이 이미 소비/무관해진 뒤" 나중에 뜬 완전히 다른 writer가
 // 우연히 같은 마커를 보고 스스로 중단하는 경쟁 상태를 막는다.
+//
+// PID 재사용 하드닝(2026-08-31, JARVIS 5.3 조사 중 확인된 결함) — targetPid 단독 식별은
+// 다음 race에 취약했다: (1) requestStop() 시점에는 target이 실제로 ALIVE였더라도, 그
+// 프로세스가 이 stop 요청과 무관한 사유로 자신의 다음 polling tick 전에 먼저 죽어버리면
+// 마커를 아무도 소비/삭제하지 못하고 orphan으로 남는다. (2) 이후 OS가 그 PID를 완전히 무관한
+// 새 프로세스(같은 project adapter로 재spawn된 정상 run.ts일 수 있음)에 재할당하면, 그
+// 새 프로세스는 시작 직후 첫 polling에서 이 leftover 마커를 "자신에 대한 stop 요청"으로
+// 오인해 정상적으로 시작한 작업을 스스로 즉시 중단시킬 수 있었다(직접 재현 확인 — targetPid만
+// 비교하던 이전 readStopRequestForPid는 이 leftover 마커에 항상 true를 반환했다). 새 identity
+// subsystem이나 새 liveness 판정 로직을 만들지 않고, project-lock.ts가 이미 PID 재사용 탐지를
+// 위해 쓰는 것과 정확히 같은 판정(assessOwnerLiveness — PID 생존 + 실제 OS 시작 시각 비교,
+// § run.ts parentIsPidAlive가 parent watchdog에 이미 이 함수를 그대로 재사용하는 것과 동일한
+// 관례)을 여기서도 그대로 재사용한다 — target 신원을 targetPid 단독이 아니라
+// (targetPid, targetProcessStartedAtMs) 쌍으로 묶는다.
 export function stopRequestMarkerPath(adapterPath: string, logsDir: string): string {
   return join(logsDir, `runner-supervisor-stop-${sanitizeForFilename(adapterPath)}.request`);
 }
 
-/** § stopRequestMarkerPath 주석. targetPid는 project lock owner pid를 그대로 넘긴다(§
- *  project-control-cli.ts decideStopAction) — 이 마커를 만들 때 이미 project-lock.ts가
- *  ALIVE로 확인한 값이다. */
-export function requestStop(adapterPath: string, logsDir: string, reason: string, targetPid: number): void {
+/** § stopRequestMarkerPath 주석. targetPid/targetProcessStartedAtMs는 project lock owner의
+ *  pid/processStartedAtMs를 그대로 넘긴다(§ project-control-cli.ts decideStopAction) — 이
+ *  마커를 만들 때 이미 project-lock.ts가 ALIVE로 확인한 값이다. */
+export function requestStop(
+  adapterPath: string,
+  logsDir: string,
+  reason: string,
+  targetPid: number,
+  targetProcessStartedAtMs: number
+): void {
   if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
   const markerPath = stopRequestMarkerPath(adapterPath, logsDir);
-  writeFileSync(markerPath, `${JSON.stringify({ requestedAt: new Date().toISOString(), reason, targetPid }, null, 2)}\n`, "utf-8");
+  writeFileSync(
+    markerPath,
+    `${JSON.stringify({ requestedAt: new Date().toISOString(), reason, targetPid, targetProcessStartedAtMs }, null, 2)}\n`,
+    "utf-8"
+  );
 }
 
 export function clearStopRequest(adapterPath: string, logsDir: string): void {
@@ -234,7 +259,16 @@ export function clearStopRequest(adapterPath: string, logsDir: string): void {
 /** run.ts가 자기 자신(selfPid=process.pid)을 대상으로 한 stop 요청이 있는지 능동적으로
  *  확인한다. 마커가 없거나, 있어도 targetPid가 이 프로세스 것이 아니거나(§ 위 race 방지
  *  주석), 손상돼 파싱할 수 없으면(fail-closed) 전부 false — "확인 못 함"을 "중단하라"로
- *  추측해서 처리하지 않는다. */
+ *  추측해서 처리하지 않는다.
+ *
+ *  PID 재사용 하드닝(2026-08-31) — targetPid가 일치해도 그것만으로 곧바로 신뢰하지 않는다.
+ *  마커에 함께 기록된 targetProcessStartedAtMs를 project-lock.ts의 assessOwnerLiveness()(새
+ *  로직 없음 — PID 재사용을 탐지하기 위해 이미 있는 것과 정확히 같은 PID+실제 OS 시작 시각
+ *  비교, § run.ts parentIsPidAlive와 동일한 재사용 관례)로 selfPid의 실제 시작 시각과
+ *  재검증해, 그 결과가 명시적으로 STALE(PID_REUSED_START_TIME_MISMATCH)일 때만 이 마커를
+ *  무시한다 — "같은 PID, 하지만 실제로는 다른 프로세스(생성 이후 PID가 재사용됨)"를 자신에
+ *  대한 stop 요청으로 오인하지 않기 위함이다. targetProcessStartedAtMs가 없거나 숫자가
+ *  아니면(구버전/손상된 마커) 신원을 확인할 방법이 없으므로 신뢰하지 않는다(fail-closed). */
 export function readStopRequestForPid(adapterPath: string, logsDir: string, selfPid: number): boolean {
   const markerPath = stopRequestMarkerPath(adapterPath, logsDir);
   let raw: string;
@@ -243,12 +277,15 @@ export function readStopRequestForPid(adapterPath: string, logsDir: string, self
   } catch {
     return false;
   }
+  let parsed: { targetPid?: unknown; targetProcessStartedAtMs?: unknown };
   try {
-    const parsed = JSON.parse(raw) as { targetPid?: unknown };
-    return typeof parsed.targetPid === "number" && parsed.targetPid === selfPid;
+    parsed = JSON.parse(raw) as { targetPid?: unknown; targetProcessStartedAtMs?: unknown };
   } catch {
     return false;
   }
+  if (typeof parsed.targetPid !== "number" || parsed.targetPid !== selfPid) return false;
+  if (typeof parsed.targetProcessStartedAtMs !== "number") return false;
+  return assessOwnerLiveness(selfPid, parsed.targetProcessStartedAtMs).verdict !== "STALE";
 }
 
 function resolveAdapterPath(): string | undefined {

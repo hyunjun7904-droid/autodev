@@ -113,7 +113,7 @@ export function formatProjectControlStatus(status: ProjectControlStatus): string
 // runAbortController.abort()를 직접 호출한다(§ requestStop/readStopRequestForPid). 새
 // IPC 경로가 아니라 이미 있는 파일 마커 메커니즘의 재사용이다.
 export type StopDecision =
-  | { action: "REQUEST_STOP"; pid: number }
+  | { action: "REQUEST_STOP"; pid: number; processStartedAtMs: number }
   | { action: "NO_TARGET"; reason: string }
   | { action: "REFUSED"; reason: string };
 
@@ -122,7 +122,13 @@ export type StopDecision =
  *  자체가 없다는 뜻이지 실패가 아니다(그 경우 project-state/lock을 이 명령이 아니라 기존
  *  stale-PID 판정이 처리한다). ownerKind가 "autodev"가 아니면(예: "local-human-approval"/
  *  "telegram-resume") REFUSED — 이 명령은 실제 AutoDev continuous writer만 대상으로 한다,
- *  다른 종류의 owner를 추측해서 건드리지 않는다. */
+ *  다른 종류의 owner를 추측해서 건드리지 않는다.
+ *
+ *  PID 재사용 하드닝(2026-08-31) — REQUEST_STOP은 pid뿐 아니라 이 project lock owner가
+ *  실제로 기록한 processStartedAtMs(§ project-lock.ts ProjectRuntimeLiveness — 이미 lock
+ *  metadata에 있던 값을 그대로 노출한 것, 새 계산 없음)도 함께 담아 반환한다 — stop marker의
+ *  대상 신원을 pid 단독이 아니라 (pid, 시작시각) 쌍으로 묶기 위함이다(§ runner-supervisor.ts
+ *  requestStop/readStopRequestForPid). */
 export function decideStopAction(liveness: ProjectRuntimeLiveness): StopDecision {
   if (!liveness.present) {
     return { action: "NO_TARGET", reason: "이 project를 점유한 writer가 현재 없습니다." };
@@ -139,7 +145,7 @@ export function decideStopAction(liveness: ProjectRuntimeLiveness): StopDecision
       reason: `이 project lock의 owner는 ownerKind="${liveness.ownerKind}"입니다(AutoDev continuous writer가 아님) — 이 명령은 ownerKind="autodev"만 대상으로 합니다.`,
     };
   }
-  return { action: "REQUEST_STOP", pid: liveness.pid };
+  return { action: "REQUEST_STOP", pid: liveness.pid, processStartedAtMs: liveness.processStartedAtMs };
 }
 
 export function parseArg(args: readonly string[], name: string): string | undefined {
@@ -203,7 +209,7 @@ function main(): void {
         return;
       }
       console.log(`[project-control] Stop 요청 — pid=${decision.pid}를 대상으로 canonical stop marker를 남깁니다(강제 종료 아님).`);
-      requestStop(adapterPath, logsDir, "project-control-cli stop", decision.pid);
+      requestStop(adapterPath, logsDir, "project-control-cli stop", decision.pid, decision.processStartedAtMs);
       console.log(
         `[project-control] Stop 요청 기록 완료 — pid=${decision.pid}가 다음 polling 주기(§ run.ts pollForStopRequest)에서 이를 발견하고 durable-wait/진행 중인 Developer subprocess를 정상적으로 중단한 뒤 스스로 종료할 때까지 기다리세요. project-state.json/lock은 이 명령이 직접 건드리지 않습니다 — 그 프로세스 자신의 canonical stop 경로(run.ts)가 처리합니다.`
       );

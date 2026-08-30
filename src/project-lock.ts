@@ -496,7 +496,18 @@ export function peekProjectLock(
 
 export type ProjectRuntimeLiveness =
   | { present: false }
-  | { present: true; pid: number; ownerKind: ProjectLockOwnerKind; taskId?: string; liveness: LivenessVerdict };
+  | {
+      present: true;
+      pid: number;
+      /** 이 owner가 lock을 만들 때 기록한 OS 시작 시각 추정값(§ ProjectLockMetadata.processStartedAtMs)
+       *  그대로 노출한다 — PID 단독이 아니라 pid+시작시각으로 신원을 식별해야 하는 호출부(예:
+       *  project-control-cli.ts의 canonical stop marker)가 이 값을 그대로 재사용한다(새 계산
+       *  로직 없음). */
+      processStartedAtMs: number;
+      ownerKind: ProjectLockOwnerKind;
+      taskId?: string;
+      liveness: LivenessVerdict;
+    };
 
 /**
  * AutoDev / JARVIS 최종 무인개발 구조 보완 — 대시보드 실행상태 보완(§ 요구사항 24). 이
@@ -520,5 +531,12 @@ export function inspectProjectRuntimeLiveness(
   if (existing.kind !== "valid") return { present: false };
   const assessLiveness = testDeps.assessLiveness ?? assessOwnerLiveness;
   const liveness = assessLiveness(existing.metadata.pid, existing.metadata.processStartedAtMs);
-  return { present: true, pid: existing.metadata.pid, ownerKind: existing.metadata.ownerKind, taskId: existing.metadata.taskId, liveness };
+  return {
+    present: true,
+    pid: existing.metadata.pid,
+    processStartedAtMs: existing.metadata.processStartedAtMs,
+    ownerKind: existing.metadata.ownerKind,
+    taskId: existing.metadata.taskId,
+    liveness,
+  };
 }

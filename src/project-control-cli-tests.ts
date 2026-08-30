@@ -123,6 +123,7 @@ function scenarioProjectLockStatusVariants(): void {
     const present: ProjectRuntimeLiveness = {
       present: true,
       pid: 12345,
+      processStartedAtMs: Date.now(),
       ownerKind: "local-human-approval",
       taskId: "5.3",
       liveness: { verdict: "ALIVE" },
@@ -165,25 +166,51 @@ function scenarioDecideStopAction(): void {
   );
   check(
     "stop: liveness가 STALE이면 NO_TARGET(보낼 대상 없음, stale-PID 판정에 맡김)",
-    decideStopAction({ present: true, pid: 111, ownerKind: "autodev", liveness: { verdict: "STALE", evidence: "PID_NOT_RUNNING" } }).action ===
-      "NO_TARGET"
+    decideStopAction({
+      present: true,
+      pid: 111,
+      processStartedAtMs: 1_000,
+      ownerKind: "autodev",
+      liveness: { verdict: "STALE", evidence: "PID_NOT_RUNNING" },
+    }).action === "NO_TARGET"
   );
   check(
     "stop: liveness가 UNCERTAIN이면 NO_TARGET(확인 못 함을 중단 대상으로 추측하지 않음)",
-    decideStopAction({ present: true, pid: 111, ownerKind: "autodev", liveness: { verdict: "UNCERTAIN", reason: "권한 없음" } }).action ===
-      "NO_TARGET"
+    decideStopAction({
+      present: true,
+      pid: 111,
+      processStartedAtMs: 1_000,
+      ownerKind: "autodev",
+      liveness: { verdict: "UNCERTAIN", reason: "권한 없음" },
+    }).action === "NO_TARGET"
   );
   check(
     "stop: ownerKind가 autodev가 아니면(local-human-approval) REFUSED — 추측해서 건드리지 않음",
-    decideStopAction({ present: true, pid: 111, ownerKind: "local-human-approval", liveness: { verdict: "ALIVE" } }).action === "REFUSED"
+    decideStopAction({
+      present: true,
+      pid: 111,
+      processStartedAtMs: 1_000,
+      ownerKind: "local-human-approval",
+      liveness: { verdict: "ALIVE" },
+    }).action === "REFUSED"
   );
   check(
     "stop: ownerKind가 autodev가 아니면(telegram-resume) REFUSED",
-    decideStopAction({ present: true, pid: 111, ownerKind: "telegram-resume", liveness: { verdict: "ALIVE" } }).action === "REFUSED"
+    decideStopAction({
+      present: true,
+      pid: 111,
+      processStartedAtMs: 1_000,
+      ownerKind: "telegram-resume",
+      liveness: { verdict: "ALIVE" },
+    }).action === "REFUSED"
   );
-  const ok = decideStopAction({ present: true, pid: 999, ownerKind: "autodev", liveness: { verdict: "ALIVE" } });
+  const ok = decideStopAction({ present: true, pid: 999, processStartedAtMs: 123_456, ownerKind: "autodev", liveness: { verdict: "ALIVE" } });
   check("stop: ownerKind=autodev + liveness=ALIVE면 REQUEST_STOP", ok.action === "REQUEST_STOP");
   check("stop: REQUEST_STOP은 실제 project lock owner pid를 그대로 담음", ok.action === "REQUEST_STOP" && ok.pid === 999);
+  check(
+    "stop: REQUEST_STOP은 project lock owner의 processStartedAtMs도 그대로 담음(PID 재사용 하드닝 — pid 단독이 아니라 pid+시작시각으로 신원을 식별)",
+    ok.action === "REQUEST_STOP" && ok.processStartedAtMs === 123_456
+  );
 }
 
 function main(): void {
