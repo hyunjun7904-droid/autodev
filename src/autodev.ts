@@ -65,7 +65,7 @@ import { rmSync } from "node:fs";
 import { getWorkingTreeChanges } from "./git-changes";
 import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
-import { isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles } from "./human-gate-policy";
+import { isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles, isNonScopeCheckpointBlockMarker } from "./human-gate-policy";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
 // manifest.taskRegistry 데이터) → Claude 실제 개발 → targeted tests(AutoDev가 직접
@@ -1783,7 +1783,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 자동 복구 대상이면 이 event를 아예 만들지 않는다 — RUN_BLOCKED(아래, 항상 기록됨)와
     // orchestrator.ts 자신의 REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED event만으로 audit
     // 기록/대시보드 집계는 이미 충분하다(둘 다 이 generic event에 의존하지 않는다).
-    if (!isTechnicalAutoRecoverableWaitingHuman(finalState)) {
+    //
+    // § BLOCKER 3 재하드닝(독립 최종 감사, 2026-08-30) — 이 investigation 도중 확인된 별도
+    // 오분류: finalState.status==="BLOCKED"(orchestrator.ts blockOnDurableWaitRetryExhausted가
+    // developerProviderWaitCount/reviewerProviderWaitCount/reviewStagnationWaitCount 및 이제
+    // gptCallCount/gptRawCallTotal cap 초과 시 설정하는, "terminal 기술적 BLOCKED —
+    // humanInterventionRequired 없음"이라고 그 함수 자신이 명시한 상태)는
+    // classifyWaitingHumanReason()이 finalState.status를 전혀 보지 않으므로(§ human-gate-
+    // policy.ts — 오직 deferredHumanTasks/lastGptDecision/humanFinalReview만 본다) 이 조건
+    // 하나만으로는 걸러지지 않고, 이 generic event가 그대로 HUMAN_APPROVAL_REQUIRED(
+    // humanInterventionRequired:true)를 만들어 blockOnDurableWaitRetryExhausted 자신의 설계
+    // 의도("Human Gate 아님")를 조용히 뒤집고 있었다(§ 요구사항 5 "technical error → Human
+    // Gate" 금지 — 새로 발견된 위반). "BLOCKED"는 이미 이 저장소 전체에서 일관되게
+    // "terminal 기술적, Human Gate 없음"만을 뜻하므로(§ decideNextAction의 status==="BLOCKED"
+    // STOP 분기와 동일한 원칙), 여기서도 명시적으로 제외한다 — classifyWaitingHumanReason을
+    // 새로 흉내내지 않고 이 저장소의 기존 status 계약을 그대로 재사용한다.
+    if (finalState.status !== "BLOCKED" && !isTechnicalAutoRecoverableWaitingHuman(finalState)) {
       emitEvent(
         events,
         {
@@ -2059,6 +2074,21 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // G2 — audit-critical 기록 실패도 같은 저장 경로로 surface한다, 새 저장 경로를 만들지
     // 않는다).
     const isSecurityGate = (checkpoint.secretFindings?.length ?? 0) > 0 || checkpoint.dependencyScanVerdict === "BLOCK";
+    // § BLOCKER 2 재하드닝(독립 최종 감사) — 아래에서 실제로 state.deferredHumanTasks에
+    // 저장하는 것과 정확히 같은 marker 문자열을 여기서 미리 계산해, human-gate-policy.ts의
+    // canonical isNonScopeCheckpointBlockMarker()(§ 그 함수 docstring — "이 파일의 기존
+    // 분류 로직을 복제하지 않고 export만 추가")로 이 checkpoint 실패가 실제로 genuine인지
+    // 재사용해 판정한다. checkpoint.reason이 정확히 CHECKPOINT_SCOPE_VIOLATION_REASON이면
+    // (allowedPathPrefixes 밖 예상치 못한 변경만으로 막힌, Secret/Dependency 문제 없는
+    // 경우) classifier가 이미 이를 기술적 자동 복구 대상으로 분류하므로(§ autodev.ts의
+    // WAITING_HUMAN 자동 복구 블록이 실제로 이 marker를 인식해 다음 실행에서 사람 승인 없이
+    // READY로 되돌린다), 이 event의 humanInterventionRequired도 그와 일치시킨다 — 이전
+    // 버전은 이 case에도 무조건 true였다("Reviewer BLOCK/HUMAN_REQUIRED가 일괄
+    // humanInterventionRequired=true가 될 수 있음"과 동일한 오분류 패턴).
+    const checkpointBlockedMarker =
+      `CHECKPOINT_BLOCKED(${taskDef.id}): ${checkpoint.reason}` +
+      (checkpoint.unexpectedFiles?.length ? ` — unexpected: ${checkpoint.unexpectedFiles.join(", ")}` : "");
+    const isGenuineCheckpointBlock = isSecurityGate || isNonScopeCheckpointBlockMarker(checkpointBlockedMarker);
     emitEvent(
       events,
       {
@@ -2068,7 +2098,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         taskId: taskDef.id,
         executionPhase: "checkpoint",
         outcome: "BLOCKED",
-        humanInterventionRequired: true,
+        humanInterventionRequired: isGenuineCheckpointBlock,
         reason: checkpoint.reason,
         metadata: { secretFindingCount: checkpoint.secretFindings?.length ?? 0, dependencyScanVerdict: checkpoint.dependencyScanVerdict ?? null },
       },
@@ -2082,11 +2112,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
     const afterOrchestrator = loadState(statePath);
     afterOrchestrator.status = "WAITING_HUMAN";
-    afterOrchestrator.deferredHumanTasks.push(
-      `CHECKPOINT_BLOCKED(${taskDef.id}): ${checkpoint.reason}` +
-        (checkpoint.unexpectedFiles?.length ? ` — unexpected: ${checkpoint.unexpectedFiles.join(", ")}` : ""),
-      ...auditFailures
-    );
+    afterOrchestrator.deferredHumanTasks.push(checkpointBlockedMarker, ...auditFailures);
     saveState(afterOrchestrator, statePath);
     log("checkpoint 실패 — WAITING_HUMAN으로 전환", { taskId: taskDef.id, reason: checkpoint.reason });
     // Phase G Task G7 — checkpoint가 BLOCK한 이유(unexpected files/secret/dependency 위험)와

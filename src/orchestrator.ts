@@ -15,6 +15,13 @@ import type { EventStore } from "./event-store";
 import type { UsageLedger } from "./usage-ledger";
 import { log } from "./logger";
 import type { ProjectState, OrchestratorStatus, ClaudeResult, GptReviewResult, CoreState } from "./types";
+// § BLOCKER 2 재하드닝(독립 최종 감사, 2026-08-30) — human-gate-policy.ts는 이 파일의
+// MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX/CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX/
+// DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX를 이미 import한다 — 이 값을 되받는
+// 것은 순수 상수/함수 값이라(모듈 top-level에서 즉시 실행되지 않고 함수 본문 안에서만
+// 호출됨) CommonJS의 순환 require에서도 안전하다. canonical 분류 단일 출처(§
+// classifyWaitingHumanReason)를 이 파일에서 재구현하지 않기 위해서다.
+import { isTechnicalAutoRecoverableWaitingHuman } from "./human-gate-policy";
 
 export const MAX_GPT_CALLS = 10; // review "cycle" 단위 상한(REVISE 루프 횟수)
 export const MAX_GPT_RAW_CALLS = 30; // gptTransportRetry 포함 실제 API 호출 총합의 hard cap(사용자 미지정 — 무한호출 방지용 보수적 기본값)
@@ -317,6 +324,11 @@ export async function runOrchestrator(
     state.reviewerProviderNextRetryAt = null;
     state.reviewStagnationWaitCount = 0;
     state.reviewStagnationNextRetryAt = null;
+    // § BLOCKER 3 재하드닝(독립 최종 감사) — gptCallCount/gptRawCallTotal도 나머지 durable
+    // counter와 동일한 원칙: 다른(새) task로 전환될 때만 리셋한다. 같은 task를 이어가는 동안은
+    // (아래 let 초기화가 state에서 그대로 이어받는다) 프로세스 재시작에도 보존된다.
+    state.gptCallCount = 0;
+    state.gptRawCallTotal = 0;
   }
   state.lastClaudeResult = null;
   state.lastGptDecision = null;
@@ -331,14 +343,20 @@ export async function runOrchestrator(
     return { finalState: state, statusHistory };
   }
 
-  let gptCallCount = 0;
-  let gptRawCallTotal = 0;
-  // Phase SI-3.8D — 이 run(while 루프) 안에서만 이어지는 loop-local 값이다(gptCallCount/
-  // gptRawCallTotal과 동일한 이유로 project-state.json에 저장하지 않는다 — § review-baseline.ts
-  // 상단 주석). 첫 round는 항상 undefined(FULL)로 시작한다.
+  // § BLOCKER 3 재하드닝(독립 최종 감사) — 더 이상 무조건 0으로 시작하지 않는다. 위
+  // resumingSameTask 블록이 새 task로 전환될 때만 state.gptCallCount/gptRawCallTotal을 0으로
+  // 리셋하므로, 같은 task를 이어가는 process restart에서는 여기서 그 durable 값을 그대로
+  // 이어받는다(§ types.ts CoreState.gptCallCount/gptRawCallTotal 문서).
+  let gptCallCount = state.gptCallCount ?? 0;
+  let gptRawCallTotal = state.gptRawCallTotal ?? 0;
+  // Phase SI-3.8D — reviewBaseline은 여전히 이 run(while 루프) 안에서만 이어지는 loop-local
+  // 값이다(claudeResult 자체가 재시작에도 살아남지 않아 재시작하면 Developer 호출부터 다시
+  // 해야 하므로, review round의 "직전 baseline"을 영속화해도 실익이 없다 — § 아래 gptResult
+  // 관련 주석과 동일한 이유). 첫 round는 항상 undefined(FULL)로 시작한다.
   let reviewBaseline: ReviewBaseline | undefined;
-  // Phase 6 — 같은 실패가 reviewCycle 내내 반복되는지 감지하는 loop-local tracker(위
-  // gptCallCount와 동일하게 project-state.json에 영속화하지 않는다).
+  // Phase 6 — 같은 실패가 reviewCycle 내내 반복되는지 감지하는 loop-local tracker(reviewBaseline과
+  // 동일하게 project-state.json에 영속화하지 않는다 — gptCallCount/gptRawCallTotal과 달리 이
+  // tracker는 크래시 우회 budget이 아니라 관측용 fingerprint 캐시일 뿐이다).
   const stagnationTracker = createStagnationTracker();
   // AutoDev Core Maintenance(2026-08-30) — 가장 최근에 관측된 required-test 실패
   // repeatCount(아래 stagnationTracker.observe 결과를 매 cycle 갱신). MAX_REVIEW_CYCLES
@@ -553,14 +571,40 @@ export async function runOrchestrator(
       };
     } else {
       gptCallCount += 1;
+      // § BLOCKER 3 재하드닝(독립 최종 감사) — REVISE round 예산(gptCallCount)도 실제
+      // 네트워크 호출 여부와 무관하게 즉시 durable하게 반영한다(아래 gptRawCallTotal 예약과
+      // 함께 저장됨).
+      state.gptCallCount = gptCallCount;
       if (gptCallCount > MAX_GPT_CALLS) {
-        log(`GPT 호출 ${MAX_GPT_CALLS}회 초과 — WAITING_HUMAN`);
+        // § BLOCKER 3 재하드닝(독립 최종 감사) — REVISE round 예산 소진은 사람의 "승인"으로
+        // 해결되는 문제가 아니다(코드가 계속 REVISE를 유발한다는 뜻 — 근본 원인을 사람이
+        // 직접 고쳐야 한다). blockOnDurableWaitRetryExhausted(§ 위)와 정확히 동일한 원칙으로
+        // WAITING_HUMAN(Telegram Human Gate)이 아니라 terminal 기술적 BLOCKED로 전환한다 —
+        // 이전에는 이 case가 WAITING_HUMAN이라 autodev.ts의 generic catch-all이
+        // HUMAN_APPROVAL_REQUIRED(humanInterventionRequired:true)를 만들었다(§ 요구사항
+        // "cap을 넘긴 뒤 ... terminal technical BLOCKED, Human Gate=0").
+        log(`GPT 호출 ${MAX_GPT_CALLS}회 초과 — 기술적 BLOCKED로 전환(Human Gate 아님)`);
         state.deferredHumanTasks.push(`${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 ${gptCallCount}회`);
-        setStatus("WAITING_HUMAN");
+        state.status = "BLOCKED";
+        emitEvent({
+          eventType: "RUN_BLOCKED",
+          executionPhase: "review",
+          outcome: "BLOCKED",
+          reason: `${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX} 총 ${gptCallCount}회`,
+        });
+        saveCurrentState(state);
         break;
       }
 
       emitEvent({ eventType: "REVIEW_STARTED", executionPhase: "review", outcome: "PENDING", reviseCycle: state.reviewCycle });
+      // § BLOCKER 3 재하드닝(독립 최종 감사) — 실제 network call(gptReviewer) 직전에
+      // crash-safe write-ahead reservation을 저장한다. 이 호출이 내부적으로 몇 번 재시도할지
+      // (gptTransportRetry)는 호출이 끝나야 알 수 있으므로, 지금 확실히 아는 최소값(+1)만
+      // 먼저 반영해 저장한다 — "호출이 성공적으로 돌아온 뒤에만 counter 저장"하면 네트워크
+      // 호출 직후 process crash 시 그 호출량이 통째로 유실되어 hard budget이 재시작으로
+      // 우회될 수 있다(§ types.ts CoreState.gptRawCallTotal 문서).
+      state.gptRawCallTotal = gptRawCallTotal + 1;
+      saveCurrentState(state);
       // SI-3.8A — 이 시점의 gptCallCount(방금 +1된, "이번이 몇 번째 호출인지")와 gptRawCallTotal
       // (이번 호출 이전까지 누적된 raw 호출 수)을 Budget Guard 관측값으로 그대로 전달한다.
       // SI-3.8D — reviewBaseline(직전 round의 결과, 첫 round는 undefined)도 그대로 전달한다.
@@ -580,6 +624,10 @@ export async function runOrchestrator(
       // reviewCycle(코드 수정 횟수)과 별개로 실제 API 통신 재시도까지 포함한 원시 호출
       // 총합에도 hard cap을 둔다 — 무한호출 방지(REVIEW 재시도가 반복돼도 실제 비용은 유한).
       gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
+      // § BLOCKER 3 재하드닝 — 호출이 실제로 끝났으므로 위 reservation을 정확한 합계로
+      // 교정해 저장한다(같은 task 안에서는 재시작에도 이 정확한 값이 이어진다).
+      state.gptRawCallTotal = gptRawCallTotal;
+      saveCurrentState(state);
       recordGptReviewUsage(gptResult, state.reviewCycle);
 
       // AutoDev / JARVIS 신뢰성 보완(2026-08-28 정책 수정) — GPT Reviewer 자신의 순수 provider
@@ -629,16 +677,38 @@ export async function runOrchestrator(
         await sleep(delayMs);
         state.reviewerProviderNextRetryAt = null;
         setStatus("WAITING_GPT_REVIEW");
+        // § BLOCKER 3 재하드닝 — 이 재시도 호출도 실제 network call이므로 동일한 write-ahead
+        // reservation을 적용한다(위 최초 호출과 동일한 원칙, 로직 복제 없이 같은 지역 변수를
+        // 그대로 재사용).
+        state.gptRawCallTotal = gptRawCallTotal + 1;
+        saveCurrentState(state);
         gptResult = await gptReviewer(claudeResult, state.reviewCycle, task, deps.allowedPathPrefixes, deps.projectContext, gptCallCount, gptRawCallTotal, reviewBaseline);
         reviewBaseline = gptResult.reviewBaseline ?? reviewBaseline;
         gptRawCallTotal += 1 + (gptResult.gptTransportRetry ?? 0);
+        state.gptRawCallTotal = gptRawCallTotal;
+        saveCurrentState(state);
         recordGptReviewUsage(gptResult, state.reviewCycle);
       }
 
       if (gptRawCallTotal > MAX_GPT_RAW_CALLS) {
-        log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — WAITING_HUMAN`, { gptRawCallTotal });
+        // § BLOCKER 3 재하드닝(독립 최종 감사) — 이 hard budget(실제 네트워크 호출 총합)
+        // 소진도 위 MAX_GPT_CALLS와 동일한 이유로 terminal 기술적 BLOCKED로 전환한다 —
+        // "승인"으로 풀리는 문제가 아니라 실제 비용 상한에 도달했다는 뜻이며, 사람은 이
+        // 상한 자체를 조정하거나 근본 원인을 조사해야 한다(Telegram Approve 버튼을 누른다고
+        // 이 task가 재개되어서는 안 된다 — 재개되면 hard budget이 무의미해진다). 이제
+        // gptRawCallTotal 자체가 durable하므로(§ types.ts CoreState.gptRawCallTotal),
+        // process restart로 이 cap을 우회할 수도 없다 — cap 도달 후 재시작해도 추가 Reviewer
+        // network call은 0이다(위 write-ahead reservation이 이미 저장된 카운트에서 시작).
+        log(`GPT 원시 API 호출 총합 ${MAX_GPT_RAW_CALLS}회 초과 — 기술적 BLOCKED로 전환(Human Gate 아님)`, { gptRawCallTotal });
         state.deferredHumanTasks.push(`GPT_RAW_CALL_LIMIT_EXCEEDED: 총 ${gptRawCallTotal}회`);
-        setStatus("WAITING_HUMAN");
+        state.status = "BLOCKED";
+        emitEvent({
+          eventType: "RUN_BLOCKED",
+          executionPhase: "review",
+          outcome: "BLOCKED",
+          reason: `GPT_RAW_CALL_LIMIT_EXCEEDED: 총 ${gptRawCallTotal}회`,
+        });
+        saveCurrentState(state);
         break;
       }
 
@@ -717,11 +787,22 @@ export async function runOrchestrator(
       // Core-wide 변경이 된다). 구체적 사유는 errorCode==="BUDGET_EXCEEDED"와
       // deferredHumanTasks의 "BUDGET_EXCEEDED: ..." 항목(위 push)으로 이미 구분 가능하다.
       setStatus("WAITING_HUMAN");
+      // § BLOCKER 2 재하드닝(독립 최종 감사) — 이전에는 여기서 humanInterventionRequired를
+      // 무조건 true로 고정했다. 하지만 human-gate-policy.ts의 canonical classifier는 이
+      // 정확히 같은 case(state.lastGptDecision.decision이 BLOCK/HUMAN_REQUIRED)를 이미
+      // TECHNICAL_AUTO_RECOVERABLE로 판정한다(코드 품질/scope 문제 — Developer가 고쳐야 할
+      // 기술적 사안, 사람 승인 없이 다음 실행에서 자동 복구됨, § autodev.ts의 WAITING_HUMAN
+      // 자동 복구 블록). state.lastGptDecision은 바로 위에서 이미 이 decision으로
+      // 갱신되었으므로, 여기서 classifier를 재사용하면 event의 humanInterventionRequired가
+      // 실제 시스템 동작(자동 복구 여부)과 항상 일치한다 — "Reviewer BLOCK/HUMAN_REQUIRED가
+      // 일괄 humanInterventionRequired=true가 될 수 있음" 오분류를 닫는다. 이 task에 이미
+      // 다른 genuine 마커/humanFinalReview가 남아있는 드문 경우에는 classifier가 여전히
+      // true를 반환해 진짜 genuine 상태를 되돌리지 않는다.
       emitEvent({
         eventType: "REVIEW_BLOCKED",
         executionPhase: "review",
         outcome: "BLOCKED",
-        humanInterventionRequired: true,
+        humanInterventionRequired: !isTechnicalAutoRecoverableWaitingHuman(state),
         reviewDecision: decision,
         reviewSeverity: gptResult.severity,
         reviseCycle: state.reviewCycle,

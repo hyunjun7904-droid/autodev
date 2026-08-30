@@ -657,10 +657,12 @@ async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
 
   // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 fake reviewer는 항상
   // REVISE만 반환하므로, REVIEW_CYCLE_EXHAUSTED는 이제 durable wait-then-retry로 계속
-  // 반복된다(사람에게 넘기지 않음). 이 run이 실제로 끝나는 지점은 이 정책 수정과 무관한 기존
-  // 비용 안전장치 MAX_GPT_CALLS(10, orchestrator.ts, 이 Maintenance가 건드리지 않음)다 —
-  // reviewCycle이 MAX_REVIEW_CYCLES(5)마다 리셋되며 durable wait을 2번 거친 뒤(gptCallCount
-  // 5, 10) 11번째 review 시도에서 gptCallCount>10으로 genuine WAITING_HUMAN이 된다. sleep을
+  // 반복된다(사람에게 넘기지 않음). 이 run이 실제로 끝나는 지점은 비용 안전장치 MAX_GPT_CALLS
+  // (10, orchestrator.ts)다 — reviewCycle이 MAX_REVIEW_CYCLES(5)마다 리셋되며 durable wait을
+  // 2번 거친 뒤(gptCallCount 5, 10) 11번째 review 시도에서 gptCallCount>10으로 terminal
+  // 기술적 BLOCKED가 된다(§ BLOCKER 3 재하드닝, 독립 최종 감사 2026-08-30 — 이전에는 여기서
+  // genuine WAITING_HUMAN이었으나, "cap을 넘긴 뒤 terminal technical BLOCKED, Human Gate=0"
+  // 요구사항에 따라 blockOnDurableWaitRetryExhausted와 동일한 원칙으로 바뀌었다). sleep을
   // 즉시 반환하도록 주입해 실제 대기 없이 테스트한다.
   await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() }, events });
 
@@ -675,26 +677,27 @@ async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
   check("event 기록: REVIEW_CYCLE_EXHAUSTED가 2회(사람에게 넘기지 않고 durable하게 재시도했으므로) 기록됨", exhaustedEvents.length === 2);
   check("event 기록: REVIEW_REVISE가 10회(두 번의 5-cycle 예산) 기록됨", events.query({ eventType: "REVIEW_REVISE" }).events.length === 10);
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("event 기록: 결국 MAX_GPT_CALLS(기존, 변경되지 않은 비용 안전장치)로 genuine WAITING_HUMAN에 도달", finalState.status === "WAITING_HUMAN");
+  check("event 기록: 결국 MAX_GPT_CALLS(비용 안전장치)로 terminal 기술적 BLOCKED에 도달", finalState.status === "BLOCKED");
   check(
-    "event 기록: 그 WAITING_HUMAN은 REVIEW_CYCLE_EXHAUSTED가 아니라 MAX_GPT_CALLS 사유임(deferredHumanTasks에 REVIEW_CYCLE_EXHAUSTED 없음)",
+    "event 기록: 그 BLOCKED는 REVIEW_CYCLE_EXHAUSTED가 아니라 MAX_GPT_CALLS 사유임(deferredHumanTasks에 REVIEW_CYCLE_EXHAUSTED 없음)",
     !finalState.deferredHumanTasks.some((t) => t.includes("REVIEW_CYCLE_EXHAUSTED"))
   );
-  // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — REVIEW_CYCLE_EXHAUSTED 자체는 canonical Human
-  // Gate Policy상 기술적 자동 복구 대상이다(§ human-gate-policy.ts classifyWaitingHumanReason).
-  // 하지만 이 시나리오가 최종적으로 도달하는 WAITING_HUMAN은 REVIEW_CYCLE_EXHAUSTED가 아니라
-  // MAX_GPT_CALLS(위에서 이미 검증) — 그리고 classifyWaitingHumanReason은 "GPT 호출 횟수 상한"을
-  // 의도적으로 TECHNICAL_AUTO_RECOVERABLE 목록에 넣지 않고 fail-closed GENUINE_HUMAN_JUDGMENT로
-  // 남긴다(비용 관련 안전장치이므로 사람이 실제로 알아야 한다는 기존 설계, § human-gate-
-  // policy.ts 상단 주석 "GPT 호출 횟수 상한 등은 여기서 fail-closed로 사람 판단을 유지한다").
-  // 그래서 generic HUMAN_APPROVAL_REQUIRED bookend는 이 경우 정상적으로 기록돼야 한다.
+  // § BLOCKER 3 재하드닝(독립 최종 감사, 2026-08-30) — MAX_GPT_CALLS 소진은 이제
+  // blockOnDurableWaitRetryExhausted(developerProviderWaitCount/reviewerProviderWaitCount/
+  // reviewStagnationWaitCount 소진)와 정확히 같은 원칙(state.status="BLOCKED")을 쓴다 — 사람의
+  // "승인"으로 풀리는 문제가 아니라 근본 원인(REVISE가 계속 필요한 이유)을 사람이 직접
+  // 고쳐야 하는 기술적 안전정지이기 때문이다(§ autodev.ts decideNextAction의 status==="BLOCKED"
+  // STOP 분기 주석과 동일한 원칙). autodev.ts의 generic catch-all은 이제
+  // finalState.status==="BLOCKED"일 때 이 event를 아예 만들지 않는다(§ 요구사항 "cap을 넘긴
+  // 뒤 ... Human Gate = 0") — 이전 정책(genuine WAITING_HUMAN + Telegram 알림)은 독립 감사가
+  // 지적한 "technical error → Human Gate" 오분류였다.
   check(
-    "event 기록: MAX_GPT_CALLS로 인한 WAITING_HUMAN은 genuine이므로 generic HUMAN_APPROVAL_REQUIRED bookend가 정상적으로 기록됨(Telegram 알림 유지)",
-    events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 1
+    "event 기록: MAX_GPT_CALLS로 인한 BLOCKED는 기술적이므로 generic HUMAN_APPROVAL_REQUIRED bookend가 생성되지 않음(Human Gate=0)",
+    events.query({ eventType: "HUMAN_APPROVAL_REQUIRED" }).events.length === 0
   );
   check(
-    "event 기록: RUN_BLOCKED가 기록됨(RUN_COMPLETED가 아님)",
-    events.query({ eventType: "RUN_BLOCKED" }).events.length === 1 && events.query({ eventType: "RUN_COMPLETED" }).events.length === 0
+    "event 기록: RUN_BLOCKED가 기록됨(RUN_COMPLETED가 아님) — orchestrator.ts 자신의 RUN_BLOCKED(blockOnDurableWaitRetryExhausted와 동일 패턴) + autodev.ts의 generic RUN_BLOCKED(모든 non-APPROVED 종료에 항상 기록됨) 2건",
+    events.query({ eventType: "RUN_BLOCKED" }).events.length === 2 && events.query({ eventType: "RUN_COMPLETED" }).events.length === 0
   );
 }
 

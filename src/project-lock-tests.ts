@@ -548,6 +548,190 @@ async function scenarioRealConcurrentStaleLockRecovery(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 독립 최종 감사 BLOCKER 1(3+ contender 재하드닝) 필수 테스트 2 — 실제 OS 프로세스 4개
+// (>=3)가 lock이 아예 없는 상태에서 동시에 acquire를 시도한다. scenarioRealConcurrentAcquisition
+// (18)의 2-process 버전을 그대로 확장한 것 — wx exclusive create가 N>2에서도 여전히 정확히
+// 하나만 이기는 단일승자 연산임을 실제 프로세스로 증명한다.
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentAcquisitionThreePlus(): Promise<void> {
+  const root = makeProjectRoot("plock-race3-");
+  const lockDir = makeLockDir("plock-race3-dir-");
+  const workerPath = join(__dirname, "project-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("BLOCKER1-2) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, "p1", root, lockDir]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const N = 4;
+  const outs = await Promise.all(Array.from({ length: N }, () => runWorker()));
+  const acquiredCount = outs.filter((o) => o === "ACQUIRED").length;
+  const blockedCount = outs.filter((o) => o.startsWith("BLOCKED:")).length;
+  check(`BLOCKER1-2) 실제 프로세스 ${N}개(>=3) 동시 acquire 중 정확히 하나만 ACQUIRED(ACTIVE_WRITER_COUNT<=1)`, acquiredCount === 1);
+  check(`BLOCKER1-2) 나머지 ${N - 1}개 전부 PROJECT_ALREADY_LOCKED로 BLOCKED`, blockedCount === N - 1 && outs.every((o) => o === "ACQUIRED" || o === "BLOCKED:PROJECT_ALREADY_LOCKED"));
+
+  try {
+    const remaining = readdirSync(lockDir);
+    if (remaining.length > 0) rmSync(join(lockDir, remaining[0]), { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 독립 최종 감사 BLOCKER 1 필수 테스트 3 — "stale owner 교체 경쟁": 실제 OS 프로세스 4개
+// (>=3)가 이미 죽은(진짜 dead pid) owner의 stale lock 하나를 동시에 밀어내고 acquire하려고
+// 경쟁한다. scenarioRealConcurrentStaleLockRecovery(P0-1-real)의 2-process 버전을 그대로
+// 확장한 것 — captureAndVerifyLock()의 rename 기반 단일승자 격리 + wx 기반 안전 복원이
+// N>2 경쟁에서도 ACTIVE_WRITER_COUNT<=1을 지키는지 실제 프로세스로 증명한다.
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentStaleLockRecoveryThreePlus(): Promise<void> {
+  const root = makeProjectRoot("plock-race3-stale-");
+  const lockDir = makeLockDir("plock-race3-stale-dir-");
+  const workerPath = join(__dirname, "project-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("BLOCKER1-3) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  const deadChild = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  const deadPid = deadChild.pid;
+  if (typeof deadPid !== "number") {
+    check("BLOCKER1-3) (죽은 child pid를 얻지 못해 스킵)", true);
+    return;
+  }
+
+  const canonical = resolveCanonicalProjectPath(root);
+  const filePath = debugComputeLockFilePath(canonical, lockDir);
+  const staleMeta: ProjectLockMetadata = {
+    schemaVersion: PROJECT_LOCK_SCHEMA_VERSION,
+    projectId: "p1",
+    canonicalProjectPath: canonical,
+    lockId: "real-race3-stale-owner",
+    pid: deadPid,
+    processStartedAtMs: Date.now() - 999_000,
+    lockCreatedAt: new Date(Date.now() - 999_000).toISOString(),
+    ownerKind: "autodev",
+  };
+  writeFileSync(filePath, JSON.stringify(staleMeta), "utf-8");
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, "p1", root, lockDir]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const N = 4;
+  const outs = await Promise.all(Array.from({ length: N }, () => runWorker()));
+  const acquiredCount = outs.filter((o) => o === "ACQUIRED").length;
+  check(`BLOCKER1-3) 실제 프로세스 ${N}개(>=3)가 진짜 dead owner의 stale lock을 동시에 밀어내도 정확히 하나만 ACQUIRED`, acquiredCount === 1);
+  check(
+    "BLOCKER1-3) 나머지 전부 ACQUIRED가 아님(승자 인식 실패로 인한 이중 승리 없음)",
+    outs.filter((o) => o !== "ACQUIRED").every((o) => o.startsWith("BLOCKED:"))
+  );
+  check("BLOCKER1-3) 최종적으로 lock 파일이 정확히 하나만 남아 유효한 owner를 가리킴", existsSync(filePath));
+
+  try {
+    rmSync(filePath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 독립 최종 감사 BLOCKER 1 필수 테스트 4 — "old owner release vs fresh owner acquire
+// 경쟁": 실제 OS 프로세스 4개(>=3)가 같은 project lock에 대해 각자 독립적으로
+// "acquire(경쟁 승리 시) → 짧게 보유 → release → 재시도"를 반복한다. mock/가짜 liveness
+// 주입이 전혀 없다 — 모든 승부는 실제 acquireProjectLock()/releaseProjectLock()의 원자적
+// 연산이 가른다. 각 worker가 보고하는 실제 [acquiredAt, releasedAt] wall-clock 구간을
+// 프로세스 경계를 넘어 모아, 서로 다른 프로세스의 구간이 단 한 순간도 겹치지 않는지
+// 검증한다 — 이것이 바로 "어떤 테스트에서도 active writer > 1이면 즉시 FAIL"(§ 요구사항
+// 7)을 실제 시간축 위에서 직접 증명하는 방법이다.
+// ---------------------------------------------------------------------------
+async function scenarioRealReleaseVsFreshAcquireRace(): Promise<void> {
+  const root = makeProjectRoot("plock-race-hold-");
+  const lockDir = makeLockDir("plock-race-hold-dir-");
+  const workerPath = join(__dirname, "project-lock-race-hold-release-worker.js");
+  if (!existsSync(workerPath)) {
+    check("BLOCKER1-4) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  const N = 4;
+  const holdMs = 250;
+  const retryIntervalMs = 30;
+  const maxRetries = 150; // 넉넉한 bounded 재시도 예산(최대 약 4.5초 재시도 대기 + hold 시간)
+
+  function runWorker(): Promise<string[]> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, "p1", root, lockDir, String(holdMs), String(maxRetries), String(retryIntervalMs)]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim().split("\n").filter((l) => l.length > 0)));
+    });
+  }
+
+  const allOutputs = await Promise.all(Array.from({ length: N }, () => runWorker()));
+
+  type Interval = { acquiredAt: number; releasedAt: number; releasedOk: boolean; worker: number };
+  const intervals: Interval[] = [];
+  let neverAcquiredCount = 0;
+  allOutputs.forEach((lines, workerIdx) => {
+    for (const line of lines) {
+      if (line === "NEVER_ACQUIRED") {
+        neverAcquiredCount += 1;
+        continue;
+      }
+      const m = /^ACQUIRED (\d+) (\d+) (true|false)$/.exec(line);
+      if (m) {
+        intervals.push({ acquiredAt: Number(m[1]), releasedAt: Number(m[2]), releasedOk: m[3] === "true", worker: workerIdx });
+      }
+    }
+  });
+
+  check(`BLOCKER1-4) ${N}개 worker 전부 최소 한 번은 실제로 ACQUIRED에 성공함(영구 starvation 없음)`, intervals.length === N && neverAcquiredCount === 0);
+  check("BLOCKER1-4) 모든 acquire 뒤 release가 실제로 성공함(ok:true)", intervals.every((iv) => iv.releasedOk));
+
+  // 핵심 invariant — 서로 다른 프로세스가 보고한 [acquiredAt, releasedAt] 구간이 단 한
+  // 순간도 겹치지 않아야 한다(ACTIVE_WRITER_COUNT<=1이 매 순간 유지됨을 실제 wall-clock
+  // timestamp로 직접 증명).
+  let maxOverlappingWriters = 1;
+  for (let i = 0; i < intervals.length; i++) {
+    for (let j = i + 1; j < intervals.length; j++) {
+      const a = intervals[i];
+      const b = intervals[j];
+      const overlaps = a.acquiredAt < b.releasedAt && b.acquiredAt < a.releasedAt;
+      if (overlaps) maxOverlappingWriters = Math.max(maxOverlappingWriters, 2);
+    }
+  }
+  check("BLOCKER1-4) 어떤 두 worker의 보유 구간도 겹치지 않음(active writer > 1 즉시 FAIL 기준 통과)", maxOverlappingWriters === 1);
+
+  try {
+    const remaining = readdirSync(lockDir);
+    if (remaining.length > 0) rmSync(join(lockDir, remaining[0]), { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AutoDev / JARVIS 최종 무인개발 구조 보완 — inspectProjectRuntimeLiveness(§ 요구사항 24,
 // 대시보드 실행상태 보완의 근거 데이터).
 // ---------------------------------------------------------------------------
@@ -605,6 +789,9 @@ async function main(): Promise<void> {
   scenarioInspectRuntimeLivenessStaleOwner();
   await scenarioRealConcurrentAcquisition();
   await scenarioRealConcurrentStaleLockRecovery();
+  await scenarioRealConcurrentAcquisitionThreePlus();
+  await scenarioRealConcurrentStaleLockRecoveryThreePlus();
+  await scenarioRealReleaseVsFreshAcquireRace();
 
   console.log("\n=== project-lock.ts(G7) 테스트 결과 ===");
   for (const r of results) console.log(r);

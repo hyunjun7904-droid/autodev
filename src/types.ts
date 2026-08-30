@@ -271,6 +271,34 @@ export interface CoreState {
    *  과 동일하게, 재시작 시 남은 시간만큼만 마저 기다린다. */
   reviewStagnationNextRetryAt?: string | null;
 
+  /**
+   * § BLOCKER 3(독립 최종 감사, 2026-08-30) Reviewer API/retry hard budget restart
+   * persistence. 이전에는 orchestrator.ts의 `let gptCallCount = 0`이 매 프로세스 시작마다
+   * 무조건 0으로 초기화되는 loop-local 변수였다 — 같은 task를 프로세스 재시작(crash/
+   * supervisor 재spawn) 후 이어가도 REVISE round 예산(MAX_GPT_CALLS)이 매번 새로
+   * 채워졌다. developerProviderWaitCount/reviewerProviderWaitCount/reviewStagnationWaitCount와
+   * 완전히 동일한 원칙(§ orchestrator.ts resumingSameTask)으로 이 값을 durable하게 만든다 —
+   * 같은 task를 이어가는 동안만 누적되고, 다른(새) task로 전환되면 0으로 리셋된다. optional인
+   * 이유도 동일하다(지정하지 않으면 기존 project-state.json과 100% 하위 호환).
+   */
+  gptCallCount?: number;
+
+  /**
+   * 위 gptCallCount와 짝을 이루지만 다른 예산이다(§ orchestrator.ts MAX_GPT_RAW_CALLS) —
+   * gptTransportRetry(같은 review round 안의 실제 API 재시도)까지 포함한 실제 네트워크 호출
+   * 총합으로, 이 값이 진짜 "hard budget"(비용 안전장치)이다. 이전에는 이 값도 loop-local
+   * 변수라 프로세스 재시작이 이 hard budget을 무제한으로 다시 채워주는 우회 수단이 됐다 —
+   * gptCallCount와 동일하게 durable하게 만들어 같은 task 안에서는 재시작에도 보존한다.
+   * orchestrator.ts는 실제 gptReviewer() 네트워크 호출 "직전"에 최소 +1(그 호출이 내부적으로
+   * 몇 번 재시도할지는 호출이 끝나야 알 수 있으므로, crash-safe accounting을 위해 알 수 있는
+   * 최소값으로 먼저 reservation을 저장한다 — § 요구사항 "실제 호출량을 과소 계산하는 것보다
+   * 보수적 초과 계산이 낫다"의 반대 방향 안전장치: 최소한 undercounting은 막는다) 예약값을
+   * 먼저 저장하고, 호출이 실제로 끝나면 정확한 합계(1 + gptTransportRetry)로 다시 저장한다 —
+   * "호출 후 성공적으로 돌아온 뒤에만 counter 저장"하던 이전 방식은 네트워크 호출 직후
+   * process crash 시 그 호출량이 통째로 유실될 수 있었다.
+   */
+  gptRawCallTotal?: number;
+
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];
 

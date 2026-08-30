@@ -282,7 +282,7 @@ export function acquireProjectLock(input: AcquireProjectLockInput, testDeps: Pro
     const existingMeta = existing.metadata;
     if (existingMeta.pid === pid) {
       // 같은 프로세스의 재진입 — 항상 안전하게 복구한다(§ 함수 docstring).
-      const removal = tryRemoveStaleLock(filePath, existingMeta.lockId);
+      const removal = captureAndVerifyLock(filePath, existingMeta.lockId);
       if (removal.outcome === "UNCERTAIN") {
         return { ok: false, code: "LOCK_STATE_UNCERTAIN", reason: `같은 프로세스의 이전 lock을 정리하지 못했습니다: ${removal.reason}` };
       }
@@ -309,13 +309,14 @@ export function acquireProjectLock(input: AcquireProjectLockInput, testDeps: Pro
       return { ok: false, code: "LOCK_STATE_UNCERTAIN", reason: `기존 lock owner(pid=${existingMeta.pid})의 생존 여부를 확인할 수 없습니다: ${verdict.reason}` };
     }
 
-    // STALE이 증명됨 — 밀어내고 재시도한다. tryRemoveStaleLock()이 이제 rename() 기반
-    // 원자적 단일승자 capture이므로(§ 함수 docstring), removal.outcome==="UNCERTAIN"(우리가
-    // 격리한 것이 기대했던 X가 아니었음 — 다른 프로세스의 fresh Y였을 가능성)이어도 즉시
-    // 전체 acquire를 실패시키지 않는다 — staleRecovery만 기록하지 않고 루프를 그대로
-    // 돌려(MAX_ACQUIRE_ATTEMPTS로 bounded) 다음 반복이 그 시점의 실제 최신 상태(Y의 진짜
-    // owner)를 처음부터 다시 판정하게 한다.
-    const removal = tryRemoveStaleLock(filePath, existingMeta.lockId);
+    // STALE이 증명됨 — 밀어내고 재시도한다. captureAndVerifyLock()이 rename() 기반 단일승자
+    // capture + wx 기반 안전 복원이므로(§ 함수 docstring), REMOVED가 아닌 다른 모든 결과
+    // (ALREADY_GONE/MISMATCH_RESTORED/MISMATCH_SUPERSEDED/UNCERTAIN)에서도 즉시 전체
+    // acquire를 실패시키지 않는다 — staleRecovery만 기록하지 않고 루프를 그대로
+    // 돌려(MAX_ACQUIRE_ATTEMPTS로 bounded) 다음 반복이 그 시점의 실제 최신 상태를 처음부터
+    // 다시 판정하게 한다. UNCERTAIN이 계속 반복되면 결국 아래 루프 종료 후
+    // LOCK_STATE_UNCERTAIN으로 fail-closed된다(무한 재시도 없음).
+    const removal = captureAndVerifyLock(filePath, existingMeta.lockId);
     if (removal.outcome === "REMOVED") {
       staleRecovery = { previousOwnerPid: existingMeta.pid, evidence: verdict.evidence };
     }
@@ -324,42 +325,62 @@ export function acquireProjectLock(input: AcquireProjectLockInput, testDeps: Pro
   return { ok: false, code: "LOCK_STATE_UNCERTAIN", reason: `lock 획득을 ${MAX_ACQUIRE_ATTEMPTS}회 시도했지만 확정하지 못했습니다.` };
 }
 
-type StaleLockRemovalOutcome =
+type LockCaptureOutcome =
   | { outcome: "REMOVED" }
   | { outcome: "ALREADY_GONE" }
+  | { outcome: "MISMATCH_RESTORED" }
+  | { outcome: "MISMATCH_SUPERSEDED" }
   | { outcome: "UNCERTAIN"; reason: string };
 
-/** stale로 판정된 lock을 제거한다 — § P0-1 재하드닝. 이전 버전(read → compare lockId →
- *  unlinkSync)은 "compare"와 "unlink"가 별도 syscall이라 그 사이에 다른 프로세스가 X를
- *  지우고 fresh Y를 새로 만들면 우리의 unlinkSync(filePath)가 (경로 기준으로 동작하므로)
- *  Y를 지워버릴 수 있었다 — read-then-act 패턴은 portable fs로 진짜 원자적 결합이 안 된다
- *  (§ filesystem-trust-model.md Option A와 동일한 근본 한계).
+/** stale-steal(acquire 안에서)과 release(releaseProjectLock) 양쪽에서 공유하는 단일
+ *  primitive — § P0-1 3+ contender 재하드닝(독립 최종 감사 BLOCKER 1). 이전 버전(read →
+ *  compare lockId → unlinkSync, 또는 stale-steal에서는 "격리 후 mismatch면 blind
+ *  renameSync로 복원")은 두 지점에서 진짜 3개 이상 프로세스 경쟁을 안전하게 못 지켰다:
  *
- *  이 버전은 순서를 뒤집는다: 먼저 renameSync(filePath, quarantinePath)로 그 경로에 현재
- *  있는 것이 무엇이든 원자적으로 "격리"부터 한다. rename은 커널이 보장하는 단일승자
- *  연산이다 — 같은 filePath를 대상으로 동시에 여러 프로세스가 각자의 quarantine 경로로
- *  rename을 시도해도, 그 directory entry를 실제로 옮기는 데 성공하는 것은 정확히 하나뿐이고
- *  나머지는 ENOENT로 실패한다(반면 unlink는 그런 단일승자 보장이 전혀 없다 — 대상이 무엇이든
- *  그냥 지워진다). 격리에 성공한 뒤에야 그 내용을 열어 우리가 원래 stale로 판정했던 lockId와
- *  같은지 확인한다.
+ *  1) unlink는 "무엇을 지우는지" 검증할 방법이 없다 — compare와 unlink 사이에 owner가
+ *     바뀌면 fresh owner의 lock을 그대로 지워버린다.
+ *  2) mismatch 복원에 쓰던 blind renameSync(quarantine, filePath)는 "그 사이 세 번째
+ *     프로세스가 이미 그 자리에 진짜 살아있는 fresh lock을 만들어뒀다면" 그 fresh lock을
+ *     통째로 덮어써 지워버린다(POSIX rename(2)/Windows MoveFileEx 둘 다 목적지가 있으면
+ *     조건 없이 교체한다) — 이것이 독립 감사가 지적한 "3개 이상 contender에서 canonical
+ *     path가 비는 창에 다른 owner가 들어온 뒤 restore가 충돌"하는 정확한 지점이었다.
  *
- *  격리한 내용이 기대와 다르면(다른 프로세스의 fresh Y를 실수로 격리한 경우) 즉시
- *  원래 경로로 복원을 시도한다 — 하지만 이 복원 자체도 portable fs로 완전히 원자적일 수는
- *  없다(그 사이 세 번째 프로세스가 이미 그 자리에 새 lock을 만들었다면 복원이 그것을 덮어쓸
- *  수 있다). 이 잔여 위험은 2개 프로세스 경쟁에서는 발생하지 않고, 정확히 같은 좁은 창에서
- *  3개 이상의 프로세스가 동시에 겹칠 때만 이론적으로 남는다 — portable Node.js fs만으로는
- *  제거할 수 없는, filesystem-trust-model.md가 이미 명시한 것과 동일한 계열의 한계다.
- *  이 함수는 그 잔여 위험을 숨기지 않고 UNCERTAIN으로 정직하게 보고한다(자동으로 계속
- *  진행하지 않는다 — 호출부가 다음 루프에서 그 시점의 실제 최신 상태를 처음부터 다시
- *  판정한다). */
-function tryRemoveStaleLock(filePath: string, expectedLockId: string): StaleLockRemovalOutcome {
+ *  이 버전은 오직 두 개의 진짜 커널 단일승자(single-winner) 연산만 쓴다 — 그 사이의
+ *  "검증 후 조건부 교체(compare-and-swap)"는 portable Node.js fs에 없으므로 아예 필요
+ *  없게 설계를 바꾼다:
+ *
+ *  (a) renameSync(filePath, quarantinePath) — 같은 filePath에서 동시에 여러 프로세스가
+ *      각자의 quarantine으로 rename을 시도해도, 그 directory entry를 실제로 옮기는 데
+ *      성공하는 것은 정확히 하나뿐이다(나머지는 ENOENT). 이 "현재 거기 있는 것을 통째로
+ *      원자적으로 가져오기"는 무엇을 캡처했는지 항상 정확히 안다(unlink와 다른 점).
+ *  (b) writeFileSync(filePath, ..., {flag:"wx"}) — acquire의 최초 lock 생성과 정확히
+ *      같은 원자적 exclusive-create. mismatch로 판명된(=우리가 기대한 stale/own lockId가
+ *      아닌) 캡처 내용을 "복원"할 때 blind rename 대신 이 exclusive-create를 쓴다:
+ *      필요하다면 성공하고, 그 사이 세 번째 프로세스가 이미 그 자리에 자신의 진짜 fresh
+ *      lock을 만들어뒀다면 EEXIST로 실패한다 — 실패 자체가 "덮어쓰지 않고 물러났다"는
+ *      뜻이므로 그 fresh lock은 항상 보존된다(절대 clobber하지 않는다).
+ *
+ *  이 두 연산만으로 구성하면: 어떤 특정 lock 인스턴스(lockId로 식별)를 실제로
+ *  "제거"하는 데 성공하는 프로세스는 정확히 하나뿐이고(단일승자 rename-away가 그 lockId를
+ *  캡처하는 것 자체가 유일한 성공 조건), 그 제거는 오직 그 owner가 진짜로 죽었다고
+ *  assessOwnerLiveness가 증명했을 때만(또는 owner 자신의 release) 일어난다. mismatch를
+ *  만난 쪽은 절대 clobber하지 않고(복원 성공) 또는 이미 새 owner가 있으므로 조용히
+ *  물러난다(복원 실패=EEXIST, 정상) — 어느 쪽이든 캡처 시도 전/후로 진짜 살아있는 owner가
+ *  둘 이상 존재하는 순간은 구조적으로 생기지 않는다. 잔여 위험은 filesystem-trust-model.md
+ *  가 이미 명시한 것과 동일한 계열(검증~실제 syscall 사이의 진짜 원자적 결합은 portable
+ *  Node.js fs로 불가능)로 한정된다 — 여기서는 그 창이 "PowerShell 조회(최대 5초)"에서
+ *  "JS statement 몇 줄"로 좁혀졌을 뿐만 아니라, 그 창 안에서 무엇이 일어나도(1 또는 그 이상
+ *  프로세스가 끼어들어도) 결과가 REMOVED/MISMATCH_RESTORED/MISMATCH_SUPERSEDED 중 하나로
+ *  수렴하고 그 어떤 경우도 살아있는 다른 owner의 lock을 지우지 않는다는 것이 이 함수의
+ *  핵심 보장이다. */
+function captureAndVerifyLock(filePath: string, expectedLockId: string): LockCaptureOutcome {
   const quarantinePath = `${filePath}.stale-${randomUUID()}`;
   try {
     renameSync(filePath, quarantinePath);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return { outcome: "ALREADY_GONE" }; // 이미 다른 프로세스가 처리함.
-    return { outcome: "UNCERTAIN", reason: `stale lock 격리(rename) 실패: ${err instanceof Error ? err.message : String(err)}` };
+    return { outcome: "UNCERTAIN", reason: `lock 격리(rename) 실패: ${err instanceof Error ? err.message : String(err)}` };
   }
 
   const captured = readLockFile(quarantinePath);
@@ -372,18 +393,44 @@ function tryRemoveStaleLock(filePath: string, expectedLockId: string): StaleLock
     return { outcome: "REMOVED" };
   }
 
-  // 우리가 격리한 것이 기대했던 stale owner(X)가 아니다 — 다른 프로세스가 이미 X를
-  // 제거하고 그 자리에 자신의 살아있는 fresh lock(Y)을 만들어둔 상태를 실수로 옮겨온
-  // 것일 수 있다. 절대 삭제하지 않고 원래 자리로 복원을 시도한다.
+  // 우리가 격리한 것이 기대했던 owner(X)가 아니다 — 다른 프로세스가 이미 X를 제거하고 그
+  // 자리에 자신의(또는 세 번째 프로세스의) 살아있는 fresh lock(Y)을 만들어둔 상태를 실수로
+  // 옮겨온 것일 수 있다. 원본 raw bytes를 그대로(재직렬화하지 않고) 복원 시도한다 —
+  // exclusive create이므로 그 사이 진짜 fresh owner가 이미 그 자리를 차지했다면 절대
+  // 덮어쓰지 않는다.
+  let rawContent: string;
   try {
-    renameSync(quarantinePath, filePath);
-    return { outcome: "UNCERTAIN", reason: "격리한 lock이 기대했던 stale owner와 일치하지 않아 원래 자리로 복원했습니다(다른 프로세스가 이미 교체함)." };
+    rawContent = readFileSync(quarantinePath, "utf-8");
   } catch (err) {
-    // 복원마저 실패하면(예: 그 사이 또 다른 프로세스가 그 경로를 다시 차지함) 격리된
-    // 파일을 그대로 남겨둔다(자동 삭제하지 않음 — 포렌식 목적, fail-closed 원칙 유지).
+    return { outcome: "UNCERTAIN", reason: `격리된 내용을 다시 읽지 못했습니다(파일은 quarantine에 보존됨): ${err instanceof Error ? err.message : String(err)}` };
+  }
+
+  try {
+    writeFileSync(filePath, rawContent, { encoding: "utf-8", flag: "wx" });
+    try {
+      unlinkSync(quarantinePath);
+    } catch {
+      /* 복원 성공 후 quarantine 사본은 더 이상 필요 없음 — 정리 실패는 무해하다. */
+    }
+    return { outcome: "MISMATCH_RESTORED" };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") {
+      // 그 사이 진짜 fresh owner가 이미 그 자리를 차지했다 — 절대 덮어쓰지 않고 우리가
+      // 실수로 격리했던(이미 무의미해진) 사본만 정리한다. fresh owner의 lock은 전혀
+      // 건드리지 않았다.
+      try {
+        unlinkSync(quarantinePath);
+      } catch {
+        /* 정리 실패는 무해하다 — fresh owner의 lock과는 무관한 orphan quarantine 파일. */
+      }
+      return { outcome: "MISMATCH_SUPERSEDED" };
+    }
+    // 복원도 실패하면(EEXIST 외의 이유) 격리된 파일을 그대로 둔다(자동 삭제하지 않음 —
+    // fail-closed, 포렌식 목적).
     return {
       outcome: "UNCERTAIN",
-      reason: `격리한 lock이 기대했던 stale owner와 일치하지 않았고 복원도 실패했습니다: ${err instanceof Error ? err.message : String(err)}`,
+      reason: `mismatch 복원 실패(quarantine에 보존됨): ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }
@@ -392,20 +439,31 @@ function tryRemoveStaleLock(filePath: string, expectedLockId: string): StaleLock
  * "내가 잡은 lock"만 release할 수 있다 — lockId가 정확히 일치할 때만 파일을 지운다. 다른
  * owner의 lock(우리가 없는 사이 stale로 판정되어 다른 프로세스가 새로 잡은 lock 포함)은
  * 절대 지우지 않는다(§ 요구사항 5 — lock stealing 금지와 동일한 원칙).
+ *
+ * § P0-1 3+ contender 재하드닝(독립 최종 감사 BLOCKER 1) — 이전 버전(read → compare
+ * lockId → unlinkSync)은 compare와 unlink가 별도 syscall이라, 그 사이에 (이론상) owner가
+ * 교체되면 unlink가 경로 기준으로 동작하므로 fresh owner의 lock을 지워버릴 수 있었다. 먼저
+ * 손상/부재 판정을 위한 non-destructive 사전 읽기로 기존 에러 메시지/동작(손상된 lock은
+ * 절대 건드리지 않음)을 그대로 유지한 뒤에만, 실제 삭제는 captureAndVerifyLock()(acquire의
+ * stale-steal과 동일한 단일승자 rename-away + wx 기반 안전 복원 primitive, 로직 복제 없음)에
+ * 위임한다 — 이 함수가 실제로 캡처한 내용이 우리 lockId와 다르면(우리가 살아있는 동안 다른
+ * 프로세스가 이미 이 lock을 교체했다는 뜻) 그 fresh owner의 lock을 절대 clobber하지 않는다.
  */
 export function releaseProjectLock(lock: ProjectLockHandle): { ok: boolean; reason?: string } {
-  const current = readLockFile(lock.filePath);
-  if (current.kind === "absent") return { ok: false, reason: "lock 파일이 이미 없습니다(이미 release되었거나 유실됨)." };
-  if (current.kind === "corrupt") return { ok: false, reason: "release 시점에 lock 파일이 손상되어 있어 안전하게 확인할 수 없습니다 — 삭제하지 않습니다." };
-  if (current.metadata.lockId !== lock.metadata.lockId) {
+  const initial = readLockFile(lock.filePath);
+  if (initial.kind === "absent") return { ok: false, reason: "lock 파일이 이미 없습니다(이미 release되었거나 유실됨)." };
+  if (initial.kind === "corrupt") return { ok: false, reason: "release 시점에 lock 파일이 손상되어 있어 안전하게 확인할 수 없습니다 — 삭제하지 않습니다." };
+  if (initial.metadata.lockId !== lock.metadata.lockId) {
     return { ok: false, reason: "이 lockId는 현재 파일의 owner와 일치하지 않습니다 — 다른 owner의 lock을 release하지 않습니다." };
   }
-  try {
-    unlinkSync(lock.filePath);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+
+  const outcome = captureAndVerifyLock(lock.filePath, lock.metadata.lockId);
+  if (outcome.outcome === "REMOVED") return { ok: true };
+  if (outcome.outcome === "ALREADY_GONE") return { ok: false, reason: "lock 파일이 이미 없습니다(이미 release되었거나 유실됨)." };
+  if (outcome.outcome === "MISMATCH_RESTORED" || outcome.outcome === "MISMATCH_SUPERSEDED") {
+    return { ok: false, reason: "release 시도 중 owner가 교체되어 이 lock을 지우지 않았습니다 — 다른 owner의 lock을 release하지 않습니다." };
   }
+  return { ok: false, reason: outcome.reason };
 }
 
 /**

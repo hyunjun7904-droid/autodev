@@ -132,25 +132,50 @@ function isCheckpointScopeViolationMarker(marker: string): boolean {
   return marker.startsWith("CHECKPOINT_BLOCKED(") && marker.includes(`: ${CHECKPOINT_SCOPE_VIOLATION_REASON}`);
 }
 
-const PROTOCOL_ERROR_STRUCTURAL_FAILURE_MARKER = `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR)`;
+/** § P0-3 재하드닝(독립 감사, 2026-08-30)이 PROTOCOL_ERROR 하나만 기술적 자동 복구
+ *  대상으로 처음 분리했다. § BLOCKER 2 재하드닝(독립 최종 감사, 2026-08-30 후속) — 그
+ *  분리 원칙을 CLAUDE_STRUCTURAL_FAILURE의 나머지 errorCode에도 claude-developer.ts의 실제
+ *  생성 의미(§ 그 파일 상단 주석 "AUTH_REQUIRED(사람 로그인 필요)/NON_ZERO_EXIT(실제 exit
+ *  code 실패 — 결정적 오류로 취급)/INVALID_OUTPUT(파싱 불가능한 응답)/...")를 직접 확인한
+ *  뒤 개별적으로 적용한다 — 추측으로 일괄 재분류하지 않는다:
+ *
+ *  - INVALID_OUTPUT — claude-runner.ts가 최상위 CLI stdout 전체를 JSON으로 파싱하지 못한
+ *    경우(claude-runner.ts makeError("INVALID_OUTPUT", ...)). PROTOCOL_ERROR(내부 라운드
+ *    단위 응답 계약 위반이 반복됨)와 같은 계열의 "응답 형식을 해석하지 못했다"는 순수 파싱
+ *    문제이지 사업/보안 판단이 아니다 — PROTOCOL_ERROR와 동일하게 기술적 자동 복구 대상으로
+ *    옮긴다.
+ *  - NON_ZERO_EXIT — Claude CLI 프로세스 자체의 실행 실패(exit code)로, "재시도 exhaustion"/
+ *    "execution environment failure" 범주에 해당한다 — 기술적 자동 복구 대상으로 옮긴다.
+ *  - TASK_ACTION_LIMIT/NO_PROGRESS_STAGNATION — Claude가 예산(내부 라운드/탐색-only grace)
+ *    안에 진척을 만들지 못하고 끝난 경우로, 이미 기술적 자동 복구 대상인
+ *    STAGNATION_DETECTED_MARKER_PREFIX(같은 required test 실패 반복)와 정확히 같은 성격의
+ *    "반복/무진척 패턴"이다 — 동일한 원칙으로 기술적 자동 복구 대상으로 옮긴다. 새 시도는
+ *    Developer를 처음부터 다시 호출하므로(§ orchestrator.ts) 다른 탐색 경로로 실제 진척이
+ *    날 여지가 있다.
+ *  - AUTH_REQUIRED(사람 로그인 필요)는 그대로 GENUINE으로 남긴다 — 어떤 횟수의 자동
+ *    재시도로도 스스로 해결될 수 없는 상태(사람이 실제로 로그인해야 함)라, bounded
+ *    retry로 옮겨도 재시도 예산만 소모하고 결국 다시 사람을 기다리게 될 뿐이다.
+ *  - TRUSTED_EXECUTABLE_NOT_FOUND/EXECUTABLE_IDENTITY_UNTRUSTED/EXECUTABLE_SHADOWING_DETECTED
+ *    (claude-developer.ts 주석: "실행 파일 신뢰 검증 실패 — 보안 성격, 무작정 재시도하면
+ *    안 됨")는 그대로 GENUINE으로 남긴다 — PATH/cwd executable shadowing류 잠재적 공격
+ *    신호일 수 있어(§ .claude/rules/future-operations.md SI-3.4 관련 기록) 조용히 재시도만
+ *    반복하고 사람에게 알리지 않는 것은 안전 회귀다.
+ *  - UNKNOWN(그 외 알 수 없는 errorCode)은 이 파일의 fail-closed 원칙("매칭되지 않는 사유는
+ *    항상 GENUINE_HUMAN_JUDGMENT") 그대로 GENUINE으로 남긴다. */
+const TECHNICAL_CLAUDE_STRUCTURAL_FAILURE_ERROR_CODES: readonly string[] = [
+  "PROTOCOL_ERROR",
+  "INVALID_OUTPUT",
+  "NON_ZERO_EXIT",
+  "TASK_ACTION_LIMIT",
+  "NO_PROGRESS_STAGNATION",
+];
 
-/** § P0-3 재하드닝(독립 감사, 2026-08-30) — 독립 감사에서 실제로 확인된 오분류: Claude
- *  응답이 반복적으로 해석 불가능해(claude-developer.ts PROTOCOL_FAILURE_HARD_STOP) 생기는
- *  `CLAUDE_STRUCTURAL_FAILURE(PROTOCOL_ERROR)`는 "protocol parse failure"다 — 실제 사업/보안/
- *  법적 판단이 필요한 문제가 아니라 순수 기술적 상황이며, orchestrator.ts가 이제 이 errorCode를
- *  DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX와 동일한 durable wait-then-retry 경로로 보내
- *  더 이상 이 마커 자체를 만들지 않는다(§ orchestrator.ts). 하지만 이 마커가 과거에(정책
- *  수정 이전) 이미 저장되어 있거나, 이 함수가 방어적으로 재검증하는 경우를 대비해 canonical
- *  classifier 스스로도 이 특정 sub-case만 기술적 자동 복구 대상으로 판정한다 — 그 외
- *  CLAUDE_STRUCTURAL_FAILURE(다른 errorCode: AUTH_REQUIRED/NON_ZERO_EXIT/INVALID_OUTPUT/
- *  TASK_ACTION_LIMIT/NO_PROGRESS_STAGNATION/UNKNOWN 등)는 여전히 GENUINE이다 — provider가
- *  응답을 아예 못 준 것과 다른, 사람이 봐야 할 진짜 문제일 수 있다. */
-function isProtocolErrorStructuralFailureMarker(marker: string): boolean {
-  return marker.startsWith(PROTOCOL_ERROR_STRUCTURAL_FAILURE_MARKER);
+function isTechnicalClaudeStructuralFailureMarker(marker: string): boolean {
+  return TECHNICAL_CLAUDE_STRUCTURAL_FAILURE_ERROR_CODES.some((code) => marker.startsWith(`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}${code})`));
 }
 
-function isNonProtocolErrorClaudeStructuralFailureMarker(marker: string): boolean {
-  return marker.startsWith(CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX) && !isProtocolErrorStructuralFailureMarker(marker);
+function isGenuineClaudeStructuralFailureMarker(marker: string): boolean {
+  return marker.startsWith(CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX) && !isTechnicalClaudeStructuralFailureMarker(marker);
 }
 
 /** Genuine Human Gate Local Approval(2026-08-29)이 재사용한다 — CHECKPOINT_BLOCKED 마커 중
@@ -172,7 +197,7 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const hasGenuineMarker =
     markers.some((m) => GENUINE_MARKER_PREFIXES.some((prefix) => m.startsWith(prefix))) ||
     markers.some(isNonScopeCheckpointBlockMarker) ||
-    markers.some(isNonProtocolErrorClaudeStructuralFailureMarker);
+    markers.some(isGenuineClaudeStructuralFailureMarker);
   if (hasGenuineMarker) return "GENUINE_HUMAN_JUDGMENT";
 
   const hasCheckpointScopeViolation = markers.some(isCheckpointScopeViolationMarker);
@@ -181,7 +206,7 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const hasReviewBlocked = decision === "BLOCK" || decision === "HUMAN_REQUIRED";
   const hasDeveloperTransientRetryExhausted = markers.some((m) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
   const hasStagnationDetected = markers.some((m) => m.startsWith(STAGNATION_DETECTED_MARKER_PREFIX));
-  const hasProtocolErrorStructuralFailure = markers.some(isProtocolErrorStructuralFailureMarker);
+  const hasTechnicalClaudeStructuralFailure = markers.some(isTechnicalClaudeStructuralFailureMarker);
 
   if (
     hasCheckpointScopeViolation ||
@@ -189,7 +214,7 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
     hasReviewBlocked ||
     hasDeveloperTransientRetryExhausted ||
     hasStagnationDetected ||
-    hasProtocolErrorStructuralFailure
+    hasTechnicalClaudeStructuralFailure
   ) {
     return "TECHNICAL_AUTO_RECOVERABLE";
   }

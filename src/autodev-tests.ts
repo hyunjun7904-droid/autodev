@@ -1891,6 +1891,112 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
   check("CHECKPOINT_SCOPE_VIOLATION 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
 }
 
+// § BLOCKER 2 재하드닝(독립 최종 감사, 2026-08-30) — Technical/Human Gate Matrix. 이전에는
+// REVIEW_BLOCKED(orchestrator.ts)/CHECKPOINT_BLOCKED-scope-violation(autodev.ts) event가
+// 실제로 canonical classifier(human-gate-policy.ts)와 무관하게 humanInterventionRequired를
+// 무조건 true로 실었다 — 이 두 case는 classifier가 이미 TECHNICAL_AUTO_RECOVERABLE로
+// 판정하는(Reviewer 코드 품질 BLOCK/scope violation) case이므로, 실제로 emit되는 event의
+// humanInterventionRequired도 그와 일치해야 한다(Human Gate=0). Secret/Dependency에 의한
+// CHECKPOINT_BLOCKED(진짜 genuine)는 계속 humanInterventionRequired=true여야 한다는 것은
+// scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersists가 별도로 지킨다(아래
+// 함수가 그 regression도 함께 재확인한다).
+async function scenarioTechnicalHumanGateMatrixReviewBlockAndScopeViolation(): Promise<void> {
+  // --- 행 1: Reviewer BLOCK 결정 → REVIEW_BLOCKED event는 기술적(Human Gate=0) ---
+  {
+    const repo = makeTempGitRepo();
+    const statePath = makeTempStateFile(repo, { status: "READY", completedTasks: ["P1.1"] });
+    const manifest = buildPlannerManifest(repo, statePath); // 다음 task = P1.2
+    const events = createInMemoryEventStore();
+    const claudeRunner = async (): Promise<ClaudeResult> => {
+      writeRepoFile(repo, "proj/matrix-review-block.txt", "marker\n");
+      return {
+        success: true,
+        summary: "매트릭스: 리뷰 BLOCK 유발용",
+        changedFiles: ["proj/matrix-review-block.txt"],
+        tests: [{ name: "proj:check", pass: true }],
+        rawOutput: "",
+      };
+    };
+    const blockReviewer = async (): Promise<GptReviewerReturn> => ({
+      decision: "BLOCK",
+      severity: { critical: 0, high: 1, medium: 0 },
+      feedback: "매트릭스 테스트: 코드 품질 문제로 BLOCK",
+      nextTask: null,
+    });
+    const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: blockReviewer } });
+
+    check("매트릭스[Reviewer BLOCK]: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
+    const all = events.query().events;
+    const reviewBlocked = all.filter((e) => e.eventType === "REVIEW_BLOCKED");
+    check("매트릭스[Reviewer BLOCK]: REVIEW_BLOCKED event가 정확히 1건 기록됨", reviewBlocked.length === 1);
+    check(
+      "매트릭스[Reviewer BLOCK]: REVIEW_BLOCKED event의 humanInterventionRequired=false(기술적 — Developer가 고칠 문제)",
+      reviewBlocked.every((e) => e.humanInterventionRequired === false)
+    );
+    check(
+      "매트릭스[Reviewer BLOCK]: genuine HUMAN_APPROVAL_REQUIRED event는 생성되지 않음(Human Gate=0)",
+      !all.some((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED")
+    );
+
+    // 재실행(Telegram 승인 없이) — 기술적 자동 복구로 같은 task가 이어져야 한다.
+    let secondCalls = 0;
+    const claudeRunner2 = async (): Promise<ClaudeResult> => {
+      secondCalls += 1;
+      writeRepoFile(repo, "proj/matrix-review-block-fixed.txt", "fixed\n");
+      return {
+        success: true,
+        summary: "매트릭스: 재시도 성공",
+        changedFiles: ["proj/matrix-review-block-fixed.txt"],
+        tests: [{ name: "proj:check", pass: true }],
+        rawOutput: "",
+      };
+    };
+    const second = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner: claudeRunner2, gptReviewer: fakePassReviewer() } });
+    check("매트릭스[Reviewer BLOCK]: 자동 복구 후 재시도 → outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", second.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+    check("매트릭스[Reviewer BLOCK]: 자동 복구 재시도에서 Developer가 실제로 다시 호출됨(정확히 1회)", secondCalls === 1);
+  }
+
+  // --- 행 2: Core checkpoint 자신의 scope-violation 판정(Reviewer는 놓침) → 기술적(Human Gate=0) ---
+  {
+    const repo = makeTempGitRepo();
+    const statePath = makeTempStateFile(repo, { status: "READY", completedTasks: ["P1.1"] });
+    const manifest = buildPlannerManifest(repo, statePath); // allowedPathPrefixes=["proj/"]
+    const events = createInMemoryEventStore();
+    const claudeRunner = async (): Promise<ClaudeResult> => {
+      writeRepoFile(repo, "proj/matrix-scope-ok.txt", "marker\n");
+      writeRepoFile(repo, "other/matrix-scope-violation.txt", "leftover\n");
+      return {
+        success: true,
+        summary: "매트릭스: scope violation 유발용(Reviewer는 놓침)",
+        changedFiles: ["proj/matrix-scope-ok.txt"], // Reviewer에게는 이 파일만 보고됨
+        tests: [{ name: "proj:check", pass: true }],
+        rawOutput: "",
+      };
+    };
+    const result = await runAutodevOnce({ manifest, events, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+    check("매트릭스[Scope Violation]: outcome=RAN_TASK_CHECKPOINT_BLOCKED", result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+    const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+    check(
+      "매트릭스[Scope Violation]: deferredHumanTasks에 CHECKPOINT_BLOCKED(scope violation) 마커 기록됨",
+      finalState.deferredHumanTasks.some((t) => t.startsWith("CHECKPOINT_BLOCKED(") && t.includes("other/matrix-scope-violation.txt"))
+    );
+    const all = events.query().events;
+    const checkpointBlockedEvents = all.filter((e) => e.eventType === "HUMAN_APPROVAL_REQUIRED" && e.executionPhase === "checkpoint");
+    check("매트릭스[Scope Violation]: checkpoint HUMAN_APPROVAL_REQUIRED event가 정확히 1건 기록됨", checkpointBlockedEvents.length === 1);
+    check(
+      "매트릭스[Scope Violation]: 그 event의 humanInterventionRequired=false(기술적 — scope violation은 자동 정리됨)",
+      checkpointBlockedEvents.every((e) => e.humanInterventionRequired === false)
+    );
+
+    try {
+      rmSync(join(repo, "other"), { recursive: true, force: true });
+    } catch {
+      /* 정리 실패는 테스트 결과에 영향 없음 */
+    }
+  }
+}
+
 // AutoDev / JARVIS 최종 무인개발 구조 보완 — Process/Restart Circuit Breaker(§ 요구사항
 // 20/21). status가 종결값이 아닌 mid-flight 값("CLAUDE_WORKING")으로 남아있다는 것은 직전
 // 프로세스가 그 상태를 종결하지 못한 채 죽었다는 뜻이다.
@@ -2163,6 +2269,7 @@ async function scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersis
   writeAlwaysPassCheckScript(repo);
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildSecretPrecheckManifest(repo, statePath);
+  const events = createInMemoryEventStore();
 
   const RAW_SECRET = "sk-abcdefghijklmnopqrstuvwx";
   let call = 0;
@@ -2191,6 +2298,7 @@ async function scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersis
   try {
     const result = await runAutodevOnce({
       manifest,
+      events,
       developerClaudeCaller,
       orchestratorDeps: { gptReviewer: fakePassReviewer() },
     });
@@ -2208,6 +2316,17 @@ async function scenarioSecretPrecheckDoesNotRepeatDeveloperCallWhenFindingPersis
     check(
       "Secret 사전검사(미해결): deferredHumanTasks에 실제 CHECKPOINT_BLOCKED 마커가 기록됨(사전검사가 이 판정을 대신하지 않음)",
       finalState.deferredHumanTasks.some((t) => t.startsWith("CHECKPOINT_BLOCKED(SP1)"))
+    );
+    // § BLOCKER 2 재하드닝(독립 최종 감사) Technical/Human Gate Matrix — Secret Scanner에
+    // 의한 CHECKPOINT_BLOCKED는 진짜 genuine이다(scope violation과 다른 사유). event의
+    // humanInterventionRequired는 계속 true여야 한다 — CHECKPOINT_BLOCKED(scope-violation)만
+    // 기술적으로 재분류한 § BLOCKER 2 수정이 이 case까지 조용히 덮지 않는지 직접 확인한다.
+    const all = events.query().events;
+    const securityBlockedEvents = all.filter((e) => e.eventType === "SECURITY_BLOCKED");
+    check("Secret 사전검사(미해결): SECURITY_BLOCKED event가 정확히 1건 기록됨", securityBlockedEvents.length === 1);
+    check(
+      "Secret 사전검사(미해결): SECURITY_BLOCKED event의 humanInterventionRequired=true(진짜 genuine, 변경 없음)",
+      securityBlockedEvents.every((e) => e.humanInterventionRequired === true)
     );
   } finally {
     if (originalDryRun === undefined) delete process.env.AUTOMATION_DRY_RUN;
@@ -2613,6 +2732,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
+    await scenarioTechnicalHumanGateMatrixReviewBlockAndScopeViolation();
     await scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap();
     await scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();

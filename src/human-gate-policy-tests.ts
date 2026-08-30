@@ -172,12 +172,17 @@ function scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine(): void {
   );
 }
 
-// § P0-3 재하드닝(독립 감사) — CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX는 errorCode에 따라
-// 갈린다: PROTOCOL_ERROR(응답 해석 반복 실패, "protocol parse failure")는 순수 기술적
-// 상황이라 TECHNICAL_AUTO_RECOVERABLE이어야 한다 — 이전 정책(무조건 GENUINE)이 독립 감사에서
-// 실제 오분류로 확인됐다. 그 외 errorCode(예: 파싱/권한 게이트 실패가 아닌 다른 구조적 실패)는
-// 여전히 GENUINE을 유지한다 — provider가 응답을 아예 못 준 것(DEVELOPER_TRANSIENT_RETRY_
-// EXHAUSTED_PREFIX)과 다른, 사람이 봐야 할 진짜 문제일 수 있다.
+// § P0-3 재하드닝(독립 감사) → § BLOCKER 2 재하드닝(독립 최종 감사, 2026-08-30 후속)이
+// 범위를 넓혔다. CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX는 errorCode에 따라 갈린다:
+// PROTOCOL_ERROR/INVALID_OUTPUT/NON_ZERO_EXIT/TASK_ACTION_LIMIT/NO_PROGRESS_STAGNATION
+// (전부 claude-developer.ts/claude-runner.ts 실제 생성 의미를 확인함 — "응답을 해석하지
+// 못함"/"프로세스 실행 실패"/"반복·무진척 예산 소진" 순수 기술적 상황)은
+// TECHNICAL_AUTO_RECOVERABLE이어야 한다 — 이전 정책(PROTOCOL_ERROR만 예외, 나머지 전부
+// GENUINE)이 독립 감사에서 오분류로 재확인됐다. AUTH_REQUIRED(사람 로그인 필요 — 재시도로
+// 해결 불가)와 실행 파일 신뢰 검증 실패(보안 성격, § 그 코드 주석)는 여전히 GENUINE을
+// 유지한다 — provider가 응답을 아예 못 준 것(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX)과
+// 다른, 사람이 봐야 할 진짜 문제일 수 있다. UNKNOWN(알 수 없는 errorCode)도 fail-closed로
+// GENUINE을 유지한다.
 function scenarioClaudeStructuralFailureProtocolErrorIsTechnical(): void {
   const s = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR): Claude 결과가 구조적으로 실패`] });
   check(
@@ -196,11 +201,21 @@ function scenarioClaudeStructuralFailureProtocolErrorIsTechnical(): void {
     classifyWaitingHumanReason(s2) === "TECHNICAL_AUTO_RECOVERABLE"
   );
 
-  const s3 = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}INVALID_OUTPUT): Claude 결과가 구조적으로 실패`] });
-  check(
-    "P0-3) CLAUDE_STRUCTURAL_FAILURE(그 외 errorCode, 예: INVALID_OUTPUT)는 여전히 GENUINE_HUMAN_JUDGMENT",
-    classifyWaitingHumanReason(s3) === "GENUINE_HUMAN_JUDGMENT"
-  );
+  for (const code of ["INVALID_OUTPUT", "NON_ZERO_EXIT", "TASK_ACTION_LIMIT", "NO_PROGRESS_STAGNATION"]) {
+    const sTech = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}${code}): Claude 결과가 구조적으로 실패`] });
+    check(
+      `BLOCKER2) CLAUDE_STRUCTURAL_FAILURE(${code}) → TECHNICAL_AUTO_RECOVERABLE(순수 파싱/실행/무진척 실패, genuine 아님)`,
+      classifyWaitingHumanReason(sTech) === "TECHNICAL_AUTO_RECOVERABLE"
+    );
+  }
+
+  for (const code of ["AUTH_REQUIRED", "TRUSTED_EXECUTABLE_NOT_FOUND", "EXECUTABLE_IDENTITY_UNTRUSTED", "EXECUTABLE_SHADOWING_DETECTED", "UNKNOWN"]) {
+    const sGenuine = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}${code}): Claude 결과가 구조적으로 실패`] });
+    check(
+      `BLOCKER2) CLAUDE_STRUCTURAL_FAILURE(${code})는 여전히 GENUINE_HUMAN_JUDGMENT(재시도로 해결 불가 또는 보안 성격 또는 알 수 없는 코드)`,
+      classifyWaitingHumanReason(sGenuine) === "GENUINE_HUMAN_JUDGMENT"
+    );
+  }
 }
 
 // AutoDev Core Maintenance(2026-08-30) — 같은 cycle에 STAGNATION_DETECTED가 먼저 push되고

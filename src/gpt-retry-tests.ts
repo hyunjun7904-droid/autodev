@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reviewClaudeResultWithRetry } from "./gpt-reviewer";
 import type { GptReviewApiResult } from "./gpt-reviewer";
-import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
+import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT, MAX_GPT_CALLS } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
 import type { ClaudeResult } from "./types";
 
@@ -369,6 +369,215 @@ async function scenarioE(statePath: string): Promise<void> {
   );
 }
 
+// § BLOCKER 3(독립 최종 감사, 2026-08-30) — Reviewer API/retry hard budget restart
+// persistence. gptCallCount/gptRawCallTotal이 이제 project-state.json에 durable하게
+// 저장되므로(§ orchestrator.ts/types.ts CoreState.gptCallCount/gptRawCallTotal), 같은
+// task를 이어가는 process restart(이 테스트에서는 scenarioReviewerBudgetPersistsAcrossRestart
+// (K)와 동일한 원칙으로 매번 새 runOrchestrator() 호출 + 같은 statePath로 실제 process
+// restart를 흉내낸다)에서도 이 예산이 리셋되지 않는지, cap 도달 후에는 추가 Reviewer
+// network call이 정확히 0인지, 그 최종 상태가 genuine WAITING_HUMAN이 아니라 terminal
+// 기술적 BLOCKED(Human Gate=0)인지, 그리고 정말 새로운 task로 전환할 때만 리셋되는지를
+// 직접 검증한다.
+async function scenarioGptCallBudgetRestartPersistence(): Promise<void> {
+  const sameTask = "BLOCKER3: gpt call/raw budget이 process restart에도 보존됨";
+
+  // 1) 같은 Task 첫 process에서 일부 budget 사용(첫 process가 이미 3회 REVISE round를
+  //    소비하고 죽었다고 가정 — scenarioReviewerBudgetPersistsAcrossRestart(K)와 동일하게
+  //    state.json에 직접 seed한다).
+  const dir1 = mkdtempSync(join(tmpdir(), "movan-gpt-budget-restart-test-"));
+  tempDirs.push(dir1);
+  const statePath1 = join(dir1, "project-state.json");
+  writeFileSync(
+    statePath1,
+    JSON.stringify(
+      {
+        currentTask: sameTask,
+        reviewCycle: 0,
+        lastClaudeResult: null,
+        lastGptDecision: null,
+        status: "READY",
+        claudeLimitWaitCount: 0,
+        gptCallCount: 3,
+        gptRawCallTotal: 3,
+        deferredHumanTasks: [],
+        completedTasks: [],
+        gitCheckpoint: "test",
+        currentPhase: 1,
+      },
+      null,
+      2
+    ) + "\n",
+    "utf-8"
+  );
+
+  // 2/3) process 종료 → 같은 Task 재시작(fresh runOrchestrator() 호출 — 실제 process
+  //    재시작과 동일하게 loadState(statePath1)부터 다시 시작한다).
+  let reviewerCalls1 = 0;
+  const gptReviewerPass = async (): Promise<{ decision: "PASS"; severity: { critical: number; high: number; medium: number }; feedback: string; nextTask: null }> => {
+    reviewerCalls1 += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null };
+  };
+  const claudeRunner = async (): Promise<ClaudeResult> => FAKE_CLAUDE_RESULT;
+  const { finalState: afterRestart1 } = await runOrchestrator(sameTask, {
+    claudeRunner,
+    gptReviewer: gptReviewerPass,
+    statePath: statePath1,
+    sleep: async () => {},
+  });
+
+  // 4) 이전 budget이 그대로 복원됨(seed 3에서 이어져 이번 호출로 4가 됨 — 0부터 재시작이
+  //    아니다).
+  check("BLOCKER3) restart 후 gptCallCount가 seed(3)에서 이어져 4로 기록됨(0부터 재시작 아님)", afterRestart1.gptCallCount === 4);
+  check("BLOCKER3) restart 후 gptRawCallTotal도 seed(3)에서 이어져 4로 기록됨", afterRestart1.gptRawCallTotal === 4);
+  // 5) 남은 budget만 사용 가능 — 이번 process는 정확히 1회만 실제로 호출해 정상 진행됨.
+  check("BLOCKER3) 이번 process에서는 정확히 1회만 Reviewer network call(남은 budget만 사용)", reviewerCalls1 === 1);
+  check("BLOCKER3) 이 attempt는 정상 APPROVED로 끝남(budget이 정확히 이어져 계속 진행 가능)", afterRestart1.status === "APPROVED");
+
+  // 6) cap(MAX_GPT_CALLS)에 정확히 도달한 상태로 seed한 뒤 재시작한다 — "남은 budget"이
+  //    0인 반대 극단을 검증한다.
+  const dir2 = mkdtempSync(join(tmpdir(), "movan-gpt-budget-restart-cap-test-"));
+  tempDirs.push(dir2);
+  const statePath2 = join(dir2, "project-state.json");
+  writeFileSync(
+    statePath2,
+    JSON.stringify(
+      {
+        currentTask: sameTask,
+        reviewCycle: 0,
+        lastClaudeResult: null,
+        lastGptDecision: null,
+        status: "READY",
+        claudeLimitWaitCount: 0,
+        gptCallCount: MAX_GPT_CALLS,
+        gptRawCallTotal: MAX_GPT_CALLS,
+        deferredHumanTasks: [],
+        completedTasks: [],
+        gitCheckpoint: "test",
+        currentPhase: 1,
+      },
+      null,
+      2
+    ) + "\n",
+    "utf-8"
+  );
+
+  // 7) 다시 process 재시작(fresh runOrchestrator() 호출).
+  let reviewerCalls2 = 0;
+  const gptReviewerShouldNotBeCalled = async (): Promise<{ decision: "PASS"; severity: { critical: number; high: number; medium: number }; feedback: string; nextTask: null }> => {
+    reviewerCalls2 += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null };
+  };
+  const { finalState: afterCap } = await runOrchestrator(sameTask, {
+    claudeRunner,
+    gptReviewer: gptReviewerShouldNotBeCalled,
+    statePath: statePath2,
+    sleep: async () => {},
+  });
+
+  // 8) 추가 Reviewer network call 정확히 0.
+  check("BLOCKER3) cap 도달 후 재시작해도 추가 Reviewer network call 정확히 0", reviewerCalls2 === 0);
+  // 9) status=terminal 기술적 BLOCKED(genuine WAITING_HUMAN 아님).
+  check("BLOCKER3) cap 도달 후 최종 status=BLOCKED(terminal 기술적, genuine WAITING_HUMAN 아님)", afterCap.status === "BLOCKED");
+  check(
+    "BLOCKER3) deferredHumanTasks에 MAX_GPT_CALLS_EXCEEDED 사유가 남음(진단용 — Human Gate 판정과는 무관, § human-gate-policy.ts는 status로 직접 판정하지 않지만 autodev.ts가 status===\"BLOCKED\"를 우선 확인한다)",
+    afterCap.deferredHumanTasks.some((t) => t.startsWith("MAX_GPT_CALLS_EXCEEDED"))
+  );
+  // 10) Human Gate=0은 runAutodevOnce 레벨(autodev.ts의 generic catch-all)에서 실제로
+  //     검증한다(§ production-agent-integration-tests.ts "event 기록: MAX_GPT_CALLS로 인한
+  //     BLOCKED는 기술적이므로 generic HUMAN_APPROVAL_REQUIRED bookend가 생성되지 않음") —
+  //     여기서는 runOrchestrator() 레벨의 계약(status==="BLOCKED")만 검증한다(로직 복제 없음).
+
+  // 11) 새로운(다른) Task로 전환하면 gptCallCount/gptRawCallTotal이 0부터 다시 시작해야
+  //     한다 — 같은 statePath2를 그대로 재사용해 완전히 다른 task 문자열로 호출한다.
+  const differentTask = "BLOCKER3: 완전히 다른 task로 전환됨";
+  let reviewerCalls3 = 0;
+  const gptReviewerPass3 = async (): Promise<{ decision: "PASS"; severity: { critical: number; high: number; medium: number }; feedback: string; nextTask: null }> => {
+    reviewerCalls3 += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null };
+  };
+  const { finalState: afterNewTask } = await runOrchestrator(differentTask, {
+    claudeRunner,
+    gptReviewer: gptReviewerPass3,
+    statePath: statePath2,
+    sleep: async () => {},
+  });
+  check("BLOCKER3) 새로운(다른) task로 전환하면 gptCallCount가 0부터 다시 시작해 이번 호출로 1이 됨", afterNewTask.gptCallCount === 1);
+  check("BLOCKER3) 새로운(다른) task로 전환하면 gptRawCallTotal도 0부터 다시 시작해 이번 호출로 1이 됨", afterNewTask.gptRawCallTotal === 1);
+  check("BLOCKER3) 새 task 전환 시 실제로 Reviewer가 다시 호출됨(cap이 새 task로 새어들지 않음)", reviewerCalls3 === 1);
+}
+
+// § BLOCKER 3 재하드닝 — crash window 검증: 실제 network call(gptReviewer)이 시작된 직후지만
+// 결과가 아직 반환되기 전에 프로세스가 죽으면(이 테스트에서는 gptReviewer가 그 자리에서
+// 즉시 reject해 이를 흉내낸다) hard budget이 유실되지 않아야 한다 — write-ahead
+// reservation이 이미 디스크에 저장돼 있어야 한다(§ types.ts CoreState.gptRawCallTotal 문서,
+// "호출 후 성공적으로 돌아온 뒤에만 counter 저장"하던 이전 방식의 정확한 반례).
+async function scenarioGptRawCallBudgetSurvivesCrashDuringNetworkCall(): Promise<void> {
+  const sameTask = "BLOCKER3-crash: 네트워크 호출 도중 crash";
+  const dir = mkdtempSync(join(tmpdir(), "movan-gpt-budget-crash-test-"));
+  tempDirs.push(dir);
+  const statePath = join(dir, "project-state.json");
+  writeFileSync(
+    statePath,
+    JSON.stringify(
+      {
+        currentTask: sameTask,
+        reviewCycle: 0,
+        lastClaudeResult: null,
+        lastGptDecision: null,
+        status: "READY",
+        claudeLimitWaitCount: 0,
+        gptCallCount: 0,
+        gptRawCallTotal: 0,
+        deferredHumanTasks: [],
+        completedTasks: [],
+        gitCheckpoint: "test",
+        currentPhase: 1,
+      },
+      null,
+      2
+    ) + "\n",
+    "utf-8"
+  );
+
+  const claudeRunner = async (): Promise<ClaudeResult> => FAKE_CLAUDE_RESULT;
+  const crashingReviewer = async (): Promise<never> => {
+    throw new Error("의도적인 테스트 crash — network call 도중 프로세스가 죽었다고 가정");
+  };
+
+  let threw = false;
+  try {
+    await runOrchestrator(sameTask, { claudeRunner, gptReviewer: crashingReviewer, statePath, sleep: async () => {} });
+  } catch {
+    threw = true;
+  }
+  check("BLOCKER3-crash) 예외가 삼켜지지 않고 그대로 전파됨(fail-closed)", threw);
+
+  const onDisk = JSON.parse(readFileSync(statePath, "utf-8")) as { gptCallCount?: number; gptRawCallTotal?: number };
+  check(
+    "BLOCKER3-crash) network call 시작 직전에 이미 write-ahead reservation이 디스크에 저장됨(gptRawCallTotal=1, 호출 결과를 기다리지 않음)",
+    onDisk.gptRawCallTotal === 1
+  );
+  check("BLOCKER3-crash) gptCallCount(REVISE round 예산)도 호출 여부와 무관하게 저장됨", onDisk.gptCallCount === 1);
+
+  // 재시작(다음 process) — 이 reservation이 실제로 이어져 cap 계산에 반영되는지 확인한다.
+  let reviewerCallsAfterCrash = 0;
+  const gptReviewerPass = async (): Promise<{ decision: "PASS"; severity: { critical: number; high: number; medium: number }; feedback: string; nextTask: null }> => {
+    reviewerCallsAfterCrash += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null };
+  };
+  const { finalState: afterRecovery } = await runOrchestrator(sameTask, {
+    claudeRunner,
+    gptReviewer: gptReviewerPass,
+    statePath,
+    sleep: async () => {},
+  });
+  check(
+    "BLOCKER3-crash) 재시작 후 gptRawCallTotal이 유실된 1에서 이어져 2가 됨(crash로 0으로 되돌아가지 않음)",
+    afterRecovery.gptRawCallTotal === 2
+  );
+  check("BLOCKER3-crash) 재시작 후 실제로 Reviewer가 호출되어 정상 진행됨", reviewerCallsAfterCrash === 1);
+}
+
 async function main(): Promise<void> {
   // 실제 project-state.json은 read-only 증거로만 쓴다 — 이 테스트가 절대 이 파일을 쓰지
   // 않는다는 것을 실행 전/후 내용 비교로 증명한다(§ 요구사항 4).
@@ -382,6 +591,8 @@ async function main(): Promise<void> {
     await scenarioReviewerBudgetPersistsAcrossRestart();
     await scenarioD(makeTempStatePath());
     await scenarioE(makeTempStatePath());
+    await scenarioGptCallBudgetRestartPersistence();
+    await scenarioGptRawCallBudgetSurvivesCrashDuringNetworkCall();
   } finally {
     for (const dir of tempDirs) {
       try {

@@ -230,6 +230,115 @@ async function scenarioRealConcurrentSupervisorStaleLockRecovery(): Promise<void
 }
 
 // ---------------------------------------------------------------------------
+// 독립 최종 감사 BLOCKER 1 필수 테스트 5 — "Supervisor >=3-process 동시 경쟁": 실제 OS
+// 프로세스 4개(>=3)가 lock이 아예 없는 상태에서 동시에 supervisor singleton lock을
+// acquire 시도한다(project-lock-tests.ts의 scenarioRealConcurrentAcquisitionThreePlus와
+// 동일한 원칙).
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentSupervisorAcquisitionThreePlus(): Promise<void> {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  const workerPath = join(__dirname, "supervisor-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("BLOCKER1-5) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, lockPath]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const N = 4;
+  const outs = await Promise.all(Array.from({ length: N }, () => runWorker()));
+  const acquiredCount = outs.filter((o) => o === "ACQUIRED").length;
+  const blockedCount = outs.filter((o) => o.startsWith("BLOCKED:")).length;
+  check(`BLOCKER1-5) 실제 프로세스 ${N}개(>=3) 동시 acquire 중 정확히 하나만 ACQUIRED(active supervisor 정확히 1개)`, acquiredCount === 1);
+  check(`BLOCKER1-5) 나머지 ${N - 1}개는 전부 BLOCKED — writer/runner를 만들지 않음`, blockedCount === N - 1);
+
+  try {
+    if (readdirSync(dir).length > 0) rmSync(lockPath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 독립 최종 감사 BLOCKER 1 필수 테스트 6 — "old supervisor release vs fresh supervisor
+// acquire 경쟁": 실제 OS 프로세스 4개(>=3)가 같은 supervisor lock에 대해 각자 독립적으로
+// "acquire(경쟁 승리 시) → 짧게 보유 → release → 재시도"를 반복한다. project-lock-
+// tests.ts의 scenarioRealReleaseVsFreshAcquireRace와 정확히 동일한 원칙 — 서로 다른
+// 프로세스가 보고하는 실제 [acquiredAt, releasedAt] wall-clock 구간이 단 한 순간도
+// 겹치지 않는지 검증한다.
+// ---------------------------------------------------------------------------
+async function scenarioRealSupervisorReleaseVsFreshAcquireRace(): Promise<void> {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  const workerPath = join(__dirname, "supervisor-lock-race-hold-release-worker.js");
+  if (!existsSync(workerPath)) {
+    check("BLOCKER1-6) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  const N = 4;
+  const holdMs = 250;
+  const retryIntervalMs = 30;
+  const maxRetries = 150;
+
+  function runWorker(): Promise<string[]> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, lockPath, String(holdMs), String(maxRetries), String(retryIntervalMs)]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim().split("\n").filter((l) => l.length > 0)));
+    });
+  }
+
+  const allOutputs = await Promise.all(Array.from({ length: N }, () => runWorker()));
+
+  type Interval = { acquiredAt: number; releasedAt: number; releasedOk: boolean };
+  const intervals: Interval[] = [];
+  let neverAcquiredCount = 0;
+  for (const lines of allOutputs) {
+    for (const line of lines) {
+      if (line === "NEVER_ACQUIRED") {
+        neverAcquiredCount += 1;
+        continue;
+      }
+      const m = /^ACQUIRED (\d+) (\d+) (true|false)$/.exec(line);
+      if (m) intervals.push({ acquiredAt: Number(m[1]), releasedAt: Number(m[2]), releasedOk: m[3] === "true" });
+    }
+  }
+
+  check(`BLOCKER1-6) ${N}개 worker 전부 최소 한 번은 실제로 ACQUIRED에 성공함(영구 starvation 없음)`, intervals.length === N && neverAcquiredCount === 0);
+  check("BLOCKER1-6) 모든 acquire 뒤 release가 실제로 성공함(ok:true)", intervals.every((iv) => iv.releasedOk));
+
+  let overlapFound = false;
+  for (let i = 0; i < intervals.length; i++) {
+    for (let j = i + 1; j < intervals.length; j++) {
+      const a = intervals[i];
+      const b = intervals[j];
+      if (a.acquiredAt < b.releasedAt && b.acquiredAt < a.releasedAt) overlapFound = true;
+    }
+  }
+  check("BLOCKER1-6) 어떤 두 worker의 보유 구간도 겹치지 않음(active writer > 1 즉시 FAIL 기준 통과)", !overlapFound);
+
+  try {
+    if (readdirSync(dir).length > 0) rmSync(lockPath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // P0-2 — shutdown()의 ownership-blind unlink 제거 검증. releaseSupervisorLockAtomic()은
 // "내가 acquire 때 발급받은 lockId"가 현재 파일의 owner와 정확히 같을 때만 지운다 — 예전
 // shutdown()의 `existsSync → unlinkSync`(자기 ownership 미확인)였다면 아래 시나리오에서
@@ -490,6 +599,8 @@ async function main(): Promise<void> {
     scenarioReleaseOnlyRemovesOwnLock();
     await scenarioRealConcurrentSupervisorAcquisition();
     await scenarioRealConcurrentSupervisorStaleLockRecovery();
+    await scenarioRealConcurrentSupervisorAcquisitionThreePlus();
+    await scenarioRealSupervisorReleaseVsFreshAcquireRace();
     await scenarioRealKillTriggersRealRespawn();
     await scenarioBoundedBackoffOnRepeatedCrash();
     await scenarioSustainedUptimeResetsRealStreak();
