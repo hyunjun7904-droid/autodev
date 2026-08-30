@@ -56,6 +56,22 @@ export interface ClaudeResult {
   model?: { provider: string; name: string };
   tokenUsage?: { inputTokens?: number; outputTokens?: number };
   durationMs?: number;
+  /** § claude-developer.ts DeveloperErrorCode와 동일한 구조를 맞춘 중복 선언(순환 의존
+   *  없이, 위 tests 필드와 동일한 기존 관례) — success===false일 때만 채워진다. */
+  errorCode?: string;
+  /**
+   * AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence(2026-08-31,
+   * JARVIS Task 5.3 실측). § claude-developer.ts DeveloperDiscoveryProgress와 동일한 구조를
+   * 맞춘다(그 파일의 tests 필드와 동일한 기존 관례 — 순환 의존 없이 구조만 맞춘 중복
+   * 선언). state.lastClaudeResult로 저장되어 같은 task의 다음 developer retry가 discovery를
+   * 처음부터 반복하지 않도록 이어받는 데만 쓰인다.
+   */
+  discoveryProgress?: {
+    filesRead: string[];
+    discoveryOnlyRoundCount: number;
+    implementationLocked: boolean;
+    lastRoundReached: number;
+  };
 }
 
 export type GptDecision = "PASS" | "REVISE" | "HUMAN_REQUIRED" | "BLOCK";

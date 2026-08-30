@@ -1202,6 +1202,119 @@ async function scenarioAA_plainTextNonJsonRepeatedAlsoStopsAfterThreeCalls(): Pr
   check("AA: NOT_JSON도 정확히 3회 만에 중단", scripted.callCount() === 3);
 }
 
+// AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence(2026-08-31,
+// JARVIS Task 5.3 실측: 같은 task가 TIMEOUT으로 반복될 때마다 --no-session-persistence로
+// discovery(READ_FILES/SEARCH)를 매번 처음부터 반복한 production defect). AD~AI 시나리오는
+// discoveryProgress capture(§ captureDiscoveryProgress)/priorDiscoveryProgress seeding을
+// 직접 검증한다 — 실제 claude CLI TIMEOUT은 makeUsageLimitAwareScriptedCaller의
+// {errorCode:"TIMEOUT"} entry로 재현한다(claude-runner.ts의 실제 subprocess timeout 자체는
+// runner-tests.ts가 이미 커버 — 여기서는 그 실패가 round loop 로컬 상태를 어떻게 capture/
+// seed하는지만 검증).
+
+async function scenarioAD_discoveryProgressCapturedOnTimeoutFailure(): Promise<void> {
+  // TEST1 전반부 — discovery 6라운드(예산 소진, 잠금) 후 7번째 라운드에서 TIMEOUT나면,
+  // 반환된 discoveryProgress가 실제로 읽은 6개 파일 경로 + implementationLocked=true +
+  // lastRoundReached=7을 정확히 담아야 한다.
+  const scripts: UsageLimitScriptEntry[] = [...DISTINCT_REAL_FILES.slice(0, 6).map(novelReadRound), { errorCode: "TIMEOUT" }];
+  const scripted = makeUsageLimitAwareScriptedCaller(scripts);
+  const result = await runDeveloperTaskViaSafeExecutor("TIMEOUT 전 discovery 6라운드 시나리오", 1, { claudeCaller: scripted.call });
+
+  check("AD: success=false(TIMEOUT)", result.success === false && result.errorCode === "TIMEOUT");
+  check("AD: discoveryProgress가 채워짐", result.discoveryProgress !== undefined);
+  check(
+    "AD: filesRead가 실제로 읽은 6개 경로와 정확히 일치",
+    JSON.stringify([...result.discoveryProgress!.filesRead].sort()) === JSON.stringify([...DISTINCT_REAL_FILES.slice(0, 6)].sort())
+  );
+  check("AD: implementationLocked=true(discovery 예산이 이미 소진된 상태였음)", result.discoveryProgress!.implementationLocked === true);
+  check("AD: lastRoundReached=7(TIMEOUT난 라운드)", result.discoveryProgress!.lastRoundReached === 7);
+  check(
+    "AD: filesRead는 경로 문자열만 담고 파일 내용은 포함하지 않음(compact, § 요구사항 5)",
+    result.discoveryProgress!.filesRead.every((p) => typeof p === "string" && p.length < 200)
+  );
+}
+
+async function scenarioAE_priorDiscoveryProgressLockedSkipsRedundantDiscoveryOnRetry(): Promise<void> {
+  // TEST1/TEST4 핵심 — 직전 attempt가 이미 discovery 예산을 소진(implementationLocked=true)한
+  // 채 실패했다면, 재시도는 discoveryOnlyRoundCount를 0부터가 아니라 DISCOVERY_BUDGET_ROUNDS-1
+  // (정확히 1 round grace)에서 이어받는다: round1이 READ(허용, grace 소비) → round2부터는
+  // 다시 잠긴다(추가 READ는 거부) → WRITE로 곧바로 완료. 새 discovery 6라운드를 처음부터
+  // 반복하지 않는다는 것을 라운드 수로 직접 증명한다.
+  const priorProgress = { filesRead: DISTINCT_REAL_FILES.slice(0, 6), discoveryOnlyRoundCount: 6, implementationLocked: true, lastRoundReached: 7 };
+  const graceRead = novelReadRound(DISTINCT_REAL_FILES[6]);
+  const rejectedSecondRead = novelReadRound(DISTINCT_REAL_FILES[7]); // grace 소비 후 또 READ 요청 — 거부되어야 함
+  const fixtureRel = "automation/tmp-claude-developer-ae-fixture.txt";
+  const fixtureAbs = resolve(PROJECT_ROOT, fixtureRel);
+  const writeRound = JSON.stringify({ type: "ACTION_REQUEST", actions: [{ type: "WRITE_FILE", path: fixtureRel, content: "retry-write\n" }] });
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-after-retry", changedFiles: [fixtureRel], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([graceRead, rejectedSecondRead, writeRound, taskComplete]);
+
+  try {
+    const result = await runDeveloperTaskViaSafeExecutor("재시도(priorDiscoveryProgress 있음) 시나리오", 2, {
+      claudeCaller: scripted.call,
+      priorDiscoveryProgress: priorProgress,
+    });
+    check("AE: 정상 성공", result.success === true);
+    check(
+      "AE: 정확히 4라운드 만에 완료(6라운드 재탐색 없이 grace 1 + 거부 1 + write + complete)",
+      scripted.callCount() === 4
+    );
+    check(
+      "AE: 2번째 READ 요청(grace 소비 후)은 실제로 거부됨(Discovery budget exhausted, 3번째 호출 입력에 반영)",
+      scripted.receivedInputs[2].includes("Discovery budget exhausted")
+    );
+  } finally {
+    if (existsSync(fixtureAbs)) unlinkSync(fixtureAbs);
+  }
+}
+
+async function scenarioAF_priorDiscoveryProgressPartialCountCarriesOver(): Promise<void> {
+  // TEST1 변형 — 직전 attempt가 discovery 도중(예산 미소진, 3라운드) TIMEOUT났다면,
+  // discoveryOnlyRoundCount는 처음부터(0) 다시 세지 않고 3부터 이어받는다 — 새로 3라운드만
+  // 더 discovery하면(합계 6) 잠긴다. 이 시나리오는 완료 스크립트를 주지 않아(READ만 계속)
+  // 결국 잠금 후 grace(3)까지 소진해 NO_PROGRESS_STAGNATION으로 끝난다 — § scenarioJ와
+  // 동일한 grace 정책이지만, discovery 성공 라운드는 3개뿐이라는 점이 다르다(6개가 아니라):
+  // 3(이어받은 성공) + 3(잠금 후 거부, grace) = 총 6회 — 신선한 6라운드를 처음부터 다시 하면
+  // 9회(§ scenarioJ)였을 것과 직접 대비된다.
+  const priorProgress = { filesRead: DISTINCT_REAL_FILES.slice(0, 3), discoveryOnlyRoundCount: 3, implementationLocked: false, lastRoundReached: 4 };
+  const scripts = [DISTINCT_REAL_FILES[3], DISTINCT_REAL_FILES[4], DISTINCT_REAL_FILES[5], DISTINCT_REAL_FILES[6]].map(novelReadRound);
+  const scripted = makeScriptedClaudeCaller(scripts);
+  const result = await runDeveloperTaskViaSafeExecutor("재시도(부분 discovery 이어받기) 시나리오", 2, {
+    claudeCaller: scripted.call,
+    priorDiscoveryProgress: priorProgress,
+  });
+
+  check("AF: success=false, errorCode=NO_PROGRESS_STAGNATION(잠금 후 READ만 반복하면 결국 무진척)", result.success === false && result.errorCode === "NO_PROGRESS_STAGNATION");
+  check(
+    "AF: 이어받은 3 + 새 3(잠금 전 성공 3 + 잠금 후 grace 3)=정확히 6회에서 조기 종료(신선한 6라운드를 다시 세면 9회였을 것)",
+    scripted.callCount() === 6
+  );
+  check(
+    "AF: 잠금 이후 거부 메시지가 실제로 전달됨",
+    scripted.receivedInputs.some((inp) => inp.includes("Discovery budget exhausted"))
+  );
+}
+
+async function scenarioAH_priorDiscoveryProgressGraceRoundStillAllowsRealRead(): Promise<void> {
+  // TEST7 — stale/invalid 저장된 progress를 맹목적으로 신뢰하지 않는다: 1 round의 grace는
+  // Claude가 실제로 다시 READ_FILES를 수행할 자유를 구조적으로 막지 않는다(hint는 텍스트
+  // 안내일 뿐 강제가 아니다) — grace round의 READ가 실제 Safe Executor를 통해 실행되어
+  // 실제 파일 내용을 받는다는 것을 직접 확인한다.
+  const priorProgress = { filesRead: DISTINCT_REAL_FILES.slice(0, 6), discoveryOnlyRoundCount: 6, implementationLocked: true, lastRoundReached: 7 };
+  const graceRead = novelReadRound(DISTINCT_REAL_FILES[6]); // git-changes.ts
+  const taskComplete = JSON.stringify({ type: "TASK_COMPLETE", summary: "done-after-grace-read", changedFiles: [], testsRequested: [] });
+  const scripted = makeScriptedClaudeCaller([graceRead, taskComplete]);
+
+  const result = await runDeveloperTaskViaSafeExecutor("grace round 실제 READ 시나리오", 2, {
+    claudeCaller: scripted.call,
+    priorDiscoveryProgress: priorProgress,
+  });
+  check("AH: grace round의 READ가 실제로 거부되지 않고 성공", result.success === true);
+  check(
+    "AH: grace round READ가 Safe Executor를 실제로 통과해 실제 파일 내용을 받음(git-changes.ts 소스 포함)",
+    scripted.receivedInputs[1].includes("export function getWorkingTreeChanges")
+  );
+}
+
 // Phase C Task C4.1(Read-only Git Command Hardening) — 요구된 source regression: "AutoDev
 // Claude Worker의 production 경로가 직접 Bash/tool 실행으로 Safe Executor를 우회할 수
 // 없는 현재 구조"를 확인한다. 이 파일의 나머지 시나리오는 fake claudeCaller로 라운드
@@ -1341,6 +1454,10 @@ async function main(): Promise<void> {
     await scenarioY_identicalUnrecognizedResponseRepeatedStopsAfterThreeCalls();
     await scenarioZ_secondRepeatSendsReinforcementThenRecoversOnThird();
     await scenarioAA_plainTextNonJsonRepeatedAlsoStopsAfterThreeCalls();
+    await scenarioAD_discoveryProgressCapturedOnTimeoutFailure();
+    await scenarioAE_priorDiscoveryProgressLockedSkipsRedundantDiscoveryOnRetry();
+    await scenarioAF_priorDiscoveryProgressPartialCountCarriesOver();
+    await scenarioAH_priorDiscoveryProgressGraceRoundStillAllowsRealRead();
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }

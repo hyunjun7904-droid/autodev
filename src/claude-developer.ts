@@ -89,6 +89,22 @@ export interface DeveloperCallStats {
   protocolFailureRounds: number;
 }
 
+/** AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence(2026-08-31,
+ *  JARVIS Task 5.3 실측: 같은 task가 TIMEOUT으로 반복될 때마다 --no-session-persistence
+ *  정책 때문에 discovery(READ_FILES/SEARCH)를 매번 완전히 처음부터 반복한 production
+ *  defect). 이 attempt 안에서 실제로 읽은 파일의 "경로"만 담는다(내용은 포함하지 않는다 —
+ *  compact progress일 뿐 raw transcript 재주입이 아니다, § 요구사항 5) + discovery budget
+ *  소진 여부. */
+export interface DeveloperDiscoveryProgress {
+  /** § 위 주석 — 경로만, 내용 없음. */
+  filesRead: string[];
+  discoveryOnlyRoundCount: number;
+  /** true면 이 attempt가 끝난 시점에 이미 DISCOVERY_BUDGET_ROUNDS를 소진해 구현 전환
+   *  상태였다. */
+  implementationLocked: boolean;
+  lastRoundReached: number;
+}
+
 export interface DeveloperResult {
   success: boolean;
   summary: string;
@@ -121,6 +137,10 @@ export interface DeveloperResult {
    *  값을 전혀 주지 않았으면(또는 실제 호출이 한 번도 성공하지 않았으면) undefined. */
   model?: { provider: string; name: string };
   tokenUsage?: { inputTokens?: number; outputTokens?: number };
+  /** § DeveloperDiscoveryProgress 주석 — 이 attempt가 (주로 실패로) 끝난 시점에 마지막으로
+   *  확인된 discovery 진행 상태. Reviewer는 이 값을 보지 않는다 — 오직 같은 task의 다음
+   *  developer retry가 opts.priorDiscoveryProgress로만 소비한다. */
+  discoveryProgress?: DeveloperDiscoveryProgress;
 }
 
 export interface DeveloperTaskOptions {
@@ -152,6 +172,11 @@ export interface DeveloperTaskOptions {
    * 전달한다는 점은 안내 문구 자체에 이미 담겨 있다).
    */
   memoryHint?: string;
+  /** § DeveloperDiscoveryProgress 주석 — 같은 task의 직전 attempt(TIMEOUT 등으로 종료)가
+   *  남긴 discovery 진행 상태. 지정하면 이 attempt는 discoveryOnlyRoundCount를 0부터가
+   *  아니라 이 값에서 이어받는다 — 이미 소진된 discovery budget을 처음부터 다시 반복하지
+   *  않기 위함. 지정하지 않으면 기존 동작과 완전히 동일(0/false부터 시작). */
+  priorDiscoveryProgress?: DeveloperDiscoveryProgress;
   /** USAGE_LIMIT 재시도 대기 시간(ms) — 테스트에서만 짧게 override, 실제 운용은 항상 30분. */
   usageLimitWaitMs?: number;
   /** USAGE_LIMIT 재시도 최대 횟수 — 이 횟수 안에서는 round/discovery budget/lock grace를
@@ -782,6 +807,17 @@ export async function runDeveloperTaskViaSafeExecutor(
   // 한다 — 잠금 자체를 되돌릴 필요가 없다).
   let implementationLocked = false;
   let discoveryOnlyRoundCount = 0;
+  // § DeveloperDiscoveryProgress 주석 — 같은 task의 직전 attempt가 이미 discovery budget을
+  // 소진했다면(implementationLocked===true) 이번 attempt는 정확히 1 round만 grace로 허용한
+  // 뒤 다시 잠근다(DISCOVERY_BUDGET_ROUNDS - 1에서 시작 — 기존 상수를 그대로 재사용할 뿐 새
+  // 숫자를 만들지 않는다). 아직 discovery 도중에 끝났다면(budget 미소진) 그 카운트를 그대로
+  // 이어받아 처음부터 다시 세지 않는다. priorDiscoveryProgress가 없으면 기존과 완전히 동일
+  // (0/false부터 시작).
+  if (opts.priorDiscoveryProgress) {
+    discoveryOnlyRoundCount = opts.priorDiscoveryProgress.implementationLocked
+      ? DISCOVERY_BUDGET_ROUNDS - 1
+      : opts.priorDiscoveryProgress.discoveryOnlyRoundCount;
+  }
   // IMPLEMENTATION_REQUIRED 상태에서 "진척 없는 시도"(거부된 discovery-only 라운드 + 1회
   // 한도를 넘긴 PLAN 반복) 누적 횟수 — novel 여부와 무관, discoveryOnlyRoundCount와 동일한
   // 정신으로 누적만 한다.
@@ -863,6 +899,7 @@ export async function runDeveloperTaskViaSafeExecutor(
       rawOutput: "",
       errorCode: "NO_PROGRESS_STAGNATION",
       deferredHumanTasks,
+      discoveryProgress: captureDiscoveryProgress(round),
       ...usageFields(),
     };
   }
@@ -879,6 +916,19 @@ export async function runDeveloperTaskViaSafeExecutor(
       `developer discovery 예산 소진 — 구현 단계 전환 안내 전송 및 READ_FILES/SEARCH 잠금(라운드 ${round}/${MAX_INTERNAL_ROUNDS}, discovery-only 누적 ${discoveryOnlyRoundCount}회)`
     );
     transcript.push(NUDGE_MESSAGE);
+  }
+
+  // § DeveloperDiscoveryProgress 주석 — fileSnapshots.keys()는 이미 이 attempt가 실제로 읽은
+  // 파일의 "경로"만 담고 있다(내용은 별도 Map value). 경로만 뽑아 compact snapshot을 만든다 —
+  // 새 추적 구조를 추가하지 않고 이미 있는 fileSnapshots/discoveryOnlyRoundCount/
+  // implementationLocked를 그대로 재사용한다.
+  function captureDiscoveryProgress(round: number): DeveloperDiscoveryProgress {
+    return {
+      filesRead: [...fileSnapshots.keys()],
+      discoveryOnlyRoundCount,
+      implementationLocked,
+      lastRoundReached: round,
+    };
   }
 
   for (let round = 1; round <= MAX_INTERNAL_ROUNDS; round++) {
@@ -923,6 +973,7 @@ export async function runDeveloperTaskViaSafeExecutor(
           rawOutput: claudeRaw.rawOutput,
           errorCode: "USAGE_LIMIT",
           deferredHumanTasks,
+          discoveryProgress: captureDiscoveryProgress(round),
           ...usageFields(),
         };
       }
@@ -963,6 +1014,7 @@ export async function runDeveloperTaskViaSafeExecutor(
         rawOutput: claudeRaw.rawOutput,
         errorCode: claudeRaw.errorCode,
         deferredHumanTasks,
+        discoveryProgress: captureDiscoveryProgress(round),
         ...usageFields(),
       };
     }
@@ -1048,6 +1100,7 @@ export async function runDeveloperTaskViaSafeExecutor(
             ...deferredHumanTasks,
             `PROTOCOL_ERROR: 동일한 응답 해석 실패(${kind}, shape=${shapeDescriptor})가 ${consecutiveProtocolFailureCount}회 연속 반복되어 재호출을 중단했습니다.`,
           ],
+          discoveryProgress: captureDiscoveryProgress(round),
           ...usageFields(),
         };
       }
@@ -1309,6 +1362,7 @@ export async function runDeveloperTaskViaSafeExecutor(
     rawOutput: "",
     errorCode: "TASK_ACTION_LIMIT",
     deferredHumanTasks,
+    discoveryProgress: captureDiscoveryProgress(MAX_INTERNAL_ROUNDS),
     ...usageFields(),
   };
 }

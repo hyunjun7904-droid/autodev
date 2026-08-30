@@ -1249,7 +1249,19 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 원인이었다. decideNextAction()은 completedTasks에 없는 task만 다시 선택하므로, 이
     // leftover state는 항상 지금 선택된 이 task 자신의 것이다(AutoDev는 한 번에 한 task만
     // 순차 처리한다 — 다른 task의 실패가 섞여 들어올 여지가 없다).
-    if (state.lastClaudeResult && state.lastGptDecision && state.lastGptDecision.decision !== "PASS") {
+    // AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence(2026-08-31,
+    // JARVIS Task 5.3 실측: 위 seed는 원래 "Reviewer가 REVISE한 직전 시도"만 다뤘다 —
+    // Developer 자신이 TIMEOUT 등으로 실패하면 Reviewer가 아예 호출되지 않아
+    // state.lastGptDecision이 null로 남고, 이 조건이 항상 false가 되어 previousAttemptResult가
+    // 절대 seed되지 않았다. 그 결과 discoveryProgress(§ claude-developer.ts)를 만들어도 다음
+    // attempt에 전달할 경로가 없어 매번 discovery를 완전히 처음부터 반복했다(§ 실제 production
+    // 관측 — 5회 연속 TIMEOUT, WRITE 0). Developer 자신의 실패(success===false)도 동일한
+    // "같은 task의 직전 시도" 원칙으로 seed한다 — 위 주석의 안전조건(decideNextAction이 이
+    // task 자신의 leftover만 선택)은 이 경우에도 동일하게 성립한다.
+    if (
+      state.lastClaudeResult &&
+      ((state.lastGptDecision && state.lastGptDecision.decision !== "PASS") || state.lastClaudeResult.success === false)
+    ) {
       previousAttemptResult = state.lastClaudeResult;
     }
 
@@ -1367,11 +1379,25 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // (Developer 호출 자체가 "무엇을 시도할지"를 만든다), 대신 직전 시도가 required test에
       // 실패했다면 그 프롬프트에 과거 해결 사례/반복 실패 전략 전환 안내를 덧붙여, 같은
       // 실수를 맹목적으로 반복하지 않게 한다(§ claude-developer.ts opts.memoryHint).
-      let memoryHint: string | undefined = !previousAttemptResult && hadPriorProtocolFailureForThisTask ? PRIOR_PROTOCOL_FAILURE_HINT : undefined;
+      let memoryHint: string | undefined;
       let lookupEntryIdThisCycle: string | undefined;
-      if (previousAttemptResult) {
+      // AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence
+      // (2026-08-31, JARVIS Task 5.3 실측 — 회귀 재발견). previousAttemptResult 확장(§ 위
+      // seed 조건) 이전에는 hadPriorProtocolFailureForThisTask 안내가 "previousAttemptResult가
+      // 없을 때만"(!previousAttemptResult) 나가는 fallback이었다 — Developer 자신의 실패도
+      // previousAttemptResult로 seed되도록 넓히면서 이 fallback 조건이 거의 항상 false가 되어
+      // 안내가 조용히 사라지는 회귀가 생겼다(§ scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt
+      // 재현). PRIOR_PROTOCOL_FAILURE_HINT는 problemProjectStore(previousAttemptResult와 무관한
+      // 별도 영속 이력)를 근거로 하므로, hintParts 안에서 그 자체 조건(hadPriorProtocolFailureForThisTask)
+      // 으로만 독립적으로 판단해 두 안내가 필요하면 함께 실린다.
+      if (previousAttemptResult || hadPriorProtocolFailureForThisTask) {
         const hintParts: string[] = [];
 
+        if (hadPriorProtocolFailureForThisTask) {
+          hintParts.push(PRIOR_PROTOCOL_FAILURE_HINT);
+        }
+
+      if (previousAttemptResult) {
         // AutoDev / JARVIS 최종 무인개발 하드닝 — RCA가 트리거됐다면(§ root-cause-analysis.ts)
         // 그 분류/권장 조치/직전 Reviewer 지적을 이번 라운드 프롬프트에 명시적으로 전달한다
         // (§ 요구사항 17 IMPLEMENTATION_ERROR 복구 — "막연한 REVISE가 아니라 이전 finding을
@@ -1515,6 +1541,28 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           if (escalation) hintParts.push(escalation);
         }
 
+        // AutoDev Core Maintenance — Greenfield/Timeout Discovery Progress Persistence
+        // (2026-08-31, JARVIS Task 5.3 실측). previousAttemptResult가 Developer 자신의 실패
+        // (TIMEOUT 등, 위 seed 확장)이고 discoveryProgress가 있으면, 이미 읽은 파일 "경로"만
+        // (내용은 포함하지 않는다 — raw transcript 재주입이 아니다) 압축해서 전달한다.
+        // discoveryOnlyRoundCount 자체의 이어받기는 claude-developer.ts
+        // opts.priorDiscoveryProgress가 기계적으로 처리한다 — 이 hint는 그 기계적 처리를
+        // Claude에게 텍스트로 설명해 왜 곧바로 구현으로 넘어가야 하는지 알려주는 역할만 한다.
+        if (previousAttemptResult.success === false && previousAttemptResult.discoveryProgress) {
+          const dp = previousAttemptResult.discoveryProgress;
+          if (dp.filesRead.length > 0 || dp.implementationLocked) {
+            hintParts.push(
+              `# AutoDev 안내(직전 시도 — discovery 이미 진행됨)\n` +
+                `직전 시도는 실패(${previousAttemptResult.errorCode ?? "알 수 없는 오류"})로 끝났지만, 그 전에 이미 다음 파일을 확인했습니다:\n` +
+                dp.filesRead.map((f) => `- ${f}`).join("\n") +
+                (dp.implementationLocked
+                  ? "\n\ndiscovery 예산이 이미 소진된 상태였습니다 — 다시 조사부터 반복하지 말고 곧바로 구현(WRITE_FILE/APPLY_PATCH)을 시작하세요. 위 파일 내용을 다시 확인해야 한다면 최소한만 다시 읽으세요."
+                  : "\n\n이미 확인한 내용을 바탕으로 불필요한 재조사를 최소화하고 남은 구현으로 빠르게 진행하세요.")
+            );
+          }
+        }
+        }
+
         if (hintParts.length > 0) memoryHint = hintParts.join("\n\n");
       }
 
@@ -1531,6 +1579,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         // 파일/명령을 검증·실행한다.
         executor: executorContext,
         memoryHint,
+        // § 위 discoveryProgress hintParts 주석 — discoveryOnlyRoundCount/implementationLocked
+        // 이어받기의 실제 기계적 처리(claude-developer.ts opts.priorDiscoveryProgress).
+        // previousAttemptResult가 Developer 성공/Reviewer REVISE 결과일 때는 discoveryProgress가
+        // 없으므로(undefined) 기존 동작과 동일하게 0/false부터 시작한다.
+        priorDiscoveryProgress: previousAttemptResult?.discoveryProgress,
         // 테스트 전용(§ AutodevRunOptions.developerClaudeCaller) — 지정하지 않으면 undefined라
         // runDeveloperTaskViaSafeExecutor의 기본값(실제 claude CLI 호출)이 그대로 쓰인다.
         claudeCaller: opts.developerClaudeCaller,
