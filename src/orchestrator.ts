@@ -304,8 +304,13 @@ export async function runOrchestrator(
   const resumingSameTask = state.currentTask === task;
   state.currentTask = task;
   state.reviewCycle = 0;
-  state.claudeLimitWaitCount = 0;
   if (!resumingSameTask) {
+    // P1-1 재하드닝(독립 감사) — claudeLimitWaitCount는 예전에 resumingSameTask 여부와
+    // 무관하게 항상 0으로 초기화됐다(이 블록 밖에 있었음) — 같은 task를 재개해도 durable
+    // USAGE_LIMIT wait 진행 상황이 매번 사라져 terminal cap(MAX_DURABLE_PROVIDER_WAIT_
+    // RETRY_COUNT)에 절대 도달하지 못하는 무한 재시도가 됐다. developerProviderWaitCount 등
+    // 나머지 durable counter와 동일하게 "다른(새) task로 전환될 때만" 리셋한다.
+    state.claudeLimitWaitCount = 0;
     state.developerProviderWaitCount = 0;
     state.developerProviderNextRetryAt = null;
     state.reviewerProviderWaitCount = 0;
@@ -433,31 +438,34 @@ export async function runOrchestrator(
 
     // Claude 자체가 구조적으로 실패한 경우(subprocess/파싱/권한 게이트 등) — 리뷰할 코드
     // 변경이 없으므로 GPT 호출을 낭비하지 않는다. Developer가 일시적 오류(TIMEOUT/
-    // CLI_NOT_FOUND)로 attempt 내 재시도까지 소진한 경우만(§
-    // DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX) durable wait-then-retry를 거친다 — Task
-    // 위험도와 실패 원인 위험도를 분리한다: provider가 응답하지 못한다는 사실 자체는 사람
-    // 판단이 필요한 사유가 아니며, 아무리 반복돼도 Human Gate로 승격하지 않는다(§ 요구사항
-    // 2026-08-28 정책 수정 — WAITING_CLAUDE_LIMIT과 달리 이 경로는 bounded 횟수 초과 후에도
-    // genuine WAITING_HUMAN으로 끝나지 않는다). 재시도 "횟수"는 무한하지만 재시도 "간격"은
-    // computeDeveloperProviderWaitDelayMs로 bounded된다(무한 tight-loop/API 폭주 방지). 그
-    // 외 구조적 실패(파싱/권한 게이트 등, transient 마커가 없는 경우)는 기존과 동일하게 즉시
-    // WAITING_HUMAN이다 — 이건 여전히 사람이 봐야 할 진짜 문제일 수 있다(예: 잘못된 실행
-    // 권한 설정, malformed 응답 등 — provider가 "응답을 아예 못 준" 것과 다른 범주).
+    // CLI_NOT_FOUND)로 attempt 내 재시도까지 소진한 경우(§
+    // DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX)와, errorCode==="PROTOCOL_ERROR"(§ P0-3
+    // 재하드닝, 독립 감사 — 응답을 반복적으로 해석하지 못한 "protocol parse failure")는
+    // durable wait-then-retry를 거친다 — Task 위험도와 실패 원인 위험도를 분리한다: provider가
+    // 응답하지 못했다는 사실이나 응답 형식을 반복 해석하지 못했다는 사실 자체는 사람 판단이
+    // 필요한 사유가 아니며(§ human-gate-policy.ts isProtocolErrorStructuralFailureMarker와
+    // 동일한 정책), 아무리 반복돼도 즉시 Human Gate로 승격하지 않는다. 재시도 "횟수"는
+    // MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT로 bounded되어(§ blockOnDurableWaitRetryExhausted)
+    // 초과하면 terminal 기술적 BLOCKED로 끝난다. 그 외 구조적 실패(파싱/권한 게이트 등, 위 두
+    // 마커가 없는 경우)는 기존과 동일하게 즉시 WAITING_HUMAN이다 — 이건 여전히 사람이 봐야 할
+    // 진짜 문제일 수 있다(예: 잘못된 실행 권한 설정 등 — provider가 "응답을 아예 못 준" 것,
+    // "응답 형식을 반복 해석 못한 것"과 다른 범주).
     if (!claudeResult.success) {
       const errorCode = (claudeResult as ClaudeResult & { errorCode?: string }).errorCode;
       const claudeResultDeferred = (claudeResult as ClaudeResult & { deferredHumanTasks?: string[] }).deferredHumanTasks ?? [];
       const isTransientRetryExhausted = claudeResultDeferred.some((m: string) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
+      const isProtocolError = errorCode === "PROTOCOL_ERROR";
 
-      if (isTransientRetryExhausted) {
+      if (isTransientRetryExhausted || isProtocolError) {
         state.developerProviderWaitCount = (state.developerProviderWaitCount ?? 0) + 1;
         state.reviewCycle -= 1; // durable wait은 실제 시도로 소비하지 않는다(claudeLimitWaitCount와 동일 관례).
         // P1-2 하드닝(독립 감사) — 재시도 "횟수"에도 이제 상한이 있다(§ 위 claudeLimitWaitCount와
         // 동일한 원칙) — 초과하면 genuine이 아니라 terminal 기술적 BLOCKED로 전환한다.
         if (
           blockOnDurableWaitRetryExhausted(
-            "DEVELOPER_PROVIDER_TRANSIENT",
+            isProtocolError ? "DEVELOPER_PROTOCOL_ERROR" : "DEVELOPER_PROVIDER_TRANSIENT",
             state.developerProviderWaitCount,
-            `Developer provider(${errorCode}) durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다`
+            `Developer ${isProtocolError ? "응답 해석 반복 실패(PROTOCOL_ERROR)" : `provider(${errorCode})`} durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다`
           )
         ) {
           break;
@@ -467,7 +475,7 @@ export async function runOrchestrator(
         setStatus("WAITING_PROVIDER_RETRY");
         saveCurrentState(state);
         log(
-          `Developer provider 일시적 오류(${errorCode}) 감지 — ${delayMs}ms 대기 후 동일 task 재시도 (${state.developerProviderWaitCount}회째, 기술적 provider 장애는 Human Gate로 승격하지 않고 계속 재시도합니다)`
+          `Developer ${isProtocolError ? "응답 해석 반복 실패(PROTOCOL_ERROR)" : `provider 일시적 오류(${errorCode})`} 감지 — ${delayMs}ms 대기 후 동일 task 재시도 (${state.developerProviderWaitCount}회째, 기술적 실패는 Human Gate로 승격하지 않고 계속 재시도합니다)`
         );
         await sleep(delayMs);
         state.developerProviderNextRetryAt = null;
@@ -594,6 +602,23 @@ export async function runOrchestrator(
       // 시간만큼만 기다리는 로직은 없다.
       while (gptResult.errorCode === "GPT_REVIEW_TEMPORARILY_UNAVAILABLE" && gptRawCallTotal <= MAX_GPT_RAW_CALLS) {
         state.reviewerProviderWaitCount = (state.reviewerProviderWaitCount ?? 0) + 1;
+        // P1-2 재하드닝(독립 감사) — 이전에는 이 카운터가 durable하게 증가만 할 뿐 어떤
+        // terminal cap에도 연결되지 않아, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT(5)를 훨씬
+        // 넘어(실제 재현: 11회) 계속 재호출되다가 결국 MAX_GPT_RAW_CALLS 소진 후에야
+        // GPT_RAW_CALL_LIMIT_EXCEEDED(genuine WAITING_HUMAN)로 끝났다 — "느리지만 무한한
+        // 재시도"였다. developerProviderWaitCount/reviewStagnationWaitCount와 동일하게 이
+        // 카운터도 상한을 넘으면 terminal 기술적 BLOCKED로 전환하고, 이 함수는 즉시
+        // 반환한다(추가 Reviewer network call 없음 — blockOnDurableWaitRetryExhausted가
+        // 참을 반환한 시점에는 아직 이번 라운드의 재호출을 시작하지 않았다).
+        if (
+          blockOnDurableWaitRetryExhausted(
+            "REVIEWER_PROVIDER_TRANSIENT",
+            state.reviewerProviderWaitCount,
+            `GPT Reviewer provider durable wait이 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT}회를 초과했습니다`
+          )
+        ) {
+          return { finalState: state, statusHistory };
+        }
         const delayMs = computeDeveloperProviderWaitDelayMs(state.reviewerProviderWaitCount, developerProviderWaitSchedule, developerProviderWaitCooldownMs);
         state.reviewerProviderNextRetryAt = new Date(now() + delayMs).toISOString();
         setStatus("WAITING_PROVIDER_RETRY");

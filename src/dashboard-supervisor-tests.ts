@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import {
   checkSupervisorLock,
   defaultIsPidAlive,
   acquireSupervisorLockAtomic,
+  releaseSupervisorLockAtomic,
   DEFAULT_BACKOFF_SCHEDULE_MS,
   runSupervisorLoop,
   shouldResetFailureStreak,
@@ -175,6 +176,88 @@ async function scenarioRealConcurrentSupervisorAcquisition(): Promise<void> {
 
   try {
     if (readdirSync(dir).length > 0) rmSync(lockPath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P0-2 재하드닝 — 실제 concurrency test: 이미 죽은(진짜 dead pid) owner의 stale supervisor
+// lock 하나를 실제 OS 프로세스 2개가 동시에 밀어내고 새로 acquire하려고 경쟁한다(§
+// project-lock-tests.ts의 scenarioRealConcurrentStaleLockRecovery와 동일한 원칙).
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentSupervisorStaleLockRecovery(): Promise<void> {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+  const workerPath = join(__dirname, "supervisor-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("P0-2-real) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  const deadChild = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  const deadPid = deadChild.pid;
+  if (typeof deadPid !== "number") {
+    check("P0-2-real) (죽은 child pid를 얻지 못해 스킵)", true);
+    return;
+  }
+  writeFileSync(lockPath, JSON.stringify({ pid: deadPid, lockId: "real-race-stale-owner", startedAt: new Date().toISOString() }), "utf-8");
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, lockPath]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const [outA, outB] = await Promise.all([runWorker(), runWorker()]);
+  const acquiredCount = [outA, outB].filter((o) => o === "ACQUIRED").length;
+  check("P0-2-real) 진짜 dead owner의 stale supervisor lock을 두 실제 프로세스가 동시에 밀어내도 정확히 하나만 ACQUIRED", acquiredCount === 1);
+  check(
+    "P0-2-real) 나머지 하나는 BLOCKED(승자를 정확히 인식) — 둘 다 자신이 supervisor라고 착각하지 않음",
+    (outA === "ACQUIRED") !== (outB === "ACQUIRED") && (outA.startsWith("BLOCKED:") || outB.startsWith("BLOCKED:"))
+  );
+
+  try {
+    rmSync(lockPath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P0-2 — shutdown()의 ownership-blind unlink 제거 검증. releaseSupervisorLockAtomic()은
+// "내가 acquire 때 발급받은 lockId"가 현재 파일의 owner와 정확히 같을 때만 지운다 — 예전
+// shutdown()의 `existsSync → unlinkSync`(자기 ownership 미확인)였다면 아래 시나리오에서
+// new supervisor(B)의 살아있는 lock까지 지워버렸을 것이다.
+// ---------------------------------------------------------------------------
+function scenarioReleaseOnlyRemovesOwnLock(): void {
+  const dir = makeTempDir();
+  const lockPath = join(dir, "supervisor.lock");
+
+  const acquired = acquireSupervisorLockAtomic(lockPath, () => false);
+  check("P0-2-release) 사전조건: old supervisor(A) acquire 성공", acquired.ok === true);
+  if (!acquired.ok) return;
+  const ownLockId = acquired.lockId;
+
+  // old supervisor(A)가 stale로 판정되어 밀려나고, new supervisor(B)가 이미 그 자리에
+  // 자신의 fresh lock을 만들어둔 상태를 흉내낸다 — A는 이 사실을 전혀 모른 채 자신이 원래
+  // 발급받은 lockId로만 shutdown release를 시도한다.
+  writeFileSync(lockPath, JSON.stringify({ pid: 8_123_456, lockId: "new-supervisor-B", startedAt: new Date().toISOString() }), "utf-8");
+
+  const released = releaseSupervisorLockAtomic(lockPath, ownLockId);
+  check("P0-2-release) old supervisor(A)의 release 시도는 거부됨(lockId 불일치)", released.ok === false);
+  check(
+    "P0-2-release) new supervisor(B)의 lock이 실수로 삭제되지 않고 그대로 존재",
+    existsSync(lockPath) && (JSON.parse(readFileSync(lockPath, "utf-8")) as { lockId?: string }).lockId === "new-supervisor-B"
+  );
+
+  try {
+    rmSync(lockPath, { force: true });
   } catch {
     /* 정리 실패는 테스트 결과에 영향 없음 */
   }
@@ -404,7 +487,9 @@ async function main(): Promise<void> {
     scenarioAtomicAcquireSucceedsOnEmptyDir();
     scenarioAtomicAcquireBlockedByAliveOwner();
     scenarioAtomicAcquireStaleReplacedByFreshDuringRemoval();
+    scenarioReleaseOnlyRemovesOwnLock();
     await scenarioRealConcurrentSupervisorAcquisition();
+    await scenarioRealConcurrentSupervisorStaleLockRecovery();
     await scenarioRealKillTriggersRealRespawn();
     await scenarioBoundedBackoffOnRepeatedCrash();
     await scenarioSustainedUptimeResetsRealStreak();

@@ -172,12 +172,18 @@ function scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine(): void {
   );
 }
 
-// CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX 단독도, STAGNATION_DETECTED와 섞여도 GENUINE을
-// 유지해야 한다 — provider가 응답을 아예 못 준 것(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX)
-// 과 달리 파싱/권한 게이트 실패 등은 여전히 사람이 봐야 할 진짜 문제일 수 있다.
-function scenarioClaudeStructuralFailureIsGenuine(): void {
+// § P0-3 재하드닝(독립 감사) — CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX는 errorCode에 따라
+// 갈린다: PROTOCOL_ERROR(응답 해석 반복 실패, "protocol parse failure")는 순수 기술적
+// 상황이라 TECHNICAL_AUTO_RECOVERABLE이어야 한다 — 이전 정책(무조건 GENUINE)이 독립 감사에서
+// 실제 오분류로 확인됐다. 그 외 errorCode(예: 파싱/권한 게이트 실패가 아닌 다른 구조적 실패)는
+// 여전히 GENUINE을 유지한다 — provider가 응답을 아예 못 준 것(DEVELOPER_TRANSIENT_RETRY_
+// EXHAUSTED_PREFIX)과 다른, 사람이 봐야 할 진짜 문제일 수 있다.
+function scenarioClaudeStructuralFailureProtocolErrorIsTechnical(): void {
   const s = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR): Claude 결과가 구조적으로 실패`] });
-  check("CLAUDE_STRUCTURAL_FAILURE 마커 단독 → GENUINE_HUMAN_JUDGMENT", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
+  check(
+    "P0-3) CLAUDE_STRUCTURAL_FAILURE(PROTOCOL_ERROR) 단독 → TECHNICAL_AUTO_RECOVERABLE(protocol parse failure는 genuine 아님)",
+    classifyWaitingHumanReason(s) === "TECHNICAL_AUTO_RECOVERABLE"
+  );
 
   const s2 = state({
     deferredHumanTasks: [
@@ -186,8 +192,14 @@ function scenarioClaudeStructuralFailureIsGenuine(): void {
     ],
   });
   check(
-    "STAGNATION_DETECTED와 CLAUDE_STRUCTURAL_FAILURE가 함께 있으면 GENUINE 유지",
-    classifyWaitingHumanReason(s2) === "GENUINE_HUMAN_JUDGMENT"
+    "P0-3) STAGNATION_DETECTED와 CLAUDE_STRUCTURAL_FAILURE(PROTOCOL_ERROR)가 함께 있어도 둘 다 기술적 신호라 TECHNICAL_AUTO_RECOVERABLE",
+    classifyWaitingHumanReason(s2) === "TECHNICAL_AUTO_RECOVERABLE"
+  );
+
+  const s3 = state({ deferredHumanTasks: [`${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}INVALID_OUTPUT): Claude 결과가 구조적으로 실패`] });
+  check(
+    "P0-3) CLAUDE_STRUCTURAL_FAILURE(그 외 errorCode, 예: INVALID_OUTPUT)는 여전히 GENUINE_HUMAN_JUDGMENT",
+    classifyWaitingHumanReason(s3) === "GENUINE_HUMAN_JUDGMENT"
   );
 }
 
@@ -248,7 +260,7 @@ function main(): void {
   scenarioStagnationDetectedWithGenuineMarkerStaysGenuine();
   scenarioStagnationDetectedWithMaxGptCallsExceededStaysGenuine();
   scenarioStagnationDetectedWithDeterministicReviewCycleExhaustedStaysGenuine();
-  scenarioClaudeStructuralFailureIsGenuine();
+  scenarioClaudeStructuralFailureProtocolErrorIsTechnical();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();
 

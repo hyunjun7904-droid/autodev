@@ -114,7 +114,9 @@ const GENUINE_MARKER_PREFIXES: readonly string[] = [
   "QUOTA_EXCEEDED:",
   "PROVIDER_SECURITY_BLOCKED:",
   MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
-  CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
+  // CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX는 여기 없다 — § P0-3 재하드닝(독립 감사) 아래
+  // isGenuineClaudeStructuralFailureMarker() 참고. errorCode==="PROTOCOL_ERROR"(응답 해석
+  // 반복 실패)만은 예외적으로 기술적 자동 복구 대상이라 이 블랑켓 목록에 넣을 수 없다.
   // AutoDev Core Maintenance(2026-08-30) — 같은 cycle에 STAGNATION_DETECTED_MARKER_PREFIX
   // 마커가 이미 함께 남아있을 수 있다(repeatCount===2 시점에 무조건 push되고, 이 exhaustion
   // 마커는 그보다 나중 cycle에 추가로 push될 수 있음) — STAGNATION_DETECTED만 있었다면
@@ -128,6 +130,27 @@ const GENUINE_MARKER_PREFIXES: readonly string[] = [
 
 function isCheckpointScopeViolationMarker(marker: string): boolean {
   return marker.startsWith("CHECKPOINT_BLOCKED(") && marker.includes(`: ${CHECKPOINT_SCOPE_VIOLATION_REASON}`);
+}
+
+const PROTOCOL_ERROR_STRUCTURAL_FAILURE_MARKER = `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR)`;
+
+/** § P0-3 재하드닝(독립 감사, 2026-08-30) — 독립 감사에서 실제로 확인된 오분류: Claude
+ *  응답이 반복적으로 해석 불가능해(claude-developer.ts PROTOCOL_FAILURE_HARD_STOP) 생기는
+ *  `CLAUDE_STRUCTURAL_FAILURE(PROTOCOL_ERROR)`는 "protocol parse failure"다 — 실제 사업/보안/
+ *  법적 판단이 필요한 문제가 아니라 순수 기술적 상황이며, orchestrator.ts가 이제 이 errorCode를
+ *  DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX와 동일한 durable wait-then-retry 경로로 보내
+ *  더 이상 이 마커 자체를 만들지 않는다(§ orchestrator.ts). 하지만 이 마커가 과거에(정책
+ *  수정 이전) 이미 저장되어 있거나, 이 함수가 방어적으로 재검증하는 경우를 대비해 canonical
+ *  classifier 스스로도 이 특정 sub-case만 기술적 자동 복구 대상으로 판정한다 — 그 외
+ *  CLAUDE_STRUCTURAL_FAILURE(다른 errorCode: AUTH_REQUIRED/NON_ZERO_EXIT/INVALID_OUTPUT/
+ *  TASK_ACTION_LIMIT/NO_PROGRESS_STAGNATION/UNKNOWN 등)는 여전히 GENUINE이다 — provider가
+ *  응답을 아예 못 준 것과 다른, 사람이 봐야 할 진짜 문제일 수 있다. */
+function isProtocolErrorStructuralFailureMarker(marker: string): boolean {
+  return marker.startsWith(PROTOCOL_ERROR_STRUCTURAL_FAILURE_MARKER);
+}
+
+function isNonProtocolErrorClaudeStructuralFailureMarker(marker: string): boolean {
+  return marker.startsWith(CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX) && !isProtocolErrorStructuralFailureMarker(marker);
 }
 
 /** Genuine Human Gate Local Approval(2026-08-29)이 재사용한다 — CHECKPOINT_BLOCKED 마커 중
@@ -148,7 +171,8 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
 
   const hasGenuineMarker =
     markers.some((m) => GENUINE_MARKER_PREFIXES.some((prefix) => m.startsWith(prefix))) ||
-    markers.some(isNonScopeCheckpointBlockMarker);
+    markers.some(isNonScopeCheckpointBlockMarker) ||
+    markers.some(isNonProtocolErrorClaudeStructuralFailureMarker);
   if (hasGenuineMarker) return "GENUINE_HUMAN_JUDGMENT";
 
   const hasCheckpointScopeViolation = markers.some(isCheckpointScopeViolationMarker);
@@ -157,13 +181,15 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const hasReviewBlocked = decision === "BLOCK" || decision === "HUMAN_REQUIRED";
   const hasDeveloperTransientRetryExhausted = markers.some((m) => m.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX));
   const hasStagnationDetected = markers.some((m) => m.startsWith(STAGNATION_DETECTED_MARKER_PREFIX));
+  const hasProtocolErrorStructuralFailure = markers.some(isProtocolErrorStructuralFailureMarker);
 
   if (
     hasCheckpointScopeViolation ||
     hasReviewCycleExhausted ||
     hasReviewBlocked ||
     hasDeveloperTransientRetryExhausted ||
-    hasStagnationDetected
+    hasStagnationDetected ||
+    hasProtocolErrorStructuralFailure
   ) {
     return "TECHNICAL_AUTO_RECOVERABLE";
   }

@@ -867,6 +867,58 @@ async function scenarioReviewStagnationBudgetPersistsAcrossRestart(): Promise<vo
   );
 }
 
+// ---------------------------------------------------------------------------
+// P1-1 재하드닝(2026-08-30, 독립 감사 실제 재현) — claudeLimitWaitCount(USAGE_LIMIT durable
+// wait 예산)가 orchestrator.ts에서 resumingSameTask 여부와 무관하게 항상 0으로 리셋되는
+// 버그가 있었다(developerProviderWaitCount 등 나머지 세 durable counter는 이미
+// `if (!resumingSameTask)` 블록 안에 있었는데 이것만 밖에 있었다). 이 시나리오는 그 정확한
+// 재현 조건(같은 task로 재개 + 이미 cap 직전까지 소진된 seed)을 fresh runAutodevOnce() 호출
+// (=실제 process 재시작과 동일하게 loadState()로 디스크에서 다시 읽음) 하나로 구성해, 수정
+// 전에는 claudeCalls가 6(0부터 다시 쌓아올려야 cap에 도달)이었고 수정 후에는 1(seed가 그대로
+// 보존되어 첫 실패가 즉시 cap을 넘음)이어야 함을 증명한다.
+// ---------------------------------------------------------------------------
+async function scenarioClaudeLimitWaitBudgetPersistsAcrossRestart(): Promise<void> {
+  const target = PLANNER_FIXTURE_REGISTRY.find((t) => t.id === "P1.2")!;
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_CLAUDE_LIMIT",
+    completedTasks: ["P1.1"],
+    currentTask: target.prompt,
+    reviewCycle: 0,
+    claudeLimitWaitCount: MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT,
+  });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: false, summary: "테스트: 재시작 이후에도 여전히 사용량 제한", changedFiles: [], tests: [], rawOutput: "", errorCode: "USAGE_LIMIT" } as ClaudeResult;
+  };
+  const gptReviewer = async (): Promise<GptReviewerReturn> => ({
+    decision: "PASS",
+    severity: { critical: 0, high: 0, medium: 0 },
+    feedback: "호출되면 안 됨",
+    nextTask: null,
+  });
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() },
+  });
+
+  check(
+    "P1-1) 재시작(fresh runAutodevOnce 호출) 직후 claudeLimitWaitCount seed가 0으로 리셋되지 않고 단 1회 실패만으로 즉시 BLOCKED(과거 버그였다면 6회 필요)",
+    claudeCalls === 1
+  );
+  check("P1-1) outcome이 APPROVED_AND_CHECKPOINTED가 아님(수렴하지 않았으므로)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("P1-1) 최종 status=BLOCKED(terminal 기술적 안전정지 — 재시작이 예산을 초기화하지 않음)", (finalState.status as unknown as string) === "BLOCKED");
+  check(
+    `P1-1) claudeLimitWaitCount가 seed(${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT})에서 이어져 상한을 초과함(=${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1}, 0부터 재시작 아님)`,
+    (finalState.claudeLimitWaitCount ?? 0) === MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1
+  );
+}
+
 // AutoDev Core Maintenance — Crash-safe Checkpoint Reconciliation(Category B, 마지막 task
 // 전용 gap) 통합 시나리오. 마지막 task의 completedTasks 갱신은 이미 저장됐지만(§ decideNextAction
 // 관점에서는 "더 이상 실행할 task 없음") admin commit(commitProjectStateOnly)이 아직 git에
@@ -2463,11 +2515,18 @@ function makeAlwaysUnrecognizedProtocolCaller(): ScriptedDeveloperCaller {
 async function scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt(): Promise<void> {
   // AutoDev 신뢰성 보완(2026-08-27, "응답 형식 오류도 기존 문제 해결 흐름에 포함") —
   // PROTOCOL_ERROR(§ claude-developer.ts PROTOCOL_FAILURE_HARD_STOP)로 developer가
-  // 구조적으로 실패하면 orchestrator.ts가 GPT 리뷰 없이 즉시 WAITING_HUMAN으로 넘어간다
-  // (§ defaultClaudeRunner의 `if (result.success)` 기록 분기를 거치지 않음) — 그래도
-  // problem-memory에 FAILURE로 기록되고, 이 task가 다시 시도될 때 최초 라운드부터(2회차
-  // 실패를 기다리지 않고) 응답 형식 안내가 미리 주입되는지 검증한다(§ 요구사항 "동일 문제
-  // 재발 시 더 빠른 해결").
+  // 구조적으로 실패해도 problem-memory에는 여전히 FAILURE로 기록되고, 이 task가 다시 시도될
+  // 때 최초 라운드부터(2회차 실패를 기다리지 않고) 응답 형식 안내가 미리 주입되는지
+  // 검증한다(§ 요구사항 "동일 문제 재발 시 더 빠른 해결").
+  //
+  // § P0-3 재하드닝(독립 감사, 2026-08-30) — 이전에는 PROTOCOL_ERROR가 GPT 리뷰 없이 즉시
+  // genuine WAITING_HUMAN으로 넘어갔다. 독립 감사에서 "protocol parse failure는 genuine Human
+  // Gate가 아니다"로 확정되어, 지금은 DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX와 동일한
+  // durable wait-then-retry(§ orchestrator.ts developerProviderWaitCount, 상한
+  // MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT)를 거친 뒤 terminal 기술적 BLOCKED로 끝난다 — 이
+  // caller는 절대 회복되지 않으므로(항상 같은 미해석 응답) 실제로 상한까지 전부 소진한다.
+  // sleep/now를 fake로 주입해 실제 대기 없이 빠르게 끝낸다(그렇지 않으면 실제 backoff
+  // schedule(최대 3600000ms)만큼 몇 시간을 기다리게 된다).
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] }); // 다음 task = M1
   writeCheckScript(repo);
@@ -2479,11 +2538,16 @@ async function scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt(): Promise<vo
     manifest,
     problemMemoryStores,
     developerClaudeCaller: firstCaller.call,
-    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    orchestratorDeps: { gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
   });
 
-  check("J) 1차 시도: PROTOCOL_ERROR로 checkpoint 없이 종료(RAN_TASK_NOT_APPROVED)", firstResult.outcome === "RAN_TASK_NOT_APPROVED");
-  check("J) 1차 시도: 정확히 3회 내부 호출 후 중단(claude-developer.ts 하드 상한, 20라운드까지 낭비되지 않음)", firstCaller.receivedInputs.length === 3);
+  check("J) 1차 시도: PROTOCOL_ERROR가 durable 상한을 소진해 checkpoint 없이 종료(RAN_TASK_NOT_APPROVED)", firstResult.outcome === "RAN_TASK_NOT_APPROVED");
+  check(
+    `J) 1차 시도: durable wait 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1=${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1}회) × 내부 3라운드 하드 상한 = 정확히 ${(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1) * 3}회 내부 호출 후 중단(무한 반복 아님)`,
+    firstCaller.receivedInputs.length === (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1) * 3
+  );
+  const stateAfterFirst = loadState(statePath);
+  check("J) 1차 시도: 최종 status=BLOCKED(genuine WAITING_HUMAN 아님)", (stateAfterFirst.status as unknown as string) === "BLOCKED");
 
   const recordedEntry = problemMemoryStores.project.load().find((e) => e.taskId === "M1" && e.errorCode === "PROTOCOL_ERROR");
   check("J) PROTOCOL_ERROR가 problem-memory에 FAILURE로 기록됨", !!recordedEntry);
@@ -2504,7 +2568,7 @@ async function scenarioProtocolErrorRecordedAndSpeedsUpNextAttempt(): Promise<vo
     manifest,
     problemMemoryStores,
     developerClaudeCaller: secondCaller.call,
-    orchestratorDeps: { gptReviewer: fakePassReviewer() },
+    orchestratorDeps: { gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
   });
 
   check(
@@ -2563,6 +2627,7 @@ async function main(): Promise<void> {
 
     await scenarioApprovedCrashBeforeCheckpointResumesWithoutRerunningDeveloper();
     await scenarioReviewStagnationBudgetPersistsAcrossRestart();
+    await scenarioClaudeLimitWaitBudgetPersistsAcrossRestart();
     await scenarioDanglingProjectStateReconciledWhenNoMoreTasks();
 
     await scenarioHumanFinalReviewGatePausesBeforeCheckpoint();

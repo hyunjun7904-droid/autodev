@@ -9,6 +9,7 @@ import {
   resolveCanonicalProjectPath,
   assessOwnerLiveness,
   inspectProjectRuntimeLiveness,
+  debugComputeLockFilePath,
   PROJECT_LOCK_SCHEMA_VERSION,
 } from "./project-lock";
 import type { ProjectLockMetadata, LivenessVerdict } from "./project-lock";
@@ -480,6 +481,73 @@ async function scenarioRealConcurrentAcquisition(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// P0-1 재하드닝 — 실제 concurrency test: mock이 아니라 실제 OS 프로세스 2개가, 이미 죽은
+// (진짜 dead pid) owner의 stale lock 하나를 동시에 밀어내고 새로 acquire하려고 경쟁한다.
+// scenarioRealConcurrentAcquisition(18)은 "lock이 아예 없는" 상태에서의 경쟁만 검증했다 —
+// 이 테스트는 tryRemoveStaleLock()의 rename 기반 원자적 격리가 진짜 프로세스 간 race에서도
+// active writer ≤ 1을 지키는지(§ 요구사항 "adversarial interleaving"의 실제 프로세스 버전)를
+// 검증한다.
+// ---------------------------------------------------------------------------
+async function scenarioRealConcurrentStaleLockRecovery(): Promise<void> {
+  const root = makeProjectRoot("plock-race-stale-");
+  const lockDir = makeLockDir("plock-race-stale-dir-");
+  const workerPath = join(__dirname, "project-lock-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("P0-1-real) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  // 진짜로 종료된 child의 pid를 얻는다(§ scenarioRealLivenessAssessment와 동일한 기법) —
+  // spawnSync는 child가 실제로 종료된 뒤에야 반환하므로 이 시점에 확실히 죽어있다.
+  const deadChild = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+  const deadPid = deadChild.pid;
+  if (typeof deadPid !== "number") {
+    check("P0-1-real) (죽은 child pid를 얻지 못해 스킵)", true);
+    return;
+  }
+
+  const canonical = resolveCanonicalProjectPath(root);
+  const filePath = debugComputeLockFilePath(canonical, lockDir);
+  const staleMeta: ProjectLockMetadata = {
+    schemaVersion: PROJECT_LOCK_SCHEMA_VERSION,
+    projectId: "p1",
+    canonicalProjectPath: canonical,
+    lockId: "real-race-stale-owner",
+    pid: deadPid,
+    processStartedAtMs: Date.now() - 999_000,
+    lockCreatedAt: new Date(Date.now() - 999_000).toISOString(),
+    ownerKind: "autodev",
+  };
+  writeFileSync(filePath, JSON.stringify(staleMeta), "utf-8");
+
+  function runWorker(): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerPath, "p1", root, lockDir]);
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("close", () => resolve(out.trim()));
+    });
+  }
+
+  const [outA, outB] = await Promise.all([runWorker(), runWorker()]);
+  const acquiredCount = [outA, outB].filter((o) => o === "ACQUIRED").length;
+  check("P0-1-real) 진짜 dead owner의 stale lock을 두 실제 프로세스가 동시에 밀어내도 정확히 하나만 ACQUIRED", acquiredCount === 1);
+  check(
+    "P0-1-real) 나머지 하나는 PROJECT_ALREADY_LOCKED(승자를 정확히 인식)로 BLOCKED — 승자의 lock을 자신도 잡았다고 착각하지 않음",
+    (outA === "ACQUIRED") !== (outB === "ACQUIRED") && (outA.startsWith("BLOCKED:") || outB.startsWith("BLOCKED:"))
+  );
+  check("P0-1-real) 최종적으로 lock 파일이 정확히 하나만 남아 유효한 owner를 가리킴", existsSync(filePath));
+
+  try {
+    rmSync(filePath, { force: true });
+  } catch {
+    /* 정리 실패는 테스트 결과에 영향 없음 */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AutoDev / JARVIS 최종 무인개발 구조 보완 — inspectProjectRuntimeLiveness(§ 요구사항 24,
 // 대시보드 실행상태 보완의 근거 데이터).
 // ---------------------------------------------------------------------------
@@ -536,6 +604,7 @@ async function main(): Promise<void> {
   scenarioInspectRuntimeLivenessAliveOwner();
   scenarioInspectRuntimeLivenessStaleOwner();
   await scenarioRealConcurrentAcquisition();
+  await scenarioRealConcurrentStaleLockRecovery();
 
   console.log("\n=== project-lock.ts(G7) 테스트 결과 ===");
   for (const r of results) console.log(r);

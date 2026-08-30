@@ -1,9 +1,15 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { appendDashboardLog } from "./dashboard-log";
 import type { DashboardLogFields } from "./dashboard-log";
-import { acquireSupervisorLockAtomic, defaultIsPidAlive, computeBackoffDelayMs, shouldResetFailureStreak } from "./dashboard-supervisor";
+import {
+  acquireSupervisorLockAtomic,
+  releaseSupervisorLockAtomic,
+  defaultIsPidAlive,
+  computeBackoffDelayMs,
+  shouldResetFailureStreak,
+} from "./dashboard-supervisor";
 
 // AutoDev Continuous Runner Lifecycle Independence(2026-08-28 Maintenance) — 이번 세션의
 // 실제 production incident: run.ts(--continuous)를 Claude Code harness가 추적하는 background
@@ -221,6 +227,7 @@ function main(): void {
     appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: acquireResult.reason });
     return;
   }
+  const ownLockId = acquireResult.lockId;
 
   const controller = new AbortController();
   let shuttingDown = false;
@@ -229,10 +236,12 @@ function main(): void {
     shuttingDown = true;
     controller.abort();
     appendDashboardLog(logFilePath, { event: "SUPERVISOR_SHUTDOWN", reason });
-    try {
-      if (existsSync(lockFilePath)) unlinkSync(lockFilePath);
-    } catch {
-      // lock 정리 실패는 다음 supervisor 시작 시 stale-lock 경로로 자연히 흡수된다.
+    // § P0-2 하드닝 — existsSync 뒤 무조건 unlink하지 않는다. 이 lockId가 여전히 파일의
+    // owner일 때만 지운다(다른 새 supervisor가 이미 이 자리를 차지했다면 그 lock은 건드리지
+    // 않는다).
+    const released = releaseSupervisorLockAtomic(lockFilePath, ownLockId);
+    if (!released.ok) {
+      appendDashboardLog(logFilePath, { event: "SUPERVISOR_LOCK_RELEASE_SKIPPED", reason: released.reason });
     }
     process.exit(0);
   }
@@ -250,6 +259,10 @@ function main(): void {
     maintenancePollMs: DEFAULT_MAINTENANCE_POLL_INTERVAL_MS,
   };
   const maintenanceMarkerPath = maintenancePauseMarkerPath(adapterPath, logsDir);
+  // § P1-4 하드닝(독립 감사) — 이 supervisor 프로세스 자신의 실제 OS 시작 시각 추정값
+  // (project-lock.ts의 processStartedAtMs와 동일한 계산). child(run.ts)에 PID와 함께 넘겨
+  // parent-liveness-watchdog이 단순 PID 생존이 아니라 PID reuse까지 재확인할 수 있게 한다.
+  const supervisorStartedAtMs = Date.now() - Math.round(process.uptime() * 1000);
 
   const deps: RunnerSupervisorDeps = {
     isMaintenancePaused: () => existsSync(maintenanceMarkerPath),
@@ -263,8 +276,15 @@ function main(): void {
         cwd: config.cwd,
         // P0-3 하드닝(§ parent-liveness-watchdog.ts) — child가 자기 자신의 supervisor PID를
         // 알 수 있게 넘긴다. supervisor가 비정상 종료되면 child가 스스로 감지하고 종료해
-        // orphan으로 무기한 남지 않는다.
-        env: { ...process.env, ...config.env, AUTODEV_SUPERVISOR_PID: String(process.pid) },
+        // orphan으로 무기한 남지 않는다. P1-4 재하드닝 — AUTODEV_SUPERVISOR_STARTED_AT_MS를
+        // 함께 넘겨 PID reuse(부모가 죽고 그 PID가 다른 프로세스에 재사용됨)까지 구분할 수
+        // 있게 한다(§ run.ts).
+        env: {
+          ...process.env,
+          ...config.env,
+          AUTODEV_SUPERVISOR_PID: String(process.pid),
+          AUTODEV_SUPERVISOR_STARTED_AT_MS: String(supervisorStartedAtMs),
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
       let outputTail = "";

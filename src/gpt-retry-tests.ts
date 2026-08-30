@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { reviewClaudeResultWithRetry } from "./gpt-reviewer";
 import type { GptReviewApiResult } from "./gpt-reviewer";
-import { runOrchestrator } from "./orchestrator";
+import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
 import { DEFAULT_STATE_PATH } from "./state";
 import type { ClaudeResult } from "./types";
 
@@ -191,11 +191,17 @@ async function scenarioC(statePath: string): Promise<void> {
   );
 }
 
-// 2026-08-28 정책 수정 이후에도 "검증 안 된 코드를 PASS 처리하지 않는다"는 원칙과 실제 비용
-// 안전장치(MAX_GPT_RAW_CALLS)는 그대로 살아있다는 것을 증명한다 — provider가 전혀 회복되지
-// 않으면(매 outer 호출마다 계속 실패) 결국 GPT_RAW_CALL_LIMIT_EXCEEDED(기존의, 이 정책과
-// 무관한 실제 비용 genuine 사유)로 bounded하게 멈춘다.
-async function scenarioCNeverRecoversHitsRawCallCap(statePath: string): Promise<void> {
+// § P1-2 재하드닝(독립 감사, 2026-08-30) — 이전 정책(이 시나리오의 예전 이름
+// scenarioCNeverRecoversHitsRawCallCap)은 reviewerProviderWaitCount에 terminal cap이 전혀
+// 연결되지 않아, provider가 전혀 회복되지 않으면 실제 비용 안전장치(MAX_GPT_RAW_CALLS=30,
+// gptTransportRetry 포함 raw 호출 총합)에 도달할 때까지(outer 7회) "느리지만 사실상 무한한"
+// 재시도가 계속되다가 결국 GPT_RAW_CALL_LIMIT_EXCEEDED(genuine WAITING_HUMAN)로 끝났다 —
+// 독립 감사가 실제로 재현한 결함이다. 지금은 orchestrator.ts의 reviewer durable-wait 루프가
+// 매 대기 전에 MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT(5)를 먼저 확인해, 그 상한을 raw-call
+// 비용 상한보다 먼저 넘겨 terminal 기술적 BLOCKED로 끝난다(Human Gate 아님, 추가 Reviewer
+// API 호출 없음) — MAX_GPT_RAW_CALLS 자체는 defense-in-depth로 여전히 존재하지만, 이
+// 시나리오에서는 더 이상 먼저 도달하는 안전장치가 아니다.
+async function scenarioCNeverRecoversHitsDurableRetryCap(statePath: string): Promise<void> {
   let claudeCalls = 0;
   const claudeRunner = async (): Promise<ClaudeResult> => {
     claudeCalls += 1;
@@ -219,18 +225,94 @@ async function scenarioCNeverRecoversHitsRawCallCap(statePath: string): Promise<
     },
   });
 
-  check("C2: 결국 WAITING_HUMAN(실제 비용 안전장치)으로 멈춤", finalState.status === "WAITING_HUMAN");
+  check("C2) 결국 terminal 기술적 BLOCKED로 멈춤(genuine WAITING_HUMAN 아님)", finalState.status === "BLOCKED");
   check(
-    "C2: deferredHumanTasks에 GPT_RAW_CALL_LIMIT_EXCEEDED가 기록됨(GPT_REVIEW_TEMPORARILY_UNAVAILABLE이 아니라)",
-    finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_RAW_CALL_LIMIT_EXCEEDED"))
+    "C2) deferredHumanTasks에 GPT_RAW_CALL_LIMIT_EXCEEDED가 기록되지 않음(retry count cap이 그보다 먼저 걸림)",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_RAW_CALL_LIMIT_EXCEEDED"))
   );
   check(
-    "C2: GPT_REVIEW_TEMPORARILY_UNAVAILABLE 자체는 genuine 마커로 남지 않음",
+    "C2) GPT_REVIEW_TEMPORARILY_UNAVAILABLE 자체는 genuine 마커로 남지 않음",
     !finalState.deferredHumanTasks.some((t) => t.startsWith("GPT_REVIEW_TEMPORARILY_UNAVAILABLE"))
   );
-  check("C2: outer 호출 횟수가 유한함(무한 재시도 아님, 정확히 7회)", outerGptCalls === 7);
-  check("C2: durable wait도 유한함(정확히 6회)", orchestratorSleepCalls === 6);
-  check("C2: Claude worker는 1회만 호출됨(같은 diff 재사용, 재실행 없음)", claudeCalls === 1);
+  check(
+    "C2) reviewerProviderWaitCount가 상한(5)을 넘어선 시점(6)에서 멈춤(0부터 재시작 아님, 무한 반복도 아님)",
+    finalState.reviewerProviderWaitCount === 6
+  );
+  check("C2) outer 호출 횟수가 유한함(초기 호출 1회 + 상한 내 재시도 5회 = 정확히 6회, 6번째 재시도는 호출 전에 차단됨)", outerGptCalls === 6);
+  check("C2) durable wait도 유한함(정확히 5회)", orchestratorSleepCalls === 5);
+  check("C2) Claude worker는 1회만 호출됨(같은 diff 재사용, 재실행 없음)", claudeCalls === 1);
+}
+
+// ---------------------------------------------------------------------------
+// § P1-2 재하드닝(독립 감사) — "재시작이 Reviewer retry budget reset 버튼이 되면 안 된다".
+// reviewerProviderWaitCount를 이미 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT) 직전까지
+// 소진한 상태를 project-state.json에 직접 심어두고(=실제 process 재시작 직전 상태를 흉내냄),
+// 완전히 새로운 runOrchestrator() 호출(같은 task, loadState()로 디스크에서 다시 읽음) 하나가
+// 그 다음 한 번의 provider 실패만으로 즉시 terminal BLOCKED로 끝나는지, 그리고 그 호출
+// 이후 추가 Reviewer network call이 전혀 없는지(outerGptCalls===1) 검증한다.
+// ---------------------------------------------------------------------------
+async function scenarioReviewerBudgetPersistsAcrossRestart(): Promise<void> {
+  const sameTask = "K: reviewer 재시작 이후 durable retry 예산 보존";
+  const dir = mkdtempSync(join(tmpdir(), "movan-gpt-retry-restart-test-"));
+  tempDirs.push(dir);
+  const statePath = join(dir, "project-state.json");
+  writeFileSync(
+    statePath,
+    JSON.stringify(
+      {
+        currentTask: sameTask,
+        reviewCycle: 0,
+        lastClaudeResult: null,
+        lastGptDecision: null,
+        status: "WAITING_PROVIDER_RETRY",
+        claudeLimitWaitCount: 0,
+        reviewerProviderWaitCount: MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT,
+        deferredHumanTasks: [],
+        completedTasks: [],
+        gitCheckpoint: "test",
+        currentPhase: 1,
+      },
+      null,
+      2
+    ) + "\n",
+    "utf-8"
+  );
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return FAKE_CLAUDE_RESULT;
+  };
+  let outerGptCalls = 0;
+  const gptReviewer = async () => {
+    outerGptCalls += 1;
+    return syntheticTemporarilyUnavailable();
+  };
+  let sleepCalls = 0;
+
+  const { finalState } = await runOrchestrator(sameTask, {
+    claudeRunner,
+    gptReviewer,
+    statePath,
+    sleep: async () => {
+      sleepCalls += 1;
+    },
+  });
+
+  check(
+    "K) 재시작(fresh runOrchestrator 호출) 직후 reviewerProviderWaitCount seed가 리셋되지 않고 단 1회 실패만으로 즉시 terminal BLOCKED",
+    outerGptCalls === 1
+  );
+  check("K) 상한 초과 판정이 실제 재호출 전에 걸려 추가 durable wait(sleep)도 0회", sleepCalls === 0);
+  check("K) 최종 status=BLOCKED(genuine WAITING_HUMAN 아님)", finalState.status === "BLOCKED");
+  check(
+    `K) reviewerProviderWaitCount가 seed(${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT})에서 이어져 ${MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1}로 기록됨(0부터 재시작 아님)`,
+    finalState.reviewerProviderWaitCount === MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1
+  );
+  check(
+    "K) Claude worker는 이번 재시작 cycle에서 정확히 1회만 호출됨(claudeResult 자체는 재시작에도 영속화되지 않으므로 Developer는 다시 호출되지만, 그 뒤 Reviewer 재시도는 즉시 차단됨)",
+    claudeCalls === 1
+  );
 }
 
 async function scenarioD(statePath: string): Promise<void> {
@@ -296,7 +378,8 @@ async function main(): Promise<void> {
     await scenarioA(makeTempStatePath());
     await scenarioB(makeTempStatePath());
     await scenarioC(makeTempStatePath());
-    await scenarioCNeverRecoversHitsRawCallCap(makeTempStatePath());
+    await scenarioCNeverRecoversHitsDurableRetryCap(makeTempStatePath());
+    await scenarioReviewerBudgetPersistsAcrossRestart();
     await scenarioD(makeTempStatePath());
     await scenarioE(makeTempStatePath());
   } finally {

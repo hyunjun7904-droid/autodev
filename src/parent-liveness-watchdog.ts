@@ -68,3 +68,17 @@ export function resolveSupervisorParentPidFromEnv(env: NodeJS.ProcessEnv = proce
   const parsed = Number(raw);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
+
+/** § P1-4 하드닝(독립 감사) — AUTODEV_SUPERVISOR_PID와 짝을 이루는 supervisor의 실제 OS
+ *  시작 시각(epoch ms) 추정값. project-lock.ts의 processStartedAtMs와 동일한 목적: 이 값이
+ *  있으면 호출부(run.ts)가 단순 PID 생존이 아니라 project-lock.ts의 assessOwnerLiveness()로
+ *  "그 PID가 정말 우리가 감시하던 그 supervisor인지"(PID reuse 여부)까지 재확인할 수 있다.
+ *  이 값이 없으면(구버전 supervisor가 spawn했거나 env가 누락된 경우) undefined를 반환해
+ *  호출부가 기존 단순 PID liveness로 안전하게 degrade하게 한다 — 이 값의 부재가 watchdog
+ *  자체를 막지는 않는다. */
+export function resolveSupervisorParentStartedAtMsFromEnv(env: NodeJS.ProcessEnv = process.env): number | undefined {
+  const raw = env.AUTODEV_SUPERVISOR_STARTED_AT_MS;
+  if (!raw || raw.trim().length === 0) return undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}

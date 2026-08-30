@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { checkExistingServer } from "./dashboard";
@@ -86,7 +86,7 @@ export function checkSupervisorLock(lockFilePath: string, isPidAlive: (pid: numb
 
 const MAX_SUPERVISOR_LOCK_ACQUIRE_ATTEMPTS = 5;
 
-export type AcquireSupervisorLockResult = { ok: true } | { ok: false; reason: string };
+export type AcquireSupervisorLockResult = { ok: true; lockId: string } | { ok: false; reason: string };
 
 /** § P0-2 하드닝 — Supervisor singleton ownership을 원자적으로 얻는다. 기존
  *  checkSupervisorLock()은 순수 read-only 판정(§ project-control-cli.ts의 상태 조회 용도로는
@@ -95,10 +95,12 @@ export type AcquireSupervisorLockResult = { ok: true } | { ok: false; reason: st
  *  write가 조용히 이기고 둘 다 이미 child를 spawn하는 race가 있었다. project-lock.ts의
  *  acquireProjectLock()과 동일한 원칙(`wx` exclusive create만이 실제 승부를 가른다)으로
  *  대체한다. 기존 lock이 살아있으면(isPidAlive) 절대 덮어쓰지 않고 ALREADY_RUNNING을
- *  반환하고, 죽었다고 판정되면(stale) CAS-equivalent compare-before-delete(§
+ *  반환하고, 죽었다고 판정되면(stale) rename 기반 원자적 단일승자 격리(§
  *  tryRemoveStaleSupervisorLock — project-lock.ts의 tryRemoveStaleLock과 동일한 원칙)로
  *  밀어내고 재시도한다 — 그 사이 다른 supervisor가 이미 살아있는 fresh lock으로 교체했다면
- *  그 lock은 절대 지우지 않는다. */
+ *  그 lock은 절대 지우지 않는다. 성공 시 발급한 lockId를 반환한다 — 호출부(main())가 이후
+ *  release 시 "내가 잡은 lock"만 안전하게 지울 수 있게 하기 위함이다(§ P0-2 shutdown 하드닝,
+ *  releaseSupervisorLockAtomic). */
 export function acquireSupervisorLockAtomic(
   lockFilePath: string,
   isPidAlive: (pid: number) => boolean,
@@ -112,7 +114,7 @@ export function acquireSupervisorLockAtomic(
         encoding: "utf-8",
         flag: "wx",
       });
-      return { ok: true };
+      return { ok: true, lockId };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
         return { ok: false, reason: `supervisor lock 파일 생성 실패: ${err instanceof Error ? err.message : String(err)}` };
@@ -130,28 +132,72 @@ export function acquireSupervisorLockAtomic(
       return { ok: false, reason: `OWNER_PID_${existing.pid}_ALIVE` };
     }
     // stale(또는 pid 필드가 없는 malformed — 기존 checkSupervisorLock과 동일하게 stale
-    // 취급)로 판정됨 — CAS compare-before-delete로 밀어낸다.
+    // 취급)로 판정됨 — rename 기반 원자적 단일승자 격리로 밀어낸다.
     tryRemoveStaleSupervisorLock(lockFilePath, existing.lockId);
   }
   return { ok: false, reason: `supervisor lock 획득을 ${MAX_SUPERVISOR_LOCK_ACQUIRE_ATTEMPTS}회 시도했지만 확정하지 못했습니다.` };
 }
 
-/** stale로 판정된 supervisor lock을 제거한다 — unlink 직전에 다시 읽어 lockId가 여전히 우리가
- *  stale로 판정했던 값과 같은지 확인한다(§ project-lock.ts의 tryRemoveStaleLock과 동일한
- *  원칙). 그 사이 다른 supervisor가 이 자리를 자신의 fresh lock으로 교체했다면(lockId가
- *  다르다) 절대 지우지 않는다. */
-function tryRemoveStaleSupervisorLock(lockFilePath: string, expectedLockId: string | undefined): void {
+/** § P0-2 재하드닝 — "내가 잡은 lock"만 release할 수 있다(project-lock.ts의
+ *  releaseProjectLock과 동일한 원칙). 기존 main()의 shutdown()은 `existsSync → unlinkSync`로
+ *  자기 ownership을 전혀 확인하지 않고 무조건 삭제했다 — 이 supervisor가 이미 stale로
+ *  판정되어 다른(새) supervisor가 그 자리를 차지한 뒤라면, 이 삭제가 그 새 supervisor의
+ *  살아있는 lock을 지워버릴 수 있었다(§ 요구사항: old supervisor shutdown이 new supervisor
+ *  lock Y를 보존해야 함). 현재 파일의 lockId가 우리가 acquire 때 발급받은 값과 정확히 같을
+ *  때만 삭제한다. */
+export function releaseSupervisorLockAtomic(lockFilePath: string, ownLockId: string): { ok: boolean; reason?: string } {
   let current: { lockId?: string } | undefined;
   try {
     current = JSON.parse(readFileSync(lockFilePath, "utf-8")) as { lockId?: string };
-  } catch {
-    return; // 이미 없어졌거나(ENOENT) 여전히 파싱 불가 — 확정할 수 있는 삭제 대상이 없다.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, reason: "lock 파일이 이미 없습니다(이미 release되었거나 유실됨)." };
+    return { ok: false, reason: "release 시점에 lock 파일을 읽을 수 없어 안전하게 확인할 수 없습니다 — 삭제하지 않습니다." };
   }
-  if (current.lockId !== expectedLockId) return; // 다른 supervisor가 이미 교체함 — 지우지 않는다.
+  if (current.lockId !== ownLockId) {
+    return { ok: false, reason: "이 lockId는 현재 파일의 owner와 일치하지 않습니다 — 다른 owner의 lock을 release하지 않습니다." };
+  }
   try {
     unlinkSync(lockFilePath);
+    return { ok: true };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { ok: true };
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** stale로 판정된 supervisor lock을 제거한다 — § P0-1/P0-2 재하드닝. rename() 기반 원자적
+ *  단일승자 격리 후 내용을 검증한다(§ project-lock.ts의 tryRemoveStaleLock 상단 주석과 동일한
+ *  설계 — 그 파일 상단 주석에 근거를 상세히 기록했으므로 여기서 반복하지 않는다). 격리한
+ *  내용이 기대했던 lockId와 다르면(다른 supervisor의 fresh lock을 실수로 격리한 경우) 원래
+ *  자리로 복원을 시도한다. */
+function tryRemoveStaleSupervisorLock(lockFilePath: string, expectedLockId: string | undefined): void {
+  const quarantinePath = `${lockFilePath}.stale-${randomUUID()}`;
+  try {
+    renameSync(lockFilePath, quarantinePath);
   } catch {
-    /* ENOENT 등 — 이미 없어졌으면 상관없다(다음 loop이 재평가). */
+    return; // 이미 없어졌거나(ENOENT) 격리 실패 — 다음 loop이 최신 상태를 재평가한다.
+  }
+  let captured: { lockId?: string } | undefined;
+  try {
+    captured = JSON.parse(readFileSync(quarantinePath, "utf-8")) as { lockId?: string };
+  } catch {
+    captured = undefined;
+  }
+  if (captured !== undefined && captured.lockId === expectedLockId) {
+    try {
+      unlinkSync(quarantinePath);
+    } catch {
+      /* 이미 격리되어 아무도 참조하지 않으므로 정리 실패는 무해하다. */
+    }
+    return;
+  }
+  // 기대와 다르다 — 다른 supervisor의 fresh lock을 실수로 격리했을 수 있다. 원래 자리로
+  // 복원을 시도한다(project-lock.ts의 tryRemoveStaleLock과 동일한 잔여 위험 — 3개 이상의
+  // 프로세스가 정확히 같은 좁은 창에서 동시에 겹칠 때만 이론적으로 남는 한계).
+  try {
+    renameSync(quarantinePath, lockFilePath);
+  } catch {
+    /* 복원도 실패하면 격리된 파일을 그대로 둔다(자동 삭제하지 않음 — fail-closed). */
   }
 }
 
@@ -251,6 +297,7 @@ function main(): void {
     appendDashboardLog(logFilePath, { event: "DUPLICATE_SUPERVISOR_BLOCKED", reason: acquireResult.reason });
     return;
   }
+  const ownLockId = acquireResult.lockId;
 
   const controller = new AbortController();
   let currentChild: SupervisedChild | undefined;
@@ -261,11 +308,12 @@ function main(): void {
     shuttingDown = true;
     controller.abort();
     appendDashboardLog(logFilePath, { event: "SUPERVISOR_SHUTDOWN", reason });
-    try {
-      if (existsSync(lockFilePath)) unlinkSync(lockFilePath);
-    } catch {
-      // lock 정리 실패는 다음 supervisor 시작 시 stale-lock 경로(§ checkSupervisorLock)로
-      // 자연히 흡수된다.
+    // § P0-2 하드닝 — existsSync 뒤 무조건 unlink하지 않는다(자기 ownership 미확인 삭제
+    // 금지). 이 lockId가 여전히 파일의 owner일 때만 지운다 — 우리가 이미 stale로 판정되어
+    // 다른 새 supervisor가 그 자리를 차지했다면 그 lock은 절대 건드리지 않는다.
+    const released = releaseSupervisorLockAtomic(lockFilePath, ownLockId);
+    if (!released.ok) {
+      appendDashboardLog(logFilePath, { event: "SUPERVISOR_LOCK_RELEASE_SKIPPED", reason: released.reason });
     }
     if (currentChild) {
       try {

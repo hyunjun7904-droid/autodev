@@ -6,7 +6,12 @@ import { loadState } from "./state";
 import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
 import { assertProductionRuntimeForContinuousLaunch } from "./runtime-origin";
 import { defaultIsPidAlive } from "./dashboard-supervisor";
-import { startParentLivenessWatchdog, resolveSupervisorParentPidFromEnv } from "./parent-liveness-watchdog";
+import { assessOwnerLiveness } from "./project-lock";
+import {
+  startParentLivenessWatchdog,
+  resolveSupervisorParentPidFromEnv,
+  resolveSupervisorParentStartedAtMsFromEnv,
+} from "./parent-liveness-watchdog";
 import { log } from "./logger";
 
 // AutoDev 범용 진입점(Phase B Task B3 — run-movan.ts 대체, Phase C Task C1 — project adapter
@@ -129,12 +134,27 @@ async function main(): Promise<void> {
   // 때만(AUTODEV_SUPERVISOR_PID) 켜진다. supervisor가 비정상 종료되면 이 프로세스가 orphan으로
   // 무기한 계속 실행되지 않고 스스로 종료한다 — crash-safe checkpoint resume이 이미 이
   // 종류의 예기치 않은 종료를 안전하게 재개한다.
+  //
+  // P1-4 재하드닝(독립 감사) — 예전에는 defaultIsPidAlive(단순 PID 생존 여부)만 봤다. 부모가
+  // 죽고 OS가 그 PID를 다른(무관한) 프로세스에 재사용하면, 새 supervisor가 이미 떠 있어도
+  // 이 프로세스는 "옛 supervisor가 여전히 살아있다"고 오인해 orphan으로 계속 남을 수 있었다.
+  // AUTODEV_SUPERVISOR_STARTED_AT_MS가 있으면 project-lock.ts의 assessOwnerLiveness()(PID +
+  // 실제 OS 시작 시각 비교로 PID reuse까지 판정하는 기존 로직, 복제하지 않음)로 재검증한다 —
+  // STALE(재사용 증명)일 때만 죽었다고 판정하고, ALIVE 또는 UNCERTAIN(시작 시각을 확인할 수
+  // 없는 경우)은 안전한 쪽으로 기울여 "아직 살아있다"로 취급한다(불확실한 상태에서 정상
+  // 작업을 스스로 중단시키지 않는다 — assessOwnerLiveness 자신의 fail-closed 기본값과 동일한
+  // 원칙). 이 env가 없으면(구버전 supervisor/수동 실행) 기존 단순 PID liveness로 degrade한다.
   const supervisorParentPid = resolveSupervisorParentPidFromEnv();
+  const supervisorParentStartedAtMs = resolveSupervisorParentStartedAtMsFromEnv();
+  const parentIsPidAlive: (pid: number) => boolean =
+    supervisorParentStartedAtMs !== undefined
+      ? (pid) => assessOwnerLiveness(pid, supervisorParentStartedAtMs).verdict !== "STALE"
+      : defaultIsPidAlive;
   const parentWatchdog = supervisorParentPid
     ? startParentLivenessWatchdog(supervisorParentPid, {
-        isPidAlive: defaultIsPidAlive,
+        isPidAlive: parentIsPidAlive,
         onParentDead: () => {
-          console.error(`[run] supervisor(pid=${supervisorParentPid})가 더 이상 살아있지 않습니다 — orphan으로 남지 않도록 즉시 종료합니다.`);
+          console.error(`[run] supervisor(pid=${supervisorParentPid})가 더 이상 살아있지 않습니다(PID 재사용 포함) — orphan으로 남지 않도록 즉시 종료합니다.`);
           process.exit(1);
         },
       })
