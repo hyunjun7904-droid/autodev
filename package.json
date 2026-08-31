@@ -44,6 +44,7 @@
     "test:human-gate-policy": "npm run build && node dist/human-gate-policy-tests.js",
     "test:failure-stagnation": "npm run build && node dist/failure-stagnation-tests.js",
     "test:failure-taxonomy": "npm run build && node dist/failure-taxonomy-tests.js",
+    "test:diagnostic-evidence-bundle": "npm run build && node dist/diagnostic-evidence-bundle-tests.js",
     "test:root-cause-analysis": "npm run build && node dist/root-cause-analysis-tests.js",
     "test:durable-recovery-state": "npm run build && node dist/durable-recovery-state-tests.js",
     "test:problem-memory": "npm run build && node dist/problem-memory-tests.js",

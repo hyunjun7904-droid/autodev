@@ -33,6 +33,7 @@ import {
 } from "./required-test-preflight";
 import { hasFailedRequiredTest } from "./review-policy";
 import { validateRequiredTestExecutionContract } from "./execution-contract";
+import { buildDiagnosticEvidenceBundle } from "./diagnostic-evidence-bundle";
 import {
   computeProblemFingerprint,
   classifyFailureCategory,
@@ -1624,11 +1625,32 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
                 projectStore: problemProjectStore,
                 commonStore: problemCommonStore,
               });
+              // Hardening F(Diagnostic Evidence Bundle) — 다음 round/다음 project가 이 조사를
+              // 처음부터 반복하지 않도록, 이미 이 지점에서 알고 있는 정보를 하나의 구조로
+              // 묶어 함께 남긴다(§ diagnostic-evidence-bundle.ts — 새 조사 없음, 이미 계산된
+              // 값만 조합). 기존 issues/similarCasesAdvisory 필드는 그대로 유지한다(정보
+              // 손실 없음) — bundle은 그 위에 대표 이슈 1건 + retries/다음 행동만 추가한다.
+              const firstIssue = envRecheck.issues[0];
+              const firstSimilarCase = similarCases[0];
+              const evidenceBundle = buildDiagnosticEvidenceBundle({
+                taskId: taskDef.id,
+                failureClass: "DETERMINISTIC_LOCAL",
+                failureClassReason: "required test 실행 환경 결함이 재확인에서도 그대로 확정됨 — Developer 재시도로 해결되지 않음.",
+                requiredTestName: firstIssue?.requiredTestName,
+                cwd: firstIssue?.cwd,
+                prerequisiteFeasibility: firstIssue?.prerequisiteFeasibility?.feasibility,
+                prerequisiteFeasibilityReason: firstIssue?.prerequisiteFeasibility?.reason,
+                retries: repeatCount,
+                problemMemoryMatch: firstSimilarCase ? { tier: firstSimilarCase.tier, entryId: firstSimilarCase.entry.id } : null,
+                priorVerifiedResolutionSummary: firstSimilarCase?.entry.finalSuccessfulSolution ?? null,
+                nextDeterministicAction: "project adapter config(commandCwdAliases/requiredTest.cwd)를 직접 확인/수정해야 합니다.",
+              });
               log("LOCAL_ROOT_CAUSE_MODE — required test 실행 환경 결함이 반복 확정되어 Developer를 다시 호출하지 않습니다", {
                 taskId: taskDef.id,
                 repeatCount,
                 issues: envRecheck.issues,
                 similarCasesAdvisory: similarCases.map((c) => ({ tier: c.tier, entryId: c.entry.id, solution: c.entry.finalSuccessfulSolution })),
+                evidenceBundle,
               });
               console.log(
                 `[autodev] task ${taskDef.id} — LOCAL_ROOT_CAUSE_MODE(execution environment, ${repeatCount}회 반복 확정, ${detail}) — Developer를 호출하지 않고 동일 실패를 그대로 반환합니다.`
