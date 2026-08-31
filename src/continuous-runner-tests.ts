@@ -211,13 +211,23 @@ async function scenarioHumanFinalReviewPendingStopsImmediately(): Promise<void> 
 // ---------------------------------------------------------------------------
 // E — AutoDev / JARVIS 신뢰성 보완(2026-08-27) — checkpoint가 scope violation(허용 경로 밖
 // 변경)으로 BLOCK되면, 이는 canonical Human Gate Policy상 기술적 자동 복구 대상이다(§
-// human-gate-policy.ts) — Telegram 승인 없이 continuous runner가 스스로 재시도하고, 다음
-// 시도가 올바른 위치에 구현하면 그대로 checkpoint까지 진행되며 나머지 task도 이어진다.
+// human-gate-policy.ts) — Telegram 승인 없이 continuous runner가 스스로 재시도한다.
+//
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31) 이후로 갱신 — "재시도가 leftover를
+// 자동으로 지워서 매끄럽게 통과한다"는 예전 전제는 더 이상 성립하지 않는다(§ autodev.ts에서
+// scope-violation 자동 삭제 자체를 제거함 — AutoDev는 이 저장소 어디에도 "이 파일을 내가
+// 만들었다"를 증명할 durable action log가 없다). leftover 파일은 그대로 남고, checkpoint는
+// 매 재시도마다 정직하게 다시 BLOCK된다 — Telegram 승인은 계속 필요 없지만(기술적 자동복구
+// 분류 자체는 유지), 진짜 진척(CONTINUABLE_OUTCOME)이 전혀 없으므로
+// continuous-runner.ts의 별도 bound(technicalRecoveryCount → TECHNICAL_RECOVERY_LIMIT_REACHED,
+// § DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS)가 결국 이 loop를 멈춘다(무한 루프 아님). T2/T3는
+// 전혀 실행되지 않는다 — 이것이 이제는 안전이 무인화보다 우선한다는 정책의 의도된 결과다.
 // ---------------------------------------------------------------------------
-async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(): Promise<void> {
+async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApprovalButNeverAutoDeletes(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
+  const maxTechnicalRecoveryAttempts = 2; // 테스트를 빠르게 끝내기 위한 작은 bound(기본값 50).
 
   const calls: string[] = [];
   let firstAttemptDone = false;
@@ -234,23 +244,37 @@ async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval(
         rawOutput: "",
       };
     }
+    // 이후 시도들은 스스로는 정상적으로 동작한다(같은 실수를 반복하지 않는다) — 그래도
+    // other/unexpected.txt는 이전 시도가 만든 채로 그대로 남아있어 매번 다시 scope
+    // violation을 유발한다는 것을 보이기 위함(정리되지 않는 한 계속 BLOCK).
     const fileName = `proj/marker-${calls.length}.txt`;
     writeRepoFile(repo, fileName, task);
     return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
 
-  const result = await runAutodevContinuous({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+  const result = await runAutodevContinuous({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
+    maxTechnicalRecoveryAttempts,
+  });
 
   check("E) 1차 시도: outcome=RAN_TASK_CHECKPOINT_BLOCKED(기술적, scope violation)", result.iterations[0].result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
   check(
-    "E) Telegram 승인 없이 자동으로 재시도되어 T1이 checkpoint까지 도달(2번째 호출)",
-    result.iterations[1].result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED" && result.iterations[1].result.taskId === "T1"
+    "E) 이후 모든 재시도도 leftover 때문에 다시 BLOCK됨(삭제로 매끄럽게 통과하지 않음, APPROVED_AND_CHECKPOINTED가 한 번도 없음)",
+    result.iterations.every((it) => it.result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED")
   );
-  check("E) 이전 시도의 leftover(허용 경로 밖 파일)가 자동 정리됨", !existsSync(join(repo, "other", "unexpected.txt")));
-  check("E) 자동 복구 이후 나머지 task(T2/T3)도 정상적으로 이어져 project complete로 종료", result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "STOPPED");
+  check("E) leftover(허용 경로 밖 파일)가 끝까지 삭제되지 않고 그대로 남음", existsSync(join(repo, "other", "unexpected.txt")));
+  check(
+    "E) Telegram 승인 없이 재시도는 계속됨(기술적 자동복구 분류 자체는 유지) — Developer가 매 iteration마다 실제로 재호출됨",
+    calls.length === result.iterations.length
+  );
+  check(
+    "E) 진짜 진척이 전혀 없으므로 결국 TECHNICAL_RECOVERY_LIMIT_REACHED로 멈춤(무한 루프 아님)",
+    result.stop.kind === "TECHNICAL_RECOVERY_LIMIT_REACHED" && result.stop.maxTechnicalRecoveryAttempts === maxTechnicalRecoveryAttempts
+  );
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("E) 최종 completedTasks=[T1,T2,T3]", JSON.stringify(finalState.completedTasks) === JSON.stringify(["T1", "T2", "T3"]));
-  check("E) 최종 status가 WAITING_HUMAN이 아님(사람 승인 필요 없이 끝까지 진행됨)", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+  check("E) T2/T3는 전혀 실행되지 않음(completedTasks가 비어있음)", finalState.completedTasks.length === 0);
+  check("E) 최종 status=WAITING_HUMAN(사람이 leftover를 직접 처리해야 함 — 이 정책의 의도된 결과)", (finalState.status as unknown as string) === "WAITING_HUMAN");
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +555,7 @@ async function main(): Promise<void> {
     await scenarioMultiTaskContinuousToProjectComplete();
     await scenarioWaitingHumanStopsImmediately();
     await scenarioHumanFinalReviewPendingStopsImmediately();
-    await scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApproval();
+    await scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApprovalButNeverAutoDeletes();
     await scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetry();
     await scenarioTechnicalRecoveryLimitStopsRunawayRetries();
     await scenarioSecretScannerBlockStopsImmediately();

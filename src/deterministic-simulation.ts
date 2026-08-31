@@ -160,13 +160,24 @@ function readState(statePath: string): CoreState {
 // 의도된 동작이다: genuine Human Gate는 이후 무관한 task를 건너뛰고 진행하지 않는다.
 // 그래서 대량 통계 검증(Run A)과 "영구 정체" 검증(Run C/D)을 의도적으로 분리한다).
 // ---------------------------------------------------------------------------
-type TaskProfile = "clean" | "revise-once" | "scope-violation-then-fix" | "transient-reviewer-failure" | "crash-during-developer" | "secret-attempt-then-fix";
+type TaskProfile = "clean" | "revise-once" | "transient-reviewer-failure" | "crash-during-developer" | "secret-attempt-then-fix";
 
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31) — "scope-violation-then-fix"
+// 프로파일은 이 목록에서 제거됐다(예전 weight 0.08). 이 프로파일의 "fix"는 실제로는 Developer
+// 자신의 행동이 아니라, attempt 1이 만든 out-of-scope leftover(outside-scope-N.txt)를 예전
+// autodev.ts Phase 7 자동 삭제가 다음 attempt 전에 지워줬기 때문에 성립했다 — 실제 조사 결과
+// AutoDev는 이 파일을 자신이 만들었다고 증명할 방법이 없다는 것이 확인돼(§ task-change-baseline.ts
+// 상단 주석) 그 자동 삭제 자체를 제거했다. Developer(LLM ACTION_REQUEST)에는 파일 삭제
+// action이 아예 없으므로(§ safe-executor.ts ExecutorAction) 이 leftover는 이제 진짜로 "다음
+// attempt가 스스로 fix"할 방법이 없다 — 즉 이 프로파일은 더 이상 "결국 완료 가능"한 프로파일이
+// 아니라 "genuine하지는 않지만 사람이 직접 처리해야 끝나는" 프로파일이 됐다. Run A(대량,
+// "전부 결국 완료 가능"이 불변식)에서 빼고, 그 새 기대 동작(사람 개입 없이는 절대 완료되지
+// 않지만 무한 루프도 아니고 억지 commit도 없음)은 § Run F(runScopeViolationNeverAutoResolvesCheck)
+// 에서 단일 task로 직접 검증한다.
 const BULK_TASK_COUNT = Number(process.env.AUTODEV_SIMULATION_BULK_TASKS ?? 400);
 const PROFILE_WEIGHTS: { profile: TaskProfile; weight: number }[] = [
   { profile: "clean", weight: 0.62 },
   { profile: "revise-once", weight: 0.15 },
-  { profile: "scope-violation-then-fix", weight: 0.08 },
   { profile: "transient-reviewer-failure", weight: 0.08 },
   { profile: "crash-during-developer", weight: 0.05 },
   { profile: "secret-attempt-then-fix", weight: 0.02 },
@@ -268,20 +279,6 @@ function makeBulkClaudeRunner(
         success: true,
         summary: "secret 파일 제거 후 정상 완료",
         changedFiles: [`src/marker-${n}.txt`],
-        tests: [{ name: `sim:task-${n}`, pass: true }],
-        rawOutput: "",
-      };
-    }
-
-    if (profile === "scope-violation-then-fix" && attemptNo === 1) {
-      // allowedPathPrefixes(src/, tests/) 밖에 파일을 쓴다 — checkpoint가 scope violation로
-      // BLOCK해야 한다(§ human-gate-policy.ts CheckpointScopeViolationIsTechnical).
-      writeSimFile(root, `outside-scope-${n}.txt`, "should not be committed\n");
-      writeSimFile(root, `src/marker-${n}.txt`, "OK\n");
-      return {
-        success: true,
-        summary: "테스트: 실수로 scope 밖 파일도 함께 작성",
-        changedFiles: [`outside-scope-${n}.txt`, `src/marker-${n}.txt`],
         tests: [{ name: `sim:task-${n}`, pass: true }],
         rawOutput: "",
       };
@@ -609,6 +606,94 @@ async function runStaleWaitingHumanReconciliationCheck(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Run F — Positive-Provenance-Only Auto-Delete Policy(2026-08-31). Developer가 실수로
+// allowedPathPrefixes 밖에 파일을 하나 만들면(attempt 1), 그 leftover는 이후 attempt에서도
+// 지워지지 않는다(Developer에게 삭제 action이 없고, AutoDev도 자신이 만들었다고 증명할 방법이
+// 없어 자동 삭제하지 않는다 — § task-change-baseline.ts/autodev.ts 상단 주석). 이 Run은 그
+// 결과로 이 task가 (1) 무한 루프에 빠지지 않고 bounded하게 멈추는지, (2) 억지로
+// completedTasks에 들어가지 않는지, (3) leftover 파일이 끝까지 디스크에 남아있고 절대
+// commit되지 않는지를 직접 검증한다 — 이것이 "무인화보다 안전을 우선한다"는 정책의 실제
+// 관측 가능한 결과다.
+// ---------------------------------------------------------------------------
+async function runScopeViolationNeverAutoResolvesCheck(): Promise<void> {
+  const root = makeSimRepo("autodev-sim-scope-violation-");
+  const registry: TaskDefinition[] = [
+    {
+      id: "F1",
+      phase: 1,
+      taskNumber: 1,
+      title: "Scope violation leftover never auto-resolves",
+      prompt: "Scope violation leftover simulation task",
+      requiredTests: [{ name: "sim:f1", command: "node", args: ["tests/run.js"], cwd: "root" }],
+      allowedPathPrefixes: ["src/"],
+      prohibitedOperations: [],
+    },
+  ];
+  const statePath = makeSimStatePath(root);
+  const manifest = buildSimManifest(root, statePath, registry, "autodev-simulation-scope-violation");
+
+  writeSimFile(
+    root,
+    "tests/run.js",
+    ["const fs = require('fs');", "let ok = false;", "try { ok = fs.readFileSync('src/f1-marker.txt', 'utf-8').includes('OK'); } catch {}", "process.exit(ok ? 0 : 1);"].join(
+      "\n"
+    ) + "\n"
+  );
+
+  let attemptNo = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    attemptNo += 1;
+    if (attemptNo === 1) {
+      // allowedPathPrefixes(src/) 밖에 실수로 파일을 하나 만든다 — checkpoint가 scope
+      // violation으로 BLOCK해야 한다.
+      writeSimFile(root, "outside-scope-f1.txt", "should never be committed or deleted\n");
+      writeSimFile(root, "src/f1-marker.txt", "OK\n");
+      return {
+        success: true,
+        summary: "테스트: 실수로 scope 밖 파일도 함께 작성(F1)",
+        changedFiles: ["outside-scope-f1.txt", "src/f1-marker.txt"],
+        tests: [{ name: "sim:f1", pass: true }],
+        rawOutput: "",
+      };
+    }
+    // 이후 attempt들은 스스로는 정상 동작한다(같은 실수를 반복하지 않음) — Developer에게는
+    // 파일 삭제 action이 없으므로 outside-scope-f1.txt는 건드릴 수 없다(정상 동작).
+    writeSimFile(root, "src/f1-marker.txt", "OK\n");
+    return { success: true, summary: `F1 attempt ${attemptNo} 정상 완료`, changedFiles: ["src/f1-marker.txt"], tests: [{ name: "sim:f1", pass: true }], rawOutput: "" };
+  };
+  const gptReviewer = async (result: ClaudeResult): Promise<GptReviewerReturn> => {
+    const hasOutOfScope = result.changedFiles.some((f) => !f.startsWith("src/"));
+    return {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      feedback: hasOutOfScope ? "정상(하지만 scope 밖 파일이 있음 — checkpoint가 독립적으로 잡아야 함)" : "정상",
+      nextTask: null,
+    };
+  };
+
+  const maxTechnicalRecoveryAttempts = 3; // 테스트를 빠르게 끝내기 위한 작은 bound(기본값 50).
+  const result = await runAutodevContinuous({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer, now: fakeNow, sleep: fakeSleep },
+    maxTechnicalRecoveryAttempts,
+  });
+  const finalState = readState(statePath);
+
+  check(
+    `Run F) leftover가 끝까지 자동 정리되지 않으므로 결국 TECHNICAL_RECOVERY_LIMIT_REACHED로 bounded하게 멈춤(무한 루프 아님, maxTechnicalRecoveryAttempts=${maxTechnicalRecoveryAttempts})`,
+    result.stop.kind === "TECHNICAL_RECOVERY_LIMIT_REACHED"
+  );
+  check("Run F) F1이 completedTasks에 절대 들어가지 않음(억지 승인 없음)", !finalState.completedTasks.includes("F1"));
+  check(
+    "Run F) 최종 status=WAITING_HUMAN이지만 여전히 TECHNICAL_AUTO_RECOVERABLE(GENUINE으로 격상되지 않음)",
+    (finalState.status as unknown as string) === "WAITING_HUMAN" && classifyWaitingHumanReason(finalState) !== "GENUINE_HUMAN_JUDGMENT"
+  );
+  check("Run F) outside-scope-f1.txt가 끝까지 디스크에 그대로 남아있음(삭제되지 않음)", existsSync(join(root, "outside-scope-f1.txt")));
+  const trackedFilesF = spawnSync("git", ["ls-files"], { cwd: root, encoding: "utf-8" }).stdout || "";
+  check("Run F) outside-scope-f1.txt가 git tracked 파일에 절대 없음(commit되지 않음)", !trackedFilesF.includes("outside-scope-f1.txt"));
+}
+
+// ---------------------------------------------------------------------------
 async function main(): Promise<void> {
   console.log(`=== AutoDev 1.0 Deterministic Simulation (seed=${SEED}) ===`);
   try {
@@ -640,6 +725,7 @@ async function main(): Promise<void> {
 
     runLockContentionCheck();
     await runStaleWaitingHumanReconciliationCheck();
+    await runScopeViolationNeverAutoResolvesCheck();
   } finally {
     for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
   }

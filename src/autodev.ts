@@ -34,7 +34,6 @@ import {
 import { hasFailedRequiredTest } from "./review-policy";
 import { validateRequiredTestExecutionContract } from "./execution-contract";
 import { buildDiagnosticEvidenceBundle } from "./diagnostic-evidence-bundle";
-import { isProvenTaskCreatedPath } from "./task-change-baseline";
 import {
   computeProblemFingerprint,
   classifyFailureCategory,
@@ -64,7 +63,6 @@ import { isAuditCriticalEvent } from "./observability-event";
 import type { AutoDevEventInput } from "./observability-event";
 import { randomUUID } from "node:crypto";
 import { log } from "./logger";
-import { rmSync } from "node:fs";
 import { getWorkingTreeChanges } from "./git-changes";
 import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
@@ -1407,30 +1405,36 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       previousAttemptResult = state.lastClaudeResult;
     }
 
-    // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 7 —
-    // 직전 시도가 scope violation으로 BLOCK됐다면, 그 파일들을 이 attempt 시작 전에
-    // 결정론적으로 제거한다. Developer(LLM ACTION_REQUEST)에는 파일 삭제 action 자체가
-    // 없고(§ safe-executor.ts ExecutorAction), 이 파일들은 이미 이 task의 allowedPathPrefixes
-    // 밖이라 Developer가 WRITE_FILE로도 지울 수 없다 — 정리하지 않으면 Developer가 다음
-    // 시도에서 올바른 경로에 정확히 다시 구현해도(실제 JARVIS Task 2.1 재현에서 확인됨)
-    // Reviewer의 scope-violation 검사가 여전히 남아있는 옛 미승인 파일을 매번 다시 찾아내
-    // 영구히 BLOCK을 반복한다. 안전조건을 전부 만족할 때만 삭제한다:
-    //   1) 직전 GPT decision이 PASS가 아님(미승인 종료가 실제로 있었음)
-    //   2) 삭제 대상 경로가 state.lastGptDecision.scopeViolations에 정확히 그 문자열
-    //      그대로 나열돼 있음(추측/패턴 매칭 없음 — Reviewer 자신이 이미 내린 판정만 그대로
-    //      재사용한다)
-    //   3) 지금 다시 git으로 확인해도 실제로 untracked임(한 번도 commit된 적 없는 파일만
-    //      — tracked 파일, 즉 이미 커밋된 사용자/과거 작업은 이 경로로 절대 건드리지 않는다)
-    //   4) 이 task의 현재 allowedPathPrefixes 밖(범위 안 미완성 변경은 기존 "재개 감지"
-    //      로직이 이어서 진행하도록 그대로 보존한다 — 이 정리 대상과 절대 겹치지 않는다)
+    // Positive-Provenance-Only Auto-Delete Policy(2026-08-31, JARVIS Task 5.3 Canary
+    // 사실검증 후속 — "AutoDev가 자신이 만들었다고 증명할 수 없는 파일을 자동삭제하는 경로가
+    // 절대로 존재하지 않도록 한다") — 이 블록은 예전에(Phase 7, 2026-08-27) 직전 시도가
+    // scope violation으로 BLOCK되면 그 남은 파일을 자동으로 rmSync해서 지웠다. 그 뒤
+    // baseline-absence 기반 안전조건(§ 이전 커밋 a4d7e0e)을 추가했지만, 실제 조사
+    // 결과(§ 아래) baseline에 없다는 사실 자체가 "AutoDev/Claude Developer가 이 파일을
+    // 만들었다"는 증명이 될 수 없다는 것이 확인됐다 — 이 저장소에는 파일 경로를 taskId/
+    // attempt/round에 연결하는 durable action log가 어디에도 없다(claude-developer.ts의
+    // ClaudeResult.changedFiles조차 실제로는 매 라운드 getWorkingTreeChanges()로 다시 계산한
+    // git status 기반 diff일 뿐이다 — "AutoDev가 실제로 이 action으로 이 파일을 썼다"는 기록이
+    // 아니다). 즉 baseline-absence("task 시작 시점엔 없었다")와 authorship proof("AutoDev가
+    // 만들었다")는 서로 다른 주장이며, 이 저장소에는 후자를 증명할 방법이 구조적으로 없다 —
+    // 같은 시간 창에 사용자/IDE/빌드도구/동기화 프로그램이 파일을 만들었을 가능성을 이 저장소
+    // 스스로는 배제할 수 없다.
     //
-    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 정리 대상 후보는 두 출처를 합친다: (a)
-    // state.lastGptDecision.scopeViolations(GPT Reviewer 자신이 BLOCK과 함께 보고한 목록,
-    // 기존 Phase 7), (b) checkpointBlockedLeftoverFiles(위에서 canonical Human Gate가
-    // CHECKPOINT_SCOPE_VIOLATION을 복구할 때 보존해 둔, Core checkpoint 자신의 독립 판정
-    // 목록 — GPT는 PASS했지만 Core가 범위 밖 파일을 발견해 commit을 막은 경우). 두 목록 다
-    // "이미 어떤 판정 로직이 실제로 내린 결과"만 그대로 재사용할 뿐 이 블록이 새로 추측하지
-    // 않으며, 안전조건 1)~4)는 출처와 무관하게 동일하게 적용한다.
+    // 따라서 이 블록은 더 이상 어떤 파일도 삭제하지 않는다. 대신 "cleanup 대상으로 보였던
+    // 파일"을 순수 관측용으로 로그만 남긴다 — Developer가 다음 attempt에서 올바른 경로에
+    // 정확히 다시 구현해도 이 leftover가 계속 남아 있으면 checkpoint가 매번 다시 scope
+    // violation으로 BLOCK된다(예전에는 자동 삭제로 "자가치유"됐던 실제 JARVIS Task 2.1류
+    // 시나리오가 이제는 사람이 직접 그 파일을 처리해야만 풀린다 — 이것은 이 정책의 의도된
+    // trade-off다, "무인화를 유지하기 위해 안전성을 희생하지 않는다"). 무한 재시도는 아니다
+    // — 이 task가 계속 진행하지 못하면(CONTINUABLE_OUTCOME 없음) continuous-runner.ts의
+    // technicalRecoveryCount가 매 재시도마다 증가해 결국 TECHNICAL_RECOVERY_LIMIT_REACHED로
+    // 멈춘다(§ continuous-runner.ts DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS — 이미 존재하는
+    // 별도 bound, 이 블록이 새로 만들지 않는다).
+    //
+    // 두 후보 출처(GPT Reviewer 자신이 보고한 scopeViolations, Core checkpoint 자신의
+    // 독립 판정 checkpointBlockedLeftoverFiles)는 여전히 그대로 합쳐 로그 목적으로만 쓴다 —
+    // 어느 쪽도 "AutoDev가 이 파일을 만들었다"를 증명하지 않는다는 점에서 동등하게 다룬다
+    // (한쪽만 더 신뢰할 근거가 없다).
     const lastGptDecisionForCleanup = state.lastGptDecision as (typeof state.lastGptDecision & { scopeViolations?: string[] }) | null;
     const gptReportedScopeViolations =
       lastGptDecisionForCleanup && lastGptDecisionForCleanup.decision !== "PASS" && lastGptDecisionForCleanup.scopeViolations
@@ -1439,49 +1443,14 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     const cleanupCandidates = Array.from(new Set([...gptReportedScopeViolations, ...checkpointBlockedLeftoverFiles]));
     if (cleanupCandidates.length > 0) {
       const currentUntracked = new Set(getWorkingTreeChanges([], executorContext.projectRoot).untracked.map((c) => c.path));
-      // Checkpoint Provenance/Baseline Hardening(2026-08-31, JARVIS Task 5.3 Canary
-      // 사실검증으로 확인된 production 결함) — 안전조건 5) 추가: 이 path가 이 task의
-      // baseline(§ task-change-baseline.ts, task 시작 시점 스냅샷) 시점에 이미 존재했다면
-      // 절대 삭제하지 않는다. 예전에는 (1)~(4)만으로 판단해 "untracked + scope 밖 + 마커에
-      // 기록됨"이면 무조건 삭제했는데, 이 세 조건은 "이 task/attempt가 새로 만든 leftover"와
-      // "이 task와 완전히 무관하게 이미 있던 사용자 파일"을 구분하지 못한다 — 실제 JARVIS
-      // 저장소에서 후자가 정확히 이 삭제 대상 후보 목록에 올라간 것이 관측됐다.
-      // isProvenTaskCreatedPath는 baseline이 없으면(레거시 task) 항상 false를 반환한다 —
-      // "provenance를 모르면 삭제하지 않는다"(요구사항 5/7)를 다른 어떤 fallback보다도
-      // 우선한다. baseline.taskId가 이 taskDef.id와 다르면(방어적 가드 — 정상 경로에서는
-      // 발생하지 않아야 한다: 이 cleanup 대상 자체가 항상 같은 task의 직전 attempt 결과이기
-      // 때문) 마찬가지로 baseline이 없는 것으로 취급한다.
-      const baselineForThisTask =
-        state.taskChangeBaseline && state.taskChangeBaseline.taskId === taskDef.id ? state.taskChangeBaseline : null;
-      const removable = cleanupCandidates.filter(
-        (p) =>
-          currentUntracked.has(p) &&
-          !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes) &&
-          isProvenTaskCreatedPath(baselineForThisTask, p)
+      const stillPresentOutOfScope = cleanupCandidates.filter(
+        (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes)
       );
-      const skippedAsPreExisting = cleanupCandidates.filter(
-        (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes) && !removable.includes(p)
-      );
-      if (skippedAsPreExisting.length > 0) {
-        log("scope-violation 정리 대상 중 일부는 삭제하지 않음(baseline 시점에 이미 존재했거나 provenance를 증명할 수 없음)", {
-          taskId: taskDef.id,
-          paths: skippedAsPreExisting,
-        });
-      }
-      for (const relPath of removable) {
-        try {
-          rmSync(join(executorContext.projectRoot, ...relPath.split("/")), { force: true });
-          log("직전 시도의 미승인 scope-violation 파일 정리(untracked, 허용 경로 밖 — commit 이력 없음)", {
-            taskId: taskDef.id,
-            path: relPath,
-          });
-        } catch (e) {
-          log("직전 시도의 미승인 scope-violation 파일 정리 실패(무시하고 계속 진행)", {
-            taskId: taskDef.id,
-            path: relPath,
-            error: e instanceof Error ? e.message : String(e),
-          });
-        }
+      if (stillPresentOutOfScope.length > 0) {
+        log(
+          "직전 시도의 scope-violation 파일이 여전히 남아있음 — 자동 삭제하지 않음(AutoDev는 이 파일을 자신이 만들었다고 증명할 방법이 없다, fail-closed)",
+          { taskId: taskDef.id, paths: stillPresentOutOfScope }
+        );
       }
     }
 

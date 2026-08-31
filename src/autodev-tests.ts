@@ -16,6 +16,7 @@ import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
 import type { RealClaudeResult } from "./claude-runner";
 import { inspectProjectRuntimeLiveness } from "./project-lock";
 import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
+import { isTechnicalAutoRecoverableWaitingHuman } from "./human-gate-policy";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -1752,16 +1753,19 @@ async function scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnviron
   );
 }
 
-// 필수 검증 — 직전 시도의 미승인 scope-violation 작업물을 attempt 시작 전에 결정론적으로
-// 정리한다(§ autodev.ts Phase 7). untracked + 현재 task의 allowedPathPrefixes 밖 + 직전
-// lastGptDecision.scopeViolations에 정확히 나열된 경우에만 삭제되고, tracked 파일이나
-// scopeViolations에 없는 파일, 허용 경로 안 파일은 절대 건드리지 않는다.
-async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt(): Promise<void> {
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31, JARVIS Task 5.3 Canary 사실검증
+// 후속) — AutoDev는 이 저장소에 "AutoDev가 이 파일을 만들었다"를 증명할 durable action log가
+// 없다는 것이 확인된 이후, scopeViolations에 정확히 나열된 파일이라도(예전 Phase 7이었다면
+// 삭제했을 파일) 더 이상 삭제하지 않는다 — untracked이고 허용 경로 밖이라는 사실만으로는
+// authorship을 증명하지 못하기 때문이다(§ autodev.ts cleanup 블록 주석). 이 시나리오는 그
+// 정책이 실제로 아무것도 지우지 않는다는 것과, 지우지 않은 결과로 checkpoint가 다시 정직하게
+// BLOCK된다는 것(억지로 통과시키지 않는다)을 함께 검증한다.
+async function scenarioRunAutodevOnceNeverAutoDeletesScopeViolationLeftoverFiles(): Promise<void> {
   const repo = makeTempGitRepo();
-  // 허용 경로(proj/) 밖에 직전 시도가 남긴 untracked 파일 — 삭제 대상.
+  // 허용 경로(proj/) 밖의 untracked 파일 — scopeViolations에 나열돼 있지만 이제는 절대
+  // 삭제되지 않아야 한다(핵심 검증 대상).
   writeRepoFile(repo, "other/wrong-place.txt", "leftover\n");
-  // scopeViolations에 없는 untracked 파일 — 절대 건드리면 안 됨(범위 밖이라도 명시적으로
-  // 나열된 것만 삭제한다).
+  // scopeViolations에 없는 untracked 파일 — 역시 건드리지 않는다(대조군).
   writeRepoFile(repo, "other/unrelated.txt", "unrelated\n");
   // 허용 경로(proj/) 안의 untracked 파일이 실수로 scopeViolations에 나열돼도 삭제되면
   // 안 됨(범위 안은 항상 "이어서 진행" 대상이지 정리 대상이 아니다).
@@ -1774,13 +1778,6 @@ async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeN
 
   const statePath = makeTempStateFile(repo, {
     status: "READY",
-    // Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-E) — 이 task(P1.2)가 이미
-    // 진행 중이었고, 그 시작 시점(baseline)에는 other/wrong-place.txt가 없었다는 것을
-    // 명시한다 — "이 파일이 이 attempt 도중 새로 생겼다"는 provenance가 증명되지 않으면
-    // 자동 정리가 삭제를 거부하므로(§ isProvenTaskCreatedPath), 이 fixture도 실제로 그
-    // provenance가 성립하는 상태를 그대로 반영한다.
-    currentTask: "Phase1 Task2 prompt", // CoreState.currentTask는 task ID가 아니라 orchestrator에 넘긴 prompt 문자열이다(§ autodev.ts state.currentTask === candidateForApprovedResume.prompt)
-    taskChangeBaseline: { taskId: "P1.2", capturedAt: new Date(0).toISOString(), entries: [] },
     lastClaudeResult: {
       success: true,
       summary: "이전 시도 요약",
@@ -1806,23 +1803,27 @@ async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeN
     rawOutput: "",
   });
 
-  await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { gptReviewer: fakePassReviewer() }, developerClaudeCaller });
 
   check(
-    "scope-violation 정리: untracked + 허용 경로 밖 + scopeViolations에 정확히 나열된 파일은 삭제됨",
-    !existsSync(join(repo, "other/wrong-place.txt"))
+    "scope-violation 정리 정책: scopeViolations에 정확히 나열된 파일이어도 더 이상 삭제되지 않음(authorship 증명 불가)",
+    existsSync(join(repo, "other/wrong-place.txt"))
   );
   check(
-    "scope-violation 정리: scopeViolations에 없는 untracked 파일은 삭제되지 않음(추측 삭제 금지)",
+    "scope-violation 정리 정책: scopeViolations에 없는 untracked 파일도 당연히 삭제되지 않음",
     existsSync(join(repo, "other/unrelated.txt"))
   );
   check(
-    "scope-violation 정리: 허용 경로 안 파일은 scopeViolations에 나열돼도 삭제되지 않음(이어서 진행 대상 보존)",
+    "scope-violation 정리 정책: 허용 경로 안 파일은 삭제되지 않음(이어서 진행 대상 보존)",
     existsSync(join(repo, "proj/in-scope-leftover.txt"))
   );
   check(
-    "scope-violation 정리: tracked(이미 commit된) 파일은 scopeViolations에 나열돼도 절대 삭제되지 않음",
+    "scope-violation 정리 정책: tracked(이미 commit된) 파일은 삭제되지 않음",
     existsSync(join(repo, "other/tracked-file.txt"))
+  );
+  check(
+    "scope-violation 정리 정책: wrong-place.txt가 여전히 남아있어 checkpoint가 다시 정직하게 BLOCK됨(억지 통과 없음)",
+    result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED"
   );
 }
 
@@ -1872,18 +1873,24 @@ async function scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingH
 // CHECKPOINT_SCOPE_VIOLATION은 GPT Reviewer가 아니라 Core checkpoint 자신의 독립 판정(§
 // checkpoint.ts plan.unexpected)으로도 발생할 수 있다(Reviewer는 PASS했지만 범위 밖 파일이
 // 남아있던 경우) — 이 leftover는 state.lastGptDecision.scopeViolations에는 없고 오직
-// deferredHumanTasks의 CHECKPOINT_BLOCKED 마커 안에만 있다. 자동 복구가 이 마커에서도 정리
-// 대상을 추출해(§ human-gate-policy.ts extractCheckpointScopeViolationFiles) 정리하는지 검증한다.
-async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover(): Promise<void> {
+// deferredHumanTasks의 CHECKPOINT_BLOCKED 마커 안에만 있다.
+//
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31) — 이 마커가 TECHNICAL_AUTO_
+// RECOVERABLE로 분류돼 Telegram 승인 없이 자동으로 같은 task가 재시도되는 것(사람이 매번
+// 버튼을 누를 필요는 없다는 정책)은 그대로 유지된다. 하지만 그 재시도가 "leftover 파일을
+// 지워서" 매끄럽게 통과하던 예전 동작(§ 삭제된 Phase 7)은 더 이상 존재하지 않는다 — 파일이
+// 그대로 남아있으므로 checkpoint는 다시 정직하게 scope violation으로 BLOCK된다(Developer가
+// 새로 만든 진짜 산출물은 여전히 정상적으로 재시도된다는 것도 함께 검증한다).
+async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationButDoesNotDeleteLeftover(): Promise<void> {
   const repo = makeTempGitRepo();
   writeRepoFile(repo, "other/leftover-from-checkpoint-block.txt", "leftover\n");
   const statePath = makeTempStateFile(repo, {
     status: "WAITING_HUMAN",
-    // Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-E) — currentTask를 이미 "P1.2"로
-    // 두고, 그 task 시작 시점 baseline에 이 leftover 파일이 없었다는 것을 명시한다(entries:
-    // []) — "이 파일이 P1.2 attempt 도중 새로 생겼다"는 provenance가 증명된 경우에만 자동
-    // 정리가 삭제를 허용하므로(§ isProvenTaskCreatedPath), 이 fixture도 실제 운영에서 이
-    // 시나리오가 발생하려면 어떤 baseline이 이미 있어야 하는지 그대로 반영한다.
+    // 이 task(P1.2)가 이미 진행 중이었고, 그 시작 시점(baseline)에는 이 leftover 파일이
+    // 없었다는 것을 명시한다(entries: []) — 실제 운영에서 checkpoint가 이 파일을 scope
+    // violation으로 처음 발견했을 때와 동일한 전제(파일이 task 시작 이후에 나타났다)를 그대로
+    // 반영한다. 이 baseline은 이제 삭제 여부에는 전혀 영향을 주지 않는다(삭제 자체가 없다) —
+    // checkpoint 자신의 commit/block 분류(§ a4d7e0e, 이번 세션에서 그대로 유지)에만 쓰인다.
     currentTask: "Phase1 Task2 prompt", // CoreState.currentTask는 task ID가 아니라 orchestrator에 넘긴 prompt 문자열이다(§ autodev.ts state.currentTask === candidateForApprovedResume.prompt)
     taskChangeBaseline: { taskId: "P1.2", capturedAt: new Date(0).toISOString(), entries: [] },
     lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null },
@@ -1899,7 +1906,7 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
     writeRepoFile(repo, "proj/marker-checkpoint-block-recovery.txt", "marker\n");
     return {
       success: true,
-      summary: "테스트: CHECKPOINT_SCOPE_VIOLATION 자동복구 이후 정상 진행",
+      summary: "테스트: CHECKPOINT_SCOPE_VIOLATION 자동복구(삭제 없음) 재현",
       changedFiles: ["proj/marker-checkpoint-block-recovery.txt"],
       tests: [{ name: "proj:check", pass: true }],
       rawOutput: "",
@@ -1909,23 +1916,31 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
   const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
   check(
-    "CHECKPOINT_SCOPE_VIOLATION 자동복구: Telegram 승인 없이 같은 task가 재개되어 checkpoint까지 도달",
-    result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구(삭제 없음): Telegram 승인 없이 같은 task가 재시도됨(TECHNICAL_AUTO_RECOVERABLE 분류 자체는 유지)",
+    claudeCalls === 1
   );
-  check("CHECKPOINT_SCOPE_VIOLATION 자동복구: Claude Developer가 정상적으로 재호출됨", claudeCalls === 1);
   check(
-    "CHECKPOINT_SCOPE_VIOLATION 자동복구: GPT가 보고하지 않은 leftover도 checkpoint 마커 기반으로 정리됨",
-    !existsSync(join(repo, "other/leftover-from-checkpoint-block.txt"))
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구(삭제 없음): leftover 파일은 더 이상 삭제되지 않고 그대로 남음",
+    existsSync(join(repo, "other/leftover-from-checkpoint-block.txt"))
   );
-  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
-  check("CHECKPOINT_SCOPE_VIOLATION 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+  check(
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구(삭제 없음): leftover가 여전히 남아있어 checkpoint가 다시 정직하게 BLOCK됨(억지 통과 없음)",
+    result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
+  const finalStateAfterRetry = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "CHECKPOINT_SCOPE_VIOLATION 자동복구(삭제 없음): 재시도도 다시 WAITING_HUMAN으로 끝나지만 여전히 TECHNICAL_AUTO_RECOVERABLE로 분류됨(GENUINE으로 격상되지 않음)",
+    (finalStateAfterRetry.status as unknown as string) === "WAITING_HUMAN" && isTechnicalAutoRecoverableWaitingHuman(finalStateAfterRetry)
+  );
 }
 
-// Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-D) — 위 시나리오의 대조군: 마커에
-// 이름이 올라간 "scope violation" 파일이 실제로는 이 task가 만든 게 아니라 task 시작 전부터
-// 있던 파일이면(baseline에 이미 기록돼 있으면), 자동 정리가 이 파일을 절대 삭제하지 않아야
-// 한다 — 이번 사실검증에서 실제 JARVIS 저장소에서 관측된 위험(무관한 pre-existing 파일이
-// 자동 삭제될 수 있었던 상황)을 직접 재현한다.
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31, §9-D) — 위 시나리오의 구체적
+// 사례: 마커에 이름이 올라간 "scope violation" 파일이 baseline에 이미 기록돼 있던(=task
+// 시작 전부터 있었을 가능성이 있는) pre-existing 파일이면, 자동 정리는 이 파일을 절대
+// 삭제하지 않는다 — 실제 JARVIS 저장소에서 관측된 위험(무관한 pre-existing 파일이 자동
+// 삭제될 수 있었던 상황)을 직접 재현한다. baseline 유무와 무관하게 이제는 어떤 unexpected
+// 파일도 삭제되지 않는다(authorship을 증명할 방법이 없으므로) — 이 시나리오는 그 일반
+// 정책이 이 구체적 사례에서도 성립하는지 확인한다.
 async function scenarioRunAutodevOnceDoesNotDeletePreExistingFileEvenIfMarkedAsScopeViolation(): Promise<void> {
   const repo = makeTempGitRepo();
   writeRepoFile(repo, "other/pre-existing-unrelated-user-file.txt", "이 task와 전혀 무관한, task 시작 전부터 있던 파일\n");
@@ -3060,9 +3075,9 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOncePassesPreviousFailureEvidenceToNextDeveloper();
     await scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment();
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnvironmentBlocked();
-    await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
+    await scenarioRunAutodevOnceNeverAutoDeletesScopeViolationLeftoverFiles();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
-    await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
+    await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationButDoesNotDeleteLeftover();
     await scenarioRunAutodevOnceDoesNotDeletePreExistingFileEvenIfMarkedAsScopeViolation();
     await scenarioTechnicalHumanGateMatrixReviewBlockAndScopeViolation();
     await scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap();

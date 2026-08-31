@@ -17,10 +17,19 @@ import type { TaskChangeBaseline, TaskChangeBaselineEntry } from "./types";
 // 실제 JARVIS 저장소에서 이 task와 무관한 사용자 파일 2건이 정확히 이 상태로 관측됨.
 //
 // 이 모듈은 "task 시작 시점의 working tree 스냅샷(baseline)"을 캡처/비교하는 유일한 구현이다
-// — checkpoint.ts(commit 대상 판정)와 autodev.ts(scope-violation 자동 정리)가 이 모듈 하나만
-// 공유한다(로직 복제 없음). 판정은 오직 실제 파일 내용의 sha256 비교로만 이뤄진다 — mtime은
-// 어디에도 쓰이지 않는다(파일 시스템에 따라 mtime 해상도가 낮거나, 내용을 바꾸지 않는 재저장
-// 등으로 mtime만 바뀌는 경우가 있어 신뢰할 수 없다).
+// — checkpoint.ts(commit 대상 판정: 이 task가 만든 것으로 보이는 변경만 commit하고, pre-
+// existing unchanged 변경은 건드리지 않는다)가 이 모듈을 쓴다. 판정은 오직 실제 파일 내용의
+// sha256 비교로만 이뤄진다 — mtime은 어디에도 쓰이지 않는다(파일 시스템에 따라 mtime 해상도가
+// 낮거나, 내용을 바꾸지 않는 재저장 등으로 mtime만 바뀌는 경우가 있어 신뢰할 수 없다).
+//
+// Positive-Provenance-Only Auto-Delete Policy(2026-08-31) — 이 모듈의 baseline-absence
+// 판정("이 경로가 task 시작 시점엔 없었다")은 "AutoDev/Claude Developer가 이 파일을 만들었다"
+// 는 증명이 아니다 — 실제 조사 결과 이 저장소에는 파일 경로를 taskId/attempt/round에 연결하는
+// durable action log가 어디에도 없다(claude-developer.ts의 ClaudeResult.changedFiles조차
+// 매 라운드 git status로 다시 계산한 diff일 뿐, "AutoDev가 이 action으로 이 파일을 썼다"는
+// 기록이 아니다). 그래서 autodev.ts는 이 모듈을 파일 자동 삭제 판단에 더 이상 쓰지 않는다 —
+// commit 대상 판정(부작위·보존 방향)과 삭제 판정(작위·파괴적 방향)은 요구되는 증명의 수준이
+// 다르며, 후자에는 이 모듈이 제공하는 신호로 충분하지 않다.
 //
 // 캡처 시점: orchestrator.ts가 이 task의 진짜 첫 attempt를 시작할 때(resumingSameTask===false)
 // 딱 한 번만 호출한다 — 같은 task를 재시도/크래시-재시작으로 이어가는 동안(resumingSameTask
@@ -78,8 +87,15 @@ export interface TaskChangeDeltaPlan {
 /** baseline 대비 현재 변경을 세 그룹으로 나눈다. baseline이 없으면(예: 이 기능 도입 이전에
  *  이미 진행 중이던 task — 레거시 project-state.json) 모든 변경을 newSinceBaseline으로
  *  본다 — 이는 이 함수 도입 이전의 기존 checkpoint 동작(working tree 전체를 이 task의 몫으로
- *  취급)과 완전히 동일한 fallback이다(새로운 위험을 만들지 않는다). 자동 삭제 판단은 이
- *  fallback을 쓰지 않는다 — § isProvenTaskCreatedPath 참고(더 엄격한 별도 규칙). */
+ *  취급)과 완전히 동일한 fallback이다(새로운 위험을 만들지 않는다).
+ *
+ *  주의 — 이 분류는 commit 대상 판정(checkpoint.ts)에만 쓰인다. "baseline에 없다(=task
+ *  시작 후 새로 생겼다)"는 사실은 "AutoDev/Claude Developer가 이 파일을 만들었다"는 증명이
+ *  아니다(같은 시간 창에 사용자/IDE/빌드도구/동기화 프로그램이 만들었을 수 있다 — 이
+ *  저장소에는 파일 경로를 taskId/attempt/round에 연결하는 durable action log가 없다, §
+ *  Positive-Provenance-Only Auto-Delete Policy 조사). 그래서 이 함수의 결과를 파일 삭제
+ *  판단에 재사용하지 않는다 — 자동 삭제는 이 baseline-absence 신호를 아예 쓰지 않는다(§
+ *  autodev.ts scope-violation cleanup, 2026-08-31 이후로는 어떤 경우에도 삭제하지 않는다). */
 export function classifyTaskChangeDelta(
   baseline: TaskChangeBaseline | null | undefined,
   changes: WorkingTreeChange[],
@@ -105,19 +121,4 @@ export function classifyTaskChangeDelta(
   }
 
   return { newSinceBaseline, modifiedSinceBaseline, preExistingUnchanged };
-}
-
-/**
- * 자동 삭제(§ autodev.ts scope-violation cleanup) 전용 판단 — "이 path가 baseline 시점에
- * 전혀 없었다(=이 task/attempt 이후 새로 생겼다는 provenance가 증명된다)"는 것이 확인될
- * 때만 true를 반환한다. baseline 자체가 없으면(레거시 — 이 기능 도입 이전에 이미 진행 중이던
- * task) 무조건 false다 — classifyTaskChangeDelta의 "baseline 없음 = 전체를 newSinceBaseline
- * 취급" fallback을 여기서는 절대 쓰지 않는다: commit 판정은 그 fallback이 "예전과 동일한
- * 동작으로 안전하게 되돌아간다"는 뜻이지만, 삭제 판정에서 같은 fallback을 쓰면 "provenance를
- * 모르는데도 삭제를 허용"하는 것이 되어 버린다(이번 사실검증이 지적한 바로 그 위험). 삭제는
- * commit보다 훨씬 더 보수적으로 다룬다 — provenance가 불확실하면 항상 삭제하지 않는다.
- */
-export function isProvenTaskCreatedPath(baseline: TaskChangeBaseline | null | undefined, relPath: string): boolean {
-  if (!baseline) return false;
-  return !baseline.entries.some((e) => e.path === relPath);
 }

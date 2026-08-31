@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, unlinkSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { captureTaskChangeBaseline, classifyTaskChangeDelta, isProvenTaskCreatedPath } from "./task-change-baseline";
+import { captureTaskChangeBaseline, classifyTaskChangeDelta } from "./task-change-baseline";
 import { getWorkingTreeChanges } from "./git-changes";
 
 const results: string[] = [];
@@ -129,38 +129,12 @@ function scenarioClassifyDeltaMissingBaselineFallsBackToAllNew(): void {
   }
 }
 
-function scenarioIsProvenTaskCreatedPath(): void {
-  const repo = makeTempGitRepo();
-  try {
-    writeFile(repo, "pre-existing.txt", "이미 있던 파일\n");
-    const baseline = captureTaskChangeBaseline("T1", repo);
-    writeFile(repo, "new-during-task.txt", "새로 생긴 파일\n");
-
-    check(
-      "isProvenTaskCreatedPath: baseline에 있던 경로는 false(삭제 금지 대상)",
-      isProvenTaskCreatedPath(baseline, "pre-existing.txt") === false
-    );
-    check(
-      "isProvenTaskCreatedPath: baseline에 없던 경로는 true(삭제 가능 후보)",
-      isProvenTaskCreatedPath(baseline, "new-during-task.txt") === true
-    );
-    check("isProvenTaskCreatedPath: baseline이 null이면 항상 false(provenance 불확실 → 삭제 금지)", isProvenTaskCreatedPath(null, "new-during-task.txt") === false);
-    check(
-      "isProvenTaskCreatedPath: baseline이 undefined여도 항상 false",
-      isProvenTaskCreatedPath(undefined, "new-during-task.txt") === false
-    );
-  } finally {
-    rmSync(repo, { recursive: true, force: true });
-  }
-}
-
 function main(): void {
   scenarioCaptureBaselineRecordsCurrentChanges();
   scenarioClassifyDeltaUnchangedVsModifiedVsNew();
   scenarioClassifyDeltaDetectsDeletion();
   scenarioClassifyDeltaDeletedThenStillDeletedIsUnchanged();
   scenarioClassifyDeltaMissingBaselineFallsBackToAllNew();
-  scenarioIsProvenTaskCreatedPath();
 
   console.log("\n=== task-change-baseline 테스트 결과 ===");
   for (const r of results) console.log(r);
