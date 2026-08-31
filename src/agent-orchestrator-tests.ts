@@ -250,6 +250,73 @@ async function scenarioDeterministicTestsOverrideQaOpinion(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 13) advisory(read-only) runner가 예외를 던져도 전체 pipeline이 죽지 않고 이 step만
+//     FAILED로 격리됨 — 하드닝 H(Advisory Agent 실패격리).
+// ---------------------------------------------------------------------------
+async function scenarioReadOnlyRunnerThrowIsolatedFromPipeline(): Promise<void> {
+  const plan = routeTask(req({ description: "새 기능을 구현해줘" }));
+  const callOrder: string[] = [];
+  const developerRunner: DeveloperAgentRunner = async () => {
+    callOrder.push("developer");
+    return { success: true, summary: "[FAKE] developer 구현 완료", changedFiles: ["a.ts"], tests: [{ name: "unit-1", pass: true }], rawOutput: "raw" };
+  };
+  const readOnlyRunner: ReadOnlyAgentRunner = async () => {
+    callOrder.push("qa-throw");
+    throw new Error("simulated network failure in advisory QA runner");
+  };
+  const reviewerRunner: ReviewerAgentRunner = async () => {
+    callOrder.push("reviewer");
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "ok", nextTask: null, gptTransportRetry: 0 };
+  };
+
+  let threw = false;
+  let result: Awaited<ReturnType<typeof executeRoutingPlan>> | undefined;
+  try {
+    result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, { developerRunner, reviewerRunner, readOnlyRunner });
+  } catch {
+    threw = true;
+  }
+
+  check("advisory throw 격리: executeRoutingPlan 자체는 예외를 던지지 않고 정상적으로 resolve됨", !threw && result !== undefined);
+  const qaResult = result?.stepResults.find((r) => r.role === "qa");
+  check("advisory throw 격리: qa step은 FAILED로 기록됨(SUCCESS로 위장하지 않음)", qaResult?.status === "FAILED");
+  check("advisory throw 격리: qa 실패 사유에 예외 메시지가 포함됨", !!qaResult?.reason?.includes("simulated network failure"));
+  const developerResult = result?.stepResults.find((r) => r.role === "developer");
+  check("advisory throw 격리: developer step은 그대로 SUCCESS로 남아있음(예외로 유실되지 않음)", developerResult?.status === "SUCCESS");
+  const reviewerResult = result?.stepResults.find((r) => r.role === "reviewer");
+  check("advisory throw 격리: qa가 실패했으므로 reviewer는 의존성 미충족으로 SKIPPED됨", reviewerResult?.status === "SKIPPED");
+  check("advisory throw 격리: reviewer의 실제 runner는 호출되지 않음", !callOrder.includes("reviewer"));
+  check("advisory throw 격리: overallStatus=FAILED(예외를 삼켜 COMPLETED로 위장하지 않음)", result?.overallStatus === "FAILED");
+}
+
+// ---------------------------------------------------------------------------
+// 14) reviewer runner가 예외를 던져도 이미 성공한 developer step 결과가 유실되지 않음.
+// ---------------------------------------------------------------------------
+async function scenarioReviewerRunnerThrowPreservesDeveloperStep(): Promise<void> {
+  const plan = routeTask(req({ description: "새 기능을 구현해줘", hasFixedRequiredTests: true }));
+  const developerRunner: DeveloperAgentRunner = async () => ({
+    success: true,
+    summary: "[FAKE] developer 구현 완료",
+    changedFiles: ["a.ts"],
+    tests: [{ name: "unit-1", pass: true }],
+    rawOutput: "raw",
+  });
+  const reviewerRunner: ReviewerAgentRunner = async () => {
+    throw new Error("simulated malformed GPT reviewer response");
+  };
+  const readOnlyRunner: ReadOnlyAgentRunner = async () => ({ success: true, summary: "", rawOutput: "" });
+
+  const result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, { developerRunner, reviewerRunner, readOnlyRunner });
+
+  const developerResult = result.stepResults.find((r) => r.role === "developer");
+  check("reviewer throw: developer step은 SUCCESS로 그대로 남아있음(유실되지 않음)", developerResult?.status === "SUCCESS");
+  const reviewerResult = result.stepResults.find((r) => r.role === "reviewer");
+  check("reviewer throw: reviewer step은 FAILED로 격리됨", reviewerResult?.status === "FAILED");
+  check("reviewer throw: 실패 사유에 예외 메시지가 포함됨", !!reviewerResult?.reason?.includes("simulated malformed GPT reviewer response"));
+  check("reviewer throw: overallStatus=FAILED", result.overallStatus === "FAILED");
+}
+
+// ---------------------------------------------------------------------------
 // computeOverallStatus 단위 테스트(순수 함수).
 // ---------------------------------------------------------------------------
 function scenarioComputeOverallStatusUnitChecks(): void {
@@ -275,6 +342,8 @@ async function main(): Promise<void> {
   await scenarioAgentPermissionViolationBlocked();
   await scenarioHighRiskHumanGateNoRunnerCalls();
   await scenarioDeterministicTestsOverrideQaOpinion();
+  await scenarioReadOnlyRunnerThrowIsolatedFromPipeline();
+  await scenarioReviewerRunnerThrowPreservesDeveloperStep();
   scenarioComputeOverallStatusUnitChecks();
 
   console.log("\n=== agent-orchestrator 테스트 결과 ===");

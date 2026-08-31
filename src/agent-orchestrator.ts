@@ -587,25 +587,47 @@ export async function executeRoutingPlan(
       continue;
     }
 
+    // Phase H(하드닝) — 어떤 role의 runner(developer/reviewer/research/read-only 공용)든
+    // 예외를 던지면(네트워크 오류, 처리되지 않은 malformed response 등) 이 step 하나만
+    // FAILED로 격리하고 실행을 계속한다. 이전에는 이 지점에 try/catch가 전혀 없어 advisory
+    // (planner/research/qa/security) runner의 예외 하나가 이미 완료된 developer 결과까지
+    // 포함한 전체 executeRoutingPlan() 호출을 처리되지 않은 rejection으로 만들었다("설계상
+    // 비필수 read-only advisory 실패가 핵심 pipeline을 죽이면 안 된다"). security-critical
+    // 판정을 조용히 무시하는 게 아니다 — 예외를 삼켜 SUCCESS로 위장하지 않고, 이미 존재하는
+    // "runner가 success:false를 반환했을 때"와 동일한 FAILED 경로로 보내 그대로
+    // computeOverallStatus/의존 step SKIPPED 로직이 그 실패를 정상적으로 반영하게 한다.
     let stepResult: AgentStepResult;
-    if (step.role === "developer") {
-      stepResult = await executeDeveloperStep(agent, input, developerRunner);
-    } else if (step.role === "reviewer") {
-      const { reviewerStep, updatedDeveloperStep } = await executeReviewerStepWithRevise(agent, stepResults, input, developerRunner, reviewerRunner, {
-        ledger: deps.ledger,
-        projectId: deps.projectId,
-      });
-      if (updatedDeveloperStep) {
-        const developerIdx = stepResults.findIndex((r) => r.role === "developer");
-        if (developerIdx !== -1) stepResults[developerIdx] = updatedDeveloperStep;
-        if (updatedDeveloperStep.status === "SUCCESS") completed.add(updatedDeveloperStep.agentId);
-        else failedOrSkipped.add(updatedDeveloperStep.agentId);
+    let updatedDeveloperStep: AgentStepResult | undefined;
+    try {
+      if (step.role === "developer") {
+        stepResult = await executeDeveloperStep(agent, input, developerRunner);
+      } else if (step.role === "reviewer") {
+        const reviewOutcome = await executeReviewerStepWithRevise(agent, stepResults, input, developerRunner, reviewerRunner, {
+          ledger: deps.ledger,
+          projectId: deps.projectId,
+        });
+        stepResult = reviewOutcome.reviewerStep;
+        updatedDeveloperStep = reviewOutcome.updatedDeveloperStep;
+      } else if (step.role === "research") {
+        stepResult = await executeResearchStep(agent, step, input, stepResults, readOnlyRunner);
+      } else {
+        stepResult = await executeReadOnlyStep(agent, step, buildStepContext(step, input, stepResults), readOnlyRunner);
       }
-      stepResult = reviewerStep;
-    } else if (step.role === "research") {
-      stepResult = await executeResearchStep(agent, step, input, stepResults, readOnlyRunner);
-    } else {
-      stepResult = await executeReadOnlyStep(agent, step, buildStepContext(step, input, stepResults), readOnlyRunner);
+    } catch (err) {
+      stepResult = {
+        agentId: agent.id,
+        role: step.role,
+        status: "FAILED",
+        summary: "",
+        reason: `agent(${agent.id}, role=${step.role}) 실행 중 예외가 발생해 이 step만 FAILED로 격리합니다: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    if (updatedDeveloperStep) {
+      const developerIdx = stepResults.findIndex((r) => r.role === "developer");
+      if (developerIdx !== -1) stepResults[developerIdx] = updatedDeveloperStep;
+      if (updatedDeveloperStep.status === "SUCCESS") completed.add(updatedDeveloperStep.agentId);
+      else failedOrSkipped.add(updatedDeveloperStep.agentId);
     }
 
     stepResults.push(stepResult);
