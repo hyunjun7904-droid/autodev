@@ -32,6 +32,7 @@ import {
   reconcileStaleRequiredTestExecutionEnvironmentTasks,
 } from "./required-test-preflight";
 import { hasFailedRequiredTest } from "./review-policy";
+import { validateRequiredTestExecutionContract } from "./execution-contract";
 import {
   computeProblemFingerprint,
   classifyFailureCategory,
@@ -462,6 +463,19 @@ export type AutodevRunOutcome =
    *  같은 결함이 더 이상 재현되지 않으면 다음 재시작 시 자동으로 READY로 복구된다(§
    *  reconcileStaleRequiredTestExecutionEnvironmentTasks 호출부). */
   | "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT"
+  /** AutoDev 최종 통합 하드닝(Hardening A, Execution Contract를 Runtime 불변조건으로) —
+   *  execution-contract.ts(SI-3.7)의 validateRequiredTestExecutionContract는 원래
+   *  spec-planner.ts의 계획 생성 시점에서만 호출됐다 — 그 이후 project adapter가 수동
+   *  편집되거나(예: task-registry.json의 requiredTest만 바뀌고 execution-policy.json의
+   *  allowedCommands가 갱신되지 않음) 서로 다른 generation의 산출물이 섞이면, 계획 시점
+   *  에는 통과했더라도 실행 시점에는 이 task의 requiredTest가 더 이상 실행 가능한
+   *  구조가 아닐 수 있다(§ JARVIS EP-1과 동일한 계열의 실행계약 불일치). 이 검사는 그
+   *  런 drift를 Developer를 부르기 직전에 다시 한 번 재확인한다 — 새 검증 로직이 아니라
+   *  같은 validateRequiredTestExecutionContract를 여기서도 재사용할 뿐이다. 실패하면
+   *  BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT와 동일한 원칙(genuine Human Gate가
+   *  아니라 기술적 BLOCKED — canonical source-of-truth가 명백하지 않은 이상 추측 수정
+   *  하지 않는다)으로 Developer/Reviewer를 전혀 부르지 않는다. */
+  | "BLOCKED_EXECUTION_CONTRACT_MISMATCH"
   /** AutoDev Core Maintenance(2026-08-30) — 같은 task에서 mid-flight 프로세스 크래시
    *  재시작(§ MID_FLIGHT_ORCHESTRATOR_STATUSES)이 MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT를
    *  초과했다. Developer/Reviewer를 다시 호출하지 않고 즉시 기술적 BLOCKED로 전환한다(genuine
@@ -1207,6 +1221,44 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       // 위험도 남기지 않았으므로 안전하게 release한다(lockShouldRelease는 기본값 true
       // 그대로, § BLOCKED_PROJECT_LOCK/BLOCKED_REMOTE_GIT과 동일한 원칙).
       return { outcome: "BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT", taskId: taskDef.id, reason: detail };
+    }
+
+    // AutoDev 최종 통합 하드닝(Hardening A) — execution-contract.ts를 runtime invariant로.
+    // spec-planner.ts는 계획 생성 시점에 이미 동일한 검증을 통과시켰지만, 그 이후 project
+    // adapter가 수동 편집되거나 서로 다른 generation의 산출물이 섞였을 가능성을
+    // Developer를 부르기 직전에 다시 한 번 재확인한다(§ 새 validator를 만들지 않고
+    // validateRequiredTestExecutionContract를 그대로 재사용). 이 task의 requiredTest만
+    // 검사한다 — 다른 task까지 매번 전수 재검증하지 않는다(이 시점에 필요한 것은 "지금
+    // 부르려는 이 task가 실행 가능한가"뿐이다).
+    const executionContractIssues = validateRequiredTestExecutionContract(
+      [{ taskId: taskDef.id, requiredTests: taskDef.requiredTests }],
+      manifest.executionPolicy.commandCwdAliases,
+      manifest.executionPolicy.allowedCommands
+    );
+    if (executionContractIssues.length > 0) {
+      const detail = executionContractIssues.map((i) => i.reason).join("; ");
+      console.log(
+        `[autodev] task ${taskDef.id} — execution contract mismatch 감지(${detail}) — Developer를 부르지 않고 기술적 BLOCKED로 전환합니다(task-registry.json의 requiredTests와 execution-policy.json의 allowedCommands/commandCwdAliases가 서로 실행 가능하게 맞물리지 않습니다 — project adapter를 직접 확인/수정해야 합니다).`
+      );
+      log("EXECUTION_CONTRACT_MISMATCH — Developer 호출 전 차단(기술적 BLOCKED, Human Gate 아님, DETERMINISTIC_LOCAL)", {
+        taskId: taskDef.id,
+        issues: executionContractIssues,
+      });
+      state.status = "BLOCKED";
+      for (const issue of executionContractIssues) {
+        state.deferredHumanTasks.push(`EXECUTION_CONTRACT_MISMATCH: task=${taskDef.id} testName=${issue.testName ?? ""} reason=${issue.reason}`);
+      }
+      emitEvent(events, {
+        eventType: "RUN_BLOCKED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "task_selection",
+        outcome: "BLOCKED",
+        reason: `EXECUTION_CONTRACT_MISMATCH(${taskDef.id}): ${detail}`,
+      });
+      saveState(state, statePath);
+      return { outcome: "BLOCKED_EXECUTION_CONTRACT_MISMATCH", taskId: taskDef.id, reason: detail };
     }
 
     console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);

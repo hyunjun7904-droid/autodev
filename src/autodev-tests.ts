@@ -15,6 +15,7 @@ import { classifyEventForNotification } from "./notification";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
 import type { RealClaudeResult } from "./claude-runner";
 import { inspectProjectRuntimeLiveness } from "./project-lock";
+import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
 
 // 이 파일은 두 계층을 검증한다:
 //   A) decideNextAction() — 순수 함수, 부수효과 없음(task-registry 엔진 + fixture registry
@@ -1295,7 +1296,13 @@ function buildRequiredTestPreflightManifestFor(root: string, statePath: string, 
     developerInstructions: "허용 범위: proj/**.",
     reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
     reviewScopeDirs: ["proj/"],
-    executionPolicy: PLANNER_EXECUTION_POLICY,
+    // Hardening A(Execution Contract를 Runtime 불변조건으로) — 실제 spec-planner.ts가 생성하는
+    // manifest는 항상 deriveAllowedCommandsFromRequiredTests()로 allowedCommands를 requiredTests와
+    // exact-match하게 파생시킨다(§ execution-contract.ts). 이 fixture도 그 실제 생성 결과를
+    // 흉내내야 runtime execution-contract 재검증(autodev.ts)이 정상 통과한다 — allowedCommands를
+    // 빈 배열로 두면 "task-registry와 execution-policy가 서로 실행 불가능하게 어긋난" 상태를
+    // 만드는 것이므로, 그 자체가 정상 시나리오가 아니라 이 하드닝이 잡아야 하는 결함 상태다.
+    executionPolicy: { ...PLANNER_EXECUTION_POLICY, allowedCommands: deriveAllowedCommandsFromRequiredTests(registry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))) },
   };
 }
 
@@ -1701,7 +1708,15 @@ async function scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnviron
     developerInstructions: "허용 범위: proj/**.",
     reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
     reviewScopeDirs: ["proj/"],
-    executionPolicy: { allowedReadPrefixes: ["proj/"], allowedWritePrefixes: ["proj/"], allowedCommands: [], commandCwdAliases: { sub: "sub" } },
+    // Hardening A — 위 REQUIRED_TEST_PREFLIGHT_REGISTRY fixture와 동일한 이유로, 실제
+    // spec-planner.ts 산출물과 동일하게 이 task의 requiredTest와 exact-match하는 allowedCommands를
+    // 채운다(§ deriveAllowedCommandsFromRequiredTests).
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests(registry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))),
+      commandCwdAliases: { sub: "sub" },
+    },
   };
 
   // 원인 해소: 그 사이(예: 사람이 project adapter 밖에서) "sub/" 디렉터리가 실제로 생겼다.
