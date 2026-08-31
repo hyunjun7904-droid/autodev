@@ -422,3 +422,34 @@ export function createEvent(input: AutoDevEventInput): AutoDevEventDraft {
     categories: classifyEventCategory(input.eventType),
   };
 }
+
+/**
+ * Process-local sequence vs. installation-wide chronological order — event-store.ts의
+ * `sequence`는 그 EventStore 인스턴스(=한 프로세스) 안에서만 1부터 단조증가하는 진단/tie-break
+ * 값이다(event identity는 `eventId`다 — § event-store.ts 상단 주석). 실측 조사(2026-09-01,
+ * 4개 실제 child process 동시 append)로 서로 다른 프로세스가 겹치는 sequence 값을 실제로
+ * 만들어낼 수 있고, 오래 살아있는 프로세스(Telegram controller 등)의 process-local counter가
+ * 다른 프로세스가 그 사이 기록한 event보다 훨씬 작은 sequence를 나중에 부여해 실제 시간
+ * 순서를 뒤집을 수 있음을 재현했다.
+ *
+ * 이 함수는 `timestamp`(실제 wall-clock 발생 시각 — 이 저장소의 실제 배포 모델인 단일 로컬
+ * 머신에서는 프로세스 경계와 무관하게 공유되는 신호다)를 1차 기준으로 정렬하고, 완전히 같은
+ * 밀리초 안에서만 `sequence`로 tie-break한다 — sequence가 원래 도입된 목적(§ event-store.ts
+ * "같은 timestamp를 가진 event가 여럿이어도 순서가 항상 명확하다")과 정확히 같은 역할만
+ * 유지하고, 서로 다른 프로세스 사이의 전역 순서 판정에는 쓰지 않는다. 단일 프로세스 안에서는
+ * timestamp가 사실상 항상 단조증가하므로(같은 프로세스의 각 append는 실제 코드 실행 순서
+ * 그대로 timestamp가 매겨진다) 이 비교 함수는 기존 sequence-only 정렬과 동일한 결과를
+ * 낸다 — 동작 변화는 오직 "서로 다른 프로세스의 event가 섞여 있는 경우"에만 발생한다.
+ *
+ * 남은 한계: 서로 다른 프로세스의 두 event가 정확히 같은 밀리초에 기록되면(진짜 sub-ms
+ * 동시성) 여전히 sequence로 tie-break하므로 그 극히 좁은 경우에는 순서가 틀릴 수 있다 —
+ * 이는 portable Node.js에서 별도의 installation-wide 전역 clock/counter 없이는 근본적으로
+ * 닫을 수 없는 한계이며(§ filesystem-trust-model.md와 동일한 원칙 — 존재하지 않는 보장을
+ * 주장하지 않는다), 실측에서 재현했던 수십 단위의 순서 역전과는 성격이 다른, 훨씬 더 좁은
+ * 잔여 위험이다.
+ */
+export function compareEventsChronologically(a: Pick<AutoDevEvent, "timestamp" | "sequence">, b: Pick<AutoDevEvent, "timestamp" | "sequence">): number {
+  const byTimestamp = Date.parse(a.timestamp) - Date.parse(b.timestamp);
+  if (byTimestamp !== 0) return byTimestamp;
+  return a.sequence - b.sequence;
+}

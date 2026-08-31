@@ -1,6 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { createFileEventStore, RUNTIME_EVENT_LOG_PATH } from "./event-store";
 import type { QueryResult } from "./event-store";
+import { compareEventsChronologically } from "./observability-event";
 import { buildAutoDevLiveSnapshot } from "./live-snapshot";
 import type { AutoDevLiveSnapshot } from "./live-snapshot";
 import { computeActiveWorkMs, computeActiveWorkMsAcrossTasks } from "./work-time";
@@ -225,12 +226,14 @@ function buildActualWorkTime(
 ): ActualWorkTime {
   const result: ActualWorkTime = {};
   const options = { freezeTail };
+  // Multi-process sequence collision(2026-09-01) — § observability-event.ts
+  // compareEventsChronologically 문서.
   if (currentTaskId) {
-    const taskEvents = allEvents.filter((e) => e.taskId === currentTaskId).sort((a, b) => a.sequence - b.sequence);
+    const taskEvents = allEvents.filter((e) => e.taskId === currentTaskId).sort(compareEventsChronologically);
     result.currentTaskMs = computeActiveWorkMs(taskEvents, now, options);
   }
   if (projectId) {
-    const projectEvents = allEvents.filter((e) => e.projectId === projectId).sort((a, b) => a.sequence - b.sequence);
+    const projectEvents = allEvents.filter((e) => e.projectId === projectId).sort(compareEventsChronologically);
     result.projectTotalMs = computeActiveWorkMsAcrossTasks(projectEvents, now, options);
   }
   return result;

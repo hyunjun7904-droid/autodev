@@ -1,6 +1,6 @@
 import { accessSync, appendFileSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { createEvent } from "./observability-event";
+import { createEvent, compareEventsChronologically } from "./observability-event";
 import type { AutoDevEvent, AutoDevEventInput, AutoDevEventType, AutoDevEventCategory } from "./observability-event";
 import { isProductionRuntime } from "./runtime-origin";
 
@@ -142,7 +142,11 @@ export function createFileEventStore(filePath: string): EventStore {
     query(filter = {}) {
       const { events, integrityIssues } = readAllEventsWithIntegrity(filePath);
       return {
-        events: events.filter((e) => matchesFilter(e, filter)).sort((a, b) => a.sequence - b.sequence),
+        // Multi-process sequence collision(2026-09-01) — sequence는 process-local 값이라
+        // 서로 다른 프로세스의 event가 섞여 있으면 전역 순서를 보장하지 않는다(§
+        // observability-event.ts compareEventsChronologically 문서). timestamp를 1차
+        // 기준으로 정렬한다.
+        events: events.filter((e) => matchesFilter(e, filter)).sort(compareEventsChronologically),
         integrityIssues,
       };
     },

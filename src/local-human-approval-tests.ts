@@ -10,7 +10,8 @@ import type { ApprovalRequest } from "./approval";
 import { createInMemoryApprovalStore } from "./approval-store";
 import type { ApprovalStore } from "./approval-store";
 import { createInMemoryEventStore } from "./event-store";
-import type { EventStore } from "./event-store";
+import type { EventStore, EventQueryFilter } from "./event-store";
+import type { AutoDevEvent } from "./observability-event";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -524,6 +525,85 @@ function scenarioCreateFreshRequestDoesNotReviveOldExpiredRecord(): void {
   check("기존 만료 레코드 자체는 전혀 건드리지 않음(여전히 PENDING 그대로, 임의로 소생되지 않음)", approvalStore.get(oldExpired.approvalId)?.status === "PENDING");
 }
 
+// ---------------------------------------------------------------------------
+// Multi-process sequence collision(2026-09-01) — createFreshLocalApprovalRequest()가
+// "가장 최근" SECURITY_BLOCKED event를 process-local sequence 내림차순이 아니라 실제
+// timestamp 기준으로 고르는지 검증한다. 실제 두 프로세스를 띄우지 않고도(그 무결성/역전
+// 재현은 event-store-tests.ts scenarioRealMultiProcessOrderingFixture가 이미 실제
+// child process로 증명했다) 이 함수 하나의 선택 로직만 정밀하게 격리해서 검증하기 위해,
+// EventStore 인터페이스를 그대로 구현하는 fake로 sequence/timestamp가 고의로 어긋난(=서로
+// 다른 프로세스가 만들었다고 가정한) 두 event를 직접 주입한다.
+// ---------------------------------------------------------------------------
+function fakeEventStoreWithFixedEvents(events: AutoDevEvent[]): EventStore {
+  function matches(e: AutoDevEvent, filter: EventQueryFilter): boolean {
+    if (filter.runId !== undefined && e.runId !== filter.runId) return false;
+    if (filter.taskId !== undefined && e.taskId !== filter.taskId) return false;
+    if (filter.eventType !== undefined && e.eventType !== filter.eventType) return false;
+    if (filter.agentId !== undefined && e.agentId !== filter.agentId) return false;
+    if (filter.category !== undefined && !e.categories.includes(filter.category)) return false;
+    return true;
+  }
+  return {
+    append() {
+      throw new Error("test fixture: append()는 이 시나리오에서 쓰이지 않습니다");
+    },
+    query(filter = {}) {
+      return { events: events.filter((e) => matches(e, filter)), integrityIssues: [] };
+    },
+  };
+}
+function scenarioCreateFreshRequestPicksRealMostRecentDespiteSequenceCollision(): void {
+  const root = makeGitRepo("local-approval-fresh-seq-collision-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  const targetMarker = "CHECKPOINT_BLOCKED(T1): commit 대상 파일에서 민감정보(secret) 패턴이 발견되어 commit을 중단했습니다.";
+  writeStateFile(statePath, { deferredHumanTasks: [targetMarker] });
+  const manifest = buildManifest(root, statePath);
+  const approvalStore = createInMemoryApprovalStore();
+
+  // realOlder — 실제로 먼저 일어났지만(00:00:00), 이미 오래 살아있던 프로세스가 더 나중에
+  // 그 위에 다른 event를 많이 쌓은 뒤라 sequence는 더 크다(40) — 오래된 프로세스가 stale
+  // sequence를 갖고 있다가 뒤늦게 재부팅되며 이어받은 상황을 흉내낸다.
+  const realOlder: AutoDevEvent = {
+    eventId: randomUUID(),
+    timestamp: "2026-01-01T00:00:00.000Z",
+    sequence: 40,
+    runId: "run-old",
+    taskId: "T1",
+    projectId: "fixture-local-approval",
+    eventType: "SECURITY_BLOCKED",
+    executionPhase: "checkpoint",
+    outcome: "BLOCKED",
+    reason: "첫 번째 SECURITY_BLOCKED(더 오래됨)",
+    categories: ["audit"],
+  };
+  // realNewer — 실제로 5분 뒤 다시 발생한(더 최근) SECURITY_BLOCKED지만, 이 event를 만든
+  // 프로세스는 방금 막 시작해 local sequence 카운터가 낮다(3).
+  const realNewer: AutoDevEvent = {
+    eventId: randomUUID(),
+    timestamp: "2026-01-01T00:05:00.000Z",
+    sequence: 3,
+    runId: "run-new",
+    taskId: "T1",
+    projectId: "fixture-local-approval",
+    eventType: "SECURITY_BLOCKED",
+    executionPhase: "checkpoint",
+    outcome: "BLOCKED",
+    reason: "두 번째 SECURITY_BLOCKED(실제로 더 최근)",
+    categories: ["audit"],
+  };
+  const events = fakeEventStoreWithFixedEvents([realOlder, realNewer]);
+
+  const result = createFreshLocalApprovalRequest("T1", { approvalStore, statePath, manifest, events });
+  check("collision fixture: 새 요청이 생성됨", result.kind === "CREATED");
+  if (result.kind === "CREATED") {
+    check(
+      "collision fixture: sequence(3 < 40)가 아니라 실제 timestamp(00:05:00이 00:00:00보다 늦음) 기준으로 진짜 최근 event(realNewer)를 근거로 삼음",
+      result.approval.sourceEventId === realNewer.eventId
+    );
+    check("collision fixture: sequence만 컸던 더 오래된 event(realOlder)를 잘못 고르지 않음", result.approval.sourceEventId !== realOlder.eventId);
+  }
+}
+
 function scenarioCreateFreshRequestRejectedWhenNotWaitingHuman(): void {
   const root = makeGitRepo("local-approval-fresh-not-waiting-");
   const statePath = join(root, ".autodev", "project-state.json");
@@ -552,6 +632,7 @@ async function main(): Promise<void> {
     await scenarioRemotePathStillCompletesNormally();
     scenarioCreateFreshRequestForCurrentGenuineBlock();
     scenarioCreateFreshRequestDoesNotReviveOldExpiredRecord();
+    scenarioCreateFreshRequestPicksRealMostRecentDespiteSequenceCollision();
     scenarioCreateFreshRequestRejectedWhenNotWaitingHuman();
   } finally {
     for (const dir of tempDirs) {

@@ -6,6 +6,7 @@ import type { ApprovalStore } from "./approval-store";
 import type { ProjectManifest } from "./project-manifest";
 import type { EventStore } from "./event-store";
 import type { AutoDevEvent } from "./observability-event";
+import { compareEventsChronologically } from "./observability-event";
 import type { OrchestratorDeps } from "./orchestrator";
 import { resumeApprovedTask } from "./auto-resume";
 import type { AutoResumeOutcome } from "./auto-resume";
@@ -291,11 +292,14 @@ export function createFreshLocalApprovalRequest(
 
   // 이 taskId에 대해 가장 최근에 기록된 SECURITY_BLOCKED event를 근거 event로 삼는다 —
   // deferredHumanTasks 마커 하나만으로는(§ 위) 텍스트 재현일 뿐, 실제 event log에 대응하는
-  // 근거가 있어야 "추측이 아니다".
+  // 근거가 있어야 "추측이 아니다". Multi-process sequence collision(2026-09-01) — sequence
+  // 단독 내림차순은 process-local counter라 "가장 최근"을 잘못 고를 수 있다(§
+  // observability-event.ts compareEventsChronologically 문서) — timestamp를 1차 기준으로
+  // 정렬한다.
   const candidates: AutoDevEvent[] = opts.events
     .query({ taskId })
     .events.filter((e) => e.eventType === "SECURITY_BLOCKED")
-    .sort((a, b) => b.sequence - a.sequence);
+    .sort((a, b) => compareEventsChronologically(b, a));
   const sourceEvent = candidates[0];
   if (!sourceEvent) {
     return { kind: "REJECTED", reason: "NO_MATCHING_EVENT_FOUND" };

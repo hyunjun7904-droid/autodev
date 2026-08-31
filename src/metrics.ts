@@ -1,6 +1,7 @@
 import type { QueryResult, AuditIntegrityStatus } from "./event-store";
 import { getAuditIntegrityStatus, describeAuditIntegrity } from "./event-store";
 import type { AutoDevEvent, AutoDevEventType, TestResultSummary } from "./observability-event";
+import { compareEventsChronologically } from "./observability-event";
 import type { GptDecision } from "./types";
 import type { AgentRole } from "./agent-registry";
 
@@ -48,7 +49,9 @@ function integrityInfo(queryResult: Pick<QueryResult, "integrityIssues">): Metri
  *  로 필터링한 결과를 넘기더라도, 서로 다른 run의 event가 섞여 들어오는 실수를 이 파일
  *  내부에서 한 번 더 막는다(§ 요구사항: 서로 다른 runId 데이터 혼합 금지). */
 function eventsForRun(queryResult: Pick<QueryResult, "events">, runId: string): AutoDevEvent[] {
-  return queryResult.events.filter((e) => e.runId === runId).sort((a, b) => a.sequence - b.sequence);
+  // Multi-process sequence collision(2026-09-01) — § observability-event.ts
+  // compareEventsChronologically 문서.
+  return queryResult.events.filter((e) => e.runId === runId).sort(compareEventsChronologically);
 }
 
 function firstOfType(events: AutoDevEvent[], type: AutoDevEventType): AutoDevEvent | undefined {

@@ -1,6 +1,7 @@
 import type { QueryResult, AuditIntegrityStatus } from "./event-store";
 import { getAuditIntegrityStatus, describeAuditIntegrity } from "./event-store";
 import type { AutoDevEvent, AutoDevEventType, TestResultSummary, ExecutionPhase } from "./observability-event";
+import { compareEventsChronologically } from "./observability-event";
 import type { GptDecision, SeverityCounts } from "./types";
 import type { AgentRole } from "./agent-registry";
 import { aggregateAgentMetrics, aggregateTaskMetrics } from "./metrics";
@@ -177,7 +178,9 @@ export function walkEvents(events: AutoDevEvent[]): EventWalkResult {
 // ---------------------------------------------------------------------------
 
 function eventsForRun(queryResult: Pick<QueryResult, "events">, runId: string): AutoDevEvent[] {
-  return queryResult.events.filter((e) => e.runId === runId).sort((a, b) => a.sequence - b.sequence);
+  // Multi-process sequence collision(2026-09-01) — § observability-event.ts
+  // compareEventsChronologically 문서.
+  return queryResult.events.filter((e) => e.runId === runId).sort(compareEventsChronologically);
 }
 
 function lastTaskIdStarted(events: AutoDevEvent[]): string | undefined {

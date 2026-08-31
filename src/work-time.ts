@@ -1,4 +1,5 @@
 import type { AutoDevEvent } from "./observability-event";
+import { compareEventsChronologically } from "./observability-event";
 import { walkEvents } from "./live-snapshot";
 import type { LiveStatus } from "./live-snapshot";
 
@@ -108,7 +109,9 @@ export function computeActiveWorkMsAcrossTasks(events: AutoDevEvent[], now: numb
 export function computeUsageLimitWaitMs(events: AutoDevEvent[]): number {
   let total = 0;
   let openStartTimestamp: string | undefined;
-  const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
+  // Multi-process sequence collision(2026-09-01) — § observability-event.ts
+  // compareEventsChronologically 문서.
+  const sorted = [...events].sort(compareEventsChronologically);
   for (const e of sorted) {
     if (e.eventType === "DEVELOPER_USAGE_LIMIT_WAIT_STARTED") {
       openStartTimestamp = e.timestamp;

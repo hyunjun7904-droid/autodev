@@ -1,8 +1,9 @@
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createEvent, classifyEventCategory, isAuditCriticalEvent } from "./observability-event";
-import type { AutoDevEventInput } from "./observability-event";
+import { spawn } from "node:child_process";
+import { createEvent, classifyEventCategory, isAuditCriticalEvent, compareEventsChronologically } from "./observability-event";
+import type { AutoDevEventInput, AutoDevEvent } from "./observability-event";
 import { createInMemoryEventStore, createFileEventStore, selectDefaultEventStore, getAuditIntegrityStatus, describeAuditIntegrity } from "./event-store";
 import type { EventStore } from "./event-store";
 
@@ -395,6 +396,95 @@ function scenarioDefaultEventStoreSelection(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-process sequence collision(2026-09-01) — compareEventsChronologically 단위 테스트.
+// sequence는 process-local diagnostic/tie-break 값이지 installation-wide 전역 순서가
+// 아니다(§ observability-event.ts 문서) — timestamp가 다르면 timestamp가 이기고, 완전히
+// 같은 timestamp일 때만 sequence로 tie-break한다.
+// ---------------------------------------------------------------------------
+function fakeEvent(overrides: Partial<Pick<AutoDevEvent, "timestamp" | "sequence">>): Pick<AutoDevEvent, "timestamp" | "sequence"> {
+  return { timestamp: "2026-01-01T00:00:00.000Z", sequence: 1, ...overrides };
+}
+function scenarioCompareEventsChronologically(): void {
+  const earlier = fakeEvent({ timestamp: "2026-01-01T00:00:00.000Z", sequence: 999 });
+  const later = fakeEvent({ timestamp: "2026-01-01T00:00:01.000Z", sequence: 1 });
+  check(
+    "compareEventsChronologically: timestamp가 다르면 sequence 값과 무관하게 timestamp가 이김(늦은 timestamp가 큰 sequence를 가진 것처럼 취급되지 않음)",
+    compareEventsChronologically(earlier, later) < 0 && compareEventsChronologically(later, earlier) > 0
+  );
+  const tieA = fakeEvent({ timestamp: "2026-01-01T00:00:00.000Z", sequence: 5 });
+  const tieB = fakeEvent({ timestamp: "2026-01-01T00:00:00.000Z", sequence: 7 });
+  check(
+    "compareEventsChronologically: timestamp가 완전히 같으면 sequence로 tie-break(§ sequence 원래 도입 목적 그대로 유지)",
+    compareEventsChronologically(tieA, tieB) < 0 && compareEventsChronologically(tieB, tieA) > 0
+  );
+  const same = fakeEvent({ timestamp: "2026-01-01T00:00:00.000Z", sequence: 5 });
+  check("compareEventsChronologically: 완전히 동일하면 0", compareEventsChronologically(same, { ...same }) === 0);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-process sequence collision(2026-09-01) — 실제 child process 2개로 "먼저 뜬(오래
+// 살아있어 local sequence 카운터가 stale해지는) 프로세스"와 "나중에 뜬(그 사이 실제
+// on-disk max sequence를 아는) 프로세스"가 같은 taskId에 대해 서로 다른 시각에 event를
+// 남기는 상황을 재현한다 — 2026-09-01 읽기 전용 조사가 실측했던 정확히 그 시나리오다.
+// 이 fixture는 실제로 sequence 값이 역전되는 것(raw evidence)과, 그럼에도 실제 production
+// query()(compareEventsChronologically로 수정됨)가 올바른 시간 순서를 복원하는 것(fix
+// evidence) 둘 다 같은 실행에서 함께 증명한다.
+// ---------------------------------------------------------------------------
+function runCollisionWorker(filePath: string, role: string, markerPath: string): Promise<{ code: number | null; out: string; err: string }> {
+  const workerPath = join(__dirname, "event-store-collision-worker.js");
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [workerPath, filePath, role, markerPath]);
+    let out = "";
+    let err = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.stderr.on("data", (d) => (err += d.toString()));
+    child.on("close", (code) => resolve({ code, out, err }));
+  });
+}
+async function scenarioRealMultiProcessOrderingFixture(): Promise<void> {
+  const workerPath = join(__dirname, "event-store-collision-worker.js");
+  if (!existsSync(workerPath)) {
+    check("MP-ORDER) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+  const dir = makeTempDir();
+  const filePath = join(dir, "collision-events.jsonl");
+  const markerPath = join(dir, "late-done.marker");
+
+  const earlyPromise = runCollisionWorker(filePath, "early", markerPath);
+  await new Promise((r) => setTimeout(r, 150)); // 실제 시간상 early가 late보다 먼저 존재/구성됨을 보장.
+  const latePromise = runCollisionWorker(filePath, "late", markerPath);
+  const [earlyResult, lateResult] = await Promise.all([earlyPromise, latePromise]);
+
+  check("MP-ORDER) early worker 정상 종료", earlyResult.code === 0);
+  check("MP-ORDER) late worker 정상 종료", lateResult.code === 0);
+
+  const earlyOut = JSON.parse(earlyResult.out.trim() || "{}") as { ok?: boolean; sequence?: number };
+  const lateOut = JSON.parse(lateResult.out.trim() || "{}") as { sequence?: number };
+
+  // Raw evidence — 실제로 sequence가 역전됐는지(그렇지 않다면 이 fixture 자체가 결함을
+  // 재현하지 못한 것이므로, 이 assertion이 실패하면 아래 fix evidence는 의미가 없다).
+  check(
+    "MP-ORDER) raw evidence: 실제로는 나중에 일어난 APPROVAL_REQUESTED(early worker)의 sequence가 먼저 일어난 HUMAN_APPROVAL_REQUIRED(late worker)의 sequence보다 작음(역전 재현)",
+    typeof earlyOut.sequence === "number" && typeof lateOut.sequence === "number" && earlyOut.sequence < lateOut.sequence
+  );
+
+  // Fix evidence — 실제 production 경로(createFileEventStore().query())가 이 역전을 그대로
+  // 반영하지 않고 실제 timestamp 순서로 복원하는지.
+  const finalStore = createFileEventStore(filePath);
+  const sharedEvents = finalStore.query({ taskId: "SHARED" }).events;
+  check("MP-ORDER) SHARED taskId 이벤트 2건 모두 관측됨(누락 0)", sharedEvents.length === 2);
+  check(
+    "MP-ORDER) fix evidence: query() 결과는 sequence(역전됨)가 아니라 실제 시간 순서대로 HUMAN_APPROVAL_REQUIRED → APPROVAL_REQUESTED 순으로 정렬됨",
+    sharedEvents[0]?.eventType === "HUMAN_APPROVAL_REQUIRED" && sharedEvents[1]?.eventType === "APPROVAL_REQUESTED"
+  );
+
+  // 무결성 — 전체 event(warmup 5 + SHARED 2 + noise 60 = 67)이 유실/손상 없이 전부 관측됨.
+  const allEvents = finalStore.query().events;
+  check("MP-ORDER) 전체 append 67건이 유실 없이 전부 관측됨", allEvents.length === 67);
+}
+
 async function main(): Promise<void> {
   try {
     scenarioEventSchemaValidation();
@@ -413,6 +503,8 @@ async function main(): Promise<void> {
     scenarioAuditIntegrityStatusHelper();
     scenarioCheckAuditWritable();
     scenarioDefaultEventStoreSelection();
+    scenarioCompareEventsChronologically();
+    await scenarioRealMultiProcessOrderingFixture();
   } finally {
     for (const d of tempDirs) {
       try {
