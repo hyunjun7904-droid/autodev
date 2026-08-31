@@ -13,6 +13,7 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import { acquireProjectLock, releaseProjectLock } from "./project-lock";
 import { classifyWaitingHumanReason } from "./human-gate-policy";
+import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
 
 // AutoDev 1.0 Hardening — Deterministic Simulation(Section 13 of the stabilization plan).
 //
@@ -128,7 +129,12 @@ function buildSimManifest(root: string, statePath: string, taskRegistry: TaskDef
     developerInstructions: "허용 범위: src/**, tests/**. 시뮬레이션 전용 fixture — 실제 프로젝트가 아님.",
     reviewInstructions: "시뮬레이션 fixture — 이 project는 fake gptReviewer로만 검토된다.",
     reviewScopeDirs: ["src/", "tests/"],
-    executionPolicy: SIM_EXECUTION_POLICY,
+    // Hardening A(Execution Contract를 Runtime 불변조건으로) — 실제 spec-planner.ts 산출물처럼
+    // allowedCommands를 이 taskRegistry의 requiredTests로부터 매번 파생시킨다. bulk simulation
+    // (runBulkSimulation)은 task마다 다른 args(인덱스 포함)를 쓰므로, 고정된 단일
+    // allowedCommands 항목으로는 exact-match할 수 없다 — 새 검증 로직이 아니라 이미 다른
+    // fixture에서 쓴 것과 동일한 패턴을 재사용한다.
+    executionPolicy: { ...SIM_EXECUTION_POLICY, allowedCommands: deriveAllowedCommandsFromRequiredTests(taskRegistry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))) },
   };
 }
 
@@ -447,7 +453,11 @@ async function runDeterministicBlockerIsolation(): Promise<void> {
       taskNumber: 1,
       title: "Deterministic blocker",
       prompt: "Deterministic blocker task",
-      requiredTests: [{ name: "sim:always-fails", command: "node", args: ["-e", "process.exit(1)"], cwd: "root" }],
+      // Hardening A(Execution Contract를 Runtime 불변조건으로) — node -e는 Core Command
+      // Safety Gate가 항상 거부하는 eval 플래그다(이 fixture가 실제 명령을 spawn하지 않고
+      // claudeRunner가 tests 결과를 직접 합성하므로 이전에는 이 무효함이 드러나지 않았다).
+      // SIM_EXECUTION_POLICY.allowedCommands가 이미 허용하는 형태로 맞춘다.
+      requiredTests: [{ name: "sim:always-fails", command: "node", args: ["tests/run.js"], cwd: "root" }],
       allowedPathPrefixes: ["src/"],
       prohibitedOperations: [],
     },
@@ -497,7 +507,8 @@ async function runPermanentCrashLoopIsolation(): Promise<{ terminal: boolean; re
       taskNumber: 1,
       title: "Permanent crash loop",
       prompt: "Permanent crash loop task",
-      requiredTests: [{ name: "sim:never-reached", command: "node", args: ["-e", "process.exit(0)"], cwd: "root" }],
+      // Hardening A — § sim:always-fails와 동일한 이유(node -e는 항상 무효).
+      requiredTests: [{ name: "sim:never-reached", command: "node", args: ["tests/run.js"], cwd: "root" }],
       allowedPathPrefixes: ["src/"],
       prohibitedOperations: [],
     },
@@ -572,7 +583,8 @@ async function runStaleWaitingHumanReconciliationCheck(): Promise<void> {
       taskNumber: 1,
       title: "Stale technical WAITING_HUMAN",
       prompt: "Stale WAITING_HUMAN reconciliation task",
-      requiredTests: [{ name: "sim:e1", command: "node", args: ["-e", "process.exit(0)"], cwd: "root" }],
+      // Hardening A — § sim:always-fails와 동일한 이유(node -e는 항상 무효).
+      requiredTests: [{ name: "sim:e1", command: "node", args: ["tests/run.js"], cwd: "root" }],
       allowedPathPrefixes: ["src/"],
       prohibitedOperations: [],
     },
