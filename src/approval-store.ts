@@ -21,7 +21,18 @@ import { isProductionRuntime } from "./runtime-origin";
 // 버튼이 다시 만들어지지 않는다 — replay 방지가 controller 재시작에도 이어진다(§ 요구사항
 // 15/28).
 
+// Store Durability Capability(2026-09-01) — Orphaned Genuine Human Gate Recovery
+// Production Wiring Defect 수정. 이전에는 "이 store가 프로세스 종료 후에도 살아남는가"를
+// 호출부가 isProductionRuntime()의 결과를 간접 추론(store 선택 함수를 신뢰)해서만 알 수
+// 있었다 — 그 store 자체는 스스로 durable한지 밝히지 않았다. `durability`는 각 store
+// 구현이 스스로 정직하게 보고하는 capability metadata다: `createInMemoryApprovalStore()`는
+// 항상 `"MEMORY"`, `createFileApprovalStore()`는 항상 `"FILE"`을 반환한다 — 호출부가
+// `isProductionRuntime()`을 다시 추측하지 않고 이 값 하나만으로 "durable 성공을 주장해도
+// 되는가"를 판별할 수 있다(§ local-human-approval.ts ensureDurableApprovalForGenuineWaitingHuman).
+export type ApprovalStoreDurability = "MEMORY" | "FILE";
+
 export interface ApprovalStore {
+  readonly durability: ApprovalStoreDurability;
   has(approvalId: string): boolean;
   get(approvalId: string): ApprovalRequest | undefined;
   getByDedupeKey(dedupeKey: string): ApprovalRequest | undefined;
@@ -47,6 +58,7 @@ export function createInMemoryApprovalStore(): ApprovalStore {
   const byDedupeKey = new Map<string, string>(); // dedupeKey -> approvalId
 
   return {
+    durability: "MEMORY",
     has(approvalId) {
       return byId.has(approvalId);
     },
@@ -247,6 +259,7 @@ export function createFileApprovalStore(filePath: string): ApprovalStore {
   }
 
   return {
+    durability: "FILE",
     has(approvalId) {
       return load().has(approvalId);
     },

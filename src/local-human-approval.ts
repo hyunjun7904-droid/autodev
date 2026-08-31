@@ -337,6 +337,13 @@ export function createFreshLocalApprovalRequest(
 
 export type EnsureDurableApprovalOutcome =
   | { kind: "NOT_APPLICABLE"; reason: "STATE_NOT_WAITING_HUMAN" | "NOT_A_GENUINE_HUMAN_GATE" }
+  /** § 핵심 invariant(2026-09-01, Production Wiring Defect 수정) — 지금 genuine
+   *  WAITING_HUMAN이 실제로 있더라도, 넘겨받은 approvalStore가 durable(file-backed)하지
+   *  않으면(§ approval-store.ts ApprovalStoreDurability) 이 함수는 CREATED/REUSED_EXISTING
+   *  중 무엇도 반환하지 않는다 — in-memory store에 PENDING을 만들어도 프로세스 종료와 함께
+   *  사라지므로, "성공"을 주장하는 순간 그 자체가 거짓 durable 보장이 된다. fail-closed로
+   *  아무 mutation도 하지 않고 이 값을 반환한다. */
+  | { kind: "STORE_NOT_DURABLE" }
   | { kind: "REUSED_EXISTING"; approval: ApprovalRequest }
   | { kind: "CREATED"; approval: ApprovalRequest };
 
@@ -385,6 +392,13 @@ export interface EnsureDurableApprovalOptions {
  * idempotency(§ approval-store.ts — 파일 store는 이미 mutation lock으로 다른 프로세스
  * 간에도 이를 보장한다, 새 lock을 만들지 않는다)가 exactly-one PENDING만 남긴다(§ 요구사항
  * G/16).
+ *
+ * **Store durability invariant(2026-09-01, Production Wiring Defect 수정)** —
+ * `opts.approvalStore.durability`가 `"FILE"`이 아니면(§ approval-store.ts
+ * ApprovalStoreDurability) CREATED/REUSED_EXISTING 중 무엇도 반환하지 않고 아무 state도
+ * mutate하지 않은 채 `{ kind: "STORE_NOT_DURABLE" }`을 반환한다 — non-durable store에 만든
+ * PENDING approval은 프로세스 종료와 함께 사라지므로, 그 상태를 "durable 성공"으로 보고하면
+ * 사람이 승인할 대상이 있다고 오인하게 만든다(§ 이 함수 이름 자체가 "durable"을 약속한다).
  */
 export function ensureDurableApprovalForGenuineWaitingHuman(
   taskId: string,
@@ -398,6 +412,14 @@ export function ensureDurableApprovalForGenuineWaitingHuman(
   const blocker = identifyGenuineWaitingHumanBlocker(state, taskId);
   if (!blocker) {
     return { kind: "NOT_APPLICABLE", reason: "NOT_A_GENUINE_HUMAN_GATE" };
+  }
+
+  // § 핵심 invariant — 여기부터는 실제로 genuine WAITING_HUMAN이 있으므로, durable
+  // 성공(CREATED/REUSED_EXISTING)을 주장하려면 store 자체가 durable해야 한다. 이 확인은
+  // git head/branch 조회나 store I/O보다 먼저 한다 — non-durable store라면 그 어떤 조회도
+  // "성공을 준비하는" 부수효과로 오인될 수 있는 여지를 남기지 않는다.
+  if (opts.approvalStore.durability !== "FILE") {
+    return { kind: "STORE_NOT_DURABLE" };
   }
 
   const cwd = opts.cwd ?? opts.manifest.targetProjectRoot;

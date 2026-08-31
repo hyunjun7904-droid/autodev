@@ -192,7 +192,15 @@ async function main(): Promise<void> {
   // 이미 throw했다) — project-control-cli.js stop --project <adapterPath>가 쓰는 값과
   // 정확히 같은 문자열이어야 마커 경로가 일치한다.
   const stopRequestPolling = startStopRequestPolling(adapterPathArg as string, repoLogsDir());
-  const controllerSupervisor = await ensureTelegramControllerStarted(manifest);
+  // § approvalStore/eventStore와 동일한 관례 — ensureTelegramControllerStarted()가 이미
+  // 노출하는 testDeps.runtimeDir seam(기본값은 이전과 100% 동일한 실제 logs/)을 env var로
+  // override할 수 있게 한다. production-entrypoint persistence 테스트(§ CLAUDE.md)가 실제
+  // production logs/telegram-controller.lock.json을 훔치지/오염시키지 않고 이 정확한
+  // entrypoint를 격리된 child process로 실행하기 위함이다 — controller 선택/routing 로직
+  // 자체는 전혀 건드리지 않는다.
+  const controllerSupervisor = await ensureTelegramControllerStarted(manifest, {
+    runtimeDir: process.env.AUTODEV_TELEGRAM_CONTROLLER_RUNTIME_DIR,
+  });
 
   // P0-3 하드닝(§ parent-liveness-watchdog.ts) — runner-supervisor.ts가 spawn한 child일
   // 때만(AUTODEV_SUPERVISOR_PID) 켜진다. supervisor가 비정상 종료되면 이 프로세스가 orphan으로
@@ -241,7 +249,17 @@ async function main(): Promise<void> {
       );
       result = continuousResult.finalResult;
     } else {
-      result = await runAutodevOnce({ manifest, abortSignal: runAbortController.signal });
+      // § approvalStore와 동일한 override 관례 — 기본값(env 미설정)은 이전과 100% 동일한
+      // 실제 RUNTIME_EVENT_LOG_PATH다. 이 override가 없으면 이 정확한 production
+      // entrypoint(one-shot)를 격리된 child process로 검증하는 테스트가, production runtime
+      // 환경변수가 설정된 시나리오에서 실제 production logs/events.jsonl(단일 공유 파일)에
+      // fixture event를 섞어 넣게 된다 — 그 위험을 막기 위한 것으로, EventStore 선택 로직
+      // 자체(isProductionRuntime() dual-gate)는 전혀 바꾸지 않는다.
+      result = await runAutodevOnce({
+        manifest,
+        abortSignal: runAbortController.signal,
+        events: selectDefaultEventStore(process.env.AUTODEV_EVENT_LOG_PATH),
+      });
     }
     console.log(`[run] 종료: outcome=${result.outcome}${result.reason ? `, reason=${result.reason}` : ""}`);
 
@@ -269,20 +287,44 @@ async function main(): Promise<void> {
         const state = loadState(manifest.statePath);
         const nextTask = getNextTask(manifest.taskRegistry, state.completedTasks ?? []);
         if (nextTask) {
+          // Production Wiring Defect 수정(2026-09-01) — project-control-cli.ts approve와
+          // 동일한 관례(§ 그 파일 AUTODEV_APPROVAL_STORE_PATH/AUTODEV_EVENT_LOG_PATH)로
+          // filePath override를 받는다 — 기본값(env 미설정)은 이전과 100% 동일하게
+          // RUNTIME_APPROVAL_STORE_PATH/RUNTIME_EVENT_LOG_PATH다. 이 override는 isolated
+          // 테스트가 실제 production logs/approvals.json을 건드리지 않고 이 정확한 진입점을
+          // child process로 검증할 수 있게 하기 위함이지, isProductionRuntime() dual-gate를
+          // 대체하거나 완화하지 않는다 — durability 판정은 여전히 그 gate가 고른 store의
+          // 실제 종류(§ approval-store.ts ApprovalStoreDurability)로만 이뤄진다.
+          const approvalStore = selectDefaultApprovalStore(process.env.AUTODEV_APPROVAL_STORE_PATH);
           const outcome = ensureDurableApprovalForGenuineWaitingHuman(nextTask.id, {
-            approvalStore: selectDefaultApprovalStore(),
+            approvalStore,
             statePath: manifest.statePath,
             manifest,
-            events: selectDefaultEventStore(),
+            events: selectDefaultEventStore(process.env.AUTODEV_EVENT_LOG_PATH),
             cwd: manifest.targetProjectRoot,
           });
           if (outcome.kind === "CREATED") {
+            // durability invariant(§ local-human-approval.ts) 덕분에 이 분기에 도달했다는
+            // 사실 자체가 approvalStore.durability==="FILE"이었다는 뜻이다 — 이 로그는 실제
+            // durable persistence(§ approval-store.ts createFileApprovalStore.createPending —
+            // 동기 write+rename) 완료 이후에만, 그리고 오직 그때만 출력된다.
             log("[run] orphaned genuine Human Gate — durable state만으로 새 PENDING approval을 생성했습니다.", {
               projectId: manifest.projectId,
               taskId: nextTask.id,
               approvalId: outcome.approval.approvalId,
               approvalType: outcome.approval.approvalType,
             });
+          } else if (outcome.kind === "STORE_NOT_DURABLE") {
+            // § 핵심 invariant — genuine WAITING_HUMAN이 실제로 있었지만 ApprovalStore가
+            // durable(file-backed)하지 않아(production runtime 환경변수 미설정 가능성이
+            // 가장 큼) fail-closed로 아무것도 만들지 않았다. 성공을 오인시키는 어떤 문구도
+            // 쓰지 않는다 — 사람이 승인할 대상이 실제로는 없다는 사실을 명시한다.
+            log(
+              "[run] orphaned genuine Human Gate 복구 차단(BLOCKED) — ApprovalStore가 durable(file-backed)하지 않아 PENDING approval을 생성하지 않았습니다. " +
+                "AUTOMATION_DRY_RUN=\"false\"와 AUTODEV_PRODUCTION_RUNTIME=\"true\"가 둘 다 설정되지 않은 상태로 보입니다 — start-autodev.ps1(공식 launcher)로 " +
+                "실행하거나 두 환경변수를 명시적으로 설정한 뒤 다시 실행하세요. 사람이 승인할 durable approval은 아직 존재하지 않습니다.",
+              { projectId: manifest.projectId, taskId: nextTask.id }
+            );
           }
         }
       } catch (err) {

@@ -104,6 +104,17 @@ function scenarioFile(): void {
   const filePath = makeTempFilePath("approvals.json");
   runApprovalStoreContractScenarios("file", createFileApprovalStore(filePath));
 }
+// Store Durability Capability(2026-09-01, Production Wiring Defect 수정) — 각 구현이
+// 스스로 정직하게 보고하는 durability metadata(§ approval-store.ts
+// ApprovalStoreDurability). local-human-approval.ts의 ensureDurableApprovalForGenuineWaitingHuman()이
+// isProductionRuntime() 재추측 없이 이 값 하나만으로 durable 성공 주장 여부를 판별한다(§
+// orphaned-human-gate-tests.ts 시나리오 P).
+function scenarioDurabilityCapability(): void {
+  check("in-memory store의 durability는 항상 MEMORY", createInMemoryApprovalStore().durability === "MEMORY");
+  const filePath = makeTempFilePath("approvals-durability.json");
+  check("file store의 durability는 항상 FILE", createFileApprovalStore(filePath).durability === "FILE");
+}
+
 function scenarioFileSurvivesRestart(): void {
   const filePath = makeTempFilePath("approvals-restart.json");
   const a = req();
@@ -236,6 +247,7 @@ function scenarioOffsetInMemoryInitial(): void {
 async function main(): Promise<void> {
   scenarioInMemory();
   scenarioFile();
+  scenarioDurabilityCapability();
   scenarioFileSurvivesRestart();
   scenarioFileCorruptedGracefulEmpty();
   await scenarioRealConcurrentTransitionOnSameApprovalExactlyOneWins();

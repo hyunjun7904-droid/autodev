@@ -7,6 +7,7 @@ import { ensureDurableApprovalForGenuineWaitingHuman, performLocalHumanApproval 
 import { buildApprovalRequest, CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import type { ApprovalRequest } from "./approval";
 import { createInMemoryApprovalStore, createFileApprovalStore } from "./approval-store";
+import type { ApprovalStore } from "./approval-store";
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 import { debugComputeLockFilePath, resolveCanonicalProjectPath, RUNTIME_LOCK_DIR } from "./project-lock";
 import type { ProjectManifest } from "./project-manifest";
@@ -33,6 +34,19 @@ function check(label: string, cond: boolean): void {
 }
 
 const tempDirs: string[] = [];
+
+// § 핵심 invariant(2026-09-01, Production Wiring Defect 수정) —
+// ensureDurableApprovalForGenuineWaitingHuman()은 이제 non-durable(in-memory) store에서는
+// CREATED/REUSED_EXISTING을 반환하지 않는다(§ local-human-approval.ts). 이 파일의 대부분의
+// 시나리오는 CREATED/REUSED_EXISTING 판정 로직 자체(dedupeKey/만료/HEAD 불일치 등)를
+// 검증하는 것이 목적이지 durability 그 자체가 아니므로, 실제 durable file store(임시
+// 디렉터리, 프로세스 종료 시 정리)로 그 로직을 계속 검증한다 — in-memory store는 오직 새
+// STORE_NOT_DURABLE 시나리오(§ 아래)에서만 의도적으로 쓴다.
+function makeTempFileApprovalStore(): ApprovalStore {
+  const dir = mkdtempSync(join(tmpdir(), "orphaned-gate-approval-store-"));
+  tempDirs.push(dir);
+  return createFileApprovalStore(join(dir, "approvals.json"));
+}
 
 function makeGitRepo(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -142,7 +156,7 @@ function scenarioCreatesFreshApprovalWhenNoneExists(): void {
   writeStateFile(statePath, {});
   const projectId = `fixture-orphaned-${randomUUID()}`;
   const manifest = buildManifest(root, statePath, projectId);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
   const currentHead = getCurrentHeadHash(root);
   const currentBranch = getCurrentBranch(root);
 
@@ -174,7 +188,7 @@ function scenarioRepeatedCallDoesNotDuplicate(): void {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const first = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, { approvalStore, statePath, manifest });
   const second = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, { approvalStore, statePath, manifest });
@@ -197,7 +211,7 @@ function scenarioExpiredOldApprovalDoesNotBlockNewOne(): void {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const currentHead = getCurrentHeadHash(root);
   const currentBranch = getCurrentBranch(root);
@@ -240,7 +254,7 @@ function scenarioOldHeadApprovalDoesNotSupersedeCurrentHead(): void {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const staleHead = "0".repeat(40); // 실제 HEAD와 절대 일치하지 않는 값.
   const oldHeadApproval: ApprovalRequest = {
@@ -281,7 +295,7 @@ function scenarioReusesValidEventBasedApprovalWithoutDuplicating(): void {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
   const currentHead = getCurrentHeadHash(root);
   const currentBranch = getCurrentBranch(root);
 
@@ -360,7 +374,7 @@ function scenarioUnmarkedFailClosedGenuineStillGetsApproval(): void {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, { deferredHumanTasks: [] }); // 알려진 마커 전혀 없음, humanFinalReview도 없음.
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const outcome = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, { approvalStore, statePath, manifest });
   check("H) 알려진 마커가 전혀 없는 fail-closed genuine에도 human gate가 고립되지 않고 approval이 생성됨", outcome.kind === "CREATED");
@@ -368,6 +382,28 @@ function scenarioUnmarkedFailClosedGenuineStillGetsApproval(): void {
     check("H) 구체적 사유를 재구성할 수 없으므로 범용 GENUINE_STATE_RECOVERY로 정직하게 남음", outcome.approval.approvalType === "GENUINE_STATE_RECOVERY");
     check("H) remotelyApprovable=false(범용 타입도 원격 승인 불가)", outcome.approval.remotelyApprovable === false);
   }
+}
+
+// ---------------------------------------------------------------------------
+// P) Production Wiring Defect 회귀 방지(2026-09-01) — genuine WAITING_HUMAN이 실제로
+//    있어도 non-durable(in-memory) store로는 durable 성공을 절대 주장하지 않는다
+//    (§ 핵심 invariant, run.ts one-shot이 production runtime 환경변수 없이 직접 실행됐을 때
+//    실제로 재현된 결함). CREATED/REUSED_EXISTING 대신 STORE_NOT_DURABLE을 반환하고, 어떤
+//    state/store mutation도 남기지 않는다 — 프로세스가 죽으면 사라질 가짜 PENDING이 애초에
+//    만들어지지 않는다.
+// ---------------------------------------------------------------------------
+function scenarioNonDurableStoreRefusesToClaimSuccess(): void {
+  const root = makeGitRepo("orphaned-gate-non-durable-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {});
+  const manifest = buildManifest(root, statePath, `fixture-orphaned-non-durable-${randomUUID()}`);
+  const approvalStore = createInMemoryApprovalStore();
+  check("P) 사전 조건: in-memory store의 durability는 MEMORY", approvalStore.durability === "MEMORY");
+
+  const outcome = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, { approvalStore, statePath, manifest });
+  check("P) genuine WAITING_HUMAN + non-durable store → STORE_NOT_DURABLE(CREATED/REUSED_EXISTING 아님)", outcome.kind === "STORE_NOT_DURABLE");
+  check("P) non-durable store에는 아무 approval도 만들어지지 않음(가짜 PENDING 없음)", approvalStore.list({}).length === 0);
+  check("P) state.json도 이 거부로 인해 전혀 변경되지 않음", JSON.stringify(readState(statePath).deferredHumanTasks) === JSON.stringify([GENUINE_SCOPE_VIOLATION_MARKER(FIXTURE_TASK_ID, "leftover.txt")]));
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +511,7 @@ async function scenarioFullApprovalResumeE2EWithStaleLock(): Promise<void> {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-e2e-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   // N) stale project lock — 이미 죽은 PID가 소유한 lock 파일을 실제 운용 lock 디렉터리에
   // 직접 만들어둔다(§ project-lock-tests.ts와 동일한 "실제로 종료된 child" 패턴). 이 project의
@@ -552,7 +588,7 @@ async function scenarioLeftoverFileNotAutoDeletedAndBlocksAgain(): Promise<void>
   writeFileSync(join(root, leftoverFileName), "이 파일은 task의 allowedPathPrefixes 밖입니다.\n");
   writeStateFile(statePath, { deferredHumanTasks: [GENUINE_SCOPE_VIOLATION_MARKER(FIXTURE_TASK_ID, leftoverFileName)], taskChangeBaseline: baseline });
   const manifest = buildManifest(root, statePath, `fixture-orphaned-leftover-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const ensured = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, { approvalStore, statePath, manifest });
   check("M) recovery approval 생성됨", ensured.kind === "CREATED");
@@ -594,7 +630,7 @@ async function scenarioExpiredRecoveryApprovalStillRejected(): Promise<void> {
   const statePath = join(root, ".autodev", "project-state.json");
   writeStateFile(statePath, {});
   const manifest = buildManifest(root, statePath, `fixture-orphaned-${randomUUID()}`);
-  const approvalStore = createInMemoryApprovalStore();
+  const approvalStore = makeTempFileApprovalStore();
 
   const ensured = ensureDurableApprovalForGenuineWaitingHuman(FIXTURE_TASK_ID, {
     approvalStore,
@@ -623,6 +659,7 @@ async function main(): Promise<void> {
     scenarioTechnicalWaitingHumanCreatesNothing();
     scenarioNonWaitingHumanStateCreatesNothing();
     scenarioUnmarkedFailClosedGenuineStillGetsApproval();
+    scenarioNonDurableStoreRefusesToClaimSuccess();
     await scenarioConcurrentSameBlockerRecoveryExactlyOne();
     await scenarioMultiProjectIsolation();
     await scenarioFullApprovalResumeE2EWithStaleLock();
