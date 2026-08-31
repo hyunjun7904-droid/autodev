@@ -7,6 +7,7 @@ import type { ExecutorAction, SafeExecutorContext } from "./safe-executor";
 import { getWorkingTreeChanges } from "./git-changes";
 import type { RequiredTestCommand } from "./task-registry";
 import { log, sanitizeForLog } from "./logger";
+import { classifyDeveloperErrorCode } from "./failure-taxonomy";
 import {
   checkRequiredTestScriptRegistration,
   attemptSafeRequiredTestScriptRepair,
@@ -1516,6 +1517,14 @@ export async function runDeveloperTaskWithRetry(
   for (let i = 0; i < DEVELOPER_TRANSIENT_MAX_ATTEMPTS; i++) {
     const result = await attemptFn(task, attempt, currentOpts);
     last = result;
+    // Hardening B(Failure Taxonomy) — 순수 진단/로그 목적으로만 분류를 남긴다. 이 분류
+    // 자체는 재시도 여부를 결정하지 않는다(그 결정은 여전히 isTransientDeveloperFailure/
+    // DEVELOPER_TRANSIENT_ERROR_CODES 단일 출처가 전담) — diagnostic evidence bundle/로그
+    // 조사 시 "이 실패가 어느 범주였는가"를 프로젝트 무관하게 일관된 어휘로 남기기 위함이다.
+    if (!result.success && result.errorCode) {
+      const classification = classifyDeveloperErrorCode(result.errorCode);
+      log(`developer 실패 분류: errorCode=${result.errorCode} failureClass=${classification.failureClass}`, { reason: classification.reason });
+    }
     if (!isTransientDeveloperFailure(result)) return result;
     log(`developer transient 실패(${result.errorCode}) — 시도 ${i + 1}/${DEVELOPER_TRANSIENT_MAX_ATTEMPTS} 실패, 재시도 예정`);
     consecutiveNoWriteFailures = result.changedFiles.length === 0 ? consecutiveNoWriteFailures + 1 : 0;

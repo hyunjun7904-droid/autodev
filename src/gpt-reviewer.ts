@@ -8,6 +8,7 @@ import { PROJECT_ROOT } from "./safe-executor";
 import { validateReadPath } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
 import { log, sanitizeForLog } from "./logger";
+import { classifyGptErrorCode } from "./failure-taxonomy";
 import { resolveGptBudgetGuardConfig, evaluateGptBudgetGuard } from "./gpt-budget-guard";
 import { resolvePricing, calculateEstimatedCost } from "./pricing-catalog";
 import type { UsageLedgerEntryInput } from "./usage-ledger";
@@ -893,6 +894,12 @@ export async function reviewClaudeResultWithRetry(
       opts.provider,
       opts.securityGateOverrides
     );
+    // Hardening B(Failure Taxonomy) — 순수 진단/로그 목적. 이 분류가 재시도 여부를 바꾸지
+    // 않는다(그 결정은 여전히 r.transient/classifyApiError 단일 출처가 전담).
+    if (r.errorCode) {
+      const classification = classifyGptErrorCode(r.errorCode, r.transient);
+      log(`GPT 리뷰 실패 분류: errorCode=${r.errorCode} failureClass=${classification.failureClass}`, { reviewCycle, reason: classification.reason });
+    }
     if (!r.transient) {
       return { ...r, gptTransportRetry: i };
     }
