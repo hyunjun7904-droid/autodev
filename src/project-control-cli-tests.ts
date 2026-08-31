@@ -1,15 +1,22 @@
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   parseArg,
   getProjectControlStatus,
   formatProjectControlStatus,
   decideStopAction,
+  formatApprovalPreview,
 } from "./project-control-cli";
 import { engageMaintenancePause, clearMaintenancePause, runnerSupervisorLockFilePath } from "./runner-supervisor";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectRuntimeLiveness } from "./project-lock";
+import { acquireProjectLock, releaseProjectLock } from "./project-lock";
+import type { ProjectLockHandle } from "./project-lock";
+import { createFileApprovalStore, createInMemoryApprovalStore } from "./approval-store";
+import type { ApprovalRequest } from "./approval";
+import type { CoreState } from "./types";
 
 // AutoDev Core Maintenance — Canonical Project Control CLI(Category C) 테스트. 이 CLI는
 // project-lock.ts/runner-supervisor.ts/dashboard-supervisor.ts에 이미 있고 각자 테스트된
@@ -213,12 +220,376 @@ function scenarioDecideStopAction(): void {
   );
 }
 
-function main(): void {
+// ---------------------------------------------------------------------------
+// Genuine Human Gate Local Approval CLI(2026-08-31) — formatApprovalPreview()는 순수
+// 함수다(어떤 상태도 바꾸지 않는다) — approvalStore.get()이 반환한 값과 loadState()
+// 결과만으로 사람이 승인 전에 봐야 할 정보를 조립한다.
+// ---------------------------------------------------------------------------
+function scenarioFormatApprovalPreviewMissingApproval(): void {
+  const store = createInMemoryApprovalStore();
+  const out = formatApprovalPreview({ projectId: "p1", statePath: "C:/nowhere/state.json" }, store, "missing-id", "T1", new Date().toISOString());
+  check("formatApprovalPreview: 없는 approvalId는 '찾을 수 없습니다'를 표시", out.includes("찾을 수 없습니다"));
+  check("formatApprovalPreview: project/task/approval id는 그대로 표시됨", out.includes("project: p1") && out.includes("approval id: missing-id"));
+}
+
+function baseApprovalFixture(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
+  const now = new Date();
+  return {
+    approvalId: "approval-1",
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + 30 * 60 * 1000).toISOString(),
+    projectId: "p1",
+    runId: "run-1",
+    taskId: "T1",
+    approvalType: "CHECKPOINT_SCOPE_VIOLATION",
+    sourceEventType: "HUMAN_APPROVAL_REQUIRED",
+    sourceEventId: "event-1",
+    status: "PENDING",
+    remotelyApprovable: false,
+    requiresSafetyRecheck: true,
+    dedupeKey: "dk-1",
+    ...overrides,
+  };
+}
+
+function scenarioFormatApprovalPreviewFoundApproval(): void {
+  const store = createInMemoryApprovalStore();
+  store.createPending(baseApprovalFixture());
+  const out = formatApprovalPreview({ projectId: "p1", statePath: "C:/nowhere/state.json" }, store, "approval-1", "T1", new Date().toISOString());
+  check("formatApprovalPreview: approval type 표시", out.includes("approval type: CHECKPOINT_SCOPE_VIOLATION"));
+  check("formatApprovalPreview: approval status 표시", out.includes("approval status: PENDING"));
+  check("formatApprovalPreview: remotelyApprovable 표시", out.includes("remotelyApprovable: false"));
+  check("formatApprovalPreview: stale 여부 표시(아직 만료 전 → false)", out.includes("stale(만료됨): false"));
+  check("formatApprovalPreview: statePath를 읽을 수 없으면 project status를 확인 불가로 표시(추측하지 않음)", out.includes("확인 불가"));
+}
+
+// ---------------------------------------------------------------------------
+// Genuine Human Gate Local Approval CLI — 실제 production child-process 검증(§ 요구사항
+// 15). 단위 테스트에서 performLocalHumanApproval()을 직접 호출하는 것(§ 이미
+// local-human-approval-tests.ts가 담당)과, 실제 컴파일된 CLI entrypoint(node
+// dist/project-control-cli.js approve ...)를 별도 프로세스로 실행해 실제 파일 기반
+// ApprovalStore/EventStore/project-state.json을 읽고 쓰는 것은 서로 다른 질문이다 — 이
+// 섹션은 후자만 검증한다. 실제 Claude CLI/GPT API를 호출하지 않기 위해 "성공" 시나리오는
+// 실제 project-lock.ts(acquireProjectLock)로 이 project를 미리 점유해 두어
+// resumeApprovedTask()가 runAutodevOnce()를 호출하기 전에 안전하게(그리고 빠르게)
+// BLOCKED(PROJECT_ALREADY_LOCKED)로 끝나도록 한다 — approve CLI 자신의 검증/전이 로직은
+// 그 지점까지 전부 실제로 실행된다(ApprovalStore PENDING→APPROVED 전이, deferredHumanTasks
+// marker 제거, project-state.json READY 전환까지 전부 실제 파일 I/O로 확인한다).
+//
+// 실제 JARVIS 저장소/두 깨진 파일은 이 섹션 어디에서도 fixture로 쓰지 않는다 — 매 시나리오가
+// 그 자체로 만드는 임시 git-init 없는 순수 임시 디렉터리만 사용한다.
+// ---------------------------------------------------------------------------
+
+const CLI_PATH = join(__dirname, "project-control-cli.js");
+
+function relFromTo(fromDir: string, toDir: string): string {
+  return relative(fromDir, toDir).split(sep).join("/");
+}
+
+function writeJson(dir: string, fileName: string, data: unknown): string {
+  const abs = join(dir, fileName);
+  writeFileSync(abs, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  return abs;
+}
+
+interface CliFixture {
+  configDir: string;
+  projectRoot: string;
+  adapterPath: string;
+  statePath: string;
+  approvalStorePath: string;
+  eventLogPath: string;
+  projectId: string;
+}
+
+/** 실제 project config(JSON)/project-state.json/빈 project root를 OS 임시 디렉터리에
+ *  만든다 — project-adapter-loader-tests.ts와 동일한 최소 유효 스키마를 그대로 따른다(중복
+ *  스키마를 새로 만들지 않는다). */
+function makeCliFixture(projectId: string, state: CoreState): CliFixture {
+  const configDir = mkdtempSync(join(tmpdir(), "project-control-cli-approve-cfg-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "project-control-cli-approve-root-"));
+  const statePathAbs = writeJson(configDir, "project-state.json", state);
+  const adapterPath = writeJson(configDir, "manifest.json", {
+    projectId,
+    projectName: projectId,
+    targetProjectRoot: relFromTo(configDir, projectRoot),
+    statePath: "project-state.json",
+    taskRegistry: [],
+    developerInstructions: "fixture",
+    reviewInstructions: "fixture",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+  });
+  const approvalStorePath = join(configDir, "approvals.json");
+  const eventLogPath = join(configDir, "events.jsonl");
+  return { configDir, projectRoot, adapterPath, statePath: statePathAbs, approvalStorePath, eventLogPath, projectId };
+}
+
+function waitingHumanScopeViolationState(taskId: string, markerFile = "other/unexpected.txt"): CoreState {
+  return {
+    currentTask: `${taskId} prompt`,
+    reviewCycle: 0,
+    lastClaudeResult: null,
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "정상(하지만 scope 밖 파일이 있음)", nextTask: null },
+    status: "WAITING_HUMAN",
+    claudeLimitWaitCount: 0,
+    deferredHumanTasks: [`CHECKPOINT_BLOCKED(${taskId}): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다. — unexpected: ${markerFile}`],
+    completedTasks: [],
+    gitCheckpoint: "",
+    currentPhase: 1,
+  };
+}
+
+function cleanupCliFixture(fixture: CliFixture): void {
+  rmSync(fixture.configDir, { recursive: true, force: true });
+  rmSync(fixture.projectRoot, { recursive: true, force: true });
+}
+
+interface CliRunResult {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+function runApproveCli(fixture: CliFixture, args: string[]): CliRunResult {
+  const res = spawnSync(
+    "node",
+    [CLI_PATH, "approve", "--project", fixture.adapterPath, ...args],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AUTODEV_APPROVAL_STORE_PATH: fixture.approvalStorePath,
+        AUTODEV_EVENT_LOG_PATH: fixture.eventLogPath,
+      },
+    }
+  );
+  return { status: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+
+function readFixtureState(fixture: CliFixture): CoreState {
+  return JSON.parse(readFileSync(fixture.statePath, "utf-8")) as CoreState;
+}
+
+function readFixtureApproval(fixture: CliFixture, approvalId: string): ApprovalRequest | undefined {
+  const store = createFileApprovalStore(fixture.approvalStorePath);
+  return store.get(approvalId);
+}
+
+// A) 정상 CHECKPOINT_SCOPE_VIOLATION + 현재 durable pending local approval → CLI 승인 성공
+// → 기존 approval transition(PENDING→APPROVED) → resumeApprovedTask 경로가 실제로 호출됨
+// (project lock을 미리 점유해 real Developer/API 호출 없이 BLOCKED(PROJECT_ALREADY_LOCKED)
+// 로 안전하게 끝난다) → project-state.json이 READY로 전환됨.
+async function scenarioRealCliApprovesPendingScopeViolation(): Promise<void> {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-a", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-a", projectId: fixture.projectId, taskId, dedupeKey: "dk-a" })
+  );
+
+  let lock: ProjectLockHandle | undefined;
+  try {
+    const acquired = acquireProjectLock({ projectId: fixture.projectId, targetProjectRoot: fixture.projectRoot, ownerKind: "autodev" });
+    if (acquired.ok) lock = acquired.lock;
+    check("A) 사전 조건: project lock을 실제로 선점함(Developer 재호출 방지용)", acquired.ok === true);
+
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+
+    check("A) CLI exit code=0", result.status === 0);
+    check("A) 출력에 승인 전 확인 정보(project/approval type/reason)가 포함됨", result.stdout.includes(`project: ${fixture.projectId}`) && result.stdout.includes("CHECKPOINT_SCOPE_VIOLATION"));
+    check("A) 출력에 '승인 처리됨' 문구 포함", result.stdout.includes("승인 처리됨"));
+
+    const approvalAfter = readFixtureApproval(fixture, approval.approvalId);
+    check("A) ApprovalStore: PENDING → APPROVED로 실제 전이됨", approvalAfter?.status === "APPROVED");
+
+    const stateAfter = readFixtureState(fixture);
+    check("A) deferredHumanTasks에서 해당 CHECKPOINT_BLOCKED marker가 제거됨", !stateAfter.deferredHumanTasks.some((m) => m.startsWith(`CHECKPOINT_BLOCKED(${taskId}):`)));
+    check(
+      "A) resumeApprovedTask가 project lock 재확인에서 BLOCKED를 반환했고, 그 결과로 status가 READY로 남음(runAutodevOnce가 실제로 호출되지 않음)",
+      (stateAfter.status as unknown as string) === "READY"
+    );
+    check("A) 출력에 안전 재확인 보류(BLOCKED) 안내 포함", result.stdout.includes("보류됨(BLOCKED)") && result.stdout.includes("PROJECT_ALREADY_LOCKED"));
+  } finally {
+    if (lock) releaseProjectLock(lock);
+    cleanupCliFixture(fixture);
+  }
+}
+
+// B) WAITING_HUMAN이지만 지정한 approvalId로 등록된 pending approval이 없음 → 거부, 어떤
+// 상태도 바뀌지 않음, fresh approval도 만들어지지 않음.
+function scenarioRealCliRejectsUnknownApproval(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-b", waitingHumanScopeViolationState(taskId));
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", "does-not-exist", "--task", taskId, "--approved-by", "qa-operator"]);
+    check("B) CLI exit code != 0", result.status !== 0);
+    check("B) 출력에 APPROVAL_NOT_FOUND 포함", result.stdout.includes("APPROVAL_NOT_FOUND"));
+    const stateAfter = readFixtureState(fixture);
+    check("B) project-state.json이 전혀 바뀌지 않음(여전히 WAITING_HUMAN, marker 그대로)", (stateAfter.status as unknown as string) === "WAITING_HUMAN" && stateAfter.deferredHumanTasks.length === 1);
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// F) 존재하는 approval이지만 --task로 다른(잘못된) taskId를 지정 → TASK_MISMATCH로 거부.
+function scenarioRealCliRejectsTaskMismatch(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-f", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-f", projectId: fixture.projectId, taskId, dedupeKey: "dk-f" })
+  );
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", "WRONG_TASK", "--approved-by", "qa-operator"]);
+    check("F) CLI exit code != 0", result.status !== 0);
+    check("F) 출력에 TASK_MISMATCH 포함", result.stdout.includes("TASK_MISMATCH"));
+    const approvalAfter = readFixtureApproval(fixture, approval.approvalId);
+    check("F) approval은 여전히 PENDING(소비되지 않음)", approvalAfter?.status === "PENDING");
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// H) 존재하는 approval이지만 다른 project의 것 → PROJECT_MISMATCH로 거부.
+function scenarioRealCliRejectsProjectMismatch(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-h", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-h", projectId: "some-other-project", taskId, dedupeKey: "dk-h" })
+  );
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("H) CLI exit code != 0", result.status !== 0);
+    check("H) 출력에 PROJECT_MISMATCH 포함", result.stdout.includes("PROJECT_MISMATCH"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// C/G) project status가 WAITING_HUMAN이 아님(READY) → STATE_NOT_WAITING_HUMAN으로 거부.
+function scenarioRealCliRejectsWhenNotWaitingHuman(): void {
+  const taskId = "T1";
+  const readyState: CoreState = { ...waitingHumanScopeViolationState(taskId), status: "READY", deferredHumanTasks: [] };
+  const fixture = makeCliFixture("real-cli-project-c", readyState);
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-c", projectId: fixture.projectId, taskId, dedupeKey: "dk-c" })
+  );
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("C/G) CLI exit code != 0", result.status !== 0);
+    check("C/G) 출력에 STATE_NOT_WAITING_HUMAN 포함", result.stdout.includes("STATE_NOT_WAITING_HUMAN"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// M/V) remotelyApprovable=true인 approval은 local CLI가 거부한다(Telegram 전용 경로로만
+// 처리돼야 한다) — NOT_A_LOCAL_APPROVAL_TARGET.
+function scenarioRealCliRejectsRemotelyApprovable(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-m", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-m", projectId: fixture.projectId, taskId, remotelyApprovable: true, dedupeKey: "dk-m" })
+  );
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("M/V) CLI exit code != 0", result.status !== 0);
+    check("M/V) 출력에 NOT_A_LOCAL_APPROVAL_TARGET 포함", result.stdout.includes("NOT_A_LOCAL_APPROVAL_TARGET"));
+    const approvalAfter = readFixtureApproval(fixture, approval.approvalId);
+    check("M/V) approval은 여전히 PENDING(Telegram 전용 경로가 아니면 아무도 소비하지 않음)", approvalAfter?.status === "PENDING");
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// I) stale(만료된) approval → APPROVAL_EXPIRED로 거부.
+function scenarioRealCliRejectsExpiredApproval(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-i", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const pastIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-i", projectId: fixture.projectId, taskId, expiresAt: pastIso, dedupeKey: "dk-i" })
+  );
+  try {
+    const result = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("I) CLI exit code != 0", result.status !== 0);
+    check("I) 출력에 APPROVAL_EXPIRED 포함", result.stdout.includes("APPROVAL_EXPIRED"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+// J/O) 같은 approval에 대해 CLI를 두 번 실행 — 두 번째는 안전하게 실패해야 하며(중복 승인
+// 없음), resumeApprovedTask가 두 번 실행되지 않는다는 것을 project-state.json이 두 번째
+// 실행으로 다시 바뀌지 않았는지로 확인한다.
+function scenarioRealCliRejectsDuplicateApproval(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-j", waitingHumanScopeViolationState(taskId));
+  const approvalStore = createFileApprovalStore(fixture.approvalStorePath);
+  const approval = approvalStore.createPending(
+    baseApprovalFixture({ approvalId: "approval-j", projectId: fixture.projectId, taskId, dedupeKey: "dk-j" })
+  );
+  let lock: ProjectLockHandle | undefined;
+  try {
+    const acquired = acquireProjectLock({ projectId: fixture.projectId, targetProjectRoot: fixture.projectRoot, ownerKind: "autodev" });
+    if (acquired.ok) lock = acquired.lock;
+
+    const first = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("J/O) 첫 번째 승인: exit code=0", first.status === 0);
+    const stateAfterFirst = readFixtureState(fixture);
+
+    const second = runApproveCli(fixture, ["--approval-id", approval.approvalId, "--task", taskId, "--approved-by", "qa-operator"]);
+    check("J/O) 두 번째(중복) 승인: exit code != 0", second.status !== 0);
+    check("J/O) 두 번째 승인 출력에 APPROVAL_ALREADY_CONSUMED 포함", second.stdout.includes("APPROVAL_ALREADY_CONSUMED"));
+
+    const stateAfterSecond = readFixtureState(fixture);
+    check(
+      "J/O) 두 번째(거부된) 실행이 project-state.json을 다시 바꾸지 않음(중복 resume 없음)",
+      JSON.stringify(stateAfterSecond) === JSON.stringify(stateAfterFirst)
+    );
+  } finally {
+    if (lock) releaseProjectLock(lock);
+    cleanupCliFixture(fixture);
+  }
+}
+
+// U) 기존 pause/resume/status/stop 서브커맨드가 approve 추가 이후에도 실제 child process로
+// 정상 동작한다(회귀 없음) — status는 상태를 바꾸지 않으므로 골라서 확인한다.
+function scenarioRealCliExistingStatusSubcommandStillWorks(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-u", waitingHumanScopeViolationState(taskId));
+  try {
+    const res = spawnSync("node", [CLI_PATH, "status", "--project", fixture.adapterPath], { encoding: "utf-8" });
+    check("U) 기존 status 명령: exit code=0(회귀 없음)", res.status === 0);
+    check("U) 기존 status 명령 출력 형식 유지(Maintenance Pause 표시 포함)", (res.stdout ?? "").includes("Maintenance Pause:"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+async function main(): Promise<void> {
   scenarioParseArg();
   scenarioMaintenancePauseReflectedInStatus();
   scenarioSupervisorLockReflectedInStatus();
   scenarioProjectLockStatusVariants();
   scenarioDecideStopAction();
+  scenarioFormatApprovalPreviewMissingApproval();
+  scenarioFormatApprovalPreviewFoundApproval();
+
+  await scenarioRealCliApprovesPendingScopeViolation();
+  scenarioRealCliRejectsUnknownApproval();
+  scenarioRealCliRejectsTaskMismatch();
+  scenarioRealCliRejectsProjectMismatch();
+  scenarioRealCliRejectsWhenNotWaitingHuman();
+  scenarioRealCliRejectsRemotelyApprovable();
+  scenarioRealCliRejectsExpiredApproval();
+  scenarioRealCliRejectsDuplicateApproval();
+  scenarioRealCliExistingStatusSubcommandStillWorks();
 
   console.log("\n=== project-control-cli 테스트 결과 ===");
   for (const r of results) console.log(r);

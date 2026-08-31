@@ -12,6 +12,45 @@ import {
 } from "./runner-supervisor";
 import { checkSupervisorLock, defaultIsPidAlive } from "./dashboard-supervisor";
 import type { LockCheckResult } from "./dashboard-supervisor";
+import { loadState } from "./state";
+import type { ProjectManifest } from "./project-manifest";
+import { selectDefaultApprovalStore } from "./approval-store";
+import type { ApprovalStore } from "./approval-store";
+import { selectDefaultEventStore } from "./event-store";
+import { isApprovalExpired } from "./approval";
+import { performLocalHumanApproval } from "./local-human-approval";
+import { isCheckpointBlockedMarker } from "./human-gate-policy";
+
+// Genuine Human Gate Local Approval CLI Entrypoint(2026-08-31) — local-human-approval.ts는
+// 이미 승인 검증/실행 로직(performLocalHumanApproval)과 그 테스트를 갖고 있었지만, 그
+// 함수를 production에서 실제로 호출할 방법이 이 저장소 어디에도 없었다(§ 그 파일 상단
+// 주석 — "이 파일을 import하는 production 코드가 없다"). 이 CLI가 그 유일한 빠진 조각이다
+// — 새 approval subsystem/state machine/store를 만들지 않는다: performLocalHumanApproval()
+// 하나를 그대로 호출할 뿐이고, 이 파일이 새로 추가하는 것은 (1) 실제 파일 기반
+// ApprovalStore/EventStore를 이 CLI 실행 컨텍스트에 연결하는 것, (2) 승인 전 확인 정보를
+// 사람이 읽을 수 있게 출력하는 순수 포맷 함수 하나뿐이다.
+//
+// createFreshLocalApprovalRequest()는 이 CLI에서 쓰지 않는다 — 그 함수는 "원본
+// ApprovalRequest가 만료/부재할 때 SECURITY_BLOCKED event를 근거로 새 요청을 만드는" 별도
+// fallback 경로로 설계됐고(§ local-human-approval.ts 자신의 docstring), CHECKPOINT_SCOPE_
+// VIOLATION은 HUMAN_APPROVAL_REQUIRED event로 기록되어 그 fallback의 대상이 아니다. 이
+// CLI의 목표(§ 요구사항 0)는 "AutoDev가 이미 만들어 둔 현재의 durable pending approval을
+// 승인하는 것"이지 승인 CLI가 승인 대상을 스스로 만들어내는 것이 아니다 — 실제 조사
+// 결과(§ run.ts ensureTelegramControllerStarted → telegram-controller.ts tick →
+// approval-service.ts createApprovalRequestsFromEvents) production 실행이 이미 자동으로
+// durable pending approval을 만들고 있으므로 이 CLI가 fresh request를 만들 필요/근거가
+// 없다.
+//
+// AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME — telegram-controller-main.ts와 동일한
+// 관례(§ 그 파일 상단 주석) — 이 CLI도 사람이 명시적으로 실행하는 real production entry
+// point이므로 isProductionRuntime()의 dual-gate를 스스로 선언한다. approve 서브커맨드가
+// 실제 파일 기반 ApprovalStore/EventStore(§ approval-store.ts/event-store.ts
+// selectDefaultApprovalStore/selectDefaultEventStore의 isProductionRuntime() 분기)를 쓰려면
+// 이 선언이 필요하다 — pause/resume/status/stop은 이 값을 전혀 참조하지 않으므로(§
+// project-lock.ts/runner-supervisor.ts/dashboard-supervisor.ts 어디도 isProductionRuntime을
+// 쓰지 않음) 이 선언을 모든 서브커맨드 앞에 두어도 기존 동작에 영향이 없다.
+process.env.AUTOMATION_DRY_RUN = "false";
+process.env.AUTODEV_PRODUCTION_RUNTIME = "true";
 
 // AutoDev Core Maintenance — Canonical Project Control CLI(Category C, AutoDev 1.0
 // 하드닝). 목적: 운영 제어(개발 일시정지/재개/현재 상태 조회)가 taskkill/process.kill/수동
@@ -158,6 +197,54 @@ function repoLogsDir(): string {
   return join(__dirname, "..", "logs");
 }
 
+/**
+ * approve 실행 전에 사람이 확인해야 할 최소 정보(§ 요구사항 4/7) — 순수 함수, 어떤 상태도
+ * 바꾸지 않는다. approvalId로 찾은 ApprovalRequest가 없으면 그 사실만 보여준다(추측하지
+ * 않는다) — 실제 승인 가능 여부의 최종 판정은 이 함수가 아니라 performLocalHumanApproval()
+ * 하나다(이 출력은 그 판정을 미리 보여주는 참고용일 뿐, 이 함수가 "승인 가능"이라고 표시해도
+ * performLocalHumanApproval()이 별도로 거부할 수 있다 — 이중 판정을 만들지 않는다).
+ */
+export function formatApprovalPreview(
+  manifest: Pick<ProjectManifest, "projectId" | "statePath">,
+  approvalStore: ApprovalStore,
+  approvalId: string,
+  taskId: string,
+  nowIso: string
+): string {
+  const lines: string[] = [
+    "Human Approval 확인 정보(읽기 전용 미리보기 — 이 출력만으로는 어떤 상태도 바뀌지 않습니다):",
+    `  project: ${manifest.projectId}`,
+    `  task(입력값): ${taskId}`,
+    `  approval id: ${approvalId}`,
+  ];
+  const approval = approvalStore.get(approvalId);
+  if (!approval) {
+    lines.push("  → 이 approvalId로 등록된 durable pending approval을 찾을 수 없습니다.");
+    return lines.join("\n");
+  }
+  lines.push(
+    `  approval.projectId: ${approval.projectId ?? "(없음)"}`,
+    `  approval.taskId: ${approval.taskId ?? "(없음)"}`,
+    `  approval type: ${approval.approvalType}`,
+    `  approval status: ${approval.status}`,
+    `  remotelyApprovable: ${approval.remotelyApprovable}`,
+    `  stale(만료됨): ${isApprovalExpired(approval, nowIso)}`
+  );
+  try {
+    const state = loadState(manifest.statePath);
+    lines.push(`  현재 project status: ${state.status}`);
+    // performLocalHumanApproval()이 실제로 매칭에 쓰는 것과 정확히 같은 판정(§
+    // human-gate-policy.ts isCheckpointBlockedMarker)만 재사용한다 — 별도 매칭 로직을 만들지
+    // 않는다. 파일 경로 등 이 marker 텍스트 자체는 secret이 아니다(오히려 CHECKPOINT_SCOPE_
+    // VIOLATION의 경우 사람이 반드시 봐야 하는 정보다, § 요구사항 10).
+    const marker = (state.deferredHumanTasks ?? []).find((m) => isCheckpointBlockedMarker(m) && m.startsWith(`CHECKPOINT_BLOCKED(${taskId}):`));
+    lines.push(`  approval reason(현재 blocker marker): ${marker ?? "(일치하는 marker 없음)"}`);
+  } catch (e) {
+    lines.push(`  현재 project status: 확인 불가(${e instanceof Error ? e.message : String(e)})`);
+  }
+  return lines.join("\n");
+}
+
 function usageAndExit(): never {
   console.error(
     [
@@ -166,12 +253,16 @@ function usageAndExit(): never {
       "  node dist/project-control-cli.js resume --project <adapterPath>",
       "  node dist/project-control-cli.js status --project <adapterPath>",
       "  node dist/project-control-cli.js stop --project <adapterPath>",
+      "  node dist/project-control-cli.js approve --project <adapterPath> --approval-id <id> --task <taskId> --approved-by <name>",
+      "      genuine Human Gate(예: CHECKPOINT_SCOPE_VIOLATION)의 이미 존재하는 durable pending",
+      "      approval을 승인합니다 — maintenance의 resume과는 완전히 다른 명령입니다. 새 approval을",
+      "      만들지 않으며, 이미 존재하는 정확한 approval-id/task가 현재 상태와 일치할 때만 승인됩니다.",
     ].join("\n")
   );
   process.exit(1);
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
   const adapterPath = parseArg(rest, "--project");
   if (!command || !adapterPath) usageAndExit();
@@ -215,6 +306,70 @@ function main(): void {
       );
       return;
     }
+    case "approve": {
+      // Genuine Human Gate Local Approval(§ 요구사항 0/16) — 이 CLI 실행 자체가 사람의 명시적
+      // approval action이다(§ 요구사항 6, "불필요한 두 번째 확인 UI를 새로 만들지 않는다" —
+      // 이 명령을 정확한 approval-id/task/approved-by와 함께 실행했다는 사실 자체가 승인
+      // 의사표시다, project-control-cli.js stop이 이미 확인 프롬프트 없이 동작하는 것과 동일한
+      // 기존 보안 모델). approvalId를 요구해 "현재 WAITING_HUMAN이면 무조건 승인" 형태를
+      // 구조적으로 막는다(§ 요구사항 6 명시 금지) — source of truth는 항상 durable
+      // ApprovalStore/project-state이고, 사용자가 입력한 값은 그것과 일치하는지 검증용으로만
+      // 쓰인다(performLocalHumanApproval 내부에서).
+      const approvalId = parseArg(rest, "--approval-id");
+      const taskId = parseArg(rest, "--task");
+      const approvedBy = parseArg(rest, "--approved-by");
+      if (!approvalId || !taskId || !approvedBy) {
+        console.error(
+          "[project-control] approve에는 --approval-id <id>, --task <taskId>, --approved-by <name>이 모두 필요합니다(단순 '현재 WAITING_HUMAN이면 승인'은 지원하지 않습니다)."
+        );
+        usageAndExit();
+      }
+
+      const manifest = loadProjectAdapter(adapterPath);
+      // 실제 파일 기반 store(§ 파일 상단 AUTOMATION_DRY_RUN/AUTODEV_PRODUCTION_RUNTIME 선언이
+      // 이를 보장한다) — 이 CLI가 승인 대상을 새로 만들지 않고 telegram-controller.ts의 tick
+      // (approval-service.ts createApprovalRequestsFromEvents)이 이미 만들어 둔 durable
+      // pending approval을 그대로 찾아 쓴다. AUTODEV_APPROVAL_STORE_PATH/AUTODEV_EVENT_LOG_PATH
+      // 는 테스트 전용 격리 override다(지정하지 않으면 selectDefaultApprovalStore/
+      // selectDefaultEventStore의 실제 운용 기본 경로 그대로) — approval-store.ts/
+      // event-store.ts에 이미 있던 선택적 filePath 매개변수를 그대로 쓸 뿐 새 저장 로직을
+      // 만들지 않는다.
+      const approvalStore = selectDefaultApprovalStore(process.env.AUTODEV_APPROVAL_STORE_PATH);
+      const eventStore = selectDefaultEventStore(process.env.AUTODEV_EVENT_LOG_PATH);
+
+      console.log(formatApprovalPreview(manifest, approvalStore, approvalId, taskId, new Date().toISOString()));
+
+      const result = await performLocalHumanApproval(
+        { approvalId, taskId, approvedBy },
+        { approvalStore, statePath: manifest.statePath, manifest, events: eventStore, cwd: manifest.targetProjectRoot }
+      );
+
+      if (result.kind === "REJECTED") {
+        console.log(`[project-control] Human Approval 거부됨(fail-closed) — reason=${result.reason}`);
+        console.log("[project-control] 어떤 상태도 변경되지 않았습니다(approval/project-state 모두 그대로입니다).");
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log("[project-control] Human Approval 승인 처리됨 — ApprovalStore: PENDING → APPROVED.");
+      if (result.outcome.kind === "COMPLETED") {
+        console.log(
+          `[project-control] Resume 실행 결과: outcome=${result.outcome.result.outcome}${result.outcome.result.reason ? `, reason=${result.outcome.result.reason}` : ""}`
+        );
+      } else {
+        console.log(`[project-control] Resume이 안전 재확인(Git/Project Lock/Remote Git Safety)에서 보류됨(BLOCKED) — reason=${result.outcome.reason}`);
+        console.log(
+          "[project-control] project-state.json은 READY로 전환되었습니다 — 다음 정상 실행(run.ts)이 이 task를 다시 안전하게 시도할 수 있습니다."
+        );
+      }
+      try {
+        const finalState = loadState(manifest.statePath);
+        console.log(`[project-control] 최종 project status=${finalState.status}`);
+      } catch (e) {
+        console.log(`[project-control] 최종 project status 확인 불가(${e instanceof Error ? e.message : String(e)})`);
+      }
+      return;
+    }
     default:
       usageAndExit();
   }
@@ -223,5 +378,8 @@ function main(): void {
 // require.main===module 가드 — 테스트가 이 파일을 import해도 실제 CLI가 자동으로 실행되지
 // 않는다(§ runner-supervisor.ts와 동일 관례).
 if (require.main === module) {
-  main();
+  main().catch((e) => {
+    console.error("[project-control] 처리되지 않은 오류로 종료:", e instanceof Error ? e.message : String(e));
+    process.exitCode = 1;
+  });
 }
