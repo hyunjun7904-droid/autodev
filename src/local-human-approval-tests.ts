@@ -16,6 +16,7 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ClaudeResult, CoreState } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
+import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 
 // Genuine Human Gate Local Approval 테스트(2026-08-29). 실제 Claude CLI/OpenAI API는
 // 호출하지 않는다 — orchestratorDeps는 항상 fake로 주입한다(§ auto-resume-tests.ts와
@@ -368,14 +369,49 @@ async function scenarioDuplicateApprovalRejected(): Promise<void> {
 
 // ---------------------------------------------------------------------------
 // 13) Genuine Human Gate가 아닌 것(기술적 자동 복구 대상)을 이 경로로 임의 승인할 수 없음.
+//
+// No-Safe-Recovery-Action Gate(2026-08-31)로 CHECKPOINT_SCOPE_VIOLATION은 더 이상 기술적
+// 자동 복구 대상이 아니다(§ human-gate-policy.ts — Developer/Reviewer 재시도로는 절대
+// 스스로 해결되지 않는다는 것이 확인됐다) — 그래서 이 대표 사례를, 이 정책 변경 이후에도
+// 여전히 기술적 자동 복구 대상으로 남아있는 REVIEW_CYCLE_EXHAUSTED_REASON 마커로 바꿨다
+// (이 시나리오가 검증하려는 것은 "기술적 자동 복구 대상은 이 경로로 승인할 수 없다"는
+// 불변식 그 자체이지 scope-violation이라는 구체적 예시가 아니다 — 그 불변식은 변하지
+// 않았다).
 // ---------------------------------------------------------------------------
 async function scenarioTechnicalAutoRecoverableCannotBeLocallyApproved(): Promise<void> {
   const root = makeGitRepo("local-approval-not-genuine-");
   const statePath = join(root, ".autodev", "project-state.json");
-  // CHECKPOINT_SCOPE_VIOLATION_REASON 마커 — human-gate-policy.ts가 기술적 자동 복구
-  // 대상으로 분류하는 대표 사례(§ classifyWaitingHumanReason).
   writeStateFile(statePath, {
-    deferredHumanTasks: ["CHECKPOINT_BLOCKED(T1): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다."],
+    deferredHumanTasks: [`${REVIEW_CYCLE_EXHAUSTED_REASON}: 재현된 required test 실패`],
+  });
+  const manifest = buildManifest(root, statePath);
+  const approvalStore = createInMemoryApprovalStore();
+  const approval = baseApproval({ approvalType: "REVIEW_CYCLE_EXHAUSTED", sourceEventType: "HUMAN_APPROVAL_REQUIRED" });
+  approvalStore.createPending(approval);
+
+  const result = await performLocalHumanApproval(
+    { approvalId: approval.approvalId, taskId: "T1", approvedBy: "local-operator" },
+    { approvalStore, statePath, manifest }
+  );
+  check(
+    "13) 기술적 자동 복구 대상(REVIEW_CYCLE_EXHAUSTED)은 이 경로로 임의 승인할 수 없음(NOT_A_GENUINE_HUMAN_GATE)",
+    result.kind === "REJECTED" && result.reason === "NOT_A_GENUINE_HUMAN_GATE"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 13-c) No-Safe-Recovery-Action Gate(2026-08-31) — CHECKPOINT_SCOPE_VIOLATION은 이제 genuine
+// 이므로, 사람이 실제로 로컬에서 파일을 확인/처리한 뒤에는 이 경로로 정상 승인·Resume까지
+// 이어져야 한다(§ 요구사항 시나리오 B — "외부에서 실제로 상태가 변경되면 재개 가능"). Auto
+// Resume의 Git Safety recheck까지는 이 fixture가 별도로 구성하지 않으므로 AUTO_RESUME_BLOCKED
+// (Git divergence 등)로 끝나는 것은 정상이다 — 여기서 검증하려는 것은 오직 "ApprovalStore
+// 전이 자체가 실제로 시작된다"(=NOT_A_GENUINE_HUMAN_GATE로 거부되지 않는다)는 것뿐이다.
+// ---------------------------------------------------------------------------
+async function scenarioCheckpointScopeViolationCanBeLocallyApproved(): Promise<void> {
+  const root = makeGitRepo("local-approval-scope-violation-genuine-");
+  const statePath = join(root, ".autodev", "project-state.json");
+  writeStateFile(statePath, {
+    deferredHumanTasks: ["CHECKPOINT_BLOCKED(T1): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다. — unexpected: other/leftover.txt"],
   });
   const manifest = buildManifest(root, statePath);
   const approvalStore = createInMemoryApprovalStore();
@@ -387,9 +423,12 @@ async function scenarioTechnicalAutoRecoverableCannotBeLocallyApproved(): Promis
     { approvalStore, statePath, manifest }
   );
   check(
-    "13) 기술적 자동 복구 대상(scope violation)은 이 경로로 임의 승인할 수 없음(NOT_A_GENUINE_HUMAN_GATE)",
-    result.kind === "REJECTED" && result.reason === "NOT_A_GENUINE_HUMAN_GATE"
+    "13-c) CHECKPOINT_SCOPE_VIOLATION은 이제 genuine이므로 NOT_A_GENUINE_HUMAN_GATE로 거부되지 않음(ApprovalStore 전이 시작됨)",
+    !(result.kind === "REJECTED" && result.reason === "NOT_A_GENUINE_HUMAN_GATE")
   );
+  check("13-c) 실제로 RESUMED 경로를 탐(승인 자체는 소비됨)", result.kind === "RESUMED");
+  const approvalAfter = approvalStore.get(approval.approvalId);
+  check("13-c) ApprovalStore 상태가 APPROVED로 전이됨", approvalAfter?.status === "APPROVED");
 }
 
 async function scenarioRemotelyApprovableTrueRejectedByLocalPath(): Promise<void> {
@@ -508,6 +547,7 @@ async function main(): Promise<void> {
     await scenarioMismatchedBlockReasonRejected();
     await scenarioDuplicateApprovalRejected();
     await scenarioTechnicalAutoRecoverableCannotBeLocallyApproved();
+    await scenarioCheckpointScopeViolationCanBeLocallyApproved();
     await scenarioRemotelyApprovableTrueRejectedByLocalPath();
     await scenarioRemotePathStillCompletesNormally();
     scenarioCreateFreshRequestForCurrentGenuineBlock();

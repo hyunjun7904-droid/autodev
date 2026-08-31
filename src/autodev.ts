@@ -66,7 +66,7 @@ import { log } from "./logger";
 import { getWorkingTreeChanges } from "./git-changes";
 import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
-import { isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles, isNonScopeCheckpointBlockMarker } from "./human-gate-policy";
+import { isTechnicalAutoRecoverableWaitingHuman, isCheckpointBlockedMarker } from "./human-gate-policy";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
 // manifest.taskRegistry 데이터) → Claude 실제 개발 → targeted tests(AutoDev가 직접
@@ -919,17 +919,6 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       saveState(state, statePath);
     }
 
-    // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — 아래 canonical Human Gate 재검사가
-    // CHECKPOINT_SCOPE_VIOLATION 기술적 WAITING_HUMAN을 복구할 때, deferredHumanTasks를
-    // 비우기 "전에" 그 마커에 이미 담겨 있던 checkpoint.unexpectedFiles 목록을 여기 보존한다
-    // — 이 목록은 GPT Reviewer가 보고하지 않는(Core checkpoint 자체의 독립 판정) 범위 밖
-    // 파일이라 Phase 7 정리(§ 아래, state.lastGptDecision.scopeViolations 기준)가 원래
-    // 감지하지 못한다. 이 값이 비어 있으면(REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED 등 다른
-    // 기술적 복구였거나 애초에 CHECKPOINT_BLOCKED가 아니었으면) Phase 7 정리는 기존과 동일하게
-    // lastGptDecision.scopeViolations만 본다 — 이 변수는 그 기존 대상 목록을 넓히기만 할
-    // 뿐 대체하지 않는다.
-    let checkpointBlockedLeftoverFiles: string[] = [];
-
     // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening Phase 5 —
     // Stale REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN Reconciliation. decideNextAction()
     // 은 순수 함수로 유지한다(§ 그 함수 상단 주석 — state만 보고 부수효과 없이 판단, 독립
@@ -997,14 +986,19 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 해소했다면(reconciliation.resolved) state.status는 이미 "READY"이므로 이 블록은
     // 자연히 아무 것도 하지 않는다(중복 판정 없음). humanFinalReview가 있으면
     // classifyWaitingHumanReason() 자체가 항상 GENUINE_HUMAN_JUDGMENT를 반환하므로 그
-    // gate는 여기서도 절대 건드리지 않는다(§ human-gate-policy.ts). CHECKPOINT_SCOPE_VIOLATION/
-    // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED로 저장된 WAITING_HUMAN만 READY로 되돌린다 —
-    // state.lastGptDecision/lastClaudeResult는 그대로 보존하므로, 아래(§ Phase 6/7)
-    // previousAttemptResult 시딩과 scope-violation leftover 정리가 이어서 정상 동작한다
-    // (이 블록은 새 정리 로직을 추가하지 않는다 — 기존 Phase 6/7 로직을 그대로 재사용).
+    // gate는 여기서도 절대 건드리지 않는다(§ human-gate-policy.ts).
+    //
+    // No-Safe-Recovery-Action Gate(2026-08-31) — CHECKPOINT_SCOPE_VIOLATION은 더 이상 여기서
+    // READY로 되돌아가지 않는다(human-gate-policy.ts가 이제 genuine으로 분류한다 — Developer/
+    // Reviewer를 아무리 재시도해도 이 파일은 절대 사라지지 않는다는 것이 확인됐기 때문에,
+    // provider/API를 다시 호출하는 대신 즉시 사람 판단 상태로 남긴다). REVIEW_CYCLE_EXHAUSTED/
+    // REVIEW_BLOCKED로 저장된 WAITING_HUMAN만 READY로 되돌린다 — state.lastGptDecision/
+    // lastClaudeResult는 그대로 보존하므로, 아래(§ Phase 6/7) previousAttemptResult 시딩과
+    // scope-violation leftover 정리(§ 아래 — 이제는 항상 lastGptDecision.scopeViolations만
+    // 본다, Core checkpoint 자신의 독립 판정 목록은 genuine 경로로 넘어가 여기 도달하지 않음)가
+    // 이어서 정상 동작한다.
     if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
       if (isTechnicalAutoRecoverableWaitingHuman(state)) {
-        checkpointBlockedLeftoverFiles = extractCheckpointScopeViolationFiles(state.deferredHumanTasks);
         console.log(
           `[autodev] 기술적 WAITING_HUMAN을 재검사했습니다 — 실제 사람 판단이 필요한 사유가 아니므로 Telegram 승인 없이 자동 복구합니다.`
         );
@@ -1431,16 +1425,19 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 멈춘다(§ continuous-runner.ts DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS — 이미 존재하는
     // 별도 bound, 이 블록이 새로 만들지 않는다).
     //
-    // 두 후보 출처(GPT Reviewer 자신이 보고한 scopeViolations, Core checkpoint 자신의
-    // 독립 판정 checkpointBlockedLeftoverFiles)는 여전히 그대로 합쳐 로그 목적으로만 쓴다 —
-    // 어느 쪽도 "AutoDev가 이 파일을 만들었다"를 증명하지 않는다는 점에서 동등하게 다룬다
-    // (한쪽만 더 신뢰할 근거가 없다).
+    // No-Safe-Recovery-Action Gate(2026-08-31) — Core checkpoint 자신의 독립 scope-violation
+    // 판정(CHECKPOINT_SCOPE_VIOLATION_REASON)은 이제 genuine으로 분류되어(§
+    // human-gate-policy.ts) 이 reconcile 블록 자체에 절대 도달하지 않는다 — 그래서 여기서는
+    // GPT Reviewer 자신이 BLOCK 판정과 함께 보고한 scopeViolations만 후보로 쓴다(코드 품질
+    // 등 다른 이유로 여전히 기술적 자동 복구 대상인 BLOCK decision에 곁다리로 딸려온 out-of-
+    // scope 목록 — 이 목록의 파일도 "AutoDev가 만들었다"를 증명하지 못하는 것은 동일하므로
+    // 여전히 삭제하지 않고 로그만 남긴다).
     const lastGptDecisionForCleanup = state.lastGptDecision as (typeof state.lastGptDecision & { scopeViolations?: string[] }) | null;
     const gptReportedScopeViolations =
       lastGptDecisionForCleanup && lastGptDecisionForCleanup.decision !== "PASS" && lastGptDecisionForCleanup.scopeViolations
         ? lastGptDecisionForCleanup.scopeViolations
         : [];
-    const cleanupCandidates = Array.from(new Set([...gptReportedScopeViolations, ...checkpointBlockedLeftoverFiles]));
+    const cleanupCandidates = Array.from(new Set(gptReportedScopeViolations));
     if (cleanupCandidates.length > 0) {
       const currentUntracked = new Set(getWorkingTreeChanges([], executorContext.projectRoot).untracked.map((c) => c.path));
       const stillPresentOutOfScope = cleanupCandidates.filter(
@@ -2354,19 +2351,15 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     const isSecurityGate = (checkpoint.secretFindings?.length ?? 0) > 0 || checkpoint.dependencyScanVerdict === "BLOCK";
     // § BLOCKER 2 재하드닝(독립 최종 감사) — 아래에서 실제로 state.deferredHumanTasks에
     // 저장하는 것과 정확히 같은 marker 문자열을 여기서 미리 계산해, human-gate-policy.ts의
-    // canonical isNonScopeCheckpointBlockMarker()(§ 그 함수 docstring — "이 파일의 기존
-    // 분류 로직을 복제하지 않고 export만 추가")로 이 checkpoint 실패가 실제로 genuine인지
-    // 재사용해 판정한다. checkpoint.reason이 정확히 CHECKPOINT_SCOPE_VIOLATION_REASON이면
-    // (allowedPathPrefixes 밖 예상치 못한 변경만으로 막힌, Secret/Dependency 문제 없는
-    // 경우) classifier가 이미 이를 기술적 자동 복구 대상으로 분류하므로(§ autodev.ts의
-    // WAITING_HUMAN 자동 복구 블록이 실제로 이 marker를 인식해 다음 실행에서 사람 승인 없이
-    // READY로 되돌린다), 이 event의 humanInterventionRequired도 그와 일치시킨다 — 이전
-    // 버전은 이 case에도 무조건 true였다("Reviewer BLOCK/HUMAN_REQUIRED가 일괄
-    // humanInterventionRequired=true가 될 수 있음"과 동일한 오분류 패턴).
+    // canonical isCheckpointBlockedMarker()로 이 checkpoint 실패가 실제로 genuine인지
+    // 재사용해 판정한다. No-Safe-Recovery-Action Gate(2026-08-31) 이후로는 CHECKPOINT_BLOCKED
+    // 마커는 이유(Secret/Dependency든 scope violation이든)와 무관하게 전부 genuine이다 —
+    // Developer/Reviewer 재시도로는 어느 쪽도 스스로 해결되지 않기 때문이다(scope violation:
+    // Developer에게 삭제 action이 없음, Secret/Dependency: 애초에 보안 판단이 필요함).
     const checkpointBlockedMarker =
       `CHECKPOINT_BLOCKED(${taskDef.id}): ${checkpoint.reason}` +
       (checkpoint.unexpectedFiles?.length ? ` — unexpected: ${checkpoint.unexpectedFiles.join(", ")}` : "");
-    const isGenuineCheckpointBlock = isSecurityGate || isNonScopeCheckpointBlockMarker(checkpointBlockedMarker);
+    const isGenuineCheckpointBlock = isSecurityGate || isCheckpointBlockedMarker(checkpointBlockedMarker);
     emitEvent(
       events,
       {

@@ -61,9 +61,18 @@ function scenarioReviewBlockedDecisionIsTechnical(): void {
   check("lastGptDecision.decision=HUMAN_REQUIRED → TECHNICAL_AUTO_RECOVERABLE", classifyWaitingHumanReason(s2) === "TECHNICAL_AUTO_RECOVERABLE");
 }
 
-function scenarioCheckpointScopeViolationIsTechnical(): void {
+// No-Safe-Recovery-Action Gate(2026-08-31) — Positive-Provenance-Only Auto-Delete Policy
+// (a490700)로 scope-violation leftover 자동 삭제가 완전히 제거된 이후로는, Developer/
+// Reviewer를 아무리 재시도해도 이 blocker는 스스로 해결되지 않는다(Developer에게 삭제
+// action이 없고, 그 경로 밖 파일이라 WRITE_FILE로도 지울 수 없다) — 그래서 더 이상
+// TECHNICAL_AUTO_RECOVERABLE이 아니라 GENUINE_HUMAN_JUDGMENT다(§ 요구사항: "실제 파일
+// 삭제/보존 판단처럼 사용자 판단이 필요한 경우"). 이 시나리오 이름/기대값을 새 정책에 맞게
+// 뒤집었다 — 기존 이름(...IsTechnical)이 그대로 남아있으면 오히려 이 재분류가 실수인 것처럼
+// 오해될 수 있어 이름도 함께 바꿨다.
+function scenarioCheckpointScopeViolationIsGenuine(): void {
   const s = state({ deferredHumanTasks: [`CHECKPOINT_BLOCKED(T1): ${CHECKPOINT_SCOPE_VIOLATION_REASON} — unexpected: other/x.txt`] });
-  check("CHECKPOINT_BLOCKED + scope-violation 이유 → TECHNICAL_AUTO_RECOVERABLE", classifyWaitingHumanReason(s) === "TECHNICAL_AUTO_RECOVERABLE");
+  check("CHECKPOINT_BLOCKED + scope-violation 이유 → GENUINE_HUMAN_JUDGMENT(No-Safe-Recovery-Action Gate)", classifyWaitingHumanReason(s) === "GENUINE_HUMAN_JUDGMENT");
+  check("isTechnicalAutoRecoverableWaitingHuman()도 동일하게 false", isTechnicalAutoRecoverableWaitingHuman(s) === false);
 }
 
 function scenarioCheckpointBlockedOtherReasonIsGenuine(): void {
@@ -266,7 +275,7 @@ function main(): void {
   scenarioHumanFinalReviewGateAlwaysGenuine();
   scenarioReviewCycleExhaustedIsTechnical();
   scenarioReviewBlockedDecisionIsTechnical();
-  scenarioCheckpointScopeViolationIsTechnical();
+  scenarioCheckpointScopeViolationIsGenuine();
   scenarioCheckpointBlockedOtherReasonIsGenuine();
   scenarioKnownGenuineMarkersStayGenuineEvenWithTechnicalSignal();
   scenarioDeveloperTransientRetryExhaustedIsTechnical();

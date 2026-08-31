@@ -17,6 +17,7 @@ import {
   PROJECT_LOCK_SCHEMA_VERSION,
 } from "./project-lock";
 import type { ProjectLockMetadata } from "./project-lock";
+import { classifyWaitingHumanReason } from "./human-gate-policy";
 
 // Generic Continuous Runner(continuous-runner.ts) 전용 회귀 테스트.
 //
@@ -209,72 +210,56 @@ async function scenarioHumanFinalReviewPendingStopsImmediately(): Promise<void> 
 }
 
 // ---------------------------------------------------------------------------
-// E — AutoDev / JARVIS 신뢰성 보완(2026-08-27) — checkpoint가 scope violation(허용 경로 밖
-// 변경)으로 BLOCK되면, 이는 canonical Human Gate Policy상 기술적 자동 복구 대상이다(§
-// human-gate-policy.ts) — Telegram 승인 없이 continuous runner가 스스로 재시도한다.
+// E — AutoDev / JARVIS 신뢰성 보완(2026-08-27) 도입 당시에는 checkpoint scope violation이
+// canonical Human Gate Policy상 기술적 자동 복구 대상이었다 — Telegram 승인 없이 continuous
+// runner가 스스로 재시도했다(그때는 자동 삭제가 leftover를 지워 실제로 매끄럽게 통과했다).
 //
-// Positive-Provenance-Only Auto-Delete Policy(2026-08-31) 이후로 갱신 — "재시도가 leftover를
-// 자동으로 지워서 매끄럽게 통과한다"는 예전 전제는 더 이상 성립하지 않는다(§ autodev.ts에서
-// scope-violation 자동 삭제 자체를 제거함 — AutoDev는 이 저장소 어디에도 "이 파일을 내가
-// 만들었다"를 증명할 durable action log가 없다). leftover 파일은 그대로 남고, checkpoint는
-// 매 재시도마다 정직하게 다시 BLOCK된다 — Telegram 승인은 계속 필요 없지만(기술적 자동복구
-// 분류 자체는 유지), 진짜 진척(CONTINUABLE_OUTCOME)이 전혀 없으므로
-// continuous-runner.ts의 별도 bound(technicalRecoveryCount → TECHNICAL_RECOVERY_LIMIT_REACHED,
-// § DEFAULT_MAX_TECHNICAL_RECOVERY_ATTEMPTS)가 결국 이 loop를 멈춘다(무한 루프 아님). T2/T3는
-// 전혀 실행되지 않는다 — 이것이 이제는 안전이 무인화보다 우선한다는 정책의 의도된 결과다.
+// No-Safe-Recovery-Action Gate(2026-08-31) 이후로 완전히 갱신 — Positive-Provenance-Only
+// Auto-Delete Policy(a490700)로 자동 삭제 자체가 제거되면서 "재시도하면 스스로 풀린다"는
+// 전제가 깨졌다는 것이 확인됐다(§ 요구사항 조사 1/2). Developer에게는 애초에 파일 삭제
+// action이 없고, leftover는 이미 allowedPathPrefixes 밖이라 WRITE_FILE로도 지울 수 없으므로
+// — 이 blocker는 Developer/Reviewer를 몇 번을 재시도해도 절대 사라지지 않는 결정론적
+// blocker다. 그래서 CHECKPOINT_SCOPE_VIOLATION은 이제 genuine으로 재분류됐다(§
+// human-gate-policy.ts) — continuous-runner.ts는 그 결과 이 task를 단 한 번도 재시도하지
+// 않고 즉시 멈춘다(§ 요구사항 시나리오 A — "동일 Developer/API 호출 반복 금지 → 빠르게
+// terminal/user-decision 상태"). T2/T3는 전혀 실행되지 않는다 — 안전이 무인화보다 우선한다는
+// 정책의 의도된 결과다.
 // ---------------------------------------------------------------------------
-async function scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApprovalButNeverAutoDeletes(): Promise<void> {
+async function scenarioCheckpointScopeViolationStopsImmediatelyWithoutRetry(): Promise<void> {
   const repo = makeTempGitRepo();
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
-  const maxTechnicalRecoveryAttempts = 2; // 테스트를 빠르게 끝내기 위한 작은 bound(기본값 50).
 
   const calls: string[] = [];
-  let firstAttemptDone = false;
   const claudeRunner = async (task: string): Promise<ClaudeResult> => {
     calls.push(task);
-    if (!firstAttemptDone) {
-      firstAttemptDone = true;
-      writeRepoFile(repo, "other/unexpected.txt", "허용 경로 밖 변경(1차 시도)");
-      return {
-        success: true,
-        summary: "테스트: 허용 경로 밖 변경(1차 시도)",
-        changedFiles: ["other/unexpected.txt"],
-        tests: [{ name: "proj:check", pass: true }],
-        rawOutput: "",
-      };
-    }
-    // 이후 시도들은 스스로는 정상적으로 동작한다(같은 실수를 반복하지 않는다) — 그래도
-    // other/unexpected.txt는 이전 시도가 만든 채로 그대로 남아있어 매번 다시 scope
-    // violation을 유발한다는 것을 보이기 위함(정리되지 않는 한 계속 BLOCK).
-    const fileName = `proj/marker-${calls.length}.txt`;
-    writeRepoFile(repo, fileName, task);
-    return { success: true, summary: `테스트: ${task} 완료`, changedFiles: [fileName], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+    writeRepoFile(repo, "other/unexpected.txt", "허용 경로 밖 변경(1차 시도)");
+    return {
+      success: true,
+      summary: "테스트: 허용 경로 밖 변경(1차 시도)",
+      changedFiles: ["other/unexpected.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
   };
 
   const result = await runAutodevContinuous({
     manifest,
     orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() },
-    maxTechnicalRecoveryAttempts,
   });
 
-  check("E) 1차 시도: outcome=RAN_TASK_CHECKPOINT_BLOCKED(기술적, scope violation)", result.iterations[0].result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check("E) 1차 시도: outcome=RAN_TASK_CHECKPOINT_BLOCKED(scope violation)", result.iterations[0].result.outcome === "RAN_TASK_CHECKPOINT_BLOCKED");
+  check("E) 단 1회 iteration만 실행됨(재시도 없음, 즉시 STOP)", result.iterations.length === 1);
+  check("E) Developer가 정확히 1회만 호출됨(API/Developer 재호출 없음)", calls.length === 1);
   check(
-    "E) 이후 모든 재시도도 leftover 때문에 다시 BLOCK됨(삭제로 매끄럽게 통과하지 않음, APPROVED_AND_CHECKPOINTED가 한 번도 없음)",
-    result.iterations.every((it) => it.result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED")
+    "E) stop.kind=OUTCOME_STOP(TECHNICAL_RECOVERY_LIMIT_REACHED로 50회 소진하는 구조가 아님)",
+    result.stop.kind === "OUTCOME_STOP" && result.stop.outcome === "RAN_TASK_CHECKPOINT_BLOCKED"
   );
-  check("E) leftover(허용 경로 밖 파일)가 끝까지 삭제되지 않고 그대로 남음", existsSync(join(repo, "other", "unexpected.txt")));
-  check(
-    "E) Telegram 승인 없이 재시도는 계속됨(기술적 자동복구 분류 자체는 유지) — Developer가 매 iteration마다 실제로 재호출됨",
-    calls.length === result.iterations.length
-  );
-  check(
-    "E) 진짜 진척이 전혀 없으므로 결국 TECHNICAL_RECOVERY_LIMIT_REACHED로 멈춤(무한 루프 아님)",
-    result.stop.kind === "TECHNICAL_RECOVERY_LIMIT_REACHED" && result.stop.maxTechnicalRecoveryAttempts === maxTechnicalRecoveryAttempts
-  );
+  check("E) leftover(허용 경로 밖 파일)가 삭제되지 않고 그대로 남음", existsSync(join(repo, "other", "unexpected.txt")));
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
   check("E) T2/T3는 전혀 실행되지 않음(completedTasks가 비어있음)", finalState.completedTasks.length === 0);
-  check("E) 최종 status=WAITING_HUMAN(사람이 leftover를 직접 처리해야 함 — 이 정책의 의도된 결과)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check("E) 최종 status=WAITING_HUMAN(즉시 명확한 사용자 판단 상태로 전환됨)", (finalState.status as unknown as string) === "WAITING_HUMAN");
+  check("E) GENUINE_HUMAN_JUDGMENT로 분류됨(기술적 자동 복구 대상 아님)", classifyWaitingHumanReason(finalState) === "GENUINE_HUMAN_JUDGMENT");
 }
 
 // ---------------------------------------------------------------------------
@@ -344,15 +329,29 @@ async function scenarioTechnicalRecoveryLimitStopsRunawayRetries(): Promise<void
   const statePath = makeTempStateFile(repo, { completedTasks: [] });
   const manifest = buildManifest(repo, statePath);
 
+  // Positive-Provenance-Only Auto-Delete Policy(a490700) + No-Safe-Recovery-Action
+  // Gate(2026-08-31) 이후로 CHECKPOINT_SCOPE_VIOLATION은 genuine이 되어(더 이상 매 runAutodevOnce
+  // 호출마다 outer loop 수준에서 조용히 재조정되지 않는다) 이 시나리오의 원래 fixture로는
+  // 더 이상 "outer-level technicalRecoveryCount 상한" 자체를 격리해 검증할 수 없다 — 그
+  // fixture는 이제 §9-D/E(autodev-tests.ts)/E(continuous-runner-tests.ts)가 검증하는 "즉시
+  // genuine으로 전환되어 재시도 자체를 안 한다"는 다른(그리고 더 안전한) 동작을 보여준다.
+  // 대신 GPT Reviewer 자신의 BLOCK 판정(hasReviewBlocked — 이번 정책 변경과 무관하게 여전히
+  // TECHNICAL_AUTO_RECOVERABLE, § human-gate-policy.ts)을 매번 반환하도록 해 "내부 REVISE
+  // 루프 없이 매 runAutodevOnce 호출마다 곧바로 WAITING_HUMAN(기술적)으로 끝나고, 다음 호출이
+  // 그걸 재조정해 다시 시도하는" 순수 outer-loop 반복을 재현한다.
   const claudeRunner = async (): Promise<ClaudeResult> => {
-    // 항상 허용 경로 밖에만 써서 매번 CHECKPOINT_SCOPE_VIOLATION(기술적)으로 끝나게 한다 —
-    // 실제로는 있을 수 없는 "영원히 고쳐지지 않는 버그"를 흉내낸다.
-    writeRepoFile(repo, "other/always-wrong.txt", `attempt-${Date.now()}-${Math.random()}`);
-    return { success: true, summary: "테스트: 항상 허용 경로 밖 변경", changedFiles: ["other/always-wrong.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+    writeRepoFile(repo, "proj/marker.txt", `attempt-${Date.now()}-${Math.random()}`);
+    return { success: true, summary: "테스트: Reviewer가 항상 BLOCK", changedFiles: ["proj/marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
+  const gptReviewer = async (): Promise<GptReviewerReturn> => ({
+    decision: "BLOCK",
+    severity: { critical: 0, high: 0, medium: 1 },
+    feedback: "테스트: 항상 BLOCK(영원히 고쳐지지 않는 코드 품질 문제를 흉내냄)",
+    nextTask: null,
+  });
 
   const result = await runAutodevContinuous(
-    { manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() }, maxTechnicalRecoveryAttempts: 3 },
+    { manifest, orchestratorDeps: { claudeRunner, gptReviewer }, maxTechnicalRecoveryAttempts: 3 },
     {}
   );
 
@@ -555,7 +554,7 @@ async function main(): Promise<void> {
     await scenarioMultiTaskContinuousToProjectComplete();
     await scenarioWaitingHumanStopsImmediately();
     await scenarioHumanFinalReviewPendingStopsImmediately();
-    await scenarioCheckpointScopeViolationAutoRecoversWithoutHumanApprovalButNeverAutoDeletes();
+    await scenarioCheckpointScopeViolationStopsImmediatelyWithoutRetry();
     await scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetry();
     await scenarioTechnicalRecoveryLimitStopsRunawayRetries();
     await scenarioSecretScannerBlockStopsImmediately();

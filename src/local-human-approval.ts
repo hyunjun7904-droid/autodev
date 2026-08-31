@@ -9,7 +9,7 @@ import type { AutoDevEvent } from "./observability-event";
 import type { OrchestratorDeps } from "./orchestrator";
 import { resumeApprovedTask } from "./auto-resume";
 import type { AutoResumeOutcome } from "./auto-resume";
-import { classifyWaitingHumanReason, isNonScopeCheckpointBlockMarker } from "./human-gate-policy";
+import { classifyWaitingHumanReason, isCheckpointBlockedMarker } from "./human-gate-policy";
 
 // Genuine Human Gate Local Approval — AutoDev Core 구조적 결함 수정(2026-08-29).
 //
@@ -130,20 +130,23 @@ export async function performLocalHumanApproval(
     return { kind: "REJECTED", reason: "NOT_A_GENUINE_HUMAN_GATE" };
   }
 
-  // deferredHumanTasks 안에서 "이 taskId의, scope-violation이 아닌 CHECKPOINT_BLOCKED
-  // 마커"를 찾는다 — SECURITY_BLOCKED(Secret/Dependency Scanner Gate)와 그 외 checkpoint
-  // 차단(scope-violation 제외)이 실제로 쓰는 마커 형식과 정확히 같다(§ autodev.ts checkpoint
-  // 실패 분기, human-gate-policy.ts isNonScopeCheckpointBlockMarker). 이 마커가 없으면
-  // "지금 실제로 막혀 있는 사유"와 이 ApprovalRequest가 대응하지 않는다는 뜻이므로 승인하지
-  // 않는다(§ 요구사항 5 "현재 차단 사유와 ApprovalRequest가 일치").
+  // deferredHumanTasks 안에서 "이 taskId의 CHECKPOINT_BLOCKED 마커"를 찾는다 —
+  // SECURITY_BLOCKED(Secret/Dependency Scanner Gate)와 CHECKPOINT_SCOPE_VIOLATION(No-Safe-
+  // Recovery-Action Gate, 2026-08-31 이후 이 마커도 genuine이다)이 실제로 쓰는 마커 형식과
+  // 정확히 같다(§ autodev.ts checkpoint 실패 분기, human-gate-policy.ts
+  // isCheckpointBlockedMarker). 도입 당시(2026-08-29)에는 scope-violation이 아직 기술적
+  // 자동 복구 대상이라 이 매칭에서 명시적으로 제외했었지만, 이제는 CHECKPOINT_BLOCKED 마커가
+  // 전부 genuine이므로 제외할 이유가 없다. 이 마커가 없으면 "지금 실제로 막혀 있는 사유"와
+  // 이 ApprovalRequest가 대응하지 않는다는 뜻이므로 승인하지 않는다(§ 요구사항 5 "현재 차단
+  // 사유와 ApprovalRequest가 일치").
   //
-  // 현재 지원 범위: CHECKPOINT_BLOCKED 계열(SECURITY_BLOCKED 등)만 정확히 마커 매칭한다.
-  // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED 등 다른 genuine 마커 형식으로의 확장은 이번
-  // 변경 범위 밖이다(필요한 최소 변경 원칙) — 지원하지 않는 approvalType은 아래에서
-  // 명시적으로 거부되며 추측하지 않는다.
+  // 현재 지원 범위: CHECKPOINT_BLOCKED 계열(SECURITY_BLOCKED/scope violation 등)만 정확히
+  // 마커 매칭한다. REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED 등 다른 genuine 마커 형식으로의
+  // 확장은 이번 변경 범위 밖이다(필요한 최소 변경 원칙) — 지원하지 않는 approvalType은
+  // 아래에서 명시적으로 거부되며 추측하지 않는다.
   const checkpointBlockedPrefix = `CHECKPOINT_BLOCKED(${input.taskId}):`;
   const matchingMarker = (state.deferredHumanTasks ?? []).find(
-    (m) => isNonScopeCheckpointBlockMarker(m) && m.startsWith(checkpointBlockedPrefix)
+    (m) => isCheckpointBlockedMarker(m) && m.startsWith(checkpointBlockedPrefix)
   );
   if (!matchingMarker) {
     return { kind: "REJECTED", reason: "NO_MATCHING_BLOCK_MARKER_FOR_TASK" };
@@ -280,7 +283,7 @@ export function createFreshLocalApprovalRequest(
   }
   const checkpointBlockedPrefix = `CHECKPOINT_BLOCKED(${taskId}):`;
   const matchingMarker = (state.deferredHumanTasks ?? []).find(
-    (m) => isNonScopeCheckpointBlockMarker(m) && m.startsWith(checkpointBlockedPrefix)
+    (m) => isCheckpointBlockedMarker(m) && m.startsWith(checkpointBlockedPrefix)
   );
   if (!matchingMarker) {
     return { kind: "REJECTED", reason: "NO_MATCHING_BLOCK_MARKER_FOR_TASK" };

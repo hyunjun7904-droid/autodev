@@ -609,11 +609,16 @@ async function runStaleWaitingHumanReconciliationCheck(): Promise<void> {
 // Run F — Positive-Provenance-Only Auto-Delete Policy(2026-08-31). Developer가 실수로
 // allowedPathPrefixes 밖에 파일을 하나 만들면(attempt 1), 그 leftover는 이후 attempt에서도
 // 지워지지 않는다(Developer에게 삭제 action이 없고, AutoDev도 자신이 만들었다고 증명할 방법이
-// 없어 자동 삭제하지 않는다 — § task-change-baseline.ts/autodev.ts 상단 주석). 이 Run은 그
-// 결과로 이 task가 (1) 무한 루프에 빠지지 않고 bounded하게 멈추는지, (2) 억지로
-// completedTasks에 들어가지 않는지, (3) leftover 파일이 끝까지 디스크에 남아있고 절대
-// commit되지 않는지를 직접 검증한다 — 이것이 "무인화보다 안전을 우선한다"는 정책의 실제
-// 관측 가능한 결과다.
+// 없어 자동 삭제하지 않는다 — § task-change-baseline.ts/autodev.ts 상단 주석).
+//
+// No-Safe-Recovery-Action Gate(2026-08-31) — 처음에는 이 blocker가 continuous-runner.ts의
+// technicalRecoveryCount 상한(50)까지 조용히 재시도될 수 있다는 것도 함께 확인됐다(§ 요구사항
+// 조사) — Developer/Reviewer 재시도로는 이 blocker가 절대 스스로 풀리지 않는다는 것이 이미
+// 구조적으로 확인된 상태에서, 그 50회까지 API를 낭비하는 것은 무의미하다. 그래서
+// CHECKPOINT_SCOPE_VIOLATION은 이제 genuine으로 재분류됐다(§ human-gate-policy.ts) — 이 Run은
+// 그 결과로 이 task가 (1) 재시도를 단 한 번도 하지 않고 즉시 멈추는지(무인화보다 안전을
+// 우선), (2) 억지로 completedTasks에 들어가지 않는지, (3) leftover 파일이 끝까지 디스크에
+// 남아있고 절대 commit되지 않는지를 직접 검증한다.
 // ---------------------------------------------------------------------------
 async function runScopeViolationNeverAutoResolvesCheck(): Promise<void> {
   const root = makeSimRepo("autodev-sim-scope-violation-");
@@ -671,22 +676,22 @@ async function runScopeViolationNeverAutoResolvesCheck(): Promise<void> {
     };
   };
 
-  const maxTechnicalRecoveryAttempts = 3; // 테스트를 빠르게 끝내기 위한 작은 bound(기본값 50).
   const result = await runAutodevContinuous({
     manifest,
     orchestratorDeps: { claudeRunner, gptReviewer, now: fakeNow, sleep: fakeSleep },
-    maxTechnicalRecoveryAttempts,
   });
   const finalState = readState(statePath);
 
+  check("Run F) 단 1회 iteration만 실행됨(재시도 없이 즉시 STOP)", result.iterations.length === 1);
+  check("Run F) Developer가 정확히 1회만 호출됨(scope violation 발견 이후 재호출 없음)", attemptNo === 1);
   check(
-    `Run F) leftover가 끝까지 자동 정리되지 않으므로 결국 TECHNICAL_RECOVERY_LIMIT_REACHED로 bounded하게 멈춤(무한 루프 아님, maxTechnicalRecoveryAttempts=${maxTechnicalRecoveryAttempts})`,
-    result.stop.kind === "TECHNICAL_RECOVERY_LIMIT_REACHED"
+    "Run F) stop.kind=OUTCOME_STOP(TECHNICAL_RECOVERY_LIMIT_REACHED로 50회를 소진하는 구조가 아님)",
+    result.stop.kind === "OUTCOME_STOP"
   );
   check("Run F) F1이 completedTasks에 절대 들어가지 않음(억지 승인 없음)", !finalState.completedTasks.includes("F1"));
   check(
-    "Run F) 최종 status=WAITING_HUMAN이지만 여전히 TECHNICAL_AUTO_RECOVERABLE(GENUINE으로 격상되지 않음)",
-    (finalState.status as unknown as string) === "WAITING_HUMAN" && classifyWaitingHumanReason(finalState) !== "GENUINE_HUMAN_JUDGMENT"
+    "Run F) 최종 status=WAITING_HUMAN이고 GENUINE_HUMAN_JUDGMENT로 분류됨(No-Safe-Recovery-Action Gate)",
+    (finalState.status as unknown as string) === "WAITING_HUMAN" && classifyWaitingHumanReason(finalState) === "GENUINE_HUMAN_JUDGMENT"
   );
   check("Run F) outside-scope-f1.txt가 끝까지 디스크에 그대로 남아있음(삭제되지 않음)", existsSync(join(root, "outside-scope-f1.txt")));
   const trackedFilesF = spawnSync("git", ["ls-files"], { cwd: root, encoding: "utf-8" }).stdout || "";

@@ -44,6 +44,24 @@ import {
 //     더 이상 생성되지 않는다.
 //   - CHECKPOINT_BLOCKED이지만 이유가 CHECKPOINT_SCOPE_VIOLATION_REASON이 아닌 경우(Secret/
 //     Dependency Scanner Gate — SECURITY_BLOCKED) — 민감 보안 판단.
+//   - CHECKPOINT_BLOCKED이고 이유가 정확히 CHECKPOINT_SCOPE_VIOLATION_REASON인 경우(No-Safe-
+//     Recovery-Action Gate, 2026-08-31) — 예전(2026-08-27 Phase 7)에는 여기 있지 않았다:
+//     그때는 autodev.ts가 이 leftover 파일을 다음 attempt 전에 자동으로 rmSync해서 지웠으므로
+//     "재시도하면 스스로 풀린다"가 실제로 성립했다. Positive-Provenance-Only Auto-Delete
+//     Policy(2026-08-31, a490700)로 그 자동 삭제가 완전히 제거된 이후로는(AutoDev가 이 파일을
+//     자신이 만들었다고 증명할 방법이 구조적으로 없다는 것이 확인됨) 이 전제가 더 이상
+//     성립하지 않는다 — Developer(LLM ACTION_REQUEST)에는 파일 삭제 action 자체가 없고, 이
+//     파일은 이미 allowedPathPrefixes 밖이라 WRITE_FILE로도 지울 수 없으므로, 같은 task를
+//     Developer/Reviewer로 몇 번을 재시도해도 이 파일은 절대 사라지지 않는다(결정론적으로
+//     재현되는 blocker — required test 반복 실패처럼 "다른 접근을 시도하면 통과할 수도
+//     있는" 종류가 아니다). 이 파일을 지우거나 그대로 둘지는 사람만 판단할 수 있으므로(§
+//     요구사항: "실제 파일 삭제/보존 판단처럼 사용자 판단이 필요한 경우") genuine으로
+//     분류한다 — 기술적 재시도를 50회(continuous-runner.ts MAX_TECHNICAL_RECOVERY_ATTEMPTS)
+//     반복한 뒤에야 사람에게 넘기는 대신, 처음 발견되는 즉시 사람 판단 상태로 전환한다.
+//     사람이 실제로 파일을 지우거나(또는 보존하기로 결정하고) local-human-approval.ts로
+//     승인하면(§ isCheckpointBlockedMarker — remotelyApprovable=false 유지, Telegram에서
+//     실수로 누르지 않도록) 그 다음 실행에서 정상 재개된다(§ 요구사항 시나리오 B) — "사람
+//     승인 없이는 다시 시도하지 않는다"이지 "영원히 막힌다"가 아니다.
 //   - MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX 마커(orchestrator.ts MAX_GPT_CALLS) — REVISE
 //     "cycle" 수(코드 수정 후 재리뷰 횟수)가 10회를 넘었다는 뜻으로, 실제 GPT 호출 비용이
 //     이미 상당히 발생했다는 신호다("실제 비용 발생" 범주, GPT_RAW_CALL_LIMIT_EXCEEDED와
@@ -61,10 +79,6 @@ import {
 //     STAGNATION_DETECTED 마커 도입에 맞춰 명시적 마커를 추가했다.
 //
 // 기술적 자동 복구 대상(사람 승인 없이 다음 시도로 이어감):
-//   - CHECKPOINT_BLOCKED이고 이유가 정확히 CHECKPOINT_SCOPE_VIOLATION_REASON인 경우 —
-//     allowedPathPrefixes 밖 예상치 못한 변경만으로 막힌 경우(Secret/Dependency 문제 없음).
-//     이미 autodev.ts Phase 7이 state.lastGptDecision.scopeViolations 기준으로 안전하게
-//     정리하는 대상과 정확히 같은 범주다.
 //   - REVIEW_CYCLE_EXHAUSTED_REASON 마커 — REVISE가 MAX_REVIEW_CYCLES에 도달해 멈춘 경우.
 //   - state.lastGptDecision.decision이 "BLOCK" 또는 "HUMAN_REQUIRED"인 경우(Reviewer 자신의
 //     BLOCK 판정 — 코드 품질/scope 문제로, Developer가 고쳐야 할 기술적 사안이다).
@@ -178,12 +192,15 @@ function isGenuineClaudeStructuralFailureMarker(marker: string): boolean {
   return marker.startsWith(CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX) && !isTechnicalClaudeStructuralFailureMarker(marker);
 }
 
-/** Genuine Human Gate Local Approval(2026-08-29)이 재사용한다 — CHECKPOINT_BLOCKED 마커 중
- *  scope-violation(기술적 자동 복구 대상)이 아닌 것만 골라낸다. 이 파일의 기존 분류 로직을
- *  복제하지 않고 그대로 export만 추가한다(동작 변화 없음, D2/D3/D4의 기존 export-추가
- *  패턴과 동일). */
-export function isNonScopeCheckpointBlockMarker(marker: string): boolean {
-  return marker.startsWith("CHECKPOINT_BLOCKED(") && !isCheckpointScopeViolationMarker(marker);
+/** Genuine Human Gate Local Approval(2026-08-29)이 재사용한다 — CHECKPOINT_BLOCKED 마커를
+ *  전부 골라낸다. 2026-08-29 도입 당시에는 이름 그대로 scope-violation(그때는 기술적 자동
+ *  복구 대상)을 "제외"했지만, No-Safe-Recovery-Action Gate(2026-08-31)로 scope-violation도
+ *  genuine이 된 뒤로는 CHECKPOINT_BLOCKED 마커 전부가 genuine이므로 더 이상 제외할 대상이
+ *  없다 — 그래서 이름도 isCheckpointBlockedMarker로 바꿨다(기존 호출부 3곳 — autodev.ts/
+ *  local-human-approval.ts × 2 — 도 함께 갱신, 로직 자체는 여전히 이 파일 하나가
+ *  단일 출처다). */
+export function isCheckpointBlockedMarker(marker: string): boolean {
+  return marker.startsWith("CHECKPOINT_BLOCKED(");
 }
 
 /** state.json에 이미 저장된 값만으로 "사람 승인 없이 자동 복구해도 되는가"를 판정한다.
@@ -196,11 +213,10 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
 
   const hasGenuineMarker =
     markers.some((m) => GENUINE_MARKER_PREFIXES.some((prefix) => m.startsWith(prefix))) ||
-    markers.some(isNonScopeCheckpointBlockMarker) ||
+    markers.some(isCheckpointBlockedMarker) ||
     markers.some(isGenuineClaudeStructuralFailureMarker);
   if (hasGenuineMarker) return "GENUINE_HUMAN_JUDGMENT";
 
-  const hasCheckpointScopeViolation = markers.some(isCheckpointScopeViolationMarker);
   const hasReviewCycleExhausted = markers.some((m) => m.startsWith(`${REVIEW_CYCLE_EXHAUSTED_REASON}:`));
   const decision = state.lastGptDecision?.decision;
   const hasReviewBlocked = decision === "BLOCK" || decision === "HUMAN_REQUIRED";
@@ -209,7 +225,6 @@ export function classifyWaitingHumanReason(state: ClassifiableState): WaitingHum
   const hasTechnicalClaudeStructuralFailure = markers.some(isTechnicalClaudeStructuralFailureMarker);
 
   if (
-    hasCheckpointScopeViolation ||
     hasReviewCycleExhausted ||
     hasReviewBlocked ||
     hasDeveloperTransientRetryExhausted ||
