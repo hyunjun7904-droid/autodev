@@ -102,6 +102,7 @@
     "test:parent-liveness-watchdog": "npm run build && node dist/parent-liveness-watchdog-tests.js",
     "test:project-control-cli": "npm run build && node dist/project-control-cli-tests.js",
     "test:local-human-approval": "npm run build && node dist/local-human-approval-tests.js",
+    "test:orphaned-human-gate": "npm run build && node dist/orphaned-human-gate-tests.js",
     "test:notification": "npm run build && node dist/notification-tests.js",
     "test:notification-store": "npm run build && node dist/notification-store-tests.js",
     "test:notification-provider": "npm run build && node dist/notification-provider-tests.js",

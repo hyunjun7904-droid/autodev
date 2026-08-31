@@ -41,6 +41,15 @@ export type ApprovalType =
   | "CHECKPOINT_SCOPE_VIOLATION"
   | "AUDIT_STORE_UNAVAILABLE"
   | "ORCHESTRATOR_NOT_APPROVED_GENERIC"
+  // Orphaned Genuine Human Gate Recovery(2026-09-01) — durable project-state가
+  // genuine WAITING_HUMAN인데 그 사유를 classifyApprovalType()이 이해하는 {eventType,reason}
+  // 형태로 정직하게 재구성할 수 없는 경우(§ human-gate-policy.ts
+  // identifyGenuineWaitingHumanBlocker — CHECKPOINT_BLOCKED 계열이 아닌 다른 genuine 마커/
+  // humanFinalReview/무마커 fail-closed 케이스)에만 쓰는 범용 fallback 분류다. 재구성 가능한
+  // 경우(CHECKPOINT_BLOCKED 계열)는 이 값을 쓰지 않고 기존 classifyApprovalType()을 그대로
+  // 재사용해 SECURITY_BLOCKED/CHECKPOINT_SCOPE_VIOLATION 등 더 구체적인 값을 그대로 쓴다(§
+  // local-human-approval.ts ensureDurableApprovalForGenuineWaitingHuman).
+  | "GENUINE_STATE_RECOVERY"
   | "UNKNOWN";
 
 const HIGH_RISK_PREGATE_PREFIX = "고위험 작업 감지(";
@@ -97,8 +106,21 @@ export interface ApprovalRequest {
   runId: string;
   taskId?: string;
   approvalType: ApprovalType;
-  sourceEventType: AutoDevEventType;
-  sourceEventId: string;
+  /** sourceKind==="EVENT"(기본값, 생략 시에도 EVENT로 취급 — 기존 buildApprovalRequest() 호출부
+   *  전부와 100% 하위 호환)일 때만 실제 EventStore event를 가리킨다. */
+  sourceEventType?: AutoDevEventType;
+  sourceEventId?: string;
+  /** Orphaned Genuine Human Gate Recovery(2026-09-01) — 이 approval이 실제 EventStore
+   *  event에서 만들어졌는지("EVENT", 기존 createApprovalRequestsFromEvents()/
+   *  createFreshLocalApprovalRequest() 경로), 아니면 durable project-state만으로(대응 event가
+   *  EventStore에 없어도) genuine WAITING_HUMAN을 복구하기 위해 만들어졌는지
+   *  ("DURABLE_STATE_RECOVERY")를 정직하게 구분한다. 생략되면 "EVENT"로 취급한다. */
+  sourceKind?: "EVENT" | "DURABLE_STATE_RECOVERY";
+  /** sourceKind==="DURABLE_STATE_RECOVERY"일 때만 채워진다 — 존재하지 않는 event를 가리키는
+   *  가짜 sourceEventId를 만드는 대신, 이 approval의 근거가 된 durable project-state의 안정적
+   *  fingerprint(§ human-gate-policy.ts identifyGenuineWaitingHumanBlocker)를 정직하게
+   *  기록한다. */
+  sourceStateFingerprint?: string;
   status: ApprovalStatus;
   /** classifyApprovalType() + isRemotelyApprovable()로 생성 시점에 고정된다 — 이후 어떤
    *  호출부도 이 값을 다시 계산하거나 override하지 않는다(승인 처리 시점에는 그대로
@@ -162,6 +184,7 @@ export function buildApprovalRequest(
     approvalType,
     sourceEventType: event.eventType,
     sourceEventId: event.eventId,
+    sourceKind: "EVENT",
     status: "PENDING",
     remotelyApprovable: isRemotelyApprovable(approvalType),
     requiresSafetyRecheck: true,
@@ -174,6 +197,53 @@ export function buildApprovalRequest(
 
 export function isApprovalExpired(approval: Pick<ApprovalRequest, "expiresAt">, nowIso: string): boolean {
   return Date.parse(nowIso) >= Date.parse(approval.expiresAt);
+}
+
+export interface BuildDurableStateRecoveryApprovalRequestInput {
+  projectId: string;
+  runId: string;
+  taskId: string;
+  approvalType: ApprovalType;
+  /** § ApprovalRequest.sourceStateFingerprint 문서 참고 — 존재하지 않는 event를 날조하지
+   *  않는다는 요구사항의 직접적인 구현이다. */
+  sourceStateFingerprint: string;
+  dedupeKey: string;
+  adapterPath?: string;
+}
+
+/** Orphaned Genuine Human Gate Recovery(2026-09-01) — buildApprovalRequest()와 나란히 두는
+ *  전용 builder다: 실제 AutoDevEvent가 아니라 durable project-state에서만 근거를 가져오므로
+ *  buildApprovalRequest()의 `event` 입력 계약(eventId/eventType 필수)을 억지로 만족시키지
+ *  않는다(가짜 event를 만들지 않는다는 요구사항) — 대신 이 전용 함수가 sourceKind/
+ *  sourceStateFingerprint를 정직하게 채운다. remotelyApprovable 판정은 기존
+ *  isRemotelyApprovable()을 그대로 재사용한다(새 원격 승인 정책을 만들지 않는다) — 이
+ *  approval의 approvalType이 REMOTELY_APPROVABLE_APPROVAL_TYPES에 없는 한(오늘 기준
+ *  GENUINE_STATE_RECOVERY를 포함해 이 함수가 실제로 만들 수 있는 모든 값이 그렇다)
+ *  remotelyApprovable은 항상 false다. */
+export function buildDurableStateRecoveryApprovalRequest(
+  input: BuildDurableStateRecoveryApprovalRequestInput,
+  opts: BuildApprovalRequestOptions = {}
+): ApprovalRequest {
+  const now = opts.now ? opts.now() : new Date();
+  const expiryMs = opts.expiryMs ?? DEFAULT_APPROVAL_EXPIRY_MS;
+  return {
+    approvalId: randomUUID(),
+    createdAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + expiryMs).toISOString(),
+    projectId: input.projectId,
+    runId: input.runId,
+    taskId: input.taskId,
+    approvalType: input.approvalType,
+    sourceKind: "DURABLE_STATE_RECOVERY",
+    sourceStateFingerprint: input.sourceStateFingerprint,
+    status: "PENDING",
+    remotelyApprovable: isRemotelyApprovable(input.approvalType),
+    requiresSafetyRecheck: true,
+    dedupeKey: input.dedupeKey,
+    ...(opts.expectedGitHead !== undefined ? { expectedGitHead: opts.expectedGitHead } : {}),
+    ...(opts.expectedBranch !== undefined ? { expectedBranch: opts.expectedBranch } : {}),
+    ...(input.adapterPath !== undefined ? { adapterPath: input.adapterPath } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------

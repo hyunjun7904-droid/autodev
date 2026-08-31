@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { loadState, saveState } from "./state";
-import type { ApprovalRequest } from "./approval";
-import { buildApprovalRequest, isApprovalExpired } from "./approval";
+import type { ApprovalRequest, ApprovalType } from "./approval";
+import { buildApprovalRequest, buildDurableStateRecoveryApprovalRequest, classifyApprovalType, isApprovalExpired } from "./approval";
 import type { ApprovalStore } from "./approval-store";
 import type { ProjectManifest } from "./project-manifest";
 import type { EventStore } from "./event-store";
@@ -10,7 +10,8 @@ import { compareEventsChronologically } from "./observability-event";
 import type { OrchestratorDeps } from "./orchestrator";
 import { resumeApprovedTask } from "./auto-resume";
 import type { AutoResumeOutcome } from "./auto-resume";
-import { classifyWaitingHumanReason, isCheckpointBlockedMarker } from "./human-gate-policy";
+import { classifyWaitingHumanReason, identifyGenuineWaitingHumanBlocker, isCheckpointBlockedMarker } from "./human-gate-policy";
+import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 
 // Genuine Human Gate Local Approval — AutoDev Core 구조적 결함 수정(2026-08-29).
 //
@@ -30,11 +31,20 @@ import { classifyWaitingHumanReason, isCheckpointBlockedMarker } from "./human-g
 // Project Lock/Remote Git Safety 재확인 + state.status READY 전환 + runAutodevOnce() 재
 // 호출)에 안전하게 연결하는 것. 새로운 두 번째 Resume 실행 경로를 만들지 않는다.
 //
-// 호출 경계 — 이 함수들은 어떤 자동 코드 경로(orchestrator.ts/autodev.ts/continuous-
-// runner.ts/telegram-controller.ts)에서도 호출되지 않는다. 이 파일을 import하는 production
-// 코드가 없다는 사실 자체가 "자동 승인 경로가 아니다"를 구조적으로 보장한다 — 실제 호출은
-// 사람이 명시적으로 실행하는 별도 스크립트/CLI(이 Task 범위 밖, 이 파일은 그 진입점이
-// 호출할 함수만 제공한다)에서만 이뤄져야 한다.
+// 호출 경계 — performLocalHumanApproval()/createFreshLocalApprovalRequest()는 어떤 자동
+// 코드 경로(orchestrator.ts/autodev.ts/continuous-runner.ts/telegram-controller.ts)에서도
+// 호출되지 않는다. 이 두 함수를 import하는 production 코드가 없다는 사실 자체가 "자동 승인
+// 경로가 아니다"를 구조적으로 보장한다 — 실제 호출은 사람이 명시적으로 실행하는 별도
+// 스크립트/CLI(project-control-cli.ts approve)에서만 이뤄져야 한다.
+//
+// Orphaned Genuine Human Gate Recovery(2026-09-01) — 아래 ensureDurableApprovalForGenuineWaitingHuman()
+// 은 위 두 함수와 안전 성격이 다르다: PENDING → APPROVED 전이나 Resume을 전혀 하지 않는다
+// (요구사항 C — "복구는 절대 자동 APPROVE가 아니다", 이 함수가 할 수 있는 것은 "유효한
+// PENDING ApprovalRequest를 다시 제공하는 것"까지다). 그래서 이 함수는 의도적으로 자동
+// production 경로(run.ts)에서 호출된다 — genuine WAITING_HUMAN을 발견한 시점에 대응하는
+// durable event/approval이 없어도 사람이 승인할 대상 자체가 영구히 사라지지 않게 하기
+// 위함이다. 최종 승인/거절은 여전히 performLocalHumanApproval()/Telegram 경로가 그대로
+// 담당한다 — 이 함수는 그 경로들이 소비할 PENDING approval을 채워 넣을 뿐이다.
 
 export interface LocalHumanApprovalInput {
   approvalId: string;
@@ -310,4 +320,152 @@ export function createFreshLocalApprovalRequest(
   const built = buildApprovalRequest(sourceEvent, freshDedupeKey, { now: nowFn });
   const created = opts.approvalStore.createPending(built);
   return { kind: "CREATED", approval: created };
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned Genuine Human Gate Recovery(2026-09-01) — AutoDev Core Freeze(autodev-core-
+// freeze-20260901) 이후 JARVIS Task 5.3 재개 과정에서 발견/DEFECT_CONFIRMED된 generic
+// production defect의 수정이다: durable project-state가 genuine WAITING_HUMAN(§
+// human-gate-policy.ts classifyWaitingHumanReason)인데, 그 사유에 대응하는 durable
+// AutoDevEvent가 EventStore에 없거나(§ createApprovalRequestsFromEvents가 스캔할 대상이
+// 없음), 기존 ApprovalRequest가 없거나/만료됐거나/expectedGitHead·branch가 지금과 다르면,
+// 사람이 승인할 유효한 durable ApprovalRequest를 만들 방법이 production 코드 어디에도 없었다
+// (createFreshLocalApprovalRequest()는 SECURITY_BLOCKED event만 대상으로 하므로
+// CHECKPOINT_SCOPE_VIOLATION 등 HUMAN_APPROVAL_REQUIRED로 기록되는 다른 genuine blocker에는
+// 쓸 수 없다 — § 그 함수 주석, project-control-cli.ts 상단 주석).
+// ---------------------------------------------------------------------------
+
+export type EnsureDurableApprovalOutcome =
+  | { kind: "NOT_APPLICABLE"; reason: "STATE_NOT_WAITING_HUMAN" | "NOT_A_GENUINE_HUMAN_GATE" }
+  | { kind: "REUSED_EXISTING"; approval: ApprovalRequest }
+  | { kind: "CREATED"; approval: ApprovalRequest };
+
+export interface EnsureDurableApprovalOptions {
+  approvalStore: ApprovalStore;
+  statePath: string;
+  manifest: ProjectManifest;
+  /** EventStore는 audit/provenance 보강에만 쓴다(§ 요구사항 3 — EventStore를 Human Gate의
+   *  유일한 source of truth로 두지 않는다) — 지정하지 않아도 recovery 자체는 그대로
+   *  동작한다(§ 아래 CREATED 분기의 opts.events?.append). */
+  events?: EventStore;
+  /** 지정하지 않으면 manifest.targetProjectRoot를 쓴다(§ resumeApprovedTask()/
+   *  checkGitSafeToResume()와 동일한 관례 — 새 기본값 계산 로직을 만들지 않는다). */
+  cwd?: string;
+  now?: () => Date;
+}
+
+/**
+ * durable project-state(§ human-gate-policy.ts identifyGenuineWaitingHumanBlocker)만으로,
+ * 대응 event가 EventStore에 있는지와 무관하게 genuine WAITING_HUMAN의 orphaned gate를
+ * 복구한다. 이 함수가 실제로 하는 일은 딱 두 가지뿐이다 — ① 이미 현재 project/task/genuine
+ * 사유/PENDING/not-expired/현재 Git HEAD·branch와 일치하는 유효한 ApprovalRequest가 있으면
+ * 그것을 그대로 재사용하고(§ 요구사항 4 — 중복 생성 금지), ② 없으면 오직 그 경우에만 현재
+ * HEAD/branch를 기록한 새 PENDING ApprovalRequest 하나를 만든다. **상태 전이(PENDING→
+ * APPROVED)나 Resume은 전혀 하지 않는다** — 최종 승인/거절은 여전히
+ * performLocalHumanApproval()/Telegram 경로가 기존 그대로 담당한다(§ 요구사항 C).
+ *
+ * state가 WAITING_HUMAN이 아니거나(§ 요구사항 G — technical WAITING_HUMAN/READY/RUNNING 등
+ * 어떤 상태에서도 approval을 만들지 않는다) classifyWaitingHumanReason()이 GENUINE_HUMAN_JUDGMENT가
+ * 아니면(기술적 자동 복구 대상이거나 판정 불가) 아무것도 만들지 않고 NOT_APPLICABLE을
+ * 반환한다 — 이 판정은 human-gate-policy.ts 하나만의 책임이고 이 함수는 그것을 다시 계산하지
+ * 않는다.
+ *
+ * 존재하지 않는 event를 날조하지 않는다(§ 요구사항 D) — CHECKPOINT_BLOCKED 계열 마커만
+ * classifyApprovalType()의 기존 {eventType,reason} 계약으로 정직하게 되돌릴 수 있어(§
+ * identifyGenuineWaitingHumanBlocker) 그 경우에는 기존 classifier를 그대로 재사용해 더
+ * 구체적인 approvalType(SECURITY_BLOCKED/CHECKPOINT_SCOPE_VIOLATION)을 쓰고, 그 외 genuine
+ * 범주는 approval.ts의 범용 GENUINE_STATE_RECOVERY로 정직하게 남긴다 — 두 경우 모두
+ * sourceKind:"DURABLE_STATE_RECOVERY" + sourceStateFingerprint만 채우고 sourceEventId는
+ * 비워둔다(가짜 UUID 없음).
+ *
+ * dedupeKey는 project+task+blocker fingerprint+현재 Git HEAD+현재 branch로만 결정된다(§
+ * 요구사항 F/13 — HEAD/branch가 바뀌면 다른 key가 되어 자동으로 "새 blocker"로 취급되고, old
+ * approval은 절대 재사용/삭제/수정되지 않는다). 이 결정론적 key 덕분에 동시에 여러 프로세스가
+ * 이 함수를 호출해도 ApprovalStore.createPending()의 기존 dedupeKey 기반 원자적
+ * idempotency(§ approval-store.ts — 파일 store는 이미 mutation lock으로 다른 프로세스
+ * 간에도 이를 보장한다, 새 lock을 만들지 않는다)가 exactly-one PENDING만 남긴다(§ 요구사항
+ * G/16).
+ */
+export function ensureDurableApprovalForGenuineWaitingHuman(
+  taskId: string,
+  opts: EnsureDurableApprovalOptions
+): EnsureDurableApprovalOutcome {
+  const state = loadState(opts.statePath);
+  if ((state.status as unknown as string) !== "WAITING_HUMAN") {
+    return { kind: "NOT_APPLICABLE", reason: "STATE_NOT_WAITING_HUMAN" };
+  }
+
+  const blocker = identifyGenuineWaitingHumanBlocker(state, taskId);
+  if (!blocker) {
+    return { kind: "NOT_APPLICABLE", reason: "NOT_A_GENUINE_HUMAN_GATE" };
+  }
+
+  const cwd = opts.cwd ?? opts.manifest.targetProjectRoot;
+  const currentHead = getCurrentHeadHash(cwd);
+  const currentBranch = getCurrentBranch(cwd);
+
+  const approvalType: ApprovalType = blocker.reconstructedReasonForClassification
+    ? classifyApprovalType(blocker.reconstructedReasonForClassification)
+    : "GENUINE_STATE_RECOVERY";
+
+  const nowIso = (opts.now ? opts.now() : new Date()).toISOString();
+
+  // § 요구사항 4 — 이미 현재 project/task/genuine 사유/PENDING/not-expired/현재 HEAD·branch와
+  // 일치하는 valid approval이 있으면(§ createApprovalRequestsFromEvents()가 만든 정상
+  // event-based approval 포함 — dedupeKey 형식이 달라도 이 의미적 비교로 찾아낸다) 그대로
+  // 재사용한다. 중복 생성 금지.
+  const existing = opts.approvalStore
+    .list()
+    .find(
+      (r) =>
+        r.projectId === opts.manifest.projectId &&
+        r.taskId === taskId &&
+        r.approvalType === approvalType &&
+        r.status === "PENDING" &&
+        !isApprovalExpired(r, nowIso) &&
+        r.expectedGitHead === currentHead &&
+        r.expectedBranch === currentBranch
+    );
+  if (existing) return { kind: "REUSED_EXISTING", approval: existing };
+
+  const dedupeKey = [
+    "STATE_RECOVERY",
+    opts.manifest.projectId,
+    taskId,
+    blocker.fingerprint,
+    currentHead ?? "UNKNOWN_HEAD",
+    currentBranch ?? "UNKNOWN_BRANCH",
+  ].join("::");
+
+  const built = buildDurableStateRecoveryApprovalRequest(
+    {
+      projectId: opts.manifest.projectId,
+      // 실제 orchestrator run이 아니라 이 recovery 자체가 만든 approval임을 runId 값
+      // 자체로도 구분 가능하게 한다 — resumeApprovedTask()/checkGitSafeToResume()은 runId를
+      // 전혀 읽지 않으므로(§ auto-resume.ts) Resume 동작에는 영향이 없다.
+      runId: `state-recovery:${opts.manifest.projectId}:${taskId}`,
+      taskId,
+      approvalType,
+      sourceStateFingerprint: blocker.fingerprint,
+      dedupeKey,
+      adapterPath: opts.manifest.adapterPath,
+    },
+    { now: opts.now, expectedGitHead: currentHead, expectedBranch: currentBranch }
+  );
+  const stored = opts.approvalStore.createPending(built);
+
+  if (stored.approvalId !== built.approvalId) {
+    // 동시 recovery 시도 — 다른 프로세스가 같은 dedupeKey로 이미 만들었다(§ 요구사항 G/16).
+    // 그 레코드를 그대로 재사용할 뿐 두 번째 audit event를 남기지 않는다.
+    return { kind: "REUSED_EXISTING", approval: stored };
+  }
+
+  opts.events?.append({
+    eventType: "APPROVAL_REQUESTED",
+    runId: stored.runId,
+    projectId: opts.manifest.projectId,
+    taskId,
+    metadata: { approvalType: stored.approvalType, remotelyApprovable: stored.remotelyApprovable, sourceKind: "DURABLE_STATE_RECOVERY" },
+  });
+  return { kind: "CREATED", approval: stored };
 }

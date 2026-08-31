@@ -1,4 +1,5 @@
 import type { CoreState } from "./types";
+import type { AutoDevEventType } from "./observability-event";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
@@ -266,4 +267,85 @@ export function extractCheckpointScopeViolationFiles(deferredHumanTasks: readonl
     }
   }
   return files;
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned Genuine Human Gate Recovery(2026-09-01) — durable project-state가 genuine
+// WAITING_HUMAN인데 대응하는 durable AutoDevEvent/valid ApprovalRequest가 없을 수 있다는
+// 것이 확인됐다(§ .claude/CLAUDE.md — JARVIS Task 5.3 실측). local-human-approval.ts의
+// ensureDurableApprovalForGenuineWaitingHuman()이 이 파일 하나만을 "지금 실제로 막고 있는
+// genuine 사유가 무엇인가"의 canonical 출처로 재사용한다 — 새 blocker parser를 별도로 만들지
+// 않는다.
+// ---------------------------------------------------------------------------
+
+/** CHECKPOINT_BLOCKED 마커(§ autodev.ts `CHECKPOINT_BLOCKED(${taskDef.id}): ${checkpoint.reason}
+ *  [ — unexpected: ...]`)를 taskId/reason으로 되돌린다 — extractCheckpointScopeViolationFiles()와
+ *  같은 저장 형식의 역파싱이다(새 저장 형식을 만들지 않는다). 형식이 예상과 다르면 null을
+ *  반환할 뿐 추측하지 않는다(fail-closed). */
+function parseCheckpointBlockedMarker(marker: string): { taskId: string; reason: string } | null {
+  if (!marker.startsWith("CHECKPOINT_BLOCKED(")) return null;
+  const closeIdx = marker.indexOf("): ");
+  if (closeIdx === -1) return null;
+  const taskId = marker.slice("CHECKPOINT_BLOCKED(".length, closeIdx);
+  let reason = marker.slice(closeIdx + "): ".length);
+  const filesIdx = reason.indexOf(UNEXPECTED_FILES_MARKER);
+  if (filesIdx !== -1) reason = reason.slice(0, filesIdx);
+  return { taskId, reason };
+}
+
+export interface GenuineWaitingHumanBlocker {
+  /** dedupe/identity에 쓰는 안정적 문자열 — 같은 project-state(같은 project/task/genuine
+   *  사유)에서는 항상 같은 값이다. state.deferredHumanTasks/state.humanFinalReview에 이미
+   *  저장된 내용에서만 유도한다 — 존재하지 않는 정보를 추측하지 않는다. */
+  fingerprint: string;
+  /** 이 marker를 approval.ts classifyApprovalType()이 이해하는 {eventType, reason} 쌍으로
+   *  정직하게 되돌릴 수 있으면 채운다 — 지금은 CHECKPOINT_BLOCKED 계열만 지원한다
+   *  (performLocalHumanApproval()/createFreshLocalApprovalRequest()와 동일한 지원 범위, §
+   *  local-human-approval.ts 주석). 이미 durable state에 저장된 고정 템플릿 문자열을 기존
+   *  classifier의 입력 모양으로 재배열할 뿐, eventId/timestamp 등 실제 event 고유 값은 전혀
+   *  만들지 않는다 — 존재하지 않았던 event를 재현하지 않는다. */
+  reconstructedReasonForClassification?: { eventType: AutoDevEventType; reason: string };
+}
+
+/** state.deferredHumanTasks(및 state.humanFinalReview)만으로 "지금 이 WAITING_HUMAN을 막고
+ *  있는 genuine 사유가 무엇인가"를 재구성한다 — classifyWaitingHumanReason()이 이미
+ *  GENUINE_HUMAN_JUDGMENT로 판정한 경우에만 non-null을 반환한다(그 판정을 다시 하지 않는다,
+ *  단일 출처 재사용). taskId는 호출부가 이미 확정한 현재 task(§ task-registry.ts
+ *  getNextTask())를 그대로 받는다 — 이 함수 자신은 "무엇이 현재 task인가"를 추측하지 않는다.
+ *
+ *  마커가 여러 genuine 범주에 걸쳐 있어도(예: STAGNATION_DETECTED와 CHECKPOINT_BLOCKED가
+ *  함께 저장된 경우) classifyWaitingHumanReason()과 동일한 우선순위(CHECKPOINT_BLOCKED류가
+ *  가장 구체적) — CHECKPOINT_BLOCKED 계열이 있으면 그것으로, 없으면 다른 genuine
+ *  marker/humanFinalReview/무마커 fail-closed 순으로 fingerprint를 고른다. */
+export function identifyGenuineWaitingHumanBlocker(state: ClassifiableState, taskId: string): GenuineWaitingHumanBlocker | null {
+  if (classifyWaitingHumanReason(state) !== "GENUINE_HUMAN_JUDGMENT") return null;
+
+  const markers = state.deferredHumanTasks ?? [];
+
+  const checkpointMarker = markers.find((m) => {
+    const parsed = parseCheckpointBlockedMarker(m);
+    return parsed !== null && parsed.taskId === taskId;
+  });
+  if (checkpointMarker) {
+    const parsed = parseCheckpointBlockedMarker(checkpointMarker);
+    if (parsed) {
+      const eventType: AutoDevEventType = parsed.reason === CHECKPOINT_SCOPE_VIOLATION_REASON ? "HUMAN_APPROVAL_REQUIRED" : "SECURITY_BLOCKED";
+      return { fingerprint: checkpointMarker, reconstructedReasonForClassification: { eventType, reason: parsed.reason } };
+    }
+  }
+
+  const genuineMarker = markers.find(
+    (m) => GENUINE_MARKER_PREFIXES.some((prefix) => m.startsWith(prefix)) || isGenuineClaudeStructuralFailureMarker(m)
+  );
+  if (genuineMarker) return { fingerprint: genuineMarker };
+
+  if (state.humanFinalReview) {
+    return { fingerprint: `HUMAN_FINAL_REVIEW(${taskId}):${JSON.stringify(state.humanFinalReview)}` };
+  }
+
+  // 알려진 marker가 전혀 없는 fail-closed genuine 케이스(예: HIGH_RISK_ACTION_PREGATE — § 위
+  // classifyWaitingHumanReason 문서, 별도 마커 없이 genuine으로 남는다). 그래도 재실행마다
+  // 다른 fingerprint를 만들지 않도록 taskId 기반 안정값을 쓴다 — 이 task에 대해 알려진
+  // marker가 전혀 없는 상태 자체가 이 fingerprint의 근거다.
+  return { fingerprint: `UNMARKED_GENUINE(${taskId})` };
 }

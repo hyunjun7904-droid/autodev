@@ -3,6 +3,10 @@ import type { AutodevRunResult } from "./autodev";
 import { runAutodevContinuous } from "./continuous-runner";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { loadState } from "./state";
+import { getNextTask } from "./task-registry";
+import { selectDefaultApprovalStore } from "./approval-store";
+import { selectDefaultEventStore } from "./event-store";
+import { ensureDurableApprovalForGenuineWaitingHuman } from "./local-human-approval";
 import { ensureTelegramControllerStarted } from "./telegram-controller-supervisor";
 import { assertProductionRuntimeForContinuousLaunch } from "./runtime-origin";
 import { defaultIsPidAlive } from "./dashboard-supervisor";
@@ -249,6 +253,43 @@ async function main(): Promise<void> {
       log("[run] 최종 state 확인 실패 — WAITING_HUMAN 여부를 판단할 수 없습니다(controller를 유지하지 않고 종료합니다).", {
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    if (waitingHuman) {
+      // Orphaned Genuine Human Gate Recovery(2026-09-01) — § local-human-approval.ts
+      // ensureDurableApprovalForGenuineWaitingHuman 주석. 이 project 자신의 manifest/state를
+      // 이미 아는 이 project-scoped 진입점에서, telegram-controller.ts의 정상 event 기반
+      // 경로(§ 그 파일 tick → approval-service.ts createApprovalRequestsFromEvents)가 이미
+      // 만든 valid approval이 있으면 그대로 재사용하고, 대응 event가 없어도(§ 요구사항 A/B)
+      // 사람이 승인할 PENDING approval이 durable project-state만으로 항상 존재하게 한다 —
+      // 상태 전이/Resume은 전혀 하지 않는다(§ 요구사항 C). controllerSupervisor의 owner 여부와
+      // 무관하게 항상 실행한다 — installation-wide controller owner context에 의존하지
+      // 않는다(§ 요구사항 8, multi-project isolation).
+      try {
+        const state = loadState(manifest.statePath);
+        const nextTask = getNextTask(manifest.taskRegistry, state.completedTasks ?? []);
+        if (nextTask) {
+          const outcome = ensureDurableApprovalForGenuineWaitingHuman(nextTask.id, {
+            approvalStore: selectDefaultApprovalStore(),
+            statePath: manifest.statePath,
+            manifest,
+            events: selectDefaultEventStore(),
+            cwd: manifest.targetProjectRoot,
+          });
+          if (outcome.kind === "CREATED") {
+            log("[run] orphaned genuine Human Gate — durable state만으로 새 PENDING approval을 생성했습니다.", {
+              projectId: manifest.projectId,
+              taskId: nextTask.id,
+              approvalId: outcome.approval.approvalId,
+              approvalType: outcome.approval.approvalType,
+            });
+          }
+        }
+      } catch (err) {
+        log("[run] orphaned genuine Human Gate 복구 확인 실패 — 기존 event 기반 approval 경로는 영향받지 않습니다.", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     if (waitingHuman && controllerSupervisor.isOwner()) {
