@@ -2075,6 +2075,75 @@ async function scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap(
   check("상한 초과 후 재시작: outcome=STOPPED(BLOCKED 유지)", resultAfterRestart.outcome === "STOPPED");
 }
 
+// AutoDev 최종 통합 하드닝(Hardening E, No-Progress를 Hard Switch로) — durable하게 누적된
+// noWriteRepeatCount(WRITE 없이 연속 실패)가 MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT(5)에
+// 도달하면, buildNoWriteStrategyEscalationHint가 매번 더 강한 문구만 반복하는 대신 실제로
+// Developer 호출을 멈추고 기술적 BLOCKED로 전환해야 한다.
+async function scenarioRunAutodevOnceEscalatesAfterNoWriteRepeatExceedsCap(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "READY",
+    technicalRecoveryState: {
+      taskId: "P1.2",
+      sameFailureCount: 0,
+      rootCauseAnalysisCount: 0,
+      providerTimeoutCount: 0,
+      noWriteRepeatCount: 5,
+      unexpectedExitCount: 0,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // completedTasks=["P1.1"] → 다음은 P1.2
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨 — no-write 상한 초과", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("no-write 상한 초과: Developer가 호출되지 않음(claudeCalls=0)", claudeCalls === 0);
+  check("no-write 상한 초과: outcome=BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED", result.outcome === "BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED");
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("no-write 상한 초과: 최종 status=BLOCKED(WAITING_HUMAN 아님 — Human Gate 활성화 안 함)", (finalState.status as unknown as string) === "BLOCKED");
+  check(
+    "no-write 상한 초과: NO_WRITE_STRATEGY_EXHAUSTED 마커가 기록됨(evidence 보존)",
+    finalState.deferredHumanTasks.some((t) => t.startsWith("NO_WRITE_STRATEGY_EXHAUSTED:"))
+  );
+  check("no-write 상한 초과: task P1.2는 completedTasks에 없음(자동 승인 아님)", !finalState.completedTasks.includes("P1.2"));
+}
+
+// 대조군 — 상한 미만(4)이면 여전히 Developer가 정상 호출돼야 한다(과도하게 이르게 차단하지
+// 않음 — buildNoWriteStrategyEscalationHint의 prompt hint 단계에는 여전히 기회를 준다).
+async function scenarioRunAutodevOnceStillCallsDeveloperBelowNoWriteCap(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo, {
+    status: "READY",
+    technicalRecoveryState: {
+      taskId: "P1.2",
+      sameFailureCount: 0,
+      rootCauseAnalysisCount: 0,
+      providerTimeoutCount: 0,
+      noWriteRepeatCount: 4,
+      unexpectedExitCount: 0,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  const manifest = buildPlannerManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "정상 호출", changedFiles: ["proj/marker.txt"], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("no-write 상한 미만(4): Developer가 정상적으로 1회 호출됨(과도하게 이르게 차단하지 않음)", claudeCalls === 1);
+  check("no-write 상한 미만(4): outcome이 BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED가 아님", result.outcome !== "BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED");
+}
+
 // 첫 번째 mid-flight 재발견(unexpectedExitCount 0 → 1)은 아직 임계치 미만이므로 정상적으로
 // Developer를 재호출해 진행을 계속해야 한다 — 여기서 즉시 차단되면 §20의 "제한적 재시작
 // 허용"이 깨진다.
@@ -2927,6 +2996,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
     await scenarioTechnicalHumanGateMatrixReviewBlockAndScopeViolation();
     await scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap();
+    await scenarioRunAutodevOnceEscalatesAfterNoWriteRepeatExceedsCap();
+    await scenarioRunAutodevOnceStillCallsDeveloperBelowNoWriteCap();
     await scenarioRunAutodevOnceProcessRestartCircuitBreakerAllowsFirstRepeat();
     await scenarioRunAutodevOnceDoesNotReconcileGenuineBudgetExceededWaitingHuman();
     await scenarioRunAutodevOnceDoesNotReconcileSecurityCheckpointBlockedWaitingHuman();

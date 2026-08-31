@@ -481,7 +481,15 @@ export type AutodevRunOutcome =
    *  초과했다. Developer/Reviewer를 다시 호출하지 않고 즉시 기술적 BLOCKED로 전환한다(genuine
    *  WAITING_HUMAN이 아니다 — § 아래 실제 구현의 status==="BLOCKED" 분기와 그 주석) —
    *  deterministic-simulation.ts Run C가 실제로 재현한 무제한 재시작 결함을 닫는다. */
-  | "BLOCKED_MID_FLIGHT_CRASH_LOOP";
+  | "BLOCKED_MID_FLIGHT_CRASH_LOOP"
+  /** AutoDev 최종 통합 하드닝(Hardening E, No-Progress를 Hard Switch로) — 같은 task가
+   *  WRITE 없이(changedFiles.length===0) MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT회 이상
+   *  연속 실패했다. buildNoWriteStrategyEscalationHint()가 이미 반복 횟수에 따라 더 강한
+   *  prompt hint를 보여주지만, 이 상한 전까지는 계속 같은 전략(더 강한 문구의 hint)만
+   *  반복할 뿐 실제로 접근을 바꾸지 않는다 — 상한을 넘으면 Developer를 다시 호출하지 않고
+   *  즉시 기술적 BLOCKED로 전환한다(genuine WAITING_HUMAN이 아니다 — MID_FLIGHT_CRASH_LOOP_DETECTED
+   *  와 동일한 원칙, project lock도 동일하게 유지한다). */
+  | "BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED";
 
 export interface AutodevRunResult {
   outcome: AutodevRunOutcome;
@@ -1259,6 +1267,52 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       });
       saveState(state, statePath);
       return { outcome: "BLOCKED_EXECUTION_CONTRACT_MISMATCH", taskId: taskDef.id, reason: detail };
+    }
+
+    // AutoDev 최종 통합 하드닝(Hardening E, No-Progress를 Hard Switch로) —
+    // buildNoWriteStrategyEscalationHint(§ 아래 memoryHint 조립부)는 WRITE 없이 연속
+    // 실패한 횟수가 늘어날수록 더 강한 prompt 문구를 보여줄 뿐, 그 자체로는 상한이 없다 —
+    // 같은 "prompt hint만 바꾸는" 전략을 무한히 반복하며 Developer 호출만 계속 소비할 수
+    // 있다(§ "같은 전략을 계속 반복하지 않는다" 원칙). durable-recovery-state.ts가 이미
+    // process 재시작을 넘어 누적하는 noWriteRepeatCount를(§ LOCAL_ROOT_CAUSE_MODE와 동일한
+    // 출처 — 새 카운터를 만들지 않는다) 위 MID_FLIGHT_CRASH_LOOP_DETECTED가 쓰는
+    // MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT(=5, "몇 번의 기회까지 허용하는가"에 대한 이
+    // 함수의 기존 기준)와 비교한다 — 새 arbitrary magic number를 만들지 않는다. 상한에
+    // 도달하면 문구만 더 강하게 바꾸는 대신 실제로 전략을 전환한다: Developer를 다시
+    // 호출하지 않고 즉시 기술적 BLOCKED로 전환한다(genuine WAITING_HUMAN이 아니다 —
+    // MID_FLIGHT_CRASH_LOOP_DETECTED/EXECUTION_CONTRACT_MISMATCH와 동일한 원칙: 사람의
+    // 사업적/보안적 "판단"이 필요한 문제가 아니라, 증명된 비생산적 전략을 자동으로 계속
+    // 반복하지 않게 막는 deterministic 안전장치다).
+    const noWriteDurableState = loadDurableFailureStateForTask(state, taskDef.id);
+    const noWriteDurableRepeatCount = noWriteDurableState.noWriteRepeatCount ?? 0;
+    if (noWriteDurableRepeatCount >= MAX_MID_FLIGHT_UNEXPECTED_EXIT_COUNT) {
+      const reason = `NO_WRITE_STRATEGY_EXHAUSTED: task=${taskDef.id} noWriteRepeatCount=${noWriteDurableRepeatCount}`;
+      log("NO_WRITE_STRATEGY_EXHAUSTED — WRITE 없이 반복된 실패 상한 초과, 동일 전략(prompt hint) 반복을 멈추고 Developer 재호출 없이 기술적 BLOCKED로 전환(Human Gate 아님, DETERMINISTIC_LOCAL)", {
+        taskId: taskDef.id,
+        noWriteRepeatCount: noWriteDurableState.noWriteRepeatCount,
+      });
+      console.log(
+        `[autodev] task ${taskDef.id} — NO_WRITE_STRATEGY_EXHAUSTED(${noWriteDurableState.noWriteRepeatCount}회 연속 WRITE 없이 실패) — 같은 prompt 전략 반복을 멈추고 기술적 BLOCKED로 전환합니다(사람이 접근 자체를 재검토해야 합니다).`
+      );
+      state.status = "BLOCKED";
+      state.deferredHumanTasks.push(reason);
+      saveState(state, statePath);
+      emitEvent(events, {
+        eventType: "RUN_BLOCKED",
+        runId,
+        projectId: manifest.projectId,
+        taskId: taskDef.id,
+        executionPhase: "task_selection",
+        outcome: "BLOCKED",
+        reason,
+      });
+      // MID_FLIGHT_CRASH_LOOP_DETECTED와 동일한 원칙 — 근본 원인(반복적으로 비생산적인
+      // 전략)이 해소될 때까지(예: 사람이 task 정의/접근을 직접 재검토) 다른 writer가 같은
+      // 실패를 즉시 다시 반복하지 않도록 lock을 유지한다. 완전히 잠기는 것은 아니다 — 이
+      // 프로세스가 종료되면 project-lock.ts의 기존 stale lock 복구가 다음 시도의 자연스러운
+      // 재시도 속도를 늦추는 역할을 한다(§ 요구사항 9와 동일한 원칙).
+      lockShouldRelease = false;
+      return { outcome: "BLOCKED_NO_WRITE_STRATEGY_EXHAUSTED", taskId: taskDef.id, reason };
     }
 
     console.log(`[autodev] 다음 task 선택: ${taskDef.id} — ${taskDef.title}`);
