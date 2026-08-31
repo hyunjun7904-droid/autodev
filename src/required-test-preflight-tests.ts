@@ -10,6 +10,7 @@ import {
   checkRequiredTestExecutionEnvironment,
   evaluateGreenfieldDefer,
   reconcileStaleRequiredTestExecutionEnvironmentTasks,
+  classifyPrerequisiteFeasibility,
 } from "./required-test-preflight";
 import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
 
@@ -937,6 +938,62 @@ function makeMinimalTask(id: string, requiredTests: RequiredTestCommand[]): Task
   };
 }
 
+// ---------------------------------------------------------------------------
+// N) classifyPrerequisiteFeasibility — Hardening G(Prerequisite Feasibility).
+// ---------------------------------------------------------------------------
+function makeScopedTask(id: string, allowedPathPrefixes: string[]): TaskDefinition {
+  return { id, phase: 1, taskNumber: 1, title: "fixture", prompt: "fixture", requiredTests: [], allowedPathPrefixes, prohibitedOperations: [] };
+}
+
+function scenarioPrerequisiteFeasibilityExpectedGreenfield(): void {
+  const registry = [makeScopedTask("T1", ["module-a/"]), makeScopedTask("T2", ["module-b/"])];
+  const result = classifyPrerequisiteFeasibility("module-a/src/index.ts", "T1", ["module-a/"], registry);
+  check("N/G1) 현재 task 자신의 scope 안 → EXPECTED_GREENFIELD", result.feasibility === "EXPECTED_GREENFIELD");
+  check("N/G1) candidateResponsibleTaskIds가 없음(자기 자신 소관이므로)", result.candidateResponsibleTaskIds === undefined);
+}
+
+function scenarioPrerequisiteFeasibilityMissingPrerequisite(): void {
+  const registry = [makeScopedTask("T1", ["module-a/"]), makeScopedTask("T2", ["module-b/"])];
+  const result = classifyPrerequisiteFeasibility("module-b/gradlew", "T1", ["module-a/"], registry);
+  check("N/G2) 다른 task(T2)의 scope 안 → MISSING_PREREQUISITE", result.feasibility === "MISSING_PREREQUISITE");
+  check("N/G2) candidateResponsibleTaskIds에 T2가 포함됨", (result.candidateResponsibleTaskIds ?? []).includes("T2"));
+  check("N/G2) 현재 task(T1) 자신은 후보에서 제외됨", !(result.candidateResponsibleTaskIds ?? []).includes("T1"));
+}
+
+function scenarioPrerequisiteFeasibilityUnsatisfiable(): void {
+  const registry = [makeScopedTask("T1", ["module-a/"]), makeScopedTask("T2", ["module-b/"])];
+  const result = classifyPrerequisiteFeasibility("module-c/gradlew", "T1", ["module-a/"], registry);
+  check("N/G3) 어떤 task의 scope도 아님 → UNSATISFIABLE_PREREQUISITE", result.feasibility === "UNSATISFIABLE_PREREQUISITE");
+  check("N/G3) candidateResponsibleTaskIds가 없음", result.candidateResponsibleTaskIds === undefined);
+}
+
+function scenarioPrerequisiteFeasibilityMultipleCandidates(): void {
+  // 두 task가 겹치는 scope를 선언한 경우(계획 결함 자체를 이 함수가 만들어내지 않는다 —
+  // 있는 그대로 후보 전부를 보고한다).
+  const registry = [makeScopedTask("T1", ["shared/"]), makeScopedTask("T2", ["shared/"]), makeScopedTask("T3", ["other/"])];
+  const result = classifyPrerequisiteFeasibility("shared/lib.ts", "T3", ["other/"], registry);
+  check("N/G4) 겹치는 scope 후보 T1/T2가 모두 보고됨", (result.candidateResponsibleTaskIds ?? []).sort().join(",") === "T1,T2");
+}
+
+function scenarioCheckRequiredTestExecutionEnvironmentAttachesFeasibilityWhenContextGiven(): void {
+  const root = mkdtempSync(join(tmpdir(), "autodev-prereq-feasibility-"));
+  const registry = [makeScopedTask("T1", ["module-a/"]), makeScopedTask("T2", ["module-b/"])];
+  const executor = { projectRoot: root, projectRootReal: realpathSync(root), policy: { commandCwdAliases: { modb: "module-b" } } };
+  const rt: RequiredTestCommand = { name: "check", command: "npm", args: ["run", "check"], cwd: "modb" };
+
+  const withoutContext = checkRequiredTestExecutionEnvironment([rt], executor, ["module-a/"]);
+  check("N/G5) feasibilityContext 미지정 시 기존 동작 그대로(prerequisiteFeasibility 없음)", withoutContext.issues[0]?.prerequisiteFeasibility === undefined);
+
+  const withContext = checkRequiredTestExecutionEnvironment([rt], executor, ["module-a/"], undefined, { currentTaskId: "T1", registry });
+  check(
+    "N/G5) feasibilityContext 지정 시 MISSING_PREREQUISITE로 분류됨(module-b/는 T2 소관)",
+    withContext.issues[0]?.prerequisiteFeasibility?.feasibility === "MISSING_PREREQUISITE"
+  );
+  check("N/G5) candidateResponsibleTaskIds에 T2가 포함됨", (withContext.issues[0]?.prerequisiteFeasibility?.candidateResponsibleTaskIds ?? []).includes("T2"));
+
+  rmSync(root, { recursive: true, force: true });
+}
+
 function envErrorMarker(taskId: string, requiredTestName: string, resolvedPath: string): string {
   return `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${taskId} requiredTest=${requiredTestName} kind=WRAPPER_NOT_FOUND cwd=wakeword resolvedPath=${resolvedPath}`;
 }
@@ -1119,6 +1176,12 @@ function main(): void {
   scenarioEnvReconcileEmptyIsNotResolved();
   scenarioEnvReconcileUnknownTaskIdNotResolved();
   scenarioEnvReconcileFailClosedOnMalformedEntry();
+
+  scenarioPrerequisiteFeasibilityExpectedGreenfield();
+  scenarioPrerequisiteFeasibilityMissingPrerequisite();
+  scenarioPrerequisiteFeasibilityUnsatisfiable();
+  scenarioPrerequisiteFeasibilityMultipleCandidates();
+  scenarioCheckRequiredTestExecutionEnvironmentAttachesFeasibilityWhenContextGiven();
 
   console.log("\n=== required-test-preflight 테스트 결과 ===");
   for (const r of results) console.log(r);

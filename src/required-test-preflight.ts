@@ -162,6 +162,62 @@ export interface RequiredTestExecutionEnvironmentIssue {
   cwd: string;
   resolvedPath: string;
   reason?: string;
+  /** AutoDev 최종 통합 하드닝(Hardening G, Prerequisite Feasibility) — 호출부가
+   *  checkRequiredTestExecutionEnvironment()에 전체 registry를 넘겼을 때만 채워지는 순수
+   *  진단 분류다(§ classifyPrerequisiteFeasibility). 이 값 자체는 BLOCK 여부를 바꾸지
+   *  않는다 — "이미 BLOCK으로 확정된 이슈가 왜 이 task 자신의 책임이 아닌지"를 사람이 로그로
+   *  바로 알 수 있게 할 뿐이다. */
+  prerequisiteFeasibility?: PrerequisiteFeasibilityResult;
+}
+
+// AutoDev 최종 통합 하드닝(Hardening G, Prerequisite Feasibility) — JARVIS 분석에서 확인된
+// "공유 prerequisite(예: gradlew wrapper)가 어느 Task의 책임인지 계획에 없을 수 있다"는
+// 문제를 특정 프로젝트/빌드 도구에 종속되지 않는 일반 판정으로 옮긴다. 이 판정은 순수
+// 함수이며(fs 접근 없음), evaluateGreenfieldDefer가 이미 내리는 "현재 task 자신의 책임"
+// 판정과 동일한 isPathInScope 기준을 그대로 재사용해 세 값 중 하나로 분류한다:
+//   - EXPECTED_GREENFIELD: 현재 task 자신의 allowedPathPrefixes 범위 안 — 이 task가 구현
+//     과정에서 만들어야 하는 정상적인 "아직 없음" 상태.
+//   - MISSING_PREREQUISITE: 현재 task의 범위 밖이지만, task-registry의 다른 task가 그
+//     경로에 대한 책임(allowedPathPrefixes)을 갖고 있다 — 계획상 책임 task는 있으나 아직
+//     만들어지지 않음.
+//   - UNSATISFIABLE_PREREQUISITE: task-registry의 어떤 task도 그 경로에 대한 책임을 갖고
+//     있지 않다 — 계획 자체에 이 prerequisite을 만들 task가 없다.
+export type PrerequisiteFeasibility = "EXPECTED_GREENFIELD" | "MISSING_PREREQUISITE" | "UNSATISFIABLE_PREREQUISITE";
+
+export interface PrerequisiteFeasibilityResult {
+  feasibility: PrerequisiteFeasibility;
+  reason: string;
+  /** MISSING_PREREQUISITE일 때만 — 그 경로에 대한 책임(allowedPathPrefixes)을 가진 것으로
+   *  보이는 다른 task id들. */
+  candidateResponsibleTaskIds?: string[];
+}
+
+/** missingPathRelative는 project root 기준 상대경로(forward-slash)여야 한다. */
+export function classifyPrerequisiteFeasibility(
+  missingPathRelative: string,
+  currentTaskId: string,
+  currentAllowedPathPrefixes: readonly string[],
+  registry: readonly TaskDefinition[]
+): PrerequisiteFeasibilityResult {
+  const normalized = missingPathRelative.replace(/\\/g, "/");
+  if (isPathInScope(normalized, [...currentAllowedPathPrefixes])) {
+    return {
+      feasibility: "EXPECTED_GREENFIELD",
+      reason: `현재 task(${currentTaskId}) 자신의 allowedPathPrefixes 범위 안 — 이 task가 구현 과정에서 만들어야 하는 대상으로 보입니다.`,
+    };
+  }
+  const candidates = registry.filter((t) => t.id !== currentTaskId && isPathInScope(normalized, [...t.allowedPathPrefixes])).map((t) => t.id);
+  if (candidates.length > 0) {
+    return {
+      feasibility: "MISSING_PREREQUISITE",
+      reason: `현재 task의 allowedPathPrefixes 범위 밖입니다 — task-registry의 다른 task(${candidates.join(", ")})가 이 경로에 대한 책임(allowedPathPrefixes)을 갖고 있으나 아직 만들어지지 않았습니다.`,
+      candidateResponsibleTaskIds: candidates,
+    };
+  }
+  return {
+    feasibility: "UNSATISFIABLE_PREREQUISITE",
+    reason: "task-registry의 어떤 task도 이 경로를 allowedPathPrefixes 범위로 갖고 있지 않습니다 — 계획에 이 prerequisite을 만들 책임을 가진 task가 없습니다(project adapter/Master Spec을 직접 재검토해야 합니다).",
+  };
 }
 
 /** greenfield defer(§ evaluateGreenfieldDefer)가 적용된 required test — 차단하지 않았지만
@@ -265,11 +321,24 @@ export function checkRequiredTestExecutionEnvironment(
   /** 테스트 전용 — 지정하지 않으면 production과 완전히 동일(process.platform, 실제 fs/env)하게
    *  동작한다. resolveTrustedGradleWrapper()로 그대로 전달한다(로직 복제 없음) — Windows에서
    *  회귀 테스트가 JAVA_HOME 없이도 결정론적으로 동작하도록 platform을 고정할 수 있게 한다. */
-  gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps }
+  gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps },
+  /** AutoDev 최종 통합 하드닝(Hardening G) — 지정하면 각 issue에 prerequisiteFeasibility를
+   *  채운다(§ classifyPrerequisiteFeasibility). 지정하지 않으면 완전한 기존 동작(필드
+   *  없음)이다 — 기존 호출부/테스트를 깨지 않는다. */
+  feasibilityContext?: { currentTaskId: string; registry: readonly TaskDefinition[] }
 ): RequiredTestExecutionEnvironmentResult {
   if (!requiredTests || requiredTests.length === 0) return { ok: true, issues: [], deferredGreenfield: [] };
   const issues: RequiredTestExecutionEnvironmentIssue[] = [];
   const deferredGreenfield: GreenfieldDeferredRequiredTest[] = [];
+
+  function classifyIfContextGiven(resolvedPath: string): PrerequisiteFeasibilityResult | undefined {
+    if (!feasibilityContext) return undefined;
+    // § evaluateGreenfieldDefer의 aliasScopeCheck와 동일한 정규화 — resolvedPath는 여기서
+    // 항상 디렉터리(cwd) 자신이므로, "이 디렉터리 및 그 하위 전체"를 뜻하는 trailing slash를
+    // 붙여야 isPathInScope의 prefix 매칭(예: "module-b/")과 정확히 일치한다.
+    const rel = `${relative(executor.projectRoot, resolvedPath).split(sep).join("/")}/`;
+    return classifyPrerequisiteFeasibility(rel, feasibilityContext.currentTaskId, allowedPathPrefixes, feasibilityContext.registry);
+  }
 
   for (const rt of requiredTests) {
     let resolvedPath: string;
@@ -290,7 +359,14 @@ export function checkRequiredTestExecutionEnvironment(
         deferredGreenfield.push({ requiredTestName: rt.name, cwd: rt.cwd, resolvedPath });
         continue;
       }
-      issues.push({ requiredTestName: rt.name, kind: "CWD_NOT_FOUND", cwd: rt.cwd, resolvedPath, reason: "디렉터리가 존재하지 않습니다." });
+      issues.push({
+        requiredTestName: rt.name,
+        kind: "CWD_NOT_FOUND",
+        cwd: rt.cwd,
+        resolvedPath,
+        reason: "디렉터리가 존재하지 않습니다.",
+        prerequisiteFeasibility: classifyIfContextGiven(resolvedPath),
+      });
       continue;
     }
     if (!st.isDirectory() || st.isSymbolicLink()) {
@@ -300,6 +376,7 @@ export function checkRequiredTestExecutionEnvironment(
         cwd: rt.cwd,
         resolvedPath,
         reason: st.isSymbolicLink() ? "경로가 symlink입니다(허용되지 않음)." : "경로가 디렉터리가 아닙니다.",
+        prerequisiteFeasibility: classifyIfContextGiven(resolvedPath),
       });
       continue;
     }

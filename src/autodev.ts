@@ -1191,7 +1191,17 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 호출부, status==="BLOCKED"도 함께 확인하도록 확장)가 매 재시작마다 이 결함이 여전히
     // 재현되는지 deterministic하게 다시 확인해, 해소되면 사람의 명시적 APPROVE 없이도 자동으로
     // READY로 되돌린다.
-    const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext, taskDef.allowedPathPrefixes);
+    // Hardening G(Prerequisite Feasibility) — feasibilityContext를 넘겨 issue에
+    // EXPECTED_GREENFIELD/MISSING_PREREQUISITE/UNSATISFIABLE_PREREQUISITE 분류가 함께
+    // 남도록 한다(§ required-test-preflight.ts classifyPrerequisiteFeasibility) — 이
+    // 분류 자체는 BLOCK 여부를 바꾸지 않는다, 순수 진단 정보다.
+    const executionEnvironmentPreflight = checkRequiredTestExecutionEnvironment(
+      taskDef.requiredTests,
+      executorContext,
+      taskDef.allowedPathPrefixes,
+      undefined,
+      { currentTaskId: taskDef.id, registry: manifest.taskRegistry }
+    );
     if (executionEnvironmentPreflight.deferredGreenfield.length > 0) {
       log("REQUIRED_TEST_EXECUTION_ENVIRONMENT greenfield defer 적용 — Developer 호출 전 차단하지 않음", {
         taskId: taskDef.id,
@@ -1200,7 +1210,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     }
     if (!executionEnvironmentPreflight.ok) {
       const detail = executionEnvironmentPreflight.issues
-        .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath} reason=${i.reason ?? ""}`)
+        .map(
+          (i) =>
+            `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath} reason=${i.reason ?? ""}` +
+            (i.prerequisiteFeasibility ? ` prerequisiteFeasibility=${i.prerequisiteFeasibility.feasibility}(${i.prerequisiteFeasibility.reason})` : "")
+        )
         .join("; ");
       console.log(
         `[autodev] task ${taskDef.id} — required test 실행 환경 결함 감지(${detail}) — Developer를 부르지 않고 기술적 BLOCKED로 전환합니다(project adapter config의 commandCwdAliases/requiredTest.cwd를 직접 확인/수정해야 합니다 — 사람 승인이 아니라 기술적 안전정지입니다).`
@@ -1588,10 +1602,17 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           // LOCAL_ROOT_CAUSE_MODE는 결정론적으로 재확인 가능한 execution-environment
           // 카테고리만 다룬다(§ 요구사항 — 추측으로 "변화 없음"을 판정하지 않는다).
           if (repeatCount >= MAX_SAME_FAILURE_LOCAL_DEVELOPER_CALLS) {
-            const envRecheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext, taskDef.allowedPathPrefixes);
+            const envRecheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executorContext, taskDef.allowedPathPrefixes, undefined, {
+              currentTaskId: taskDef.id,
+              registry: manifest.taskRegistry,
+            });
             if (!envRecheck.ok) {
               const detail = envRecheck.issues
-                .map((i) => `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath}`)
+                .map(
+                  (i) =>
+                    `requiredTest=${i.requiredTestName} kind=${i.kind} cwd=${i.cwd} resolvedPath=${i.resolvedPath}` +
+                    (i.prerequisiteFeasibility ? ` prerequisiteFeasibility=${i.prerequisiteFeasibility.feasibility}(${i.prerequisiteFeasibility.reason})` : "")
+                )
                 .join("; ");
               // AutoDev Core Maintenance(2026-08-30) — advisory-only(§ problem-memory.ts
               // lookupSolutionsByRootCauseClass 주석 — "검증된 정답이 아니라 우선 검토할
