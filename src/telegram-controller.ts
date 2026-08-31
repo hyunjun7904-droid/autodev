@@ -8,9 +8,11 @@ import { selectDefaultApprovalStore, selectDefaultTelegramOffsetStore } from "./
 import type { ApprovalStore, TelegramOffsetStore } from "./approval-store";
 import { validateProjectManifest } from "./project-manifest";
 import type { ProjectManifest } from "./project-manifest";
+import { loadProjectAdapter } from "./project-adapter-loader";
 import { getTelegramUpdates, resolveTelegramAllowlist } from "./telegram-callback-client";
 import type { TelegramAllowlistConfig } from "./telegram-callback-client";
 import { createApprovalRequestsFromEvents, handleTelegramCallbackUpdate } from "./approval-service";
+import type { GitExpectationForEvent } from "./approval-service";
 import { getCurrentBranch, getCurrentHeadHash } from "./git-changes";
 import { classifyEventForNotification } from "./notification";
 import { processNotifications } from "./notification-service";
@@ -122,6 +124,9 @@ export interface TelegramControllerOptions {
   /** notification-service.ts processNotifications()의 maxAttempts로 그대로 전달된다. */
   maxDeliveryAttempts?: number;
   answerTimeoutMs?: number;
+  /** 테스트 전용 override — § resolveGitExpectationForEvent. 지정하지 않으면 실제
+   *  loadProjectAdapter()(project-adapter-loader.ts)를 그대로 쓴다. */
+  loadProjectAdapter?: typeof loadProjectAdapter;
 }
 
 export interface TelegramControllerTickSummary {
@@ -160,6 +165,37 @@ interface ControllerDeps {
   requestTimeoutMs: number;
   answerTimeoutMs?: number;
   maxDeliveryAttempts?: number;
+  loadProjectAdapter?: typeof loadProjectAdapter;
+}
+
+/**
+ * Multi-Project Approval Isolation(2026-09-01) — DEFECT 1 수정. installation-wide
+ * controller가 owner project 하나의 cwd로 계산한 Git HEAD/branch를 다른 project의 event에
+ * 그대로 섞어 쓰지 않는다(§ 요구사항 invariant A/B). event.projectId가 controller owner와
+ * 같으면(대부분의 단일-project 운용, 그리고 projectId가 없는 구형/self-dev event) 기존
+ * owner cwd 경로를 그대로 쓴다 — 동작 변화 없음. 다르면(cross-project) event.metadata.
+ * adapterPath(그 project 자신의 autodev.ts/orchestrator.ts가 채운 값, § approval.ts
+ * ApprovalRequest.adapterPath와 동일한 출처)로 loadProjectAdapter()를 다시 호출해 그
+ * project의 진짜 targetProjectRoot를 얻는다. adapterPath가 없거나 로드 결과의 projectId가
+ * event.projectId와 다르면(신뢰할 수 없음) undefined를 반환한다 — 호출부(approval-service.ts
+ * createApprovalRequestsFromEvents)는 owner 값으로 대체하지 않고 이번 tick에서 그 event를
+ * 건너뛴다.
+ */
+function resolveGitExpectationForEvent(event: AutoDevEvent, deps: ControllerDeps): GitExpectationForEvent | undefined {
+  if (event.projectId === undefined || event.projectId === deps.manifest.projectId) {
+    return { expectedGitHead: getCurrentHeadHash(deps.cwd), expectedBranch: getCurrentBranch(deps.cwd) };
+  }
+  const adapterPath = typeof event.metadata?.adapterPath === "string" ? event.metadata.adapterPath : undefined;
+  if (!adapterPath) return undefined;
+  const load = deps.loadProjectAdapter ?? loadProjectAdapter;
+  let foreignManifest: ProjectManifest;
+  try {
+    foreignManifest = load(adapterPath);
+  } catch {
+    return undefined;
+  }
+  if (foreignManifest.projectId !== event.projectId) return undefined;
+  return { expectedGitHead: getCurrentHeadHash(foreignManifest.targetProjectRoot), expectedBranch: getCurrentBranch(foreignManifest.targetProjectRoot) };
 }
 
 async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSummary> {
@@ -167,16 +203,10 @@ async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSumm
   const nowIso = nowDate.toISOString();
   const { events } = deps.eventStore.query();
 
-  // Auto Resume Git Safety recheck(§ auto-resume.ts)의 기준값 — 이 tick이 ApprovalRequest를
-  // 만드는 시점의 HEAD/branch를 캡처한다. git-changes.ts의 기존 읽기 전용 helper만 쓴다.
-  const expectedGitHead = getCurrentHeadHash(deps.cwd);
-  const expectedBranch = getCurrentBranch(deps.cwd);
-
   const approvalsResult = createApprovalRequestsFromEvents(events, deps.approvalStore, {
     now: deps.now,
-    expectedGitHead,
-    expectedBranch,
     eventStore: deps.eventStore,
+    resolveGitExpectation: (event) => resolveGitExpectationForEvent(event, deps),
   });
 
   // AutoDev production notification policy(2026-08-27) — ntfy는 production에서 쓰지 않는다
@@ -227,6 +257,7 @@ async function runTick(deps: ControllerDeps): Promise<TelegramControllerTickSumm
           answerTimeoutMs: deps.answerTimeoutMs,
           statePath: deps.statePath,
           cwd: deps.cwd,
+          loadProjectAdapter: deps.loadProjectAdapter,
         });
         updatesProcessed += 1;
         // update마다 즉시 반영한다 — batch 중간에 process가 죽어도 이미 끝까지 처리된
@@ -279,6 +310,7 @@ export async function startTelegramController(opts: TelegramControllerOptions): 
     requestTimeoutMs: opts.requestTimeoutMs ?? longPollTimeoutSec * 1000 + DEFAULT_REQUEST_TIMEOUT_BUFFER_MS,
     answerTimeoutMs: opts.answerTimeoutMs,
     maxDeliveryAttempts: opts.maxDeliveryAttempts,
+    loadProjectAdapter: opts.loadProjectAdapter,
   };
 
   const tickDelayMs = opts.tickDelayMs ?? DEFAULT_TICK_DELAY_MS;

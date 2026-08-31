@@ -11,6 +11,7 @@ import { answerTelegramCallbackQuery, verifyCallbackSender } from "./telegram-ca
 import { performAutoResume } from "./auto-resume";
 import type { AutoResumeOutcome } from "./auto-resume";
 import type { ProjectManifest } from "./project-manifest";
+import { loadProjectAdapter } from "./project-adapter-loader";
 import type { OrchestratorDeps } from "./orchestrator";
 
 // Approval Orchestration — Phase G Task G6.
@@ -31,15 +32,29 @@ import type { OrchestratorDeps } from "./orchestrator";
 // 1) Event → ApprovalRequest
 // ---------------------------------------------------------------------------
 
+export interface GitExpectationForEvent {
+  expectedGitHead?: string;
+  expectedBranch?: string;
+}
+
 export interface CreateApprovalsOptions {
   now?: () => Date;
   expiryMs?: number;
   /** Auto Resume Git Safety recheck의 기준값(§ approval.ts ApprovalRequest.expectedGitHead/
-   *  expectedBranch) — 호출부(telegram-controller.ts)가 이 batch를 처리하는 시점에
-   *  git-changes.ts로 조회해 넘긴다(이 파일은 git을 직접 조회하지 않는다). */
+   *  expectedBranch) — resolveGitExpectation이 지정되지 않았을 때만 모든 event에 그대로
+   *  쓰인다(기존 단일-project 호출부/테스트와의 하위호환 전용 — 새 호출부는 아래
+   *  resolveGitExpectation을 쓴다). */
   expectedGitHead?: string;
   expectedBranch?: string;
   eventStore?: EventStore;
+  /** Multi-Project Approval Isolation(2026-09-01) — 지정하면 event마다 이 함수로 Git Safety
+   *  recheck 기준값을 개별적으로 계산한다(§ 요구사항 — installation-wide controller owner
+   *  project의 Git metadata를 다른 project event에 섞어 쓰지 않는다). 이 파일은 여전히 git을
+   *  직접 조회하지 않는다(§ 파일 상단 주석) — 실제 조회/adapterPath 재해석은 호출부
+   *  (telegram-controller.ts)가 담당한다. undefined를 반환하면 "이 event의 project context를
+   *  안전하게 확정하지 못했다"는 뜻이며, 그 event는 이번 tick에서 approval을 만들지 않고
+   *  건너뛴다(owner project 값으로 대체하지 않는다 — fail-closed, 다음 tick에 다시 시도). */
+  resolveGitExpectation?: (event: AutoDevEvent) => GitExpectationForEvent | undefined;
 }
 
 export interface CreateApprovalsResult {
@@ -75,11 +90,25 @@ export function createApprovalRequestsFromEvents(
 
     if (approvalStore.getByDedupeKey(notification.dedupeKey)) continue;
 
+    // Multi-Project Approval Isolation(2026-09-01) — resolveGitExpectation이 지정됐으면
+    // 이 event 하나만의 project context로 Git 기준값을 새로 계산한다. undefined가 돌아오면
+    // (project context를 안전하게 확정하지 못함) owner project의 batch 값으로 대체하지
+    // 않고 이 event는 이번 tick에서 건너뛴다 — dedupeKey 기준 idempotent 재스캔이므로 다음
+    // tick이 다시 시도한다.
+    let gitExpectation: GitExpectationForEvent;
+    if (opts.resolveGitExpectation) {
+      const resolved = opts.resolveGitExpectation(event);
+      if (!resolved) continue;
+      gitExpectation = resolved;
+    } else {
+      gitExpectation = { expectedGitHead: opts.expectedGitHead, expectedBranch: opts.expectedBranch };
+    }
+
     const request = buildApprovalRequest(event, notification.dedupeKey, {
       now: opts.now,
       expiryMs: opts.expiryMs,
-      expectedGitHead: opts.expectedGitHead,
-      expectedBranch: opts.expectedBranch,
+      expectedGitHead: gitExpectation.expectedGitHead,
+      expectedBranch: gitExpectation.expectedBranch,
     });
     const stored = approvalStore.createPending(request);
     if (stored.approvalId !== request.approvalId) continue; // 다른 곳에서 이미 만들어짐(idempotent)
@@ -111,7 +140,12 @@ export type HandleCallbackOutcomeKind =
   | "REMOTE_NOT_ALLOWED"
   | "REJECTED"
   | "DEFERRED"
-  | "APPROVED";
+  | "APPROVED"
+  // Multi-Project Approval Isolation(2026-09-01) — 이 approval이 owner project와 다른
+  // project에 속하는데, 그 project의 진짜 manifest를 안전하게 resolve하지 못했다(§
+  // resolveApprovalProjectContext). owner project의 manifest/statePath/cwd로 대체하지 않고
+  // fail-closed로 거부한다 — approval 자체는 PENDING으로 그대로 남는다(재시도 가능).
+  | "PROJECT_CONTEXT_UNRESOLVED";
 
 export interface HandleCallbackResult {
   kind: HandleCallbackOutcomeKind;
@@ -130,6 +164,7 @@ const ANSWER_TEXT: Record<Exclude<HandleCallbackOutcomeKind, "IGNORED_NOT_CALLBA
   REJECTED: "승인 거절됨.",
   DEFERRED: "나중에 처리하도록 보류했습니다.",
   APPROVED: "승인 접수됨.",
+  PROJECT_CONTEXT_UNRESOLVED: "이 요청이 속한 프로젝트를 안전하게 확인할 수 없습니다 — PC에서 직접 확인하세요.",
 };
 
 export interface HandleCallbackContext {
@@ -147,6 +182,53 @@ export interface HandleCallbackContext {
    *  auto-resume.ts 주석과 동일한 seam). production 호출부(telegram-controller.ts)는 이
    *  필드를 지정하지 않는다. */
   orchestratorDeps?: OrchestratorDeps;
+  /** 테스트 전용 override — § resolveApprovalProjectContext. 지정하지 않으면 실제
+   *  loadProjectAdapter()(project-adapter-loader.ts)를 그대로 쓴다. */
+  loadProjectAdapter?: typeof loadProjectAdapter;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 2 수정.
+// ---------------------------------------------------------------------------
+
+export interface ResolvedApprovalProjectContext {
+  manifest: ProjectManifest;
+  statePath: string;
+  cwd: string;
+}
+
+/**
+ * 이 approval이 실제로 속한 project의 manifest/statePath/cwd를 안전하게 resolve한다 —
+ * installation-wide Telegram controller owner의 manifest/statePath/cwd(ctx.manifest/
+ * ctx.statePath/ctx.cwd)를 다른 project 처리에 fallback으로 쓰지 않는다(§ 요구사항 invariant
+ * B). approval.projectId가 controller owner와 같으면(대부분의 단일-project 운용, 그리고
+ * approval.projectId가 없는 구형 레코드) 기존 owner 경로를 그대로 쓴다 — 동작 변화 없음.
+ * 다르면(cross-project) approval.adapterPath(§ approval.ts, event를 만든 project 자신이
+ * 채운 값)로 loadProjectAdapter()(이미 검증된 유일한 project 진입점, 새 registry를 만들지
+ * 않는다)를 다시 호출해 그 project의 진짜 manifest를 복원하고, 복원된 manifest.projectId가
+ * approval.projectId와 실제로 일치하는지도 재확인한다(방어적 이중 확인). 이 중 하나라도
+ * 실패/불확실하면 undefined를 반환한다 — 호출부는 owner 값으로 대체하지 않고 fail-closed로
+ * 처리해야 한다.
+ */
+export function resolveApprovalProjectContext(
+  approval: ApprovalRequest,
+  ctx: Pick<HandleCallbackContext, "manifest" | "statePath" | "cwd" | "loadProjectAdapter">
+): ResolvedApprovalProjectContext | undefined {
+  const ownerStatePath = ctx.statePath ?? ctx.manifest.statePath;
+  const ownerCwd = ctx.cwd ?? ctx.manifest.targetProjectRoot;
+  if (approval.projectId === undefined || approval.projectId === ctx.manifest.projectId) {
+    return { manifest: ctx.manifest, statePath: ownerStatePath, cwd: ownerCwd };
+  }
+  if (!approval.adapterPath) return undefined;
+  const load = ctx.loadProjectAdapter ?? loadProjectAdapter;
+  let resolved: ProjectManifest;
+  try {
+    resolved = load(approval.adapterPath);
+  } catch {
+    return undefined;
+  }
+  if (resolved.projectId !== approval.projectId) return undefined;
+  return { manifest: resolved, statePath: resolved.statePath, cwd: resolved.targetProjectRoot };
 }
 
 function emit(ctx: HandleCallbackContext, input: AutoDevEventInput): void {
@@ -192,7 +274,6 @@ export async function handleTelegramCallbackUpdate(update: TelegramUpdate, ctx: 
   if (!isCallbackQuery(update)) return { kind: "IGNORED_NOT_CALLBACK" };
   const cq = update.callback_query;
   const nowIso = (ctx.now ? ctx.now() : new Date()).toISOString();
-  const statePath = ctx.statePath ?? ctx.manifest.statePath;
 
   const verification = verifyCallbackSender(cq, ctx.allowlist);
   if (!verification.ok) {
@@ -248,8 +329,29 @@ export async function handleTelegramCallbackUpdate(update: TelegramUpdate, ctx: 
     return { kind: "REMOTE_NOT_ALLOWED", approvalId: approval.approvalId };
   }
 
+  // Multi-Project Approval Isolation(2026-09-01) — DEFECT 2. REJECT/DEFER는 project별
+  // state/git을 전혀 건드리지 않으므로(순수 ApprovalStore CAS) project context가 필요
+  // 없다 — 이 resolve는 APPROVE에만 관여한다. owner project와 다른데 안전하게 resolve하지
+  // 못하면 owner의 manifest/statePath/cwd로 대체하지 않고 즉시 fail-closed로 거부한다 —
+  // approval 상태는 바꾸지 않는다(PENDING 그대로, 나중에 다시 시도 가능).
+  let projectCtx: ResolvedApprovalProjectContext | undefined;
   if (parsed.action === "APPROVE") {
-    const staleReason = checkApprovalStale(approval, statePath);
+    projectCtx = resolveApprovalProjectContext(approval, ctx);
+    if (!projectCtx) {
+      emit(ctx, {
+        eventType: "APPROVAL_STALE",
+        runId: approval.runId,
+        projectId: approval.projectId,
+        taskId: approval.taskId,
+        reason: "PROJECT_CONTEXT_UNRESOLVED",
+      });
+      await answer(ctx, cq.id, ANSWER_TEXT.PROJECT_CONTEXT_UNRESOLVED);
+      return { kind: "PROJECT_CONTEXT_UNRESOLVED", approvalId: approval.approvalId };
+    }
+  }
+
+  if (parsed.action === "APPROVE") {
+    const staleReason = checkApprovalStale(approval, projectCtx!.statePath);
     if (staleReason) {
       ctx.approvalStore.transition(approval.approvalId, "INVALIDATED", nowIso);
       emit(ctx, {
@@ -297,9 +399,12 @@ export async function handleTelegramCallbackUpdate(update: TelegramUpdate, ctx: 
   emit(ctx, { eventType: "AUTO_RESUME_STARTED", runId: approval.runId, projectId: approval.projectId, taskId: approval.taskId });
 
   const approvedRequest = consumed.request ?? { ...approval, status: "APPROVED" as const };
-  const resumed = await performAutoResume(approvedRequest, ctx.manifest, {
-    statePath: ctx.statePath,
-    cwd: ctx.cwd,
+  // Multi-Project Approval Isolation(2026-09-01) — projectCtx는 이 지점에 도달했다는 사실
+  // 자체로 이미 위에서 resolve됐다(APPROVE 분기, 실패 시 이미 return됨) — owner project의
+  // manifest/statePath/cwd가 아니라 이 approval이 실제로 속한 project의 값을 쓴다.
+  const resumed = await performAutoResume(approvedRequest, projectCtx!.manifest, {
+    statePath: projectCtx!.statePath,
+    cwd: projectCtx!.cwd,
     events: ctx.eventStore,
     ...(ctx.orchestratorDeps ? { orchestratorDeps: ctx.orchestratorDeps } : {}),
   });

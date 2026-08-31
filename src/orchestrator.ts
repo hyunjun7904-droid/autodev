@@ -177,6 +177,14 @@ export interface OrchestratorDeps {
   runId?: string;
   taskId?: string;
   projectId?: string;
+  /** Multi-Project Approval Isolation(2026-09-01) — 이 run의 manifest.adapterPath를
+   *  그대로 넘긴다(autodev.ts). 지정하면 이 파일이 emitEvent()로 남기는 모든 event의
+   *  metadata에 adapterPath가 함께 실린다(§ 아래 emitEvent) — installation-wide Telegram
+   *  controller가 이 event로부터 ApprovalRequest를 만들 때, owner project의 manifest로
+   *  짐작하지 않고 이 값으로 진짜 project manifest를 다시 로드할 수 있게 하기 위함이다.
+   *  지정하지 않으면(기존 호출부/테스트) 이전과 완전히 동일하게 metadata에 아무 것도
+   *  추가되지 않는다. */
+  adapterPath?: string;
   /**
    * Phase SI-3.8B — 지정하면 실제 GPT reviewer 호출(정확히 1회, 위 gptReviewer 호출)마다
    * requestCount/token/추정비용을 Usage Ledger에 append한다(§ gpt-reviewer.ts
@@ -342,7 +350,12 @@ export async function runOrchestrator(
   // 실패 처리 정책을 이 함수 하나에서 구분한다).
   const emitEvent = (input: Omit<AutoDevEventInput, "runId" | "taskId" | "projectId">): void => {
     if (!deps.events || !deps.runId) return;
-    const result = deps.events.append({ ...input, runId: deps.runId, taskId: deps.taskId, projectId: deps.projectId });
+    // Multi-Project Approval Isolation(2026-09-01) — deps.adapterPath가 있으면(§
+    // OrchestratorDeps.adapterPath 문서) 모든 event의 metadata에 그대로 실어보낸다. 호출부가
+    // 이미 채운 metadata가 있으면 덮어쓰지 않고 그 옆에 추가한다(단일 key 추가, 기존 값
+    // 보존).
+    const metadata = deps.adapterPath ? { ...(input.metadata ?? {}), adapterPath: deps.adapterPath } : input.metadata;
+    const result = deps.events.append({ ...input, runId: deps.runId, taskId: deps.taskId, projectId: deps.projectId, metadata });
     if (result.ok) return;
     if (isAuditCriticalEvent(input.eventType)) {
       log(`AUDIT_CRITICAL_EVENT_LOST: ${input.eventType} 기록 실패 — 이 실행의 감사 기록이 불완전합니다.`, { error: result.error });

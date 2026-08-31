@@ -77,6 +77,18 @@ export interface ProjectManifest {
    * 않는다 — Project Adapter/Manifest가 명시적으로 주입하는 값만 본다.
    */
   humanFinalReviewPolicy?: HumanFinalReviewPolicy;
+  /**
+   * Multi-Project Approval Isolation(2026-09-01) — 이 manifest를 실제로 로드한 project
+   * config(JSON) 파일의 절대경로. loadProjectAdapter()가 항상 채운다(project-adapter-loader.ts
+   * — resolvedPath). installation-wide Telegram controller처럼 "지금 이 event/approval이
+   * 어느 project에 속하는가"를 owner project의 manifest로 짐작하지 않고, 이 값(이미
+   * loadProjectAdapter()가 신뢰하는 유일한 project 진입점)으로 그 project 자신의 manifest를
+   * 다시 안전하게 로드하기 위한 용도다. 새 project registry를 만들지 않는다 — 이미 존재하는
+   * loadProjectAdapter() 하나만 재사용한다. loadProjectAdapter()를 거치지 않고 manifest를
+   * 직접 구성하는 테스트/fixture는 이 필드가 없을 수 있다(그 경우 cross-project 승인 처리는
+   * fail-closed로 거부된다 — owner manifest로 대체하지 않는다).
+   */
+  adapterPath?: string;
 }
 
 export interface RemoteGitSafetyPolicy {

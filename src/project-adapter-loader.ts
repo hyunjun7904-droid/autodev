@@ -316,6 +316,11 @@ export function loadProjectAdapter(adapterPath: string | undefined): ProjectMani
     projectName: raw.projectName as string,
     targetProjectRoot,
     statePath,
+    // Multi-Project Approval Isolation(2026-09-01) — 이 project config 자신의 절대경로.
+    // 이 함수(loadProjectAdapter)가 유일한 신뢰된 진입점이므로, 다른 project 처리 시 이
+    // 경로로 다시 loadProjectAdapter()를 호출해 그 project의 진짜 manifest를 안전하게
+    // 복원할 수 있다(§ project-manifest.ts adapterPath 문서).
+    adapterPath: resolvedPath,
     taskRegistry,
     developerInstructions: raw.developerInstructions as string,
     reviewInstructions: raw.reviewInstructions as string,

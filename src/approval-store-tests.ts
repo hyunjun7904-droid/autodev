@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import {
   createInMemoryApprovalStore,
   createFileApprovalStore,
@@ -129,6 +130,82 @@ function scenarioFileCorruptedGracefulEmpty(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 3 실제 concurrency test. 실제 Node
+// child process 2개 이상이 동시에 같은 file-based ApprovalStore를 mutate한다(§ 요구사항 —
+// "동시 mutation과 함수 mock만으로 concurrency safety를 COMPLETE 처리하지 않는다").
+// project-lock-tests.ts scenarioRealConcurrentAcquisition과 동일한 spawn+Promise.all 패턴을
+// 재사용한다.
+// ---------------------------------------------------------------------------
+function runWorker(filePath: string, args: string[]): Promise<string> {
+  const workerPath = join(__dirname, "approval-store-concurrency-worker.js");
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [workerPath, filePath, ...args]);
+    let out = "";
+    child.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+    child.on("close", () => resolve(out.trim()));
+  });
+}
+
+async function scenarioRealConcurrentTransitionOnSameApprovalExactlyOneWins(): Promise<void> {
+  const filePath = makeTempFilePath("approvals-concurrent-transition.json");
+  const workerPath = join(__dirname, "approval-store-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("H) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+  const a = req();
+  createFileApprovalStore(filePath).createPending(a);
+
+  // controller와 local CLI가 같은 approval을 동시에 승인하는 상황을 실제 프로세스 두 개로
+  // 재현한다.
+  const [outA, outB] = await Promise.all([
+    runWorker(filePath, ["transition", a.approvalId]),
+    runWorker(filePath, ["transition", a.approvalId]),
+  ]);
+  const transitionedCount = [outA, outB].filter((o) => o === "TRANSITIONED").length;
+  const notTransitionedCount = [outA, outB].filter((o) => o === "NOT_TRANSITIONED").length;
+  check("H) 동시 승인 시도 중 정확히 하나만 TRANSITIONED(exactly-one)", transitionedCount === 1);
+  check("H) 나머지 하나는 NOT_TRANSITIONED(duplicate resume 없음)", notTransitionedCount === 1);
+
+  const finalStore = createFileApprovalStore(filePath);
+  check("H) 최종 상태는 APPROVED 정확히 한 번만 반영됨", finalStore.get(a.approvalId)?.status === "APPROVED");
+
+  const raw = readFileSync(filePath, "utf-8");
+  let parsedOk = true;
+  try {
+    JSON.parse(raw);
+  } catch {
+    parsedOk = false;
+  }
+  check("I) 동시 mutation 이후에도 approvals.json이 완전한 JSON으로 남음(손상 없음)", parsedOk);
+}
+
+async function scenarioRealConcurrentCreateOnDifferentApprovalsNoLostUpdate(): Promise<void> {
+  const filePath = makeTempFilePath("approvals-concurrent-create.json");
+  const workerPath = join(__dirname, "approval-store-concurrency-worker.js");
+  if (!existsSync(workerPath)) {
+    check("G) (컴파일된 worker 스크립트를 찾지 못해 스킵 — npm run build 필요)", true);
+    return;
+  }
+
+  // controller(createApprovalRequestsFromEvents)와 local CLI가 서로 다른 approval을 동시에
+  // mutation하는 상황 — N개의 실제 프로세스가 각자 다른 approvalId/dedupeKey로 createPending()
+  // 한다. load→mutate→save 전체가 직렬화되지 않으면 서로의 쓰기를 덮어써 일부가 사라진다
+  // (silent lost-update).
+  const N = 6;
+  const ids = Array.from({ length: N }, () => randomUUID());
+  const outs = await Promise.all(ids.map((id) => runWorker(filePath, ["create", id, `dk-${id}`])));
+  check("G) 모든 concurrent create가 실제로 CREATED로 성공함(모두 서로 다른 approval)", outs.every((o) => o === "CREATED"));
+
+  const finalStore = createFileApprovalStore(filePath);
+  const finalIds = new Set(finalStore.list().map((r) => r.approvalId));
+  check("G) 서로 다른 approval을 동시에 mutation해도 silent lost-update 0(전부 최종 파일에 존재)", ids.every((id) => finalIds.has(id)));
+  check("G) 유실/중복 없이 정확히 N개만 존재", finalStore.list().length === N);
+}
+
+// ---------------------------------------------------------------------------
 // TelegramOffsetStore
 // ---------------------------------------------------------------------------
 function runOffsetStoreContractScenarios(label: string, store: TelegramOffsetStore): void {
@@ -161,6 +238,8 @@ async function main(): Promise<void> {
   scenarioFile();
   scenarioFileSurvivesRestart();
   scenarioFileCorruptedGracefulEmpty();
+  await scenarioRealConcurrentTransitionOnSameApprovalExactlyOneWins();
+  await scenarioRealConcurrentCreateOnDifferentApprovalsNoLostUpdate();
   scenarioOffsetInMemory();
   scenarioOffsetFile();
   scenarioOffsetFileSurvivesRestart();

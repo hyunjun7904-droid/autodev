@@ -578,6 +578,112 @@ async function scenarioNonApprovalNotificationsNotSentToTelegram(): Promise<void
   check("ntfy 호출 없음(15)", routable.ntfyCalls.length === 0);
 }
 
+// Multi-Project Approval Isolation(2026-09-01) — foreign project(controller owner와 다른
+// project)를 흉내낸다. loadProjectAdapter()로 실제로 로드 가능한 JSON config를 그 project
+// 자신의 root(이미 git repo)에 둔다 — approval-service-tests.ts writeProjectAdapterConfig와
+// 동일한 최소 fixture 패턴.
+function writeProjectAdapterConfig(root: string, projectId: string, taskId: string): string {
+  const configPath = join(root, "adapter.json");
+  const lower = taskId.toLowerCase();
+  const config = {
+    projectId,
+    projectName: projectId,
+    targetProjectRoot: ".",
+    statePath: ".autodev/project-state.json",
+    taskRegistry: [
+      {
+        id: taskId,
+        phase: 1,
+        taskNumber: 1,
+        title: "cross-project isolation fixture task",
+        prompt: `src/${lower}.js에 ${lower}() 함수를 작성하세요.`,
+        requiredTests: [{ name: "cross-fixture-test", command: "node", args: [`tests/${lower}.test.js`], cwd: "root" }],
+        allowedPathPrefixes: ["src/", "tests/"],
+        prohibitedOperations: ["src/, tests/ 밖 파일 수정"],
+      },
+    ],
+    developerInstructions: "허용 범위: src/**, tests/**만 다룹니다.",
+    reviewInstructions: "함수가 정확히 동작하는지 확인하세요.",
+    reviewScopeDirs: ["src/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["src/", "tests/"],
+      allowedWritePrefixes: ["src/", "tests/"],
+      allowedCommands: [{ cwd: "root", command: "node", args: [`tests/${lower}.test.js`] }],
+    },
+  };
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+  return configPath;
+}
+function currentHeadOf(root: string): string {
+  const res = spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf-8" });
+  return res.stdout.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 1. installation-wide controller가
+// owner project(A) 하나의 cwd로 계산한 Git HEAD/branch를 다른 project(B)의 event에 그대로
+// 섞어 쓰지 않는지 실제 tick 루프(startTelegramController)로 검증한다 — approval-service-
+// tests.ts는 resolveGitExpectation 콜백 자체의 계약만 단위 테스트하고, 이 시나리오는
+// telegram-controller.ts의 실제 배선(resolveGitExpectationForEvent, loadProjectAdapter
+// 재호출, getCurrentHeadHash/getCurrentBranch)까지 end-to-end로 검증한다.
+// ---------------------------------------------------------------------------
+async function scenarioMultiProjectGitMetadataIsolation(): Promise<void> {
+  const rootA = makeGitRepo("controller-crossA-");
+  const statePathA = join(rootA, ".autodev", "project-state.json");
+  writeStateFile(statePathA, {});
+  const manifestA = buildManifest(rootA, statePathA);
+
+  const rootB = makeGitRepo("controller-crossB-");
+  writeStateFile(join(rootB, ".autodev", "project-state.json"), {});
+  const adapterPathB = writeProjectAdapterConfig(rootB, "fixture-controller-b", "B1");
+  // A와 B의 실제 HEAD가 서로 다르다는 것을 보장한다(같은 초기 commit 메시지로 시작하므로,
+  // 이 추가 commit이 없으면 우연히 같은 hash가 나올 수는 없지만 — 서로 다른 repo이므로
+  // 이미 다르다 — 그래도 명시적으로 한 번 더 다르게 만들어 둔다).
+  writeFileSync(join(rootB, "extra.txt"), "b-only\n");
+  spawnSync("git", ["add", "--", "extra.txt"], { cwd: rootB });
+  spawnSync("git", ["commit", "-q", "-m", "b-extra"], { cwd: rootB });
+
+  const headA = currentHeadOf(rootA);
+  const headB = currentHeadOf(rootB);
+
+  const eventStore: EventStore = createInMemoryEventStore();
+  eventStore.append({ eventType: "HUMAN_APPROVAL_REQUIRED", runId: "r-a", taskId: "C1", reason: "orchestrator status=WAITING_HUMAN(x)" });
+  eventStore.append({
+    eventType: "HUMAN_APPROVAL_REQUIRED",
+    runId: "r-b",
+    taskId: "B1",
+    projectId: "fixture-controller-b",
+    reason: "orchestrator status=WAITING_HUMAN(x)",
+    metadata: { adapterPath: adapterPathB },
+  });
+
+  const approvalStore: ApprovalStore = createInMemoryApprovalStore();
+  const routable = createRoutableFakeFetch();
+
+  const handle = await startTelegramController({
+    manifest: manifestA,
+    eventStore,
+    notificationStore: createInMemoryNotificationStore(),
+    approvalStore,
+    offsetStore: createInMemoryTelegramOffsetStore(),
+    fetchImpl: routable.fetch,
+    tickDelayMs: 5,
+  });
+
+  await waitUntil(() => approvalStore.list().length >= 2);
+  await handle.stop();
+
+  const approvalA = approvalStore.list().find((r) => r.runId === "r-a");
+  const approvalB = approvalStore.list().find((r) => r.runId === "r-b");
+
+  check("A(owner) approval에는 A의 실제 HEAD가 담김", approvalA?.expectedGitHead === headA);
+  check("B(foreign) approval에는 B의 실제 HEAD가 담김(A의 값이 아님)", approvalB?.expectedGitHead === headB);
+  check("A와 B의 HEAD는 실제로 서로 다름(fixture sanity)", headA !== headB);
+  check("B approval에 A의 HEAD가 혼입되지 않음", approvalB?.expectedGitHead !== headA);
+  check("B approval에는 adapterPath가 그대로 담김", approvalB?.adapterPath === adapterPathB);
+  check("A approval에는 adapterPath가 없음(owner fast path, 새 항목 추가 없음)", approvalA?.adapterPath === undefined);
+}
+
 async function main(): Promise<void> {
   await scenarioInvalidManifestThrowsAndDoesNotStartLoop();
   await scenarioStartStopLifecycle();
@@ -588,6 +694,7 @@ async function main(): Promise<void> {
   await scenarioControllerRestartPreservesState();
   await scenarioApprovalRequiredNotificationsSentToTelegram();
   await scenarioNonApprovalNotificationsNotSentToTelegram();
+  await scenarioMultiProjectGitMetadataIsolation();
 
   console.log("\n=== telegram-controller.ts(G6) 테스트 결과 ===");
   for (const r of results) console.log(r);

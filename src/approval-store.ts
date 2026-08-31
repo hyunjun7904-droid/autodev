@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ApprovalRequest, ApprovalStatus } from "./approval";
 import { isProductionRuntime } from "./runtime-origin";
 
@@ -102,26 +103,147 @@ function readStoreFile(filePath: string): ApprovalStoreFile {
   }
 }
 
-function writeStoreFile(filePath: string, data: ApprovalStoreFile): void {
+/** same-directory temp write + rename() — filesystem-trust-model.md/project-lock.ts와 동일한
+ *  원칙(§ 그 문서 "same-directory temp + atomic rename"): 프로세스가 write 도중 죽어도
+ *  approvals.json은 이전 완전한 내용 그대로거나 새 완전한 내용 그대로다 — 절반만 쓰인 JSON이
+ *  남지 않는다(§ Multi-Project Approval Isolation, invariant I). */
+function writeStoreFileAtomic(filePath: string, data: ApprovalStoreFile): void {
   const dir = dirname(filePath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+  const tmpPath = join(dir, `.${basename(filePath)}.tmp-${randomUUID()}`);
+  writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+  renameSync(tmpPath, filePath);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 3 수정.
+//
+// 배경: 이 store는 원래 "이 프로세스 하나만 이 파일에 쓴다"는 전제로 설계됐다(load 전체 →
+// mutate → save 전체, 락 없음) — Node 단일 스레드 + 동기 I/O라 같은 프로세스 안에서는 항상
+// 안전했다. Genuine Human Gate Local Approval CLI(project-control-cli.ts approve,
+// local-human-approval.ts)가 추가되면서 실제로 이 파일에 쓰는 production writer가
+// Telegram controller 프로세스 + CLI 프로세스, 최소 둘이 됐다 — 서로 다른 OS 프로세스이므로
+// 그 전제가 더 이상 성립하지 않는다: A가 읽은 뒤 쓰기 전에 B가 읽고 쓰면 A의 쓰기가 B의
+// 변경을 덮어써 lost-update가 된다.
+//
+// project-lock.ts/telegram-controller-supervisor.ts가 이미 쓰는 것과 동일한 원자적
+// exclusive-create(`wx`) idiom을 재사용해, load→mutate→save 전체를 짧은 critical section
+// 하나로 직렬화한다 — 이 store 전용의 별도 mutation lock 파일(approvals.json과 나란히,
+// "<file>.mutlock")이며 project-lock.ts의 ProjectLockMetadata 스키마/의미(canonical project
+// path/ownerKind 등)와는 무관하다(§ telegram-controller-supervisor.ts 상단 주석과 동일한
+// 원칙 — 서로 다른 목적의 lock을 섞지 않는다). 이 critical section은 항상 매우 짧다(파일
+// 하나를 읽고 파싱하고 다시 쓰는 동기 연산뿐, 네트워크/사용자 입력 없음)이므로 staleness
+// 기준(STORE_MUTATION_LOCK_STALE_MS)은 project-lock.ts의 PID liveness 판정보다 훨씬 단순한
+// "이 시간보다 오래 남아있으면 그 writer는 critical section 도중 죽은 것"이라는 시간 기반
+// 판단만으로 충분하다 — 그래도 project-lock.ts의 stale-steal과 동일한 "rename-away로 캡처한
+// 것을 실제로 안다"는 원칙(blind unlink 금지)을 그대로 따른다.
+// ---------------------------------------------------------------------------
+
+const STORE_MUTATION_LOCK_STALE_MS = 10_000; // 실제 critical section은 항상 수 ms~수십 ms
+const STORE_MUTATION_LOCK_ACQUIRE_BUDGET_MS = 5_000;
+const STORE_MUTATION_LOCK_RETRY_DELAY_MS = 15;
+
+function mutationLockPath(filePath: string): string {
+  return `${filePath}.mutlock`;
+}
+
+/** Node.js 메인 스레드에서도 허용되는(브라우저와 달리) 동기 sleep — createPending/transition의
+ *  기존 완전 동기 시그니처를 바꾸지 않기 위해 async/await 대신 이 방식을 쓴다(§ ApprovalStore
+ *  인터페이스, 이미 이 저장소 전체에 넓게 재사용됨 — 시그니처를 바꾸면 그 blast radius가
+ *  이번 수정 범위를 크게 벗어난다). */
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** project-lock.ts captureAndVerifyLock()과 동일한 단일승자 원칙(rename-away로 실제 캡처한
+ *  내용만 지운다 — blind unlink 금지)을 이 짧은 mutation lock에도 적용한다. 캡처한 내용이
+ *  기대한 stale owner가 아니면(그 사이 다른 프로세스가 이미 새로 획득함) 절대 지우지 않고
+ *  물러난다. */
+function tryReclaimStaleMutationLock(lockPath: string): void {
+  const quarantine = `${lockPath}.stale-${randomUUID()}`;
+  try {
+    renameSync(lockPath, quarantine);
+  } catch {
+    return; // 이미 사라졌거나 그 사이 다른 프로세스가 처리함 — 다음 재시도가 최신 상태를 다시 판정한다.
+  }
+  try {
+    unlinkSync(quarantine);
+  } catch {
+    /* 이미 격리되어 아무도 더 이상 참조하지 않으므로 정리 실패는 무해하다. */
+  }
+}
+
+/** load→mutate→save 전체를 감싸는 exclusive lock을 얻는다. 얻지 못하면(budget 소진 — 극단적
+ *  경합) undefined를 반환한다 — 호출부는 이를 "안전하게 진행할 수 없다"로 취급해야 한다
+ *  (조용히 lock 없이 진행하지 않는다). */
+function acquireMutationLock(lockPath: string): { release: () => void } | undefined {
+  const deadline = Date.now() + STORE_MUTATION_LOCK_ACQUIRE_BUDGET_MS;
+  for (;;) {
+    try {
+      writeFileSync(lockPath, `${process.pid}\n`, { encoding: "utf-8", flag: "wx" });
+      return {
+        release: () => {
+          try {
+            unlinkSync(lockPath);
+          } catch {
+            /* 이미 없거나(레이스로 다른 프로세스가 stale로 판정해 재점유함) 정리 실패 — 어느 쪽도
+             * 이 프로세스가 더 손댈 일이 아니다(release는 "내가 다 썼다"는 의사표시일 뿐, 여기서
+             * lockId 소유권 검증까지 하지 않는 이유는 이 lock의 생명주기가 항상 이 함수 호출
+             * 안에서 시작/종료되어 project-lock.ts처럼 장기 보유되는 소유권 개념이 없기
+             * 때문이다). */
+          }
+        },
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+
+    try {
+      const stat = statSync(lockPath);
+      if (Date.now() - stat.mtimeMs > STORE_MUTATION_LOCK_STALE_MS) {
+        tryReclaimStaleMutationLock(lockPath);
+        continue; // 즉시 재시도(wx create) — 회수에 성공했으면 이번엔 우리가 얻는다.
+      }
+    } catch {
+      continue; // stat 실패(그 사이 사라짐) — 즉시 재시도.
+    }
+
+    if (Date.now() >= deadline) return undefined;
+    sleepSyncMs(STORE_MUTATION_LOCK_RETRY_DELAY_MS);
+  }
 }
 
 /** 파일 기반 store — controller 재시작에도 PENDING/소비 상태가 이어진다(§ 요구사항 15/28).
  *  매 호출마다 디스크에서 다시 읽고 전체를 다시 쓴다(notification-store.ts의
- *  createFileNotificationStore와 동일한 패턴) — 이 프로세스 하나만 이 파일에 쓴다는 전제
- *  (§ 요구사항: 단일 process local controller)에서 안전하다. */
+ *  createFileNotificationStore와 동일한 패턴) — createPending/transition(실제 mutation이
+ *  일어나는 두 메서드)은 이제 위 acquireMutationLock()으로 서로 다른 프로세스 간에도
+ *  load→mutate→save 전체를 직렬화한다(§ Multi-Project Approval Isolation DEFECT 3 — 이제
+ *  이 파일에 쓰는 production writer가 둘 이상이다). 순수 조회(get/getByDedupeKey/has/list)는
+ *  lock이 필요 없다 — writeStoreFileAtomic()이 파일을 항상 완전한 상태로만 남기므로(rename
+ *  기반) torn read가 없다. */
 export function createFileApprovalStore(filePath: string): ApprovalStore {
   function load(): Map<string, ApprovalRequest> {
     return new Map(readStoreFile(filePath).records.map((r) => [r.approvalId, r]));
   }
   function save(records: Map<string, ApprovalRequest>): void {
-    writeStoreFile(filePath, { records: Array.from(records.values()) });
+    writeStoreFileAtomic(filePath, { records: Array.from(records.values()) });
   }
   function findByDedupeKey(records: Map<string, ApprovalRequest>, dedupeKey: string): ApprovalRequest | undefined {
     for (const r of records.values()) if (r.dedupeKey === dedupeKey) return r;
     return undefined;
+  }
+  function withMutationLock<T>(fn: () => T): T {
+    const lock = acquireMutationLock(mutationLockPath(filePath));
+    if (!lock) {
+      throw new Error(
+        "ApprovalStore mutation lock을 획득하지 못했습니다(타임아웃) — 동시 writer가 과도하게 경합 중입니다. 이 mutation은 적용되지 않았습니다."
+      );
+    }
+    try {
+      return fn();
+    } finally {
+      lock.release();
+    }
   }
 
   return {
@@ -135,22 +257,26 @@ export function createFileApprovalStore(filePath: string): ApprovalStore {
       return findByDedupeKey(load(), dedupeKey);
     },
     createPending(request) {
-      const records = load();
-      const existing = findByDedupeKey(records, request.dedupeKey);
-      if (existing) return existing;
-      records.set(request.approvalId, request);
-      save(records);
-      return request;
+      return withMutationLock(() => {
+        const records = load();
+        const existing = findByDedupeKey(records, request.dedupeKey);
+        if (existing) return existing;
+        records.set(request.approvalId, request);
+        save(records);
+        return request;
+      });
     },
     transition(approvalId, nextStatus) {
-      const records = load();
-      const current = records.get(approvalId);
-      if (!current) return { ok: false };
-      if (current.status !== "PENDING") return { ok: false, request: current };
-      const updated: ApprovalRequest = { ...current, status: nextStatus };
-      records.set(approvalId, updated);
-      save(records);
-      return { ok: true, request: updated };
+      return withMutationLock(() => {
+        const records = load();
+        const current = records.get(approvalId);
+        if (!current) return { ok: false };
+        if (current.status !== "PENDING") return { ok: false, request: current };
+        const updated: ApprovalRequest = { ...current, status: nextStatus };
+        records.set(approvalId, updated);
+        save(records);
+        return { ok: true, request: updated };
+      });
     },
     list(filter = {}) {
       return Array.from(load().values()).filter((r) => matchesFilter(r, filter));

@@ -116,6 +116,15 @@ export interface ApprovalRequest {
    *  조회 실패 등) undefined로 남기고 추측하지 않는다. */
   expectedGitHead?: string;
   expectedBranch?: string;
+  /** Multi-Project Approval Isolation(2026-09-01) — 이 approval이 속한 project의
+   *  project-manifest.ts ProjectManifest.adapterPath를 그대로 옮긴 것(event.metadata.adapterPath
+   *  경유, § buildApprovalRequest). installation-wide Telegram controller가 owner project의
+   *  manifest/statePath/cwd를 다른 project 처리에 fallback으로 쓰지 않고, 이 값으로
+   *  loadProjectAdapter()를 다시 호출해 이 approval이 실제로 속한 project의 manifest를
+   *  안전하게 복원하기 위한 용도다(§ approval-service.ts resolveApprovalProjectContext).
+   *  알 수 없으면(원본 event에 없었음) undefined로 남기고 추측하지 않는다 — 이 경우
+   *  cross-project 처리는 fail-closed로 거부된다. */
+  adapterPath?: string;
 }
 
 export const DEFAULT_APPROVAL_EXPIRY_MS = 30 * 60 * 1000; // 30분
@@ -132,13 +141,17 @@ export interface BuildApprovalRequestOptions {
  *  로직을 새로 만들지 않는다, § approval-service.ts가 notification.ts의
  *  classifyEventForNotification()을 그대로 재사용하는 것과 짝을 이룬다). */
 export function buildApprovalRequest(
-  event: Pick<AutoDevEvent, "eventType" | "reason" | "runId" | "taskId" | "projectId" | "eventId">,
+  event: Pick<AutoDevEvent, "eventType" | "reason" | "runId" | "taskId" | "projectId" | "eventId" | "metadata">,
   notificationDedupeKey: string,
   opts: BuildApprovalRequestOptions = {}
 ): ApprovalRequest {
   const approvalType = classifyApprovalType(event);
   const now = opts.now ? opts.now() : new Date();
   const expiryMs = opts.expiryMs ?? DEFAULT_APPROVAL_EXPIRY_MS;
+  // Multi-Project Approval Isolation(2026-09-01) — 이 event를 실제로 만든 project 자신의
+  // autodev.ts/orchestrator.ts가 채운 값만 옮긴다(§ project-manifest.ts adapterPath) — 이
+  // 함수 자신은 어떤 경로도 추측/계산하지 않는다.
+  const adapterPath = typeof event.metadata?.adapterPath === "string" ? event.metadata.adapterPath : undefined;
   return {
     approvalId: randomUUID(),
     createdAt: now.toISOString(),
@@ -155,6 +168,7 @@ export function buildApprovalRequest(
     dedupeKey: notificationDedupeKey,
     ...(opts.expectedGitHead !== undefined ? { expectedGitHead: opts.expectedGitHead } : {}),
     ...(opts.expectedBranch !== undefined ? { expectedBranch: opts.expectedBranch } : {}),
+    ...(adapterPath !== undefined ? { adapterPath } : {}),
   };
 }
 

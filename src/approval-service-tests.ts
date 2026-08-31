@@ -68,6 +68,43 @@ function buildManifest(root: string, statePath: string): ProjectManifest {
     executionPolicy: FIXTURE_EXECUTION_POLICY,
   };
 }
+// Multi-Project Approval Isolation(2026-09-01) — 이 project config가 loadProjectAdapter()로
+// 실제로 로드 가능한 "foreign project"(controller owner와 다른 project)를 흉내낸다. 이
+// 함수가 config 파일 자신과 같은 디렉터리(root)를 targetProjectRoot로 지정하므로, root는
+// 이미 git repo(makeGitRepo)여야 한다.
+function writeProjectAdapterConfig(root: string, projectId: string, taskId: string): string {
+  const configPath = join(root, "adapter.json");
+  const lower = taskId.toLowerCase();
+  const config = {
+    projectId,
+    projectName: projectId,
+    targetProjectRoot: ".",
+    statePath: ".autodev/project-state.json",
+    taskRegistry: [
+      {
+        id: taskId,
+        phase: 1,
+        taskNumber: 1,
+        title: "cross-project isolation fixture task",
+        prompt: `src/${lower}.js에 ${lower}() 함수를 작성하세요.`,
+        requiredTests: [{ name: "cross-fixture-test", command: "node", args: [`tests/${lower}.test.js`], cwd: "root" }],
+        allowedPathPrefixes: ["src/", "tests/"],
+        prohibitedOperations: ["src/, tests/ 밖 파일 수정"],
+      },
+    ],
+    developerInstructions: "허용 범위: src/**, tests/**만 다룹니다.",
+    reviewInstructions: "함수가 정확히 동작하는지 확인하세요.",
+    reviewScopeDirs: ["src/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["src/", "tests/"],
+      allowedWritePrefixes: ["src/", "tests/"],
+      allowedCommands: [{ cwd: "root", command: "node", args: [`tests/${lower}.test.js`] }],
+    },
+  };
+  writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+  return configPath;
+}
+
 function writeStateFile(statePath: string, overrides: Partial<CoreState>): void {
   mkdirSync(join(statePath, ".."), { recursive: true });
   const state: CoreState = {
@@ -193,6 +230,54 @@ function scenarioGitExpectationPassedThrough(): void {
     expectedBranch: "main",
   });
   check("expectedGitHead/expectedBranch가 생성된 ApprovalRequest에 그대로 담김", result.created[0]?.expectedGitHead === "abc123" && result.created[0]?.expectedBranch === "main");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 1. resolveGitExpectation이
+// undefined를 반환하면(이 event의 project context를 안전하게 확정하지 못함) owner project의
+// batch 값으로 대체하지 않고 이번 tick에서 그 event를 건너뛴다.
+// ---------------------------------------------------------------------------
+function scenarioResolveGitExpectationPerEventSkipsWhenUnresolved(): void {
+  const approvalStore: ApprovalStore = createInMemoryApprovalStore();
+  const eventStore: EventStore = createInMemoryEventStore();
+  eventStore.append({
+    eventType: "HUMAN_APPROVAL_REQUIRED",
+    runId: "r1",
+    taskId: "T1",
+    projectId: "other-project",
+    reason: "orchestrator status=WAITING_HUMAN(x)",
+  });
+  const result = createApprovalRequestsFromEvents(eventStore.query().events, approvalStore, {
+    eventStore,
+    resolveGitExpectation: () => undefined,
+  });
+  check("resolveGitExpectation이 undefined를 반환하면 owner 값으로 대체하지 않고 이 event를 건너뜀", result.created.length === 0);
+  check("건너뛴 event는 store에 approval을 남기지 않음(다음 tick 재시도 가능)", approvalStore.list().length === 0);
+}
+function scenarioResolveGitExpectationPerEventOverridesBatchDefault(): void {
+  const approvalStore: ApprovalStore = createInMemoryApprovalStore();
+  const eventStore: EventStore = createInMemoryEventStore();
+  eventStore.append({
+    eventType: "HUMAN_APPROVAL_REQUIRED",
+    runId: "r1",
+    taskId: "T1",
+    projectId: "project-b",
+    reason: "orchestrator status=WAITING_HUMAN(x)",
+    metadata: { adapterPath: "/fake/b.json" },
+  });
+  const result = createApprovalRequestsFromEvents(eventStore.query().events, approvalStore, {
+    eventStore,
+    // owner project(batch-level) 값 — resolveGitExpectation이 지정되면 이 값은 전혀 쓰이지
+    // 않아야 한다(§ DEFECT 1 — owner metadata가 다른 project event에 섞여 들어가면 안 됨).
+    expectedGitHead: "OWNER_HEAD_MUST_NOT_LEAK",
+    expectedBranch: "OWNER_BRANCH_MUST_NOT_LEAK",
+    resolveGitExpectation: (event) => (event.projectId === "project-b" ? { expectedGitHead: "b-head", expectedBranch: "b-branch" } : undefined),
+  });
+  check(
+    "resolveGitExpectation이 지정되면 batch-level expectedGitHead/expectedBranch(owner 값)보다 항상 우선함",
+    result.created[0]?.expectedGitHead === "b-head" && result.created[0]?.expectedBranch === "b-branch"
+  );
+  check("event.metadata.adapterPath가 ApprovalRequest.adapterPath로 그대로 옮겨짐", result.created[0]?.adapterPath === "/fake/b.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +601,162 @@ async function scenarioResultNeverLeaksBotToken(): Promise<void> {
   check("HandleCallbackResult 어디에도 Bot Token 원문이 없음", JSON.stringify(result).includes("super-secret-bot-token-value") === false);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-Project Approval Isolation(2026-09-01) — DEFECT 2. installation-wide controller
+// owner(project A)와 다른 project(B)의 approval을 처리할 때, A의 manifest/statePath/cwd로
+// fallback하지 않고 approval.adapterPath로 B의 진짜 manifest를 다시 로드해 그것만 검증/실행
+// 한다. A의 project-state.json은 전혀 건드리지 않는다.
+// ---------------------------------------------------------------------------
+async function scenarioCrossProjectApproveUsesForeignManifestNotOwner(): Promise<void> {
+  const rootA = makeGitRepo("approval-svc-crossA-");
+  const statePathA = join(rootA, ".autodev", "project-state.json");
+  writeStateFile(statePathA, {});
+  const manifestA = buildManifest(rootA, statePathA);
+
+  const rootB = makeGitRepo("approval-svc-crossB-");
+  const statePathB = join(rootB, ".autodev", "project-state.json");
+  writeStateFile(statePathB, {});
+  const adapterPathB = writeProjectAdapterConfig(rootB, "fixture-project-b", "B1");
+
+  const approvalStore = createInMemoryApprovalStore();
+  const approvalId = randomUUID();
+  approvalStore.createPending({
+    approvalId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    projectId: "fixture-project-b",
+    runId: "r-b",
+    taskId: "B1",
+    approvalType: "ORCHESTRATOR_NOT_APPROVED_GENERIC",
+    sourceEventType: "HUMAN_APPROVAL_REQUIRED",
+    sourceEventId: randomUUID(),
+    status: "PENDING",
+    remotelyApprovable: true,
+    requiresSafetyRecheck: true,
+    dedupeKey: "dk-cross-b",
+    adapterPath: adapterPathB,
+  });
+  const eventStore: EventStore = createInMemoryEventStore();
+
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    mkdirSync(join(rootB, "src"), { recursive: true });
+    mkdirSync(join(rootB, "tests"), { recursive: true });
+    writeFileSync(join(rootB, "src", "b1.js"), "function b1() {\n  return 'b1';\n}\n\nmodule.exports = { b1 };\n");
+    writeFileSync(
+      join(rootB, "tests", "b1.test.js"),
+      "const assert = require('node:assert');\nconst { b1 } = require('../src/b1');\nassert.strictEqual(b1(), 'b1');\nconsole.log('OK');\n"
+    );
+    const res = spawnSync(process.execPath, ["tests/b1.test.js"], { cwd: rootB, encoding: "utf-8" });
+    return {
+      success: true,
+      summary: "b1() 구현 완료",
+      changedFiles: ["src/b1.js", "tests/b1.test.js"],
+      tests: [{ name: "cross-fixture-test", pass: res.status === 0 }],
+      rawOutput: (res.stdout || "") + (res.stderr || ""),
+    };
+  };
+  const gptReviewer = async (): Promise<GptReviewerReturn> => ({
+    decision: "PASS",
+    severity: { critical: 0, high: 0, medium: 0 },
+    feedback: "정상",
+    nextTask: null,
+  });
+
+  // ctx.manifest/statePath/cwd는 여전히 owner(A)를 가리킨다 — installation-wide controller가
+  // 실제로 이렇게 호출한다(§ telegram-controller.ts, HandleCallbackContext는 항상 owner
+  // 하나로 고정). approval.projectId가 A와 다르므로, resolveApprovalProjectContext()가
+  // owner 값을 절대 쓰지 않고 adapterPath로 B를 다시 로드해야만 이 시나리오가 통과한다.
+  const ctx = baseCtx({ approvalStore, eventStore, manifest: manifestA, statePath: statePathA, cwd: rootA, orchestratorDeps: { claudeRunner, gptReviewer } });
+  const result = await handleTelegramCallbackUpdate(callbackUpdate(1, `ap:${approvalId}:A`), ctx);
+
+  check("cross-project APPROVE도 kind=APPROVED", result.kind === "APPROVED");
+  check("cross-project Auto Resume outcome은 COMPLETED(B의 진짜 manifest/task로 실행됨)", result.autoResume?.kind === "COMPLETED");
+
+  const finalStateB = JSON.parse(readFileSync(statePathB, "utf-8")) as CoreState;
+  check("B project-state.json에 B1이 완료 처리됨(B의 manifest/statePath가 실제로 쓰임)", (finalStateB.completedTasks ?? []).includes("B1"));
+
+  const finalStateA = JSON.parse(readFileSync(statePathA, "utf-8")) as CoreState;
+  check(
+    "A project-state.json은 전혀 바뀌지 않음(owner project로 fallback되지 않음, A resume 0)",
+    (finalStateA.status as unknown as string) === "WAITING_HUMAN" && (finalStateA.completedTasks ?? []).length === 0
+  );
+}
+
+async function scenarioCrossProjectApproveWithoutAdapterPathFailsClosed(): Promise<void> {
+  const rootA = makeGitRepo("approval-svc-failclosed-noadapter-");
+  const statePathA = join(rootA, ".autodev", "project-state.json");
+  writeStateFile(statePathA, {});
+  const manifestA = buildManifest(rootA, statePathA);
+
+  const approvalStore = createInMemoryApprovalStore();
+  const approvalId = randomUUID();
+  approvalStore.createPending({
+    approvalId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    // owner(A)와 다른 project인데 adapterPath가 없다(구형 레코드/조회 실패를 흉내낸다).
+    projectId: "fixture-project-c",
+    runId: "r-c",
+    taskId: "C1",
+    approvalType: "ORCHESTRATOR_NOT_APPROVED_GENERIC",
+    sourceEventType: "HUMAN_APPROVAL_REQUIRED",
+    sourceEventId: randomUUID(),
+    status: "PENDING",
+    remotelyApprovable: true,
+    requiresSafetyRecheck: true,
+    dedupeKey: "dk-cross-c-no-adapter",
+  });
+
+  const ctx = baseCtx({ approvalStore, manifest: manifestA, statePath: statePathA, cwd: rootA });
+  const result = await handleTelegramCallbackUpdate(callbackUpdate(1, `ap:${approvalId}:A`), ctx);
+
+  check("adapterPath가 없는 cross-project approval은 owner로 fallback하지 않고 PROJECT_CONTEXT_UNRESOLVED", result.kind === "PROJECT_CONTEXT_UNRESOLVED");
+  check("PROJECT_CONTEXT_UNRESOLVED 후에도 approval은 PENDING 그대로(재시도 가능, 소비되지 않음)", approvalStore.get(approvalId)?.status === "PENDING");
+  const finalStateA = JSON.parse(readFileSync(statePathA, "utf-8")) as CoreState;
+  check("PROJECT_CONTEXT_UNRESOLVED여도 A project-state.json은 전혀 바뀌지 않음", (finalStateA.status as unknown as string) === "WAITING_HUMAN");
+}
+
+async function scenarioCrossProjectApproveWithMismatchedAdapterFailsClosed(): Promise<void> {
+  const rootA = makeGitRepo("approval-svc-failclosed-mismatch-");
+  const statePathA = join(rootA, ".autodev", "project-state.json");
+  writeStateFile(statePathA, {});
+  const manifestA = buildManifest(rootA, statePathA);
+
+  const rootD = makeGitRepo("approval-svc-failclosed-mismatch-d-");
+  writeStateFile(join(rootD, ".autodev", "project-state.json"), {});
+  // adapter.json은 실제로 "fixture-project-d"를 로드하지만, approval.projectId는 그와 다른
+  // "fixture-project-e"라고 주장한다 — stale/조작된 조합을 흉내낸다.
+  const adapterPathD = writeProjectAdapterConfig(rootD, "fixture-project-d", "D1");
+
+  const approvalStore = createInMemoryApprovalStore();
+  const approvalId = randomUUID();
+  approvalStore.createPending({
+    approvalId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expiresAt: "2099-01-01T00:00:00.000Z",
+    projectId: "fixture-project-e",
+    runId: "r-e",
+    taskId: "D1",
+    approvalType: "ORCHESTRATOR_NOT_APPROVED_GENERIC",
+    sourceEventType: "HUMAN_APPROVAL_REQUIRED",
+    sourceEventId: randomUUID(),
+    status: "PENDING",
+    remotelyApprovable: true,
+    requiresSafetyRecheck: true,
+    dedupeKey: "dk-cross-e-mismatch",
+    adapterPath: adapterPathD,
+  });
+
+  const ctx = baseCtx({ approvalStore, manifest: manifestA, statePath: statePathA, cwd: rootA });
+  const result = await handleTelegramCallbackUpdate(callbackUpdate(1, `ap:${approvalId}:A`), ctx);
+
+  check(
+    "adapterPath가 가리키는 project의 실제 projectId가 approval.projectId와 다르면 신뢰하지 않고 fail-closed",
+    result.kind === "PROJECT_CONTEXT_UNRESOLVED"
+  );
+  check("mismatch 감지 후에도 approval은 PENDING 그대로(소비되지 않음)", approvalStore.get(approvalId)?.status === "PENDING");
+}
+
 async function main(): Promise<void> {
   scenarioCreatesApprovalForHumanApprovalRequired();
   scenarioCreatesApprovalForSecurityBlockedNotRemotelyApprovable();
@@ -524,6 +765,8 @@ async function main(): Promise<void> {
   scenarioNoApprovalForSelfDevWaitingHuman();
   scenarioIdempotentAcrossRepeatedBatches();
   scenarioGitExpectationPassedThrough();
+  scenarioResolveGitExpectationPerEventSkipsWhenUnresolved();
+  scenarioResolveGitExpectationPerEventOverridesBatchDefault();
 
   await scenarioIgnoresNonCallbackUpdate();
   await scenarioUnauthorizedChatIdRejected();
@@ -541,6 +784,9 @@ async function main(): Promise<void> {
   await scenarioApproveGitDivergedBlocksAutoResumeButConsumesApproval();
   await scenarioNoBotTokenAnswerDoesNotThrow();
   await scenarioResultNeverLeaksBotToken();
+  await scenarioCrossProjectApproveUsesForeignManifestNotOwner();
+  await scenarioCrossProjectApproveWithoutAdapterPathFailsClosed();
+  await scenarioCrossProjectApproveWithMismatchedAdapterFailsClosed();
 
   console.log("\n=== approval-service.ts(G6) 테스트 결과 ===");
   for (const r of results) console.log(r);

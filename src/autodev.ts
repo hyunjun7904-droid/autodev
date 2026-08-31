@@ -1920,6 +1920,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       runId,
       taskId: taskDef.id,
       projectId: manifest.projectId,
+      // Multi-Project Approval Isolation(2026-09-01) — § orchestrator.ts OrchestratorDeps.adapterPath.
+      adapterPath: manifest.adapterPath,
       abortSignal: opts.abortSignal,
       ...opts.orchestratorDeps,
     });
@@ -2080,7 +2082,10 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           outcome: "BLOCKED",
           humanInterventionRequired: true,
           reason: `orchestrator status=${finalState.status}`,
-          ...(Object.keys(metadataFields).length > 0 ? { metadata: metadataFields } : {}),
+          // Multi-Project Approval Isolation(2026-09-01) — § project-manifest.ts adapterPath.
+          ...(Object.keys(metadataFields).length > 0 || manifest.adapterPath
+            ? { metadata: { ...metadataFields, ...(manifest.adapterPath ? { adapterPath: manifest.adapterPath } : {}) } }
+            : {}),
         },
         auditFailures
       );
@@ -2175,6 +2180,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         outcome: "BLOCKED",
         humanInterventionRequired: true,
         reason: `HUMAN_FINAL_REVIEW_PENDING(${taskDef.id})`,
+        // Multi-Project Approval Isolation(2026-09-01) — § project-manifest.ts adapterPath.
+        ...(manifest.adapterPath ? { metadata: { adapterPath: manifest.adapterPath } } : {}),
       },
       auditFailures
     );
@@ -2226,6 +2233,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         outcome: "BLOCKED",
         humanInterventionRequired: true,
         reason: `AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT: ${auditHealth.error ?? "unknown"}`,
+        // Multi-Project Approval Isolation(2026-09-01) — § project-manifest.ts adapterPath.
+        ...(manifest.adapterPath ? { metadata: { adapterPath: manifest.adapterPath } } : {}),
       },
       auditFailures
     );
@@ -2371,7 +2380,12 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         outcome: "BLOCKED",
         humanInterventionRequired: isGenuineCheckpointBlock,
         reason: checkpoint.reason,
-        metadata: { secretFindingCount: checkpoint.secretFindings?.length ?? 0, dependencyScanVerdict: checkpoint.dependencyScanVerdict ?? null },
+        // Multi-Project Approval Isolation(2026-09-01) — § project-manifest.ts adapterPath.
+        metadata: {
+          secretFindingCount: checkpoint.secretFindings?.length ?? 0,
+          dependencyScanVerdict: checkpoint.dependencyScanVerdict ?? null,
+          ...(manifest.adapterPath ? { adapterPath: manifest.adapterPath } : {}),
+        },
       },
       auditFailures
     );
