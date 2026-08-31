@@ -1,3 +1,27 @@
+/**
+ * Checkpoint Provenance/Baseline Hardening — task-change-baseline.ts가 만들고 소비하는
+ * 스냅샷 레코드 하나. status는 git-changes.ts WorkingTreeChange.status와 동일한 값 집합을
+ * 그대로 쓰지만(문자열 그대로 복제 — types.ts는 이 저장소 관례상 다른 모듈을 import하지
+ * 않는 leaf 모듈이라 타입을 직접 import할 수 없다), 판정 자체는 이 status 문자열이 아니라
+ * contentHash 비교로만 이뤄진다 — mtime은 어디에도 쓰이지 않는다.
+ */
+export interface TaskChangeBaselineEntry {
+  /** POSIX 상대경로(프로젝트 루트 기준). */
+  path: string;
+  /** 캡처 시점의 git status 상태(관측/디버깅 용 — 판정에는 쓰이지 않는다). */
+  status: "modified" | "added" | "deleted" | "renamed" | "untracked";
+  /** 캡처 시점 파일 내용의 sha256 hex, 또는 특수 sentinel("DELETED"/"UNREADABLE") — mtime이
+   *  아니라 실제 내용을 기준으로 "이후 바뀌었는가"를 판정하기 위한 값. */
+  contentHash: string;
+}
+
+export interface TaskChangeBaseline {
+  taskId: string;
+  /** ISO 8601 — 관측용(판정에는 쓰이지 않는다). */
+  capturedAt: string;
+  entries: TaskChangeBaselineEntry[];
+}
+
 export interface ClaudeResult {
   success: boolean;
   summary: string;
@@ -318,6 +342,28 @@ export interface CoreState {
    * process crash 시 그 호출량이 통째로 유실될 수 있었다.
    */
   gptRawCallTotal?: number;
+
+  /**
+   * Checkpoint Provenance/Baseline Hardening — 이 task의 첫 attempt가 시작되는 시점(§
+   * orchestrator.ts resumingSameTask===false)에 딱 한 번 캡처하는 working-tree 스냅샷.
+   * gptCallCount 등 나머지 durable per-task 필드와 동일한 원칙: 같은 task를 이어가는 동안
+   * (재시도/크래시 재시작)은 절대 재캡처하지 않고 그대로 보존하며, 다른(새) task로 전환될
+   * 때만 새로 캡처한다 — 재캡처하면 이 task 자신이 이미 만든 변경을 "task 시작 전부터 있던
+   * 것"으로 오분류해 그 변경을 영원히 commit하지 못하게 된다.
+   *
+   * checkpoint.ts(computeCommitPlan)가 이 baseline과 현재 working tree를 비교해 "이 task가
+   * 실제로 만든 변경"과 "task 시작 전부터 있었고 내용이 그대로인(이 task와 무관한) 변경"을
+   * 구분한다 — 예전에는 allowedPathPrefixes(경로만)로만 판정해 그 두 가지를 전혀 구분하지
+   * 못했다(§ .claude/CLAUDE.md 보안 섹션에 기록되지 않은 실제 production 결함 — 사실검증으로
+   * 확인됨). optional인 이유는 나머지 durable 필드와 동일하다 — 이 필드가 없는(이 기능 도입
+   * 이전에 이미 진행 중이던) 기존 project-state.json/task는 task-change-baseline.ts의
+   * classifyTaskChangeDelta()가 "baseline 없음 = 이 필드 도입 이전의 기존 동작(모든 현재
+   * 변경을 이 task의 몫으로 취급)"으로 안전하게 대체한다 — 단, 자동 삭제(§ autodev.ts
+   * scope-violation cleanup)는 baseline이 없으면 이 fallback을 적용하지 않고 항상 삭제를
+   * 보류한다(요구사항: "provenance가 불확실하면 삭제하지 않는다" — commit 판정보다 삭제
+   * 판정을 더 엄격하게 다룬다, § task-change-baseline.ts isProvenTaskCreatedPath).
+   */
+  taskChangeBaseline?: TaskChangeBaseline | null;
 
   /** 사람 검토가 필요해 뒤로 미뤄진 항목(반복 거부된 action, GPT 일시 장애 등). */
   deferredHumanTasks: string[];

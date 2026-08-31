@@ -1,8 +1,9 @@
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { evaluateApproval, computeCommitPlan, performTaskCheckpoint, commitProjectStateOnly } from "./checkpoint";
+import { captureTaskChangeBaseline } from "./task-change-baseline";
 import type { TaskDefinition } from "./task-registry";
 
 // 이 테스트는 실제 프로젝트 git repo에 어떤 git 명령도 실행하지 않는다 — 매 시나리오마다
@@ -83,6 +84,194 @@ function scenarioComputeCommitPlan(): void {
     check("computeCommitPlan: allowed에 src/allowed/a.ts 포함", plan.allowed.some((c) => c.path === "src/allowed/a.ts"));
     check("computeCommitPlan: unexpected에 src/outside/b.ts 포함", plan.unexpected.some((c) => c.path === "src/outside/b.ts"));
     check("computeCommitPlan: allowed에 src/outside/b.ts 없음", !plan.allowed.some((c) => c.path === "src/outside/b.ts"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// Checkpoint Provenance/Baseline Hardening(2026-08-31, JARVIS Task 5.3 Canary 사실검증 —
+// §9 회귀 시나리오 A~H) — baseline이 "task 시작 전부터 있던 변경"과 "이 task가 실제로 만든
+// 변경"을 실제 파일 내용(sha256)으로 구분하는지 검증한다. 두 실제 JARVIS 손상 파일은 이
+// fixture로 절대 쓰지 않는다 — 임시 git repo에 이 테스트가 직접 만드는 파일만 쓴다.
+
+// §9-A. pre-existing out-of-scope untracked unchanged → 보존, checkpoint 방해 안 함.
+function scenarioBaselinePreExistingOutOfScopeUnchangedPreserved(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "src/outside/stray.txt", "이 task와 무관한 기존 파일\n");
+    const baseline = captureTaskChangeBaseline("99.1", repo);
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-A pre-existing out-of-scope unchanged: checkpoint가 BLOCK되지 않음(ok=true)", outcome.ok === true);
+    check(
+      "§9-A pre-existing out-of-scope unchanged: commit 대상에 stray.txt가 없음",
+      !(outcome.filesCommitted ?? []).includes("src/outside/stray.txt")
+    );
+    const statusAfter = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf-8" });
+    check(
+      "§9-A pre-existing out-of-scope unchanged: 파일 자체는 삭제되지 않고 그대로 남음",
+      (statusAfter.stdout || "").includes("stray.txt")
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// §9-B. pre-existing out-of-scope untracked modified during Task → BLOCK.
+function scenarioBaselinePreExistingOutOfScopeModifiedBlocks(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "src/outside/stray.txt", "원래 내용\n");
+    const baseline = captureTaskChangeBaseline("99.1", repo);
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    writeFile(repo, "src/outside/stray.txt", "이번 task 도중 내용이 바뀜\n");
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-B pre-existing out-of-scope modified: BLOCK(ok=false)", outcome.ok === false);
+    check("§9-B pre-existing out-of-scope modified: unexpectedFiles에 stray.txt 포함", (outcome.unexpectedFiles ?? []).includes("src/outside/stray.txt"));
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// §9-C. new out-of-scope untracked created during Task(baseline 있어도) → BLOCK.
+function scenarioBaselineNewOutOfScopeCreatedDuringTaskBlocks(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const baseline = captureTaskChangeBaseline("99.1", repo); // 시작 시점 clean
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    writeFile(repo, "src/outside/new-junk.txt", "이 task 도중 새로 생김\n");
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-C new out-of-scope created during task: BLOCK(ok=false)", outcome.ok === false);
+    check(
+      "§9-C new out-of-scope created during task: unexpectedFiles에 new-junk.txt 포함",
+      (outcome.unexpectedFiles ?? []).includes("src/outside/new-junk.txt")
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// §9-F. pre-existing in-scope dirty unchanged → current Task commit에 포함 금지.
+function scenarioBaselinePreExistingInScopeUnchangedExcludedFromCommit(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "src/allowed/pre-existing-wip.ts", "// 사용자가 이미 작업 중이던 미완성 코드\n");
+    const baseline = captureTaskChangeBaseline("99.1", repo);
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n"); // 이 task 자신의 실제 산출물
+    const before = gitLogCount(repo);
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-F pre-existing in-scope unchanged: checkpoint 성공(ok=true)", outcome.ok === true);
+    check("§9-F pre-existing in-scope unchanged: commit 1건 생성", gitLogCount(repo) === before + 1);
+    check(
+      "§9-F pre-existing in-scope unchanged: commit 대상에 이 task 산출물(a.ts)만 포함되고 pre-existing-wip.ts는 빠짐",
+      (outcome.filesCommitted ?? []).includes("src/allowed/a.ts") && !(outcome.filesCommitted ?? []).includes("src/allowed/pre-existing-wip.ts")
+    );
+    const statusAfter = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf-8" });
+    check(
+      "§9-F pre-existing in-scope unchanged: 사용자의 기존 파일은 삭제되지 않고 미커밋 상태로 남음",
+      (statusAfter.stdout || "").includes("pre-existing-wip.ts")
+    );
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// §9-G. pre-existing in-scope file modified during Task → 훼손하거나 통째로 commit하지 않음
+// (내용을 건드리지 않고 checkpoint 전체를 BLOCK — provenance가 섞여 안전하게 분리할 수 없다).
+function scenarioBaselinePreExistingInScopeModifiedBlocksWithoutCorrupting(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const originalContent = "// 사용자의 기존 미완성 작업\nexport const wip = 1;\n";
+    writeFile(repo, "src/allowed/mixed.ts", originalContent);
+    const baseline = captureTaskChangeBaseline("99.1", repo);
+    const taskModifiedContent = "// 사용자의 기존 미완성 작업\nexport const wip = 1;\nexport const addedByTask = 2;\n";
+    writeFile(repo, "src/allowed/mixed.ts", taskModifiedContent); // 같은 in-scope 파일을 task가 이어서 수정
+    const before = gitLogCount(repo);
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-G pre-existing in-scope modified: BLOCK(ok=false, 통째로 commit하지 않음)", outcome.ok === false);
+    check("§9-G pre-existing in-scope modified: unexpectedFiles에 mixed.ts 포함", (outcome.unexpectedFiles ?? []).includes("src/allowed/mixed.ts"));
+    check("§9-G pre-existing in-scope modified: commit이 생성되지 않음", gitLogCount(repo) === before);
+    const actualContent = readFileSync(join(repo, "src/allowed/mixed.ts"), "utf-8");
+    check("§9-G pre-existing in-scope modified: 파일 내용 자체는 전혀 훼손되지 않음(task가 만든 내용 그대로 보존)", actualContent === taskModifiedContent);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// §9-H. clean baseline의 정상 Task → 기존 checkpoint 동작 회귀 없음(baseline을 명시적으로
+// 넘겨도 결과가 baseline 없이 호출했을 때(§ scenarioPerformCheckpointHappyPath)와 동일하다).
+function scenarioBaselineCleanStartNoRegression(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const baseline = captureTaskChangeBaseline("99.1", repo); // 시작 시점 완전히 clean
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    writeFile(repo, "src/allowed/b.ts", "export const b = 2;\n");
+    const before = gitLogCount(repo);
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      baseline,
+    });
+    check("§9-H clean baseline 정상 task: ok=true(회귀 없음)", outcome.ok === true);
+    check(
+      "§9-H clean baseline 정상 task: 두 파일 모두 commit됨",
+      (outcome.filesCommitted ?? []).includes("src/allowed/a.ts") && (outcome.filesCommitted ?? []).includes("src/allowed/b.ts")
+    );
+    check("§9-H clean baseline 정상 task: commit 1건 생성", gitLogCount(repo) === before + 1);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// 레거시 호환 — baseline을 아예 넘기지 않으면(이 기능 도입 이전 project-state.json) 이
+// 기능 도입 이전과 완전히 동일한 fallback(pre-existing out-of-scope 파일도 여전히 BLOCK)
+// 으로 동작해야 한다. §9-A와 대비해 baseline의 실제 효과를 증명한다.
+function scenarioBaselineMissingFallsBackToLegacyBehavior(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(repo, "src/outside/stray.txt", "이 task와 무관한 기존 파일\n");
+    writeFile(repo, "src/allowed/a.ts", "export const a = 1;\n");
+    const outcome = performTaskCheckpoint(fakeTask(), {
+      decision: "PASS",
+      severity: { critical: 0, high: 0, medium: 0 },
+      requiredTestsAllPassed: true,
+      cwd: repo,
+      // baseline 미지정 — 레거시 fallback
+    });
+    check("baseline 미지정(레거시): 여전히 BLOCK됨(회귀 아님, 도입 이전과 동일)", outcome.ok === false);
+    check("baseline 미지정(레거시): unexpectedFiles에 stray.txt 포함", (outcome.unexpectedFiles ?? []).includes("src/outside/stray.txt"));
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
@@ -277,6 +466,13 @@ function scenarioCommitProjectStateOnlyBlocksOnPollutedIndex(): void {
 function main(): void {
   scenarioEvaluateApproval();
   scenarioComputeCommitPlan();
+  scenarioBaselinePreExistingOutOfScopeUnchangedPreserved();
+  scenarioBaselinePreExistingOutOfScopeModifiedBlocks();
+  scenarioBaselineNewOutOfScopeCreatedDuringTaskBlocks();
+  scenarioBaselinePreExistingInScopeUnchangedExcludedFromCommit();
+  scenarioBaselinePreExistingInScopeModifiedBlocksWithoutCorrupting();
+  scenarioBaselineCleanStartNoRegression();
+  scenarioBaselineMissingFallsBackToLegacyBehavior();
   scenarioPerformCheckpointHappyPath();
   scenarioPerformCheckpointUnexpectedBlocks();
   scenarioPerformCheckpointRejectedApproval();

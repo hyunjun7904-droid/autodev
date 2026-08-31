@@ -1774,6 +1774,13 @@ async function scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeN
 
   const statePath = makeTempStateFile(repo, {
     status: "READY",
+    // Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-E) — 이 task(P1.2)가 이미
+    // 진행 중이었고, 그 시작 시점(baseline)에는 other/wrong-place.txt가 없었다는 것을
+    // 명시한다 — "이 파일이 이 attempt 도중 새로 생겼다"는 provenance가 증명되지 않으면
+    // 자동 정리가 삭제를 거부하므로(§ isProvenTaskCreatedPath), 이 fixture도 실제로 그
+    // provenance가 성립하는 상태를 그대로 반영한다.
+    currentTask: "Phase1 Task2 prompt", // CoreState.currentTask는 task ID가 아니라 orchestrator에 넘긴 prompt 문자열이다(§ autodev.ts state.currentTask === candidateForApprovedResume.prompt)
+    taskChangeBaseline: { taskId: "P1.2", capturedAt: new Date(0).toISOString(), entries: [] },
     lastClaudeResult: {
       success: true,
       summary: "이전 시도 요약",
@@ -1872,6 +1879,13 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
   writeRepoFile(repo, "other/leftover-from-checkpoint-block.txt", "leftover\n");
   const statePath = makeTempStateFile(repo, {
     status: "WAITING_HUMAN",
+    // Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-E) — currentTask를 이미 "P1.2"로
+    // 두고, 그 task 시작 시점 baseline에 이 leftover 파일이 없었다는 것을 명시한다(entries:
+    // []) — "이 파일이 P1.2 attempt 도중 새로 생겼다"는 provenance가 증명된 경우에만 자동
+    // 정리가 삭제를 허용하므로(§ isProvenTaskCreatedPath), 이 fixture도 실제 운영에서 이
+    // 시나리오가 발생하려면 어떤 baseline이 이미 있어야 하는지 그대로 반영한다.
+    currentTask: "Phase1 Task2 prompt", // CoreState.currentTask는 task ID가 아니라 orchestrator에 넘긴 prompt 문자열이다(§ autodev.ts state.currentTask === candidateForApprovedResume.prompt)
+    taskChangeBaseline: { taskId: "P1.2", capturedAt: new Date(0).toISOString(), entries: [] },
     lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null },
     deferredHumanTasks: [
       "CHECKPOINT_BLOCKED(P1.2): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다. — unexpected: other/leftover-from-checkpoint-block.txt",
@@ -1905,6 +1919,61 @@ async function scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndC
   );
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
   check("CHECKPOINT_SCOPE_VIOLATION 자동복구: 최종 status가 WAITING_HUMAN이 아님", (finalState.status as unknown as string) !== "WAITING_HUMAN");
+}
+
+// Checkpoint Provenance/Baseline Hardening(2026-08-31, §9-D) — 위 시나리오의 대조군: 마커에
+// 이름이 올라간 "scope violation" 파일이 실제로는 이 task가 만든 게 아니라 task 시작 전부터
+// 있던 파일이면(baseline에 이미 기록돼 있으면), 자동 정리가 이 파일을 절대 삭제하지 않아야
+// 한다 — 이번 사실검증에서 실제 JARVIS 저장소에서 관측된 위험(무관한 pre-existing 파일이
+// 자동 삭제될 수 있었던 상황)을 직접 재현한다.
+async function scenarioRunAutodevOnceDoesNotDeletePreExistingFileEvenIfMarkedAsScopeViolation(): Promise<void> {
+  const repo = makeTempGitRepo();
+  writeRepoFile(repo, "other/pre-existing-unrelated-user-file.txt", "이 task와 전혀 무관한, task 시작 전부터 있던 파일\n");
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    currentTask: "Phase1 Task2 prompt", // CoreState.currentTask는 task ID가 아니라 orchestrator에 넘긴 prompt 문자열이다(§ autodev.ts state.currentTask === candidateForApprovedResume.prompt)
+    // baseline이 이 파일을 이미 알고 있다(=task 시작 전부터 존재했다는 증거) — §9-E와 정확히
+    // 대비되는 지점이다.
+    taskChangeBaseline: {
+      taskId: "P1.2",
+      capturedAt: new Date(0).toISOString(),
+      entries: [{ path: "other/pre-existing-unrelated-user-file.txt", status: "untracked", contentHash: "irrelevant-for-this-test" }],
+    },
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "테스트: 문제 없음", nextTask: null },
+    deferredHumanTasks: [
+      "CHECKPOINT_BLOCKED(P1.2): 예상치 못한 범위 밖 파일 변경이 있어 commit을 중단했습니다. — unexpected: other/pre-existing-unrelated-user-file.txt",
+    ],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // P1.2, allowedPathPrefixes=["proj/"]
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-checkpoint-block-recovery.txt", "marker\n");
+    return {
+      success: true,
+      summary: "테스트: pre-existing 파일 보존 확인",
+      changedFiles: ["proj/marker-checkpoint-block-recovery.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("§9-D pre-existing 파일 보존: Claude Developer가 정상적으로 재호출됨", claudeCalls === 1);
+  check(
+    "§9-D pre-existing 파일 보존: baseline에 이미 있던 파일은 자동 정리로 삭제되지 않음",
+    existsSync(join(repo, "other/pre-existing-unrelated-user-file.txt"))
+  );
+  // 파일이 그대로 남아 있으므로(여전히 scope 밖) 이번 checkpoint도 다시 BLOCK된다 — "삭제하지
+  // 않는다"가 "억지로 통과시킨다"를 뜻하지 않는다(요구사항 7 — provenance 불확실 시 삭제도
+  // commit도 하지 않는다. 이 경우는 provenance가 오히려 명확히 "task와 무관"으로 확인됐으므로
+  // 안전하게 계속 BLOCK 상태를 유지한다).
+  check(
+    "§9-D pre-existing 파일 보존: 파일이 여전히 남아있어 checkpoint가 다시 BLOCK됨(APPROVED_AND_CHECKPOINTED 아님)",
+    result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED"
+  );
 }
 
 // § BLOCKER 2 재하드닝(독립 최종 감사, 2026-08-30) — Technical/Human Gate Matrix. 이전에는
@@ -2994,6 +3063,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceCleansUpUntrackedScopeViolationFilesBeforeNextAttempt();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceReconcilesStaleCheckpointScopeViolationAndCleansUpLeftover();
+    await scenarioRunAutodevOnceDoesNotDeletePreExistingFileEvenIfMarkedAsScopeViolation();
     await scenarioTechnicalHumanGateMatrixReviewBlockAndScopeViolation();
     await scenarioRunAutodevOnceEscalatesAfterMidFlightCrashLoopExceedsCap();
     await scenarioRunAutodevOnceEscalatesAfterNoWriteRepeatExceedsCap();

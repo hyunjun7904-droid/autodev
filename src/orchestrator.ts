@@ -5,7 +5,9 @@ import { reviewClaudeResult as fakeReviewClaudeResult } from "./fake-gpt-reviewe
 import { reviewClaudeResult as realReviewClaudeResult, buildGptReviewLedgerEntryInput } from "./gpt-reviewer";
 import type { ReviewProjectContext } from "./gpt-reviewer";
 import type { ReviewBaseline } from "./review-baseline";
+import { PROJECT_ROOT } from "./safe-executor";
 import type { SafeExecutorContext } from "./safe-executor";
+import { captureTaskChangeBaseline } from "./task-change-baseline";
 import { requiresHumanApproval, classifyTaskRisk, MAX_REVIEW_CYCLES } from "./policy";
 import { applyReviewDecisionPolicy, hasFailedRequiredTest, REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { computeFailureFingerprint, classifyFailureCategory, createStagnationTracker, STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
@@ -401,6 +403,17 @@ export async function runOrchestrator(
     // (아래 let 초기화가 state에서 그대로 이어받는다) 프로세스 재시작에도 보존된다.
     state.gptCallCount = 0;
     state.gptRawCallTotal = 0;
+    // Checkpoint Provenance/Baseline Hardening(2026-08-31) — 새 task로 전환될 때만 working
+    // tree baseline을 새로 캡처한다(§ task-change-baseline.ts 상단 주석). 같은 task를
+    // 재개(크래시 복구/재시도)하는 동안(resumingSameTask===true, 이 블록 밖)은 절대
+    // 재캡처하지 않는다 — 재캡처하면 이 task 자신이 이미 만든(아직 commit 전인) 변경을
+    // "task 시작 전부터 있던 것"으로 오분류해 그 변경을 영원히 commit하지 못하게 된다.
+    // deps.taskId(taskDef.id, 예: "T1")가 있으면 그것을 쓴다 — task(orchestrator에 실제로
+    // 넘어오는 값은 taskDef.prompt다, § autodev.ts runOrchestrator(taskDef.prompt, ...))를
+    // 그대로 taskId로 쓰면 autodev.ts의 baseline.taskId===taskDef.id 방어적 재검증(§
+    // scope-violation cleanup)이 항상 실패해 자동 정리가 절대 동작하지 않게 된다.
+    // computeFailureFingerprint(위)와 동일한 fallback 패턴(deps.taskId ?? task).
+    state.taskChangeBaseline = captureTaskChangeBaseline(deps.taskId ?? task, deps.executor?.projectRoot ?? PROJECT_ROOT);
   }
   state.lastClaudeResult = null;
   state.lastGptDecision = null;

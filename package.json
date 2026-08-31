@@ -63,6 +63,7 @@
     "test:spec-planner": "npm run build && node dist/spec-planner-tests.js",
     "test:claude-developer": "npm run build && node dist/claude-developer-tests.js",
     "test:checkpoint": "npm run build && node dist/checkpoint-tests.js",
+    "test:task-change-baseline": "npm run build && node dist/task-change-baseline-tests.js",
     "test:secret-scanner": "npm run build && node dist/secret-scanner-tests.js",
     "test:dependency-scanner": "npm run build && node dist/dependency-scanner-tests.js",
     "test:capability-resolver": "npm run build && node dist/capability-resolver-tests.js",

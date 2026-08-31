@@ -34,6 +34,7 @@ import {
 import { hasFailedRequiredTest } from "./review-policy";
 import { validateRequiredTestExecutionContract } from "./execution-contract";
 import { buildDiagnosticEvidenceBundle } from "./diagnostic-evidence-bundle";
+import { isProvenTaskCreatedPath } from "./task-change-baseline";
 import {
   computeProblemFingerprint,
   classifyFailureCategory,
@@ -1438,9 +1439,35 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     const cleanupCandidates = Array.from(new Set([...gptReportedScopeViolations, ...checkpointBlockedLeftoverFiles]));
     if (cleanupCandidates.length > 0) {
       const currentUntracked = new Set(getWorkingTreeChanges([], executorContext.projectRoot).untracked.map((c) => c.path));
+      // Checkpoint Provenance/Baseline Hardening(2026-08-31, JARVIS Task 5.3 Canary
+      // 사실검증으로 확인된 production 결함) — 안전조건 5) 추가: 이 path가 이 task의
+      // baseline(§ task-change-baseline.ts, task 시작 시점 스냅샷) 시점에 이미 존재했다면
+      // 절대 삭제하지 않는다. 예전에는 (1)~(4)만으로 판단해 "untracked + scope 밖 + 마커에
+      // 기록됨"이면 무조건 삭제했는데, 이 세 조건은 "이 task/attempt가 새로 만든 leftover"와
+      // "이 task와 완전히 무관하게 이미 있던 사용자 파일"을 구분하지 못한다 — 실제 JARVIS
+      // 저장소에서 후자가 정확히 이 삭제 대상 후보 목록에 올라간 것이 관측됐다.
+      // isProvenTaskCreatedPath는 baseline이 없으면(레거시 task) 항상 false를 반환한다 —
+      // "provenance를 모르면 삭제하지 않는다"(요구사항 5/7)를 다른 어떤 fallback보다도
+      // 우선한다. baseline.taskId가 이 taskDef.id와 다르면(방어적 가드 — 정상 경로에서는
+      // 발생하지 않아야 한다: 이 cleanup 대상 자체가 항상 같은 task의 직전 attempt 결과이기
+      // 때문) 마찬가지로 baseline이 없는 것으로 취급한다.
+      const baselineForThisTask =
+        state.taskChangeBaseline && state.taskChangeBaseline.taskId === taskDef.id ? state.taskChangeBaseline : null;
       const removable = cleanupCandidates.filter(
-        (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes)
+        (p) =>
+          currentUntracked.has(p) &&
+          !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes) &&
+          isProvenTaskCreatedPath(baselineForThisTask, p)
       );
+      const skippedAsPreExisting = cleanupCandidates.filter(
+        (p) => currentUntracked.has(p) && !isPathWithinAllowedPrefixes(p, taskDef.allowedPathPrefixes) && !removable.includes(p)
+      );
+      if (skippedAsPreExisting.length > 0) {
+        log("scope-violation 정리 대상 중 일부는 삭제하지 않음(baseline 시점에 이미 존재했거나 provenance를 증명할 수 없음)", {
+          taskId: taskDef.id,
+          paths: skippedAsPreExisting,
+        });
+      }
       for (const relPath of removable) {
         try {
           rmSync(join(executorContext.projectRoot, ...relPath.split("/")), { force: true });
@@ -2340,6 +2367,11 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     reviewFeedback: finalState.lastGptDecision?.feedback,
     cwd,
     excludePaths: [stateRelPath],
+    // Checkpoint Provenance/Baseline Hardening(2026-08-31) — orchestrator.ts가 이 task의
+    // 진짜 첫 attempt 시작 시점에 캡처해 state에 durable하게 저장한 baseline(§
+    // task-change-baseline.ts). finalState는 orchestrator 실행 결과(RESUME_APPROVED_CHECKPOINT
+    // 경로에서는 loadState() 그대로)이므로 항상 이 필드를 그대로 갖고 있다.
+    baseline: finalState.taskChangeBaseline,
   });
 
   if (!checkpoint.ok) {

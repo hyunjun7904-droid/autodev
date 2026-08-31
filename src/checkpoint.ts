@@ -3,7 +3,8 @@ import { PROJECT_ROOT } from "./safe-executor";
 import { getWorkingTreeChanges, isPathInScope } from "./git-changes";
 import type { WorkingTreeChange } from "./git-changes";
 import type { TaskDefinition } from "./task-registry";
-import type { GptDecision, SeverityCounts } from "./types";
+import type { GptDecision, SeverityCounts, TaskChangeBaseline } from "./types";
+import { classifyTaskChangeDelta } from "./task-change-baseline";
 import { log } from "./logger";
 import { scanChangesForSecrets } from "./secret-scanner";
 import type { SecretFinding } from "./secret-scanner";
@@ -25,32 +26,62 @@ import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 export interface CommitPlan {
   allowed: WorkingTreeChange[];
   unexpected: WorkingTreeChange[];
+  /** Checkpoint Provenance/Baseline Hardening — baseline과 내용이 완전히 동일해(§
+   *  task-change-baseline.ts) 이 task와 무관하다고 확인된 변경. allowed에도 unexpected에도
+   *  들어가지 않는다(commit 대상도 아니고 scope violation도 아니다) — 순수 관측/테스트용. */
+  preExistingUnchanged: WorkingTreeChange[];
 }
 
-/** taskDef.allowedPathPrefixes 기준으로 실제 변경 파일을 allowed/unexpected로 나눈다.
- *  scope는 repo 전체(".")로 잡는다 — web/automation/supabase 바깥에서 뭔가 바뀌었다면
- *  그것도 놓치지 않고 unexpected로 잡아야 하기 때문이다.
+/** taskDef.allowedPathPrefixes와 baseline(§ task-change-baseline.ts) 기준으로 실제 변경
+ *  파일을 allowed/unexpected/preExistingUnchanged로 나눈다. scope는 repo 전체(".")로 잡는다
+ *  — web/automation/supabase 바깥에서 뭔가 바뀌었다면 그것도 놓치지 않고 unexpected로
+ *  잡아야 하기 때문이다.
  *
- *  excludePaths(보통 project-state.json 경로 하나)는 allowed에도 unexpected에도 넣지
- *  않는다 — orchestrator가 이 task를 실행하는 동안에도(진행 상황 저장을 위해) 정상적으로
+ *  excludePaths(보통 project-state.json 경로 하나)는 세 그룹 어디에도 넣지 않는다 —
+ *  orchestrator가 이 task를 실행하는 동안에도(진행 상황 저장을 위해) 정상적으로
  *  project-state.json을 계속 갱신하므로, 이 product commit의 "이 task가 실제로 만든
  *  변경" 판정에서는 완전히 무시한다. project-state.json은 checkpoint 성공 이후 별도의
- *  administrative commit(commitProjectStateOnly)으로만 다뤄진다. */
+ *  administrative commit(commitProjectStateOnly)으로만 다뤄진다.
+ *
+ *  Checkpoint Provenance/Baseline Hardening(2026-08-31) — baseline이 주어지면(task 시작
+ *  시점 스냅샷, § task-change-baseline.ts) 다음 원칙으로 판정한다:
+ *    1) baseline과 내용이 완전히 동일한 변경(preExistingUnchanged) — scope 안팎과 무관하게
+ *       commit 대상도, scope violation도 아니다(요구사항 3/F — "이 task와 무관한 변경은
+ *       건드리지 않는다").
+ *    2) baseline에 없던(순수 신규) 변경 — scope 안이면 allowed, 밖이면 unexpected(기존과
+ *       동일, 요구사항 C).
+ *    3) baseline에 있었지만 내용이 달라진(task 시작 전부터 있었지만 이번 task 동안 내용이
+ *       바뀐) 변경 — scope 안팎과 무관하게 항상 unexpected다(요구사항 4/6/B/G — pre-existing
+ *       내용과 이 task의 변경이 한 파일에 섞여 있으면 어느 쪽 내용인지 안전하게 분리할 수
+ *       없으므로, 그 파일을 훼손하거나 사용자의 기존 변경을 임의로 commit하지 않고 통째로
+ *       막는다 — 기존 "unexpected가 하나라도 있으면 부분 commit 없이 전체 BLOCK" 불변식을
+ *       그대로 재사용한다).
+ *  baseline이 없으면(레거시 — 이 기능 도입 이전에 이미 진행 중이던 task) classifyTaskChangeDelta
+ *  가 모든 변경을 "신규"로 취급하는 fallback을 쓴다 — 이는 이 기능 도입 이전의 기존 동작과
+ *  완전히 동일하다(회귀 없음). */
 export function computeCommitPlan(
   taskDef: TaskDefinition,
   cwd: string = PROJECT_ROOT,
-  excludePaths: string[] = []
+  excludePaths: string[] = [],
+  baseline?: TaskChangeBaseline | null
 ): CommitPlan {
   const changes = getWorkingTreeChanges(["."], cwd);
   const excludeSet = new Set(excludePaths);
+  const relevantChanges = changes.all.filter((c) => !excludeSet.has(c.path));
+
+  const delta = classifyTaskChangeDelta(baseline, relevantChanges, cwd);
+
   const allowed: WorkingTreeChange[] = [];
   const unexpected: WorkingTreeChange[] = [];
-  for (const c of changes.all) {
-    if (excludeSet.has(c.path)) continue;
+  for (const c of delta.newSinceBaseline) {
     const inScope = isPathInScope(c.path, taskDef.allowedPathPrefixes);
     (inScope ? allowed : unexpected).push(c);
   }
-  return { allowed, unexpected };
+  // pre-existing 파일이 이번 task 동안 내용이 바뀐 경우 — scope 안팎과 무관하게 항상
+  // unexpected(§ 위 docstring 3번).
+  unexpected.push(...delta.modifiedSinceBaseline);
+
+  return { allowed, unexpected, preExistingUnchanged: delta.preExistingUnchanged };
 }
 
 export interface ApprovalInput {
@@ -103,6 +134,12 @@ export interface PerformCheckpointOptions {
    *  끄거나 약화시키는 옵션이 아니다 — 구조/source/integrity/install-script 검사는 이
    *  값과 무관하게 항상 수행된다). */
   dependencyVulnerabilityAuditSource?: VulnerabilityAuditSource;
+  /** Checkpoint Provenance/Baseline Hardening — 이 task 시작 시점 working-tree 스냅샷(§
+   *  task-change-baseline.ts, orchestrator.ts가 resumingSameTask===false일 때 한 번만
+   *  캡처해 state.taskChangeBaseline에 durable하게 저장한다). 지정하지 않으면(레거시 —
+   *  이 기능 도입 이전에 이미 진행 중이던 task) computeCommitPlan이 이 기능 도입 이전과
+   *  동일한 fallback으로 동작한다(회귀 없음). */
+  baseline?: TaskChangeBaseline | null;
 }
 
 export interface CheckpointOutcome {
@@ -143,7 +180,7 @@ export function performTaskCheckpoint(taskDef: TaskDefinition, opts: PerformChec
     return { ok: false, reason: approval.reason };
   }
 
-  const plan = computeCommitPlan(taskDef, cwd, opts.excludePaths ?? []);
+  const plan = computeCommitPlan(taskDef, cwd, opts.excludePaths ?? [], opts.baseline);
   if (plan.unexpected.length > 0) {
     const unexpectedFiles = plan.unexpected.map((c) => c.path);
     log("checkpoint BLOCK — allowedPathPrefixes 밖 예상치 못한 변경 발견", { taskId: taskDef.id, unexpectedFiles });
