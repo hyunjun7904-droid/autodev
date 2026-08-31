@@ -77,6 +77,72 @@ export interface ProblemMemoryEntry {
   inapplicableConditions?: string;
   reuseSuccessCount: number;
   reuseFailureCount: number;
+  /** AutoDev 최종 통합 하드닝(§15~21, Self-Reinforcing Knowledge Loop) — VERIFIED 승격
+   *  조건(재현/root cause 증거 연결/최소 수정/targeted test PASS/fault simulation PASS/
+   *  regression PASS) 중 이 store가 직접 관측할 수 없는 3개(targeted test/fault
+   *  simulation/regression 각각의 실제 PASS 여부)를 호출부가 실제로 확인했을 때만
+   *  명시적으로 채운다. 이 필드가 없으면(대부분의 기존 항목) classifyKnowledgeLifecycleState()
+   *  는 VERIFIED로 승격하지 않는다 — 증거 없이 추측으로 최고 신뢰등급을 주지 않는다는
+   *  원칙(§ 요구사항 17)을 지키기 위함이다. */
+  verifiedEvidence?: {
+    targetedTestPass: boolean;
+    faultSimulationPass: boolean;
+    regressionPass: boolean;
+  };
+}
+
+// AutoDev 최종 통합 하드닝(§15~21) — Knowledge 신뢰등급. 새 저장소를 만들지 않는다 — 이미
+// 있는 필드(finalSuccessfulSolution/pendingConfirmation/finalVerificationResult/
+// verificationTests/reuseSuccessCount/reuseFailureCount/verifiedEvidence)를 그대로
+// 읽어서 6개 상태(OBSERVED/HYPOTHESIS/REPRODUCED/VERIFIED/SUPERSEDED/INVALIDATED) 중
+// 하나로 순수 분류만 한다(부수효과 없음, 저장 스키마 변경 없음). 이 분류는 lookupSolution()
+// 등 기존 재사용/승격 로직의 동작을 바꾸지 않는다 — 순수 진단/보고용 오버레이다(§
+// failure-taxonomy.ts와 동일한 설계 원칙: 이미 내려진 판단에 이름을 붙일 뿐, 새 판단을
+// 이 함수가 대신 내리지 않는다).
+export type KnowledgeLifecycleState = "OBSERVED" | "HYPOTHESIS" | "REPRODUCED" | "VERIFIED" | "SUPERSEDED" | "INVALIDATED";
+
+export interface KnowledgeLifecycleClassification {
+  state: KnowledgeLifecycleState;
+  reason: string;
+}
+
+/**
+ * SUPERSEDED는 이 함수가 자동으로 판정하지 않는다 — "더 나은 해결책으로 대체됨"은 같은
+ * fingerprint를 가리키는 다른 entry와의 관계를 추적해야 하는데, 이 store는 현재 entry
+ * 간 supersession 관계를 저장하지 않는다(§ 알려진 한계, 추측으로 판정하지 않음 원칙).
+ * 필요해지면 별도 필드/Task에서 다뤄야 한다.
+ */
+export function classifyKnowledgeLifecycleState(entry: ProblemMemoryEntry): KnowledgeLifecycleClassification {
+  if (!entry.finalSuccessfulSolution) {
+    return { state: "OBSERVED", reason: "실패는 기록됐지만 아직 성공한 해결책이 기록되지 않음." };
+  }
+  if (entry.finalVerificationResult === "FAIL") {
+    return { state: "INVALIDATED", reason: "검증 시도에서 최종적으로 FAIL로 확인됨 — 더 이상 신뢰할 수 없음." };
+  }
+  if (entry.pendingConfirmation) {
+    return { state: "HYPOTHESIS", reason: "해결책 후보는 있으나 아직 실제 checkpoint로 확정되지 않음(§ pendingConfirmation=true)." };
+  }
+  // 이 시점: finalSuccessfulSolution 있음 + pendingConfirmation=false(confirmResolution을
+  // 이미 거쳐 실제 checkpoint commit으로 확정됨).
+  if (entry.reuseFailureCount > 0 && entry.reuseSuccessCount === 0) {
+    return {
+      state: "INVALIDATED",
+      reason: `이후 재사용 시도가 전부 실패함(reuseFailureCount=${entry.reuseFailureCount}, reuseSuccessCount=0) — 더 이상 자동 재사용 대상으로 신뢰하지 않아야 함.`,
+    };
+  }
+  const evidence = entry.verifiedEvidence;
+  if (evidence && evidence.targetedTestPass && evidence.faultSimulationPass && evidence.regressionPass) {
+    return {
+      state: "VERIFIED",
+      reason: "checkpoint로 확정됐고 targeted test/fault simulation/regression 3개 증거가 모두 PASS로 기록됨(§ 요구사항 17 승격 조건 충족).",
+    };
+  }
+  return {
+    state: "REPRODUCED",
+    reason: evidence
+      ? "checkpoint로 확정됐지만 targeted test/fault simulation/regression 중 일부가 아직 PASS로 확인되지 않음 — VERIFIED로 승격하지 않음."
+      : "checkpoint로 확정됐지만 targeted test/fault simulation/regression 각각의 개별 PASS 증거가 기록되지 않음 — VERIFIED로 자동 승격하지 않음(증거 없는 낙관적 승격 금지).",
+  };
 }
 
 export interface ProblemMemoryStore {
@@ -254,6 +320,23 @@ export function confirmResolution(store: ProblemMemoryStore, entryId: string, co
   entry.resolvedAtCommit = commitHash;
   const last = entry.attemptedSolutions[entry.attemptedSolutions.length - 1];
   if (last) last.gitRef = commitHash;
+  store.save(entries);
+}
+
+/** 호출부가 targeted test/fault simulation/regression 각각을 실제로 확인했을 때만
+ *  호출한다(§ classifyKnowledgeLifecycleState VERIFIED 조건) — 추측으로 채우지 않는다.
+ *  entryId가 이미 confirmResolution()을 거치지 않았어도(pendingConfirmation=true) 값 자체는
+ *  기록한다 — VERIFIED 판정은 classifyKnowledgeLifecycleState()가 pendingConfirmation을
+ *  먼저 확인하므로 순서가 뒤바뀌어도 안전하다. */
+export function recordVerifiedEvidence(
+  store: ProblemMemoryStore,
+  entryId: string,
+  evidence: { targetedTestPass: boolean; faultSimulationPass: boolean; regressionPass: boolean }
+): void {
+  const entries = store.load();
+  const entry = entries.find((e) => e.id === entryId);
+  if (!entry) return;
+  entry.verifiedEvidence = evidence;
   store.save(entries);
 }
 

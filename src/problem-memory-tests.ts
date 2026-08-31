@@ -11,6 +11,8 @@ import {
   recordReuseOutcome,
   scrubPathLikeTokens,
   isGenericCommonProblem,
+  classifyKnowledgeLifecycleState,
+  recordVerifiedEvidence,
 } from "./problem-memory";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
 import type { ClaudeResult } from "./types";
@@ -452,6 +454,105 @@ function scenarioRootCauseClassRespectsLimitAndAlreadyFailedExclusion(): void {
   );
 }
 
+// ---------------------------------------------------------------------------
+// K) classifyKnowledgeLifecycleState — Hardening §15~21(Self-Reinforcing Knowledge Loop).
+// ---------------------------------------------------------------------------
+function scenarioLifecycleObservedThenHypothesisThenReproducedThenVerified(): void {
+  const store = makeMemoryStore();
+
+  const entryAfterFailure = recordAttempt(store, {
+    projectId: "PK",
+    taskId: "TK",
+    tests: FAILING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: [],
+    attemptDescription: "아직 해결 못함",
+    outcome: "FAILURE",
+  });
+  check("K) 성공 기록 전에는 OBSERVED", classifyKnowledgeLifecycleState(entryAfterFailure).state === "OBSERVED");
+
+  const entry = recordAttempt(store, {
+    projectId: "PK",
+    taskId: "TK",
+    tests: PASSING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: ["a.ts"],
+    attemptDescription: "해결책 후보",
+    outcome: "SUCCESS",
+  });
+  check("K) 성공 기록 직후(checkpoint 확정 전)는 HYPOTHESIS", classifyKnowledgeLifecycleState(entry).state === "HYPOTHESIS");
+
+  confirmResolution(store, entry.id, "abc123");
+  const confirmedEntry = store.load().find((e) => e.id === entry.id)!;
+  check(
+    "K) checkpoint 확정 후 targeted/fault/regression 증거가 없으면 REPRODUCED(자동으로 VERIFIED 승격 안 함)",
+    classifyKnowledgeLifecycleState(confirmedEntry).state === "REPRODUCED"
+  );
+
+  recordVerifiedEvidence(store, entry.id, { targetedTestPass: true, faultSimulationPass: true, regressionPass: true });
+  const verifiedEntry = store.load().find((e) => e.id === entry.id)!;
+  check("K) 3개 증거가 전부 PASS로 기록되면 VERIFIED", classifyKnowledgeLifecycleState(verifiedEntry).state === "VERIFIED");
+}
+
+function scenarioLifecyclePartialEvidenceStaysReproduced(): void {
+  const store = makeMemoryStore();
+  const entry = recordAttempt(store, {
+    projectId: "PK2",
+    taskId: "TK2",
+    tests: PASSING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: ["a.ts"],
+    attemptDescription: "부분 증거",
+    outcome: "SUCCESS",
+  });
+  confirmResolution(store, entry.id, "def456");
+  recordVerifiedEvidence(store, entry.id, { targetedTestPass: true, faultSimulationPass: false, regressionPass: true });
+  const partial = store.load().find((e) => e.id === entry.id)!;
+  check("K) 증거 중 하나라도 FAIL/미확인이면 REPRODUCED에 머무름(VERIFIED 아님)", classifyKnowledgeLifecycleState(partial).state === "REPRODUCED");
+}
+
+function scenarioLifecycleFinalVerificationFailIsInvalidated(): void {
+  const store = makeMemoryStore();
+  const entry = recordAttempt(store, {
+    projectId: "PK3",
+    taskId: "TK3",
+    tests: PASSING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: ["a.ts"],
+    attemptDescription: "해결책",
+    outcome: "SUCCESS",
+  });
+  entry.finalVerificationResult = "FAIL";
+  check("K) finalVerificationResult=FAIL이면 INVALIDATED", classifyKnowledgeLifecycleState(entry).state === "INVALIDATED");
+}
+
+function scenarioLifecycleAllReuseFailuresIsInvalidated(): void {
+  const store = makeMemoryStore();
+  const entry = recordAttempt(store, {
+    projectId: "PK4",
+    taskId: "TK4",
+    tests: PASSING_TESTS,
+    errorType: "IMPLEMENTATION",
+    changedFiles: ["a.ts"],
+    attemptDescription: "해결책",
+    outcome: "SUCCESS",
+  });
+  confirmResolution(store, entry.id, "ghi789");
+  recordReuseOutcome(store, entry.id, "FAILURE");
+  const invalidated = store.load().find((e) => e.id === entry.id)!;
+  check(
+    "K) 확정된 해결책이지만 재사용 시도가 전부 실패(성공 이력 0)면 INVALIDATED로 강등됨",
+    classifyKnowledgeLifecycleState(invalidated).state === "INVALIDATED"
+  );
+
+  recordReuseOutcome(store, entry.id, "SUCCESS");
+  const recovered = store.load().find((e) => e.id === entry.id)!;
+  check(
+    "K) 이후 재사용 성공 이력이 하나라도 생기면 더 이상 INVALIDATED가 아님(REPRODUCED로 복귀)",
+    classifyKnowledgeLifecycleState(recovered).state !== "INVALIDATED"
+  );
+}
+
 function main(): void {
   scenarioSameTaskDoesNotRecommendAlreadyFailedSolution();
   scenarioCrossTaskReuseWithinSameProject();
@@ -466,6 +567,11 @@ function main(): void {
   scenarioRootCauseClassFindsDifferentFingerprintSameClass();
   scenarioRootCauseClassExcludesDifferentClassAndUnconfirmed();
   scenarioRootCauseClassRespectsLimitAndAlreadyFailedExclusion();
+
+  scenarioLifecycleObservedThenHypothesisThenReproducedThenVerified();
+  scenarioLifecyclePartialEvidenceStaysReproduced();
+  scenarioLifecycleFinalVerificationFailIsInvalidated();
+  scenarioLifecycleAllReuseFailuresIsInvalidated();
 
   console.log("\n=== problem-memory 테스트 결과 ===");
   for (const r of results) console.log(r);
