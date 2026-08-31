@@ -13,6 +13,7 @@ import type { ReadOnlyAgentRunner } from "./agent-orchestrator";
 import { createInMemoryEventStore } from "./event-store";
 import type { EventStore, AuditWritableCheck } from "./event-store";
 import { isAuditCriticalEvent } from "./observability-event";
+import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
 
 // Production Pipeline Integration & Review Policy 단일화 테스트(Phase F Task F4/F4.1). 실제
 // Claude/GPT 유료 API를 전혀 호출하지 않는다 — claudeRunner/gptReviewer/advisoryReadOnlyRunner는
@@ -112,7 +113,13 @@ function buildManifest(root: string, statePath: string, taskRegistry: TaskDefini
     developerInstructions: "허용 범위: proj/**. F4 통합 테스트 fixture 프로젝트.",
     reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
     reviewScopeDirs: ["proj/"],
-    executionPolicy: FIXTURE_EXECUTION_POLICY,
+    // Hardening A(Execution Contract를 Runtime 불변조건으로) — 실제 spec-planner.ts가
+    // 생성하는 manifest는 항상 deriveAllowedCommandsFromRequiredTests()로 allowedCommands를
+    // requiredTests와 exact-match하게 파생시킨다(§ execution-contract.ts). FIXTURE_EXECUTION_POLICY의
+    // 정적 allowedCommands=[]는 그 실제 생성 결과를 흉내내지 못해 autodev.ts의 runtime
+    // execution-contract 재검증에 매번 걸린다 — 이 registry의 실제 requiredTests로부터 매번
+    // 파생시켜 그 재검증이 정상 통과하게 한다.
+    executionPolicy: { ...FIXTURE_EXECUTION_POLICY, allowedCommands: deriveAllowedCommandsFromRequiredTests(taskRegistry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))) },
   };
 }
 

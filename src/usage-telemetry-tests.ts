@@ -13,6 +13,7 @@ import { runAutodevOnce } from "./autodev";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
+import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
 import type { ClaudeResult, ProjectState } from "./types";
 import type { ReadOnlyAgentRunner, AgentOrchestratorDeps, DeveloperAgentRunner, AgentExecutionInput } from "./agent-orchestrator";
 import { executeRoutingPlan } from "./agent-orchestrator";
@@ -498,7 +499,10 @@ function buildManifest(root: string, statePath: string, taskRegistry: TaskDefini
     developerInstructions: "허용 범위: proj/**.",
     reviewInstructions: "proj/** 범위 밖 변경이 있으면 REVISE.",
     reviewScopeDirs: ["proj/"],
-    executionPolicy: FIXTURE_EXECUTION_POLICY,
+    // Hardening A(Execution Contract를 Runtime 불변조건으로) — § production-agent-integration-tests.ts와
+    // 동일한 이유. 실제 spec-planner.ts 산출물처럼 allowedCommands를 requiredTests로부터
+    // 파생시켜야 autodev.ts의 runtime execution-contract 재검증을 통과한다.
+    executionPolicy: { ...FIXTURE_EXECUTION_POLICY, allowedCommands: deriveAllowedCommandsFromRequiredTests(taskRegistry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))) },
   };
 }
 

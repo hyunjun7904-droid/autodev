@@ -7,6 +7,7 @@ import { configureSafeExecutor, validateReadPath, validateWritePath } from "./sa
 import { decideNextAction, runAutodevOnce, approveHumanFinalReview } from "./autodev";
 import type { GptReviewerReturn } from "./orchestrator";
 import type { ClaudeResult } from "./types";
+import { deriveAllowedCommandsFromRequiredTests } from "./execution-contract";
 
 // AutoDev 범용화 Phase C Task C1 — External Project Adapter를 data-only(JSON)로 전환한
 // project-adapter-loader.ts 검증.
@@ -761,7 +762,15 @@ async function scenarioHumanFinalReviewPolicyVisibleToRunAutodevOnce(): Promise<
     developerInstructions: "dev",
     reviewInstructions: "review",
     reviewScopeDirs: ["fixture/"],
-    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+    // Hardening A(Execution Contract를 Runtime 불변조건으로) — 이 시나리오는 실제로
+    // runAutodevOnce()까지 도달해 checkpoint를 완료하므로(§ E2E), allowedCommands가
+    // VALID_FIXTURE_TASK.requiredTests와 exact-match해야 autodev.ts의 runtime
+    // execution-contract 재검증을 통과한다(실제 spec-planner.ts 산출물과 동일하게).
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests([{ taskId: VALID_FIXTURE_TASK.id, requiredTests: VALID_FIXTURE_TASK.requiredTests }]),
+    },
     humanFinalReviewPolicy: { enabled: true },
   });
   // manifest.json/task-registry.json/project-state.json은 이 fixture project의 project-state
