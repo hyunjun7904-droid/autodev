@@ -33,6 +33,11 @@ export interface AttemptOutcomeEntry {
    *  섞여 들어올 수 있는 원시 stdout/stderr는 여기 담기지 않는다, § autodev.ts가 이미
    *  reason을 고정 템플릿/reviewer feedback 텍스트로만 채운다). */
   reason?: string;
+  /** SUCCESS일 때만, 그리고 CHECKPOINT_CREATED event가 실제로 metadata.commitHash를
+   *  string으로 담고 있을 때만 채워진다(§ autodev.ts가 checkpoint 확정 시 항상 이 값을
+   *  기록함 — 새 필드를 만들지 않고 이미 기록된 값을 그대로 노출할 뿐이다). 없으면
+   *  undefined(추측 금지) — Dashboard UX 정리(§ 요구사항 8 Git 표시)를 위해 추가됐다. */
+  commitHash?: string;
 }
 
 export interface AttemptOutcomesSummary {
@@ -61,7 +66,8 @@ export function buildAttemptOutcomes(allEvents: readonly AutoDevEvent[], project
     // runId에는 구조적으로 RUN_BLOCKED가 함께 존재할 수 없다(§ 위 주석, 상호 배타적인 두
     // 종료 경로).
     if (checkpoint) {
-      entries.push({ runId, taskId: checkpoint.taskId, result: "SUCCESS", occurredAt: checkpoint.timestamp });
+      const commitHash = typeof checkpoint.metadata?.commitHash === "string" ? checkpoint.metadata.commitHash : undefined;
+      entries.push({ runId, taskId: checkpoint.taskId, result: "SUCCESS", occurredAt: checkpoint.timestamp, commitHash });
     } else if (blocked) {
       entries.push({ runId, taskId: blocked.taskId, result: "FAILURE", occurredAt: blocked.timestamp, reason: blocked.reason });
     }

@@ -390,10 +390,32 @@ function scenarioMultiProjectEventsWithoutProjectIdGetOwnBucket(): void {
   check("projectId 있는 project에 taskId 없는 event가 섞이지 않음", real?.snapshot?.taskId === "T2");
 }
 
+// Dashboard 운영 UX 정리(§ 요구사항 12 Baseline) — buildTaskBaseline()이 이 project의
+// projectEvents로만 계산되고 다른 project와 섞이지 않는지, 그리고 projectId가 없는
+// UNASSIGNED 버킷에서는(재필터 버그를 만들지 않도록) 추측 없이 undefined로 남는지 확인한다.
+function scenarioMultiProjectBaselineScopedPerProject(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [
+    ev({ eventType: "TASK_STARTED", runId: "run-base-a", taskId: "TA", projectId: "base-proj-a" }),
+    ev({ eventType: "TASK_STARTED", runId: "run-base-b", taskId: "TB", projectId: "base-proj-b" }),
+    ev({ eventType: "TASK_STARTED", runId: "run-base-none", taskId: "TN" }), // projectId 없음
+  ]);
+  const multi = getMultiProjectDashboardSnapshot(filePath);
+  const a = multi.projects.find((p) => p.projectId === "base-proj-a");
+  const b = multi.projects.find((p) => p.projectId === "base-proj-b");
+  const unassigned = multi.projects.find((p) => p.projectId === "__UNASSIGNED_PROJECT__");
+  check("base-proj-a: baseline이 자신의 taskId(TA)로 계산됨", a?.baseline?.taskId === "TA" && a?.baseline?.projectId === "base-proj-a");
+  check("base-proj-b: baseline이 자신의 taskId(TB)로 계산됨(A와 섞이지 않음)", b?.baseline?.taskId === "TB" && b?.baseline?.projectId === "base-proj-b");
+  check("projectId 없는 UNASSIGNED 버킷: baseline을 추측해서 채우지 않고 undefined로 남김", unassigned?.baseline === undefined);
+}
+
 function main(): void {
   try {
     scenarioNoRunYet();
     scenarioMultiProjectAttributionNoContamination();
+    scenarioMultiProjectBaselineScopedPerProject();
     scenarioMultiProjectRegisteredEventlessProjectStillShown();
     scenarioMultiProjectUnregisteredButHasEventsStillShown();
     scenarioMultiProjectMaintenancePauseSurfacedSeparately();

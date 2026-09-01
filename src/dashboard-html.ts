@@ -75,10 +75,43 @@ export const DASHBOARD_HTML = `<!doctype html>
   .layout { display: flex; gap: 12px; align-items: flex-start; }
   .main-col { flex: 1 1 auto; min-width: 0; }
   .chat-col { flex: 0 0 320px; position: sticky; top: 12px; }
+  .chat-col[hidden] { display: none; }
+  .chat-toggle-row { text-align: right; margin-bottom: 10px; }
+  .chat-toggle-btn {
+    background: var(--card-bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  .chat-toggle-btn:hover { border-color: var(--accent); }
   @media (max-width: 980px) {
     .layout { flex-direction: column; }
     .chat-col { flex-basis: auto; width: 100%; position: static; }
+    .chat-col:not([hidden]) {
+      position: fixed; inset: 0; z-index: 20; background: var(--bg);
+      padding: 12px; overflow-y: auto;
+    }
   }
+  .summarybar {
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: baseline;
+    background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; margin-bottom: 10px; font-size: 13px;
+  }
+  .summarybar .item { display: flex; gap: 6px; align-items: baseline; }
+  .summarybar .item .n { font-size: 16px; font-weight: 700; }
+  .summarybar .item .k { color: var(--muted); }
+  .filtertabs { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+  .filtertab {
+    background: var(--card-bg); border: 1px solid var(--border); color: var(--muted);
+    border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+  }
+  .filtertab.active { border-color: var(--accent); color: var(--text); background: color-mix(in srgb, var(--accent) 16%, var(--card-bg)); }
+  .pc-status-line { font-size: 13px; font-weight: 700; margin: 2px 0 6px; }
+  .pc-blocker { font-size: 11px; color: var(--red); margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
+  .stagerow { display: flex; align-items: center; gap: 4px; margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .stagerow .stage { display: flex; align-items: center; gap: 4px; }
+  .stagerow .dot { width: 8px; height: 8px; border-radius: 999px; border: 1px solid var(--muted); display: inline-block; }
+  .stagerow .stage.active .dot { background: var(--accent); border-color: var(--accent); }
+  .stagerow .stage.active { color: var(--text); font-weight: 700; }
+  .stagerow .arrow { color: var(--border); }
   .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   .toolbar input[type="search"] {
     background: var(--card-bg); border: 1px solid var(--border); color: var(--text);
@@ -183,10 +216,11 @@ export const DASHBOARD_HTML = `<!doctype html>
   <h1>오토데브 대시보드 <span style="color:var(--muted); font-weight:400;">(읽기 전용 · localhost)</span></h1>
   <div class="layout">
     <div class="main-col">
+      <div class="chat-toggle-row"><button type="button" class="chat-toggle-btn" id="chat-toggle">운영 질문</button></div>
       <div id="content"><div class="empty">불러오는 중...</div></div>
     </div>
-    <div class="chat-col">
-      <div class="section-title">운영 질문창</div>
+    <div class="chat-col" id="chat-panel" hidden>
+      <div class="section-title">운영 질문창 <button type="button" class="chat-toggle-btn" id="chat-close" style="float:right;">닫기</button></div>
       <div class="chatbox">
         <div class="chat-scope" id="chat-scope">선택된 프로젝트 없음 — 질문에 프로젝트 이름을 포함하거나 카드를 먼저 선택하세요.</div>
         <div class="chat-log" id="chat-log"></div>
@@ -333,71 +367,245 @@ export const DASHBOARD_HTML = `<!doctype html>
   // ---------------------------------------------------------------------
   // Project Office — N개 project 카드 grid.
   // ---------------------------------------------------------------------
-  var state = { projects: [], selectedProjectId: null, filter: "", chatHistory: [], autoSelectAttempted: false };
+  var state = {
+    projects: [], selectedProjectId: null, filter: "", chatHistory: [], autoSelectAttempted: false,
+    // Dashboard 운영 UX 정리 — 최초 진입 기본값은 "운영"(registered:true)만 보여준다(§
+    // 요구사항 2). 사용자가 명시적으로 탭을 바꾸기 전까지는 polling이 반복돼도 이 값이
+    // 임의로 바뀌지 않는다.
+    registryFilter: "REGISTERED",
+    // 운영 질문창은 기본 접힘 상태로 시작한다(§ 요구사항 9) — 버튼으로만 연다.
+    chatOpen: false
+  };
+
+  // ---------------------------------------------------------------------
+  // Dashboard 운영 UX 정리 — 대표 상태 6종 단순화(§ 요구사항 6). 내부 enum
+  // (taskStatus/runtimeTruth.state)은 전혀 바꾸지 않는다 — 이 함수는 이미 존재하는 값들의
+  // 조합만 보고 사람이 5초 안에 읽을 수 있는 대표 라벨 하나로 매핑할 뿐이다. Maintenance
+  // Pause는 반드시 "일시정지"이고 절대 "문제 발생"으로 격하되지 않는다(최우선 판정).
+  // ---------------------------------------------------------------------
+  var REPRESENTATIVE_SUBPHASE_KO = { RUNNING: "개발", TESTING: "테스트", REVIEWING: "검토", REVISING: "수정", CHECKPOINTING: "저장" };
+  function representativeStatus(p) {
+    if (p.maintenancePause && p.maintenancePause.active) {
+      return { label: "일시정지", tone: "GRAY", sub: null };
+    }
+    if (!p.snapshot) {
+      return { label: "준비", tone: "GRAY", sub: null };
+    }
+    var snap = p.snapshot;
+    var rt = p.runtimeTruth;
+    if (snap.safety.securityBlocked || snap.taskStatus === "BLOCKED" || snap.runStatus === "BLOCKED") {
+      return { label: "문제 발생", tone: "RED", sub: null };
+    }
+    if (rt && rt.state === "STALE") {
+      return { label: "문제 발생", tone: "RED", sub: "정체됨 — 응답 없음" };
+    }
+    if (snap.taskStatus === "WAITING_HUMAN" || snap.safety.humanApprovalRequired) {
+      return { label: "승인 필요", tone: "YELLOW", sub: null };
+    }
+    if (rt && (rt.state === "RUNNING" || rt.state === "WAITING")) {
+      return { label: "작업 중", tone: "GREEN", sub: REPRESENTATIVE_SUBPHASE_KO[snap.taskStatus] || null };
+    }
+    if (snap.taskStatus === "COMPLETED" || (rt && rt.state === "STOPPED")) {
+      return { label: "준비", tone: "GRAY", sub: null };
+    }
+    return { label: "확인 불가", tone: "GRAY", sub: null };
+  }
+
+  // ---------------------------------------------------------------------
+  // Dashboard 운영 UX 정리 — 현재 작업/최근 완료/다음 작업 의미 분리(§ 요구사항 5). 실제로
+  // 실행 중일 때만 "현재 작업"이라고 주장한다 — 이미 끝난 task를 "현재 작업"으로 표시하던
+  // 기존 결함(예: JARVIS 5.4가 COMPLETED인데도 "현재 작업 5.4"로 보이는 것)을 여기서 고정
+  // 한다. 확정할 수 없는 조합은 항상 null(UNKNOWN)로 남긴다 — 임의로 추측하지 않는다.
+  // ---------------------------------------------------------------------
+  function deriveTaskDisplay(p) {
+    var snap = p.snapshot;
+    var rep = representativeStatus(p);
+    var isRunningNow = rep.label === "작업 중" || rep.label === "승인 필요" || (rep.label === "문제 발생" && snap && snap.taskStatus === "BLOCKED");
+    var pr = p.projectProgress;
+    if (!snap) {
+      return { current: null, lastCompleted: null, next: pr && pr.currentTaskId ? { id: pr.currentTaskId, title: pr.currentTaskTitle } : null };
+    }
+    if (isRunningNow && snap.taskId) {
+      return {
+        current: { id: snap.taskId, title: undefined },
+        lastCompleted: null,
+        next: pr && pr.nextTaskId ? { id: pr.nextTaskId, title: pr.nextTaskTitle } : null
+      };
+    }
+    if (snap.taskStatus === "COMPLETED" && snap.taskId) {
+      return {
+        current: null,
+        lastCompleted: { id: snap.taskId, title: undefined },
+        next: pr && pr.currentTaskId ? { id: pr.currentTaskId, title: pr.currentTaskTitle } : null
+      };
+    }
+    // 실행 중도 아니고 완료도 아닌 애매한 조합(예: 확인 불가) — 임의로 현재/완료로 단정하지
+    // 않는다.
+    return { current: null, lastCompleted: null, next: pr && pr.currentTaskId ? { id: pr.currentTaskId, title: pr.currentTaskTitle } : null };
+  }
+
+  var STAGE_ORDER = ["개발", "테스트", "검토"];
+  function stageRowHtml(sub) {
+    if (!sub || STAGE_ORDER.indexOf(sub) === -1) return "";
+    var idx = STAGE_ORDER.indexOf(sub);
+    var html = '<div class="stagerow">';
+    STAGE_ORDER.forEach(function (s, i) {
+      if (i > 0) html += '<span class="arrow">→</span>';
+      html += '<span class="stage' + (i === idx ? " active" : "") + '"><span class="dot"></span>' + esc(s) + "</span>";
+    });
+    html += "</div>";
+    return html;
+  }
 
   function projectDensityClass(count) {
     if (count > 12) return "dense";
     return "";
   }
 
+  // Dashboard 운영 UX 정리(§ 요구사항 4) — 기본 카드는 7개 필수 항목만 보여준다: 이름/
+  // 대표상태/현재·완료·다음 작업/경과시간(작업 중일 때만)/현재 단계/최근 검토 결과/blocker
+  // 한 줄. Developer attempt 전체 이력·Reviewer 전체 호출이력·Git hash·세부 테스트 같은
+  // 깊은 정보는 카드 클릭 후 상세 패널(renderProjectDetail, Level 3)에서만 보여준다.
   function projectCardHtml(p) {
+    var rep = representativeStatus(p);
+    var taskDisplay = deriveTaskDisplay(p);
     var snap = p.snapshot;
-    var runtimeStatus = snap ? resolveRuntimeStatus(snap.taskStatus, p.runtimeTruth) : { label: "실행 이력 없음", tone: "GRAY" };
-    var evidence = delayEvidence(p);
-    var isPaused = p.maintenancePause && p.maintenancePause.active;
-    var tags = "";
-    if (isPaused) tags += pill("일시정지", "GRAY");
-    if (!isPaused && evidence.some(function (e) { return e.tone === "RED"; })) tags += pill("장애 의심", "RED");
-    if (!isPaused && evidence.some(function (e) { return e.tone === "YELLOW"; })) tags += pill("대기/지연", "YELLOW");
-    if (!p.registered) tags += pill("미등록(event만 존재)", "GRAY");
 
-    var developerRow = "";
-    var latestAttempt = p.developerLifecycle && p.developerLifecycle.latest;
-    if (latestAttempt) {
-      developerRow =
-        '<div class="pc-row"><span>Developer</span><span class="v">시도 ' + latestAttempt.attemptNumber + '회 · ' +
-        esc(DEVELOPER_OUTCOME_LABEL_KO[latestAttempt.outcome] || latestAttempt.outcome) + "</span></div>";
+    var taskRows = "";
+    if (taskDisplay.current) {
+      taskRows += '<div class="pc-row"><span>현재 작업</span><span class="v">' + esc(taskDisplay.current.id) + "</span></div>";
+    } else if (taskDisplay.lastCompleted) {
+      taskRows += '<div class="pc-row"><span>최근 완료</span><span class="v">' + esc(taskDisplay.lastCompleted.id) + "</span></div>";
+    } else {
+      taskRows += '<div class="pc-row"><span>최근 완료</span><span class="v">' + NOT_AVAILABLE + "</span></div>";
     }
-    var reviewerRow = "";
+    if (taskDisplay.next) {
+      taskRows += '<div class="pc-row"><span>다음 작업</span><span class="v">' + esc(taskDisplay.next.id) + "</span></div>";
+    } else if (p.registered) {
+      taskRows += '<div class="pc-row"><span>다음 작업</span><span class="v">' + (p.projectProgress ? "없음(전체 완료)" : NOT_AVAILABLE) + "</span></div>";
+    }
+
+    var elapsedRow = "";
+    if (rep.label === "작업 중" && snap && snap.currentOperation) {
+      elapsedRow = '<div class="pc-row"><span>경과</span><span class="v">' + fmtDuration(snap.currentOperation.elapsedMs) + "</span></div>";
+    }
+
+    var phaseRow = "";
+    if (p.projectProgress && typeof p.projectProgress.currentTaskPhase === "number") {
+      phaseRow = '<div class="pc-row"><span>현재 단계</span><span class="v">' + p.projectProgress.currentTaskPhase +
+        (p.projectProgress.totalPhases ? " / " + p.projectProgress.totalPhases : "") + "</span></div>";
+    }
+
+    var reviewRow = "";
     var revHistory = p.reviewerHistory || [];
     if (revHistory.length > 0) {
       var lastRev = revHistory[revHistory.length - 1];
-      reviewerRow =
-        '<div class="pc-row"><span>Reviewer</span><span class="v">' + esc(lastRev.service) + " · " +
-        esc(REVIEWER_CALL_RESULT_LABEL_KO[lastRev.result] || lastRev.result) + " (" + revHistory.length + "회)</span></div>";
+      reviewRow = '<div class="pc-row"><span>최근 검토</span><span class="v">' +
+        esc(REVIEWER_CALL_RESULT_LABEL_KO[lastRev.result] || lastRev.result) + "</span></div>";
+    } else {
+      reviewRow = '<div class="pc-row"><span>최근 검토</span><span class="v">' + NOT_AVAILABLE + "</span></div>";
     }
+
+    var blockerLine = "";
+    if (rep.label === "문제 발생" || rep.label === "승인 필요") {
+      var evidence = delayEvidence(p);
+      if (evidence.length > 0) {
+        blockerLine = '<div class="pc-blocker">' + esc(evidence[0].label) + (evidence[0].detail ? " — " + esc(evidence[0].detail) : "") + "</div>";
+      }
+    }
+
+    var regTag = !p.registered ? '<div class="pc-tags">' + pill("미등록(event만 존재)", "GRAY") + "</div>" : "";
 
     return (
       '<div class="projectcard' + (state.selectedProjectId === p.projectId ? " selected" : "") + '" data-project-id="' + esc(p.projectId) + '">' +
-      '<div class="pc-head"><span class="pc-name">' + esc(p.projectLabel) + "</span>" + pill(runtimeStatus.label, runtimeStatus.tone) + "</div>" +
-      '<div class="pc-id">' + esc(p.projectId) + "</div>" +
-      '<div class="pc-row"><span>현재 작업</span><span class="v">' + orDash(snap && snap.taskId) + "</span></div>" +
-      developerRow +
-      reviewerRow +
-      '<div class="pc-row"><span>경과</span><span class="v">' + fmtDuration(snap && snap.currentOperation && snap.currentOperation.elapsedMs) + "</span></div>" +
-      '<div class="pc-tags">' + tags + "</div>" +
+      '<div class="pc-head"><span class="pc-name">' + esc(p.projectLabel) + "</span></div>" +
+      '<div class="pc-status-line value ' + rep.tone + '">' + esc(rep.label) + (rep.sub ? " · " + esc(rep.sub) : "") + "</div>" +
+      taskRows + phaseRow + reviewRow + elapsedRow +
+      stageRowHtml(rep.label === "작업 중" ? rep.sub : null) +
+      blockerLine + regTag +
       "</div>"
     );
   }
 
+  // Dashboard 운영 UX 정리(§ 요구사항 2/3) — 기본 화면은 registered:true("운영")만 보여준다.
+  // projectId 이름 문자열로 canary/fixture를 추측 분류하지 않는다 — 오직 registered 값만
+  // 근거로 쓴다(§ 요구사항: "그런 metadata가 없다면 최소한 운영=registered:true, 기타/과거=
+  // registered:false로 정확히 나눈다").
+  var REGISTRY_FILTER_TABS = [
+    { key: "REGISTERED", label: "운영" },
+    { key: "OTHER", label: "기타/과거" },
+    { key: "ALL", label: "전체" }
+  ];
+  function matchesRegistryFilter(p, filterKey) {
+    if (filterKey === "REGISTERED") return p.registered === true;
+    if (filterKey === "OTHER") return p.registered !== true;
+    return true;
+  }
+  function renderFilterTabs() {
+    var html = '<div class="filtertabs">';
+    REGISTRY_FILTER_TABS.forEach(function (t) {
+      var count = state.projects.filter(function (p) { return matchesRegistryFilter(p, t.key); }).length;
+      html += '<button type="button" class="filtertab' + (state.registryFilter === t.key ? " active" : "") +
+        '" data-filter-key="' + t.key + '">' + esc(t.label) + " " + count + "</button>";
+    });
+    html += "</div>";
+    return html;
+  }
+
+  // Dashboard 운영 UX 정리(§ 요구사항 3 LEVEL 1) — "운영"(registered:true) 프로젝트 전체를
+  // 대상으로 5초 안에 읽을 수 있는 요약 한 줄. 현재 선택된 필터 탭과 무관하게 항상 운영
+  // 프로젝트 기준으로 집계한다(전체 상황 요약이라는 목적 자체가 필터 전환과 별개다).
+  function renderSummaryBar() {
+    var ops = state.projects.filter(function (p) { return p.registered === true; });
+    var counts = { 작업중: 0, 준비: 0, 문제: 0, 승인필요: 0 };
+    ops.forEach(function (p) {
+      var label = representativeStatus(p).label;
+      if (label === "작업 중") counts.작업중++;
+      else if (label === "준비") counts.준비++;
+      else if (label === "문제 발생") counts.문제++;
+      else if (label === "승인 필요") counts.승인필요++;
+    });
+    var items = [
+      { k: "운영 프로젝트", n: ops.length },
+      { k: "작업 중", n: counts.작업중 },
+      { k: "준비", n: counts.준비 },
+      { k: "문제", n: counts.문제 },
+      { k: "승인 필요", n: counts.승인필요 }
+    ];
+    var html = '<div class="summarybar">';
+    items.forEach(function (it) {
+      html += '<span class="item"><span class="n">' + it.n + '</span><span class="k">' + esc(it.k) + "</span></span>";
+    });
+    html += "</div>";
+    return html;
+  }
+
   function renderOfficeGrid() {
-    var filtered = state.projects.filter(function (p) {
+    var byRegistryFilter = state.projects.filter(function (p) { return matchesRegistryFilter(p, state.registryFilter); });
+    var filtered = byRegistryFilter.filter(function (p) {
       if (!state.filter) return true;
       var needle = state.filter.toLowerCase();
       return p.projectLabel.toLowerCase().indexOf(needle) !== -1 || p.projectId.toLowerCase().indexOf(needle) !== -1;
     });
     var toolbar =
+      renderFilterTabs() +
       '<div class="toolbar">' +
-      '<input type="search" id="project-filter" placeholder="프로젝트 이름/ID 검색" value="' + esc(state.filter) + '" />' +
-      '<span class="count">' + filtered.length + " / " + state.projects.length + "개 표시</span>" +
+      '<input type="search" id="project-filter" placeholder="현재 필터 안에서 이름/ID 검색" value="' + esc(state.filter) + '" />' +
+      '<span class="count">' + filtered.length + " / " + byRegistryFilter.length + "개 표시</span>" +
       "</div>";
     if (state.projects.length === 0) {
-      return toolbar + '<div class="card"><div class="empty">표시할 프로젝트가 없습니다. AUTODEV_DASHBOARD_PROJECT_ADAPTERS(또는 AUTODEV_PROJECT_ADAPTER) 설정과 event 기록을 확인하세요.</div></div>';
+      return renderSummaryBar() + toolbar + '<div class="card"><div class="empty">표시할 프로젝트가 없습니다. AUTODEV_DASHBOARD_PROJECT_ADAPTERS(또는 AUTODEV_PROJECT_ADAPTER) 설정과 event 기록을 확인하세요.</div></div>';
     }
-    var html = '<div class="officegrid ' + projectDensityClass(state.projects.length) + '">';
+    if (byRegistryFilter.length === 0) {
+      var emptyMsg = state.registryFilter === "REGISTERED"
+        ? "운영(registered) 프로젝트가 없습니다 — '전체' 탭에서 다른 프로젝트를 확인할 수 있습니다."
+        : "이 필터에 해당하는 프로젝트가 없습니다.";
+      return renderSummaryBar() + toolbar + '<div class="card"><div class="empty">' + esc(emptyMsg) + "</div></div>";
+    }
+    var html = '<div class="officegrid ' + projectDensityClass(byRegistryFilter.length) + '">';
     filtered.forEach(function (p) { html += projectCardHtml(p); });
     html += "</div>";
-    return toolbar + html;
+    return renderSummaryBar() + toolbar + html;
   }
 
   // ---------------------------------------------------------------------
@@ -470,8 +678,12 @@ export const DASHBOARD_HTML = `<!doctype html>
       row("전체 단계 수", fmtNum(pr.totalPhases)) +
       row("전체 작업 수", fmtNum(pr.totalTasks)) +
       row("완료 작업 수", fmtNum(pr.completedTaskCount)) +
-      row("현재 작업", pr.currentTaskId ? esc(pr.currentTaskId) + (pr.currentTaskTitle ? " · " + esc(pr.currentTaskTitle) : "") : "없음(전체 완료)") +
-      row("다음 작업", pr.nextTaskId ? esc(pr.nextTaskId) + (pr.nextTaskTitle ? " · " + esc(pr.nextTaskTitle) : "") : "없음");
+      // Dashboard 운영 UX 정리(§ 요구사항 5) — 여기서 말하는 "다음 진행 예정"은 task-registry
+      // 상 아직 완료되지 않은 첫 task(pr.currentTaskId)다 — 실제로 지금 실행 중이라는 뜻이
+      // 아니다(그건 대표 상태/§ deriveTaskDisplay의 "현재 작업"만 주장할 수 있다). 혼동을
+      // 피하기 위해 "현재 작업"이라고 부르지 않는다.
+      row("다음 진행 예정", pr.currentTaskId ? esc(pr.currentTaskId) + (pr.currentTaskTitle ? " · " + esc(pr.currentTaskTitle) : "") : "없음(전체 완료)") +
+      row("그 다음 작업", pr.nextTaskId ? esc(pr.nextTaskId) + (pr.nextTaskTitle ? " · " + esc(pr.nextTaskTitle) : "") : "없음");
     var bars =
       progressBar(pr.overallProgressPercent, "전체 진행률") +
       (typeof pr.currentPhaseProgressPercent === "number" ? progressBar(pr.currentPhaseProgressPercent, "현재 단계 진행률") : "");
@@ -489,7 +701,11 @@ export const DASHBOARD_HTML = `<!doctype html>
       row("오토데브 상태", esc(runtimeStatus.label), runtimeStatus.tone) +
       row("프로젝트", orDash(snap.projectId)) +
       row("실행", orDash(snap.runId ? snap.runId.slice(0, 8) : undefined)) +
-      row("현재 작업", orDash(snap.taskId)) +
+      // 이 행은 "지금 이 run/snapshot이 어떤 task에 대한 것인가"를 보여줄 뿐, 그 task가
+      // 실제로 지금 실행 중이라고 주장하지 않는다(완료된 task여도 그대로 표시됨) — "현재
+      // 작업"이라는 이름은 그 오해를 만들 수 있어 대상 작업으로 부른다(§ 요구사항 5, 위
+      // renderTaskSummaryCard의 "현재 작업"만 실제 실행 여부를 판정한다).
+      row("대상 작업", orDash(snap.taskId)) +
       row("현재 수행 중", orDash(snap.currentOperation.currentAction)) +
       row("현재 개발/검토 담당", esc(agent)) +
       row("개발 진행(현재 라운드/최대)", rs ? rs.round + " / 최대 " + rs.maxRounds : NOT_AVAILABLE) +
@@ -520,7 +736,7 @@ export const DASHBOARD_HTML = `<!doctype html>
   function renderDeveloperLifecycle(p) {
     var lc = p.developerLifecycle;
     if (!lc || lc.attempts.length === 0) {
-      return card("Developer 실행 이력", '<div class="empty">이 작업에 대한 Developer 호출 기록이 아직 없습니다.</div>');
+      return card("개발 이력", '<div class="empty">이 작업에 대한 개발 담당 호출 기록이 아직 없습니다.</div>');
     }
     var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
       "<th>시도</th><th>시작</th><th>종료</th><th>실행시간</th><th>종료 상태</th><th>종료 사유</th>" +
@@ -535,14 +751,14 @@ export const DASHBOARD_HTML = `<!doctype html>
         esc(outcomeLabel) + "</td><td>" + reason + "</td></tr>";
     });
     html += "</tbody></table></div>";
-    return card("Developer 실행 이력(현재 작업)", html, true);
+    return card("개발 이력(현재 작업)", html, true);
   }
 
   // § 요구사항 6 — Reviewer 호출 이력(provider/model/결과/순번/escalation 관측 여부).
   function renderReviewerHistory(p) {
     var history = p.reviewerHistory || [];
     if (history.length === 0) {
-      return card("Reviewer 호출 이력", '<div class="empty">아직 Reviewer가 호출된 적이 없습니다.</div>');
+      return card("검토 이력", '<div class="empty">아직 검토 담당이 호출된 적이 없습니다.</div>');
     }
     var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
       "<th>순번</th><th>시각</th><th>작업</th><th>서비스</th><th>모델</th><th>결과</th><th>검토 cycle</th><th>비고</th>" +
@@ -555,7 +771,7 @@ export const DASHBOARD_HTML = `<!doctype html>
         esc(REVIEWER_CALL_RESULT_LABEL_KO[r.result] || r.result) + "</td><td>" + orDash(r.reviewCycle) + "</td><td>" + esc(note) + "</td></tr>";
     });
     html += "</tbody></table></div>";
-    return card("Reviewer 호출 이력(호출 " + history.length + "회)", html, true);
+    return card("검토 이력(호출 " + history.length + "회)", html, true);
   }
 
   // § 요구사항 7 — 지연/blocker 근거를 항목별로 구분해서 표시.
@@ -645,6 +861,37 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("작업 시도 결과(성공/실패 사례)", html, true);
   }
 
+  // Dashboard 운영 UX 정리(§ 요구사항 8 상세 패널 Git) — 새 기록 경로를 만들지 않는다.
+  // attemptOutcomes.recent(이미 CHECKPOINT_CREATED event만 근거로 삼는 기존 집계, §
+  // dashboard-attempt-outcomes.ts)에서 가장 최근 SUCCESS 항목의 commitHash를 그대로
+  // 노출할 뿐이다 — commitHash가 기록돼 있지 않으면 추측하지 않고 확인 불가로 남긴다.
+  function renderGitInfo(p) {
+    var recent = (p.attemptOutcomes && p.attemptOutcomes.recent) || [];
+    var latestSuccess = recent.filter(function (a) { return a.result === "SUCCESS" && a.commitHash; })[0];
+    if (!latestSuccess) {
+      return card("Git", '<div class="empty">최근 checkpoint commit 기록이 없습니다.</div>');
+    }
+    return card("Git", row("최근 checkpoint", latestSuccess.commitHash) + row("작업", orDash(latestSuccess.taskId)));
+  }
+
+  // Dashboard 운영 UX 정리(§ 요구사항 12 Baseline/Telemetry) — dashboard-baseline.ts가
+  // 계산한 "현재 task의 실측치"를 그대로 보여준다. 비교할 이전 기준을 어디에도 저장하지
+  // 않으므로(§ dashboard-baseline.ts 주석) 가짜 %/증감을 만들지 않고 "기준 데이터 없음"을
+  // 그대로 표시한다 — 원시 수치만 보조 정보로 함께 보여준다.
+  function renderBaseline(p) {
+    var b = p.baseline;
+    if (!b) {
+      return card("기준(Baseline)", '<div class="empty">현재 작업에 대한 실측 자료가 아직 없습니다.</div>');
+    }
+    var html =
+      row("기준 대비", "기준 데이터 없음") +
+      row("개발 담당 호출(현재 작업)", fmtNum(b.developerCallCount)) +
+      row("검토 담당 호출(현재 작업)", fmtNum(b.reviewerCallCount)) +
+      row("작업시간(현재 작업)", fmtDuration(b.taskDurationMs)) +
+      row("수정 요청(REVISE) 횟수", fmtNum(b.reviseCount));
+    return card("기준(Baseline)", html);
+  }
+
   function renderCost(snap) {
     var u = snap.usage;
     var actual = fmtUsd(u.actualCostUsd);
@@ -731,13 +978,25 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("보조 담당", rows);
   }
 
+  // Dashboard 운영 UX 정리(§ 요구사항 8) — 상세 패널 맨 위에 카드에서 이미 봤던 대표
+  // 상태/최근완료/다음작업을 한 번 더 요약해준다(깊은 표로 내려가기 전에 다시 확인).
+  function renderTaskSummaryCard(p) {
+    var rep = representativeStatus(p);
+    var taskDisplay = deriveTaskDisplay(p);
+    var rows = row("상태", esc(rep.label) + (rep.sub ? " · " + esc(rep.sub) : ""), rep.tone);
+    rows += row("최근 완료", taskDisplay.lastCompleted ? esc(taskDisplay.lastCompleted.id) : NOT_AVAILABLE);
+    rows += row("현재 작업", taskDisplay.current ? esc(taskDisplay.current.id) : "없음");
+    rows += row("다음 작업", taskDisplay.next ? esc(taskDisplay.next.id) : NOT_AVAILABLE);
+    return card("요약", rows);
+  }
+
   function renderProjectDetail(p) {
     if (!p) return "";
     if (p.status === "NO_RUN_YET" || !p.snapshot) {
       return (
         '<div class="section-title">' + esc(p.projectLabel) + " 상세" + "</div>" +
         renderMaintenanceBanner(p) +
-        '<div class="grid">' + renderProjectProgress(p) + card("실행 이력", '<div class="empty">이 프로젝트는 아직 실행된 적이 없습니다(NO_RUN_YET).</div>') + "</div>"
+        '<div class="grid">' + renderTaskSummaryCard(p) + renderProjectProgress(p) + card("실행 이력", '<div class="empty">이 프로젝트는 아직 실행된 적이 없습니다(NO_RUN_YET).</div>') + "</div>"
       );
     }
     var snap = p.snapshot;
@@ -750,6 +1009,7 @@ export const DASHBOARD_HTML = `<!doctype html>
     html += '<div class="banner badge-' + tone + '"><span>오토데브 ' + esc(bannerStatus.label) +
       '</span><span class="sub">' + esc(orDash(snap.taskId)) + "</span></div>";
     html += '<div class="grid">' +
+      renderTaskSummaryCard(p) +
       renderQuickGlance(p) +
       renderProjectProgress(p) +
       renderCurrentStatus(p) +
@@ -758,6 +1018,8 @@ export const DASHBOARD_HTML = `<!doctype html>
       renderLiveOperations(snap) +
       renderDeveloperLifecycle(p) +
       renderReviewerHistory(p) +
+      renderGitInfo(p) +
+      renderBaseline(p) +
       renderUsage(p) +
       renderServiceUsage(p) +
       renderRecentCalls(p) +
@@ -926,6 +1188,12 @@ export const DASHBOARD_HTML = `<!doctype html>
         if (filterEl) filterEl.focus({ preventScroll: true });
       });
     });
+    document.querySelectorAll(".filtertab").forEach(function (el) {
+      el.addEventListener("click", function () {
+        state.registryFilter = el.getAttribute("data-filter-key");
+        render(data);
+      });
+    });
     var filterInput = document.getElementById("project-filter");
     if (filterInput) {
       filterInput.addEventListener("input", function () {
@@ -964,6 +1232,31 @@ export const DASHBOARD_HTML = `<!doctype html>
       input.value = "";
     });
   }
+
+  // Dashboard 운영 UX 정리(§ 요구사항 9) — 운영 질문창은 기본 접힘. panel/버튼은 정적
+  // 셸에 고정으로 존재하므로(카드처럼 매 polling마다 다시 그려지지 않는다) 리스너를 한 번만
+  // 붙인다. state.chatOpen이 유일한 진실 출처이고, panel의 hidden attribute만 그 값을
+  // 따라간다 — 다른 렌더링 로직에는 영향을 주지 않는다.
+  function applyChatOpenState() {
+    var panel = document.getElementById("chat-panel");
+    if (panel) panel.hidden = !state.chatOpen;
+  }
+  var chatToggleBtn = document.getElementById("chat-toggle");
+  if (chatToggleBtn) {
+    chatToggleBtn.addEventListener("click", function () {
+      state.chatOpen = true;
+      applyChatOpenState();
+      renderChatScope();
+    });
+  }
+  var chatCloseBtn = document.getElementById("chat-close");
+  if (chatCloseBtn) {
+    chatCloseBtn.addEventListener("click", function () {
+      state.chatOpen = false;
+      applyChatOpenState();
+    });
+  }
+  applyChatOpenState();
 
   tick();
   setInterval(tick, REFRESH_MS);

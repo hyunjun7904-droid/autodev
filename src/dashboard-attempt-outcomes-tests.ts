@@ -131,6 +131,42 @@ function scenarioScopedToProjectId(): void {
   check("이 project의 실패 event만 집계됨", summary.failureCount === 1);
 }
 
+// Dashboard 운영 UX 정리(§ 요구사항 8 상세 패널 Git) — CHECKPOINT_CREATED event가 이미
+// 기록하고 있는 metadata.commitHash를 그대로 노출한다. metadata가 아예 없거나 commitHash가
+// string이 아니면 추측하지 않고 undefined로 남긴다.
+function scenarioCommitHashExposedWhenPresent(): void {
+  const store = createInMemoryEventStore();
+  const result = store.append({
+    eventType: "CHECKPOINT_CREATED",
+    runId: "r8",
+    taskId: "T8",
+    projectId: "P",
+    executionPhase: "checkpoint",
+    outcome: "SUCCESS",
+    metadata: { commitHash: "abc123def456" },
+  });
+  if (result.ok && result.event) result.event.timestamp = iso(0);
+
+  const summary = buildAttemptOutcomes(store.query().events, "P");
+  check("commitHash가 metadata에서 그대로 노출됨", summary.recent[0]?.commitHash === "abc123def456");
+}
+
+function scenarioCommitHashUndefinedWhenMissing(): void {
+  const store = createInMemoryEventStore();
+  const result = store.append({
+    eventType: "CHECKPOINT_CREATED",
+    runId: "r9",
+    taskId: "T9",
+    projectId: "P",
+    executionPhase: "checkpoint",
+    outcome: "SUCCESS",
+  });
+  if (result.ok && result.event) result.event.timestamp = iso(0);
+
+  const summary = buildAttemptOutcomes(store.query().events, "P");
+  check("metadata.commitHash가 없으면 추측하지 않고 undefined로 남음", summary.recent[0]?.commitHash === undefined);
+}
+
 function main(): void {
   scenarioSuccessfulAttemptCountsAsOneSuccess();
   scenarioFailedAttemptCountsAsOneFailureNotFour();
@@ -138,6 +174,8 @@ function main(): void {
   scenarioExitCodeZeroAloneIsNotSuccess();
   scenarioTransientRetryThenSuccessCountsOnce();
   scenarioScopedToProjectId();
+  scenarioCommitHashExposedWhenPresent();
+  scenarioCommitHashUndefinedWhenMissing();
 
   console.log("\n=== dashboard-attempt-outcomes 테스트 결과 ===");
   for (const r of results) console.log(r);

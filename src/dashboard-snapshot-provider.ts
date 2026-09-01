@@ -26,6 +26,8 @@ import { buildDeveloperLifecycle } from "./dashboard-developer-lifecycle";
 import type { DeveloperLifecycle } from "./dashboard-developer-lifecycle";
 import { loadProjectRegistry, readMaintenancePauseStatus } from "./dashboard-project-registry";
 import type { MaintenancePauseStatus, ProjectRegistryLoadIssue } from "./dashboard-project-registry";
+import { buildTaskBaseline } from "./dashboard-baseline";
+import type { TaskBaselineRecord } from "./dashboard-baseline";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -354,6 +356,13 @@ export interface ProjectDashboardEntry extends DashboardSnapshot {
   /** registry에 등록된 project만 판정 가능하다(마커 파일 경로가 adapterPath 기준이므로) —
    *  등록되지 않았으면 undefined(추측 금지). */
   maintenancePause?: MaintenancePauseStatus;
+  /** Dashboard UX 정리(§ 요구사항 12 Baseline/Telemetry 표시) — dashboard-baseline.ts의
+   *  buildTaskBaseline()을 그대로 재호출할 뿐, 새 집계 로직을 만들지 않는다. 지금 보여줄
+   *  taskId(snapshot.taskId)가 없으면(NO_RUN_YET 등) undefined — 추측하지 않는다. 이 값은
+   *  "현재 task의 실측치"일 뿐 비교 대상 기준(baseline)이 아니다 — 비교 가능한 이전 기준을
+   *  어디에도 저장하지 않으므로(§ dashboard-baseline.ts 주석) client는 이 값을 %/증감으로
+   *  가공하지 않고 "기준 데이터 없음"과 함께 원시 수치만 보여준다. */
+  baseline?: TaskBaselineRecord;
 }
 
 export interface MultiProjectDashboardSnapshot {
@@ -453,6 +462,11 @@ export function getMultiProjectDashboardSnapshot(
       reviewerHistory: buildReviewerHistory(projectEvents, eventsKey),
       developerLifecycle: buildDeveloperLifecycle(projectEvents, eventsKey, snapshot?.taskId),
       maintenancePause,
+      // eventsKey가 undefined인 경우(UNASSIGNED_PROJECT_ID 버킷)는 buildTaskBaseline()이
+      // projectId를 다시 event.projectId와 대조 필터링하므로(그 event들의 실제 projectId는
+      // undefined이지 이 loop의 projectId 문자열이 아니다) 계산하지 않는다(추측 금지) —
+      // projectEvents는 이미 이 project로 정확히 좁혀져 있으므로 재필터 자체가 불필요하다.
+      baseline: eventsKey && snapshot?.taskId ? buildTaskBaseline(projectEvents, eventsKey, snapshot.taskId) : undefined,
     });
   }
 
