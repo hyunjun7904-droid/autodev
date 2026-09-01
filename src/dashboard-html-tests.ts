@@ -36,14 +36,23 @@ interface FakeElement {
 async function renderWithFixture(data: unknown): Promise<{ content: string; footer: string }> {
   const content: FakeElement = { innerHTML: "", textContent: "" };
   const footer: FakeElement = { innerHTML: "", textContent: "" };
-  const elements: Record<string, FakeElement> = { content, footer };
+  const chatScope: FakeElement = { innerHTML: "", textContent: "" };
+  const chatLog: FakeElement = { innerHTML: "", textContent: "" };
+  const elements: Record<string, FakeElement> = { content, footer, "chat-scope": chatScope, "chat-log": chatLog };
 
+  // AutoDev Dashboard 멀티프로젝트 운영센터 개선 — 이 fake DOM은 real DOM tree를 파싱하지
+  // 않는다(content.innerHTML은 그냥 문자열이다). render()가 조회하는 project-filter/
+  // chat-form/.projectcard 같은 동적 요소는 실제로 만들어지지 않으므로, 알 수 없는 id는
+  // undefined를 반환하고(render()가 이미 `if (el)` 가드로 안전하게 처리한다) querySelectorAll은
+  // 항상 빈 목록을 반환한다(클릭 바인딩은 이 테스트의 관심사가 아니다 — 상태 판정/배너
+  // 렌더링만 검증한다).
   const sandbox = {
     document: {
-      getElementById(id: string): FakeElement {
-        const el = elements[id];
-        if (!el) throw new Error(`dashboard-html-tests fixture: 알 수 없는 element id ${id}`);
-        return el;
+      getElementById(id: string): FakeElement | undefined {
+        return elements[id];
+      },
+      querySelectorAll(): FakeElement[] {
+        return [];
       },
     },
     fetch: async (): Promise<{ json: () => Promise<unknown> }> => ({ json: async () => data }),
@@ -85,11 +94,14 @@ function baseSnapshot(overrides: Record<string, unknown> = {}): Record<string, u
   };
 }
 
-function baseData(snapshotOverrides: Record<string, unknown> = {}, dataOverrides: Record<string, unknown> = {}): Record<string, unknown> {
+function baseProjectEntry(snapshotOverrides: Record<string, unknown> = {}, entryOverrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     status: "OK",
     generatedAt: "2026-08-28T00:00:00.000Z",
     snapshot: baseSnapshot(snapshotOverrides),
+    projectId: "JARVIS",
+    projectLabel: "JARVIS",
+    registered: true,
     projectProgress: undefined,
     actualWorkTime: {},
     usageOverview: undefined,
@@ -99,7 +111,23 @@ function baseData(snapshotOverrides: Record<string, unknown> = {}, dataOverrides
     roundStatus: undefined,
     attemptOutcomes: undefined,
     runtimeTruth: undefined,
-    ...dataOverrides,
+    reviewerHistory: [],
+    developerLifecycle: { attempts: [] },
+    maintenancePause: undefined,
+    ...entryOverrides,
+  };
+}
+
+/** AutoDev Dashboard 멀티프로젝트 운영센터 개선 — client script는 이제 /api/snapshots(복수형,
+ *  {generatedAt, projects: [...], registryIssues: []})를 받는다. 이 테스트 파일은 원래
+ *  단일 project fixture 하나만 다루므로, projects 배열에 project 1개만 담아 감싼다 —
+ *  project가 정확히 1개면 render()가 자동으로 그 project를 선택해 상세를 펼치므로(§
+ *  dashboard-html.ts), 아래 기존 시나리오들의 배너/경고 검증은 그대로 유효하다. */
+function baseData(snapshotOverrides: Record<string, unknown> = {}, dataOverrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    generatedAt: "2026-08-28T00:00:00.000Z",
+    registryIssues: [],
+    projects: [baseProjectEntry(snapshotOverrides, dataOverrides)],
   };
 }
 

@@ -19,6 +19,13 @@ import { buildAttemptOutcomes } from "./dashboard-attempt-outcomes";
 import type { AttemptOutcomesSummary } from "./dashboard-attempt-outcomes";
 import { loadProjectAdapter } from "./project-adapter-loader";
 import { inspectProjectRuntimeLiveness } from "./project-lock";
+import { join } from "node:path";
+import { buildReviewerHistory } from "./dashboard-reviewer-history";
+import type { ReviewerCallEntry } from "./dashboard-reviewer-history";
+import { buildDeveloperLifecycle } from "./dashboard-developer-lifecycle";
+import type { DeveloperLifecycle } from "./dashboard-developer-lifecycle";
+import { loadProjectRegistry, readMaintenancePauseStatus } from "./dashboard-project-registry";
+import type { MaintenancePauseStatus, ProjectRegistryLoadIssue } from "./dashboard-project-registry";
 
 // Local Operations Dashboard — Read Service / Cache Seam (Phase G Task G4.1).
 //
@@ -306,4 +313,150 @@ export function getDashboardSnapshot(
     attemptOutcomes: buildAttemptOutcomes(result.events, snapshot.projectId),
     runtimeTruth,
   };
+}
+
+// ---------------------------------------------------------------------------
+// AutoDev Dashboard 멀티프로젝트 운영센터 개선 — Multi-Project Read Model.
+// ---------------------------------------------------------------------------
+//
+// § DASHBOARD_ONLY_ATTRIBUTION_DEFECT 근본 원인 — 위 getDashboardSnapshot()은 "AutoDev는
+// 한 번에 하나의 run만 실행한다"는 원래 전제(§ 파일 상단 주석)를 그대로 따라 파일 store
+// 전체에서 가장 최근 event 하나의 projectId만 "지금 보여줄 project"로 선택한다. 실제로는
+// 여러 project(JARVIS/Canary 등)가 서로 다른 프로세스로 동시에 실행되며 그 event가 전부
+// 같은 RUNTIME_EVENT_LOG_PATH 파일 하나에 project별로 이미 정확히 태깅되어 섞여 들어온다
+// (Core가 이미 event 단위로 projectId를 정확히 붙인다 — 이 사실은 dashboard-usage.ts/
+// dashboard-attempt-outcomes.ts 등 기존 파일들이 이미 projectId로 필터링해 증명한다). 즉
+// 결함은 Core의 event 격리에 있지 않고, 이 Dashboard 파일이 "마지막 event 하나"만 보고
+// 나머지 project를 아예 조회하지 않는 데 있다 — 그래서 이 함수는 새 격리 로직을 만들지
+// 않고, distinct projectId마다 위와 동일한 builder 함수(buildAutoDevLiveSnapshot/
+// buildUsageOverview/buildActualWorkTime/buildRecentCalls/buildAttemptOutcomes/
+// buildProblemSolvingSnapshot/aggregateCallEfficiency)를 그대로 재호출할 뿐이다.
+//
+// project 목록은 두 출처의 합집합이다: (1) event log에 실제로 나타난 projectId(등록 여부와
+// 무관하게 실제로 실행된 적이 있으면 반드시 보여야 한다), (2) dashboard-project-registry.ts에
+// 등록된 project(아직 한 번도 실행되지 않았어도 — 예: 새로 만든 Canary — task-registry 자체는
+// 보여줄 수 있어야 한다). event에 projectId가 아예 없는 레거시/self-dev 기록은
+// UNASSIGNED_PROJECT_ID로 별도 묶어 다른 project와 섞지 않는다(추측으로 특정 project에
+// 붙이지 않는다).
+
+const UNASSIGNED_PROJECT_ID = "__UNASSIGNED_PROJECT__";
+
+export interface ProjectDashboardEntry extends DashboardSnapshot {
+  projectId: string;
+  /** registry에 등록된 project면 manifest.projectName, event에만 있고 등록되지 않았으면
+   *  projectId를 그대로 표시한다(추측된 이름을 만들지 않는다). */
+  projectLabel: string;
+  /** registry에 등록되지 않은 project는 undefined(§ 요구사항: 등록되지 않아도 event만으로
+   *  최소 표시는 가능해야 하지만, 그 사실 자체를 숨기지 않는다). */
+  registered: boolean;
+  reviewerHistory: ReviewerCallEntry[];
+  developerLifecycle: DeveloperLifecycle;
+  /** registry에 등록된 project만 판정 가능하다(마커 파일 경로가 adapterPath 기준이므로) —
+   *  등록되지 않았으면 undefined(추측 금지). */
+  maintenancePause?: MaintenancePauseStatus;
+}
+
+export interface MultiProjectDashboardSnapshot {
+  generatedAt: string;
+  /** projectLabel 가나다순 — 매 polling마다 카드 순서가 임의로 흔들리지 않게 한다. */
+  projects: ProjectDashboardEntry[];
+  /** registry 로딩 중 발생한 문제(파일 없음/JSON 오류 등) — 한 project의 등록 실패가 다른
+   *  project 표시를 막지 않는다는 사실을 그대로 드러낸다(추측 금지). */
+  registryIssues: ProjectRegistryLoadIssue[];
+}
+
+export interface MultiProjectSnapshotOptions {
+  env?: NodeJS.ProcessEnv;
+  /** 테스트 전용 — Maintenance Pause 마커 파일을 찾을 logs 디렉터리를 override한다.
+   *  production 호출부(dashboard-server.ts)는 지정하지 않는다(기본값
+   *  join(process.cwd(), "logs") — runner-supervisor.ts/dashboard-server.ts의 기존 관례와
+   *  동일). */
+  logsDir?: string;
+  problemMemoryStores?: { project: ProblemMemoryStore; common: ProblemMemoryStore };
+}
+
+/**
+ * 등록됐거나 실제로 event가 있는 모든 project를 각각 독립적으로 스캔해 project별
+ * DashboardSnapshot을 만든다. 이 함수는 event 파일을 다시 읽지 않는다 — readQueryResult()의
+ * 동일한 mtime/size 캐시를 그대로 재사용한다(§ 파일 상단 주석 "매 refresh마다 비효율적으로
+ * 재처리하는 구조는 피한다" — project 수가 늘어도 파일 재파싱은 여전히 1회다).
+ */
+export function getMultiProjectDashboardSnapshot(
+  filePath: string = RUNTIME_EVENT_LOG_PATH,
+  roundStatusFilePath: string = RUNTIME_ROUND_STATUS_PATH,
+  options: MultiProjectSnapshotOptions = {}
+): MultiProjectDashboardSnapshot {
+  const result = readQueryResult(filePath);
+  const now = Date.now();
+  const registry = loadProjectRegistry(options.env ?? process.env);
+  const registryByProjectId = new Map(registry.projects.map((p) => [p.projectId, p]));
+  const logsDir = options.logsDir ?? join(process.cwd(), "logs");
+
+  const idsFromEvents = new Set(result.events.map((e) => e.projectId ?? UNASSIGNED_PROJECT_ID));
+  const allIds = new Set<string>([...idsFromEvents, ...registryByProjectId.keys()]);
+
+  const projects: ProjectDashboardEntry[] = [];
+  for (const projectId of allIds) {
+    const registered = registryByProjectId.get(projectId);
+    const eventsKey = projectId === UNASSIGNED_PROJECT_ID ? undefined : projectId;
+    const projectEvents = result.events.filter((e) => (projectId === UNASSIGNED_PROJECT_ID ? e.projectId === undefined : e.projectId === projectId));
+    const lastEvent = projectEvents.length > 0 ? projectEvents[projectEvents.length - 1] : undefined;
+
+    let snapshot: AutoDevLiveSnapshot | undefined;
+    if (lastEvent) {
+      snapshot = buildAutoDevLiveSnapshot(result, { runId: lastEvent.runId, projectId: eventsKey, now });
+    }
+
+    const rawRoundStatus = readRoundStatus(roundStatusFilePath);
+    const roundStatus =
+      rawRoundStatus && snapshot?.taskId && lastEvent && isRoundStatusLive(rawRoundStatus, lastEvent.runId, snapshot.taskId, now, ROUND_STATUS_MAX_AGE_MS)
+        ? rawRoundStatus
+        : undefined;
+
+    let runtimeTruth: DashboardRuntimeTruth | undefined;
+    let projectProgress: ProjectProgress | undefined;
+    let maintenancePause: MaintenancePauseStatus | undefined;
+    if (registered) {
+      const projectProgressResult = loadProjectProgress(registered.adapterPath);
+      projectProgress = projectProgressResult.ok ? projectProgressResult.progress : undefined;
+      try {
+        const liveness = inspectProjectRuntimeLiveness(registered.manifest.projectId, registered.manifest.targetProjectRoot);
+        runtimeTruth = computeDashboardRuntimeTruth(liveness, snapshot?.taskStatus);
+      } catch {
+        // 조회 실패 시 조용히 undefined로 남긴다(§ getDashboardSnapshot과 동일한 원칙).
+      }
+      maintenancePause = readMaintenancePauseStatus(registered.adapterPath, logsDir);
+    }
+
+    projects.push({
+      status: snapshot ? "OK" : "NO_RUN_YET",
+      generatedAt: snapshot?.generatedAt ?? new Date(now).toISOString(),
+      snapshot,
+      projectId,
+      projectLabel: registered?.projectName ?? (projectId === UNASSIGNED_PROJECT_ID ? "프로젝트 미지정(self-dev 등)" : projectId),
+      registered: registered !== undefined,
+      projectProgress,
+      actualWorkTime: buildActualWorkTime(
+        projectEvents,
+        eventsKey,
+        snapshot?.taskId,
+        now,
+        runtimeTruth !== undefined && (runtimeTruth.state === "STALE" || runtimeTruth.state === "STOPPED")
+      ),
+      usageOverview: buildUsageOverview(projectEvents, eventsKey, snapshot?.taskId),
+      recentCalls: buildRecentCalls(projectEvents, RECENT_CALLS_LIMIT),
+      problemSolving: buildProblemSolvingSnapshot(eventsKey, snapshot?.taskId, options.problemMemoryStores),
+      callEfficiency: aggregateCallEfficiency(snapshot?.taskId ? projectEvents.filter((e) => e.taskId === snapshot!.taskId) : projectEvents),
+      roundStatus,
+      attemptOutcomes: buildAttemptOutcomes(projectEvents, eventsKey),
+      runtimeTruth,
+      reviewerHistory: buildReviewerHistory(projectEvents, eventsKey),
+      developerLifecycle: buildDeveloperLifecycle(projectEvents, eventsKey, snapshot?.taskId),
+      maintenancePause,
+    });
+  }
+
+  projects.sort((a, b) => a.projectLabel.localeCompare(b.projectLabel, "ko"));
+
+  return { generatedAt: new Date(now).toISOString(), projects, registryIssues: registry.issues };
 }

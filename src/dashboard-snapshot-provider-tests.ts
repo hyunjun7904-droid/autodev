@@ -1,13 +1,20 @@
-import { mkdtempSync, rmSync, appendFileSync } from "node:fs";
+import { mkdtempSync, rmSync, appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFileEventStore } from "./event-store";
 import type { EventStore } from "./event-store";
 import type { AutoDevEventInput } from "./observability-event";
-import { getDashboardSnapshot, resetDashboardSnapshotCacheForTests, computeDashboardRuntimeTruth } from "./dashboard-snapshot-provider";
+import {
+  getDashboardSnapshot,
+  getMultiProjectDashboardSnapshot,
+  resetDashboardSnapshotCacheForTests,
+  computeDashboardRuntimeTruth,
+} from "./dashboard-snapshot-provider";
 import { createRoundStatusReporterForTests } from "./round-status";
 import type { ProjectRuntimeLiveness } from "./project-lock";
 import type { ProblemMemoryStore } from "./problem-memory";
+import { DASHBOARD_PROJECT_ADAPTERS_ENV } from "./dashboard-project-registry";
+import { maintenancePauseMarkerPath } from "./runner-supervisor";
 
 // Local Operations Dashboard — Read Service / Cache Seam 테스트(Phase G Task G4.1). 실제
 // Claude/GPT 유료 API를 호출하지 않는다 — 이 파일은 파일 기반 EventStore에 직접 event를
@@ -271,9 +278,126 @@ function scenarioRuntimeTruthStaleLockDoesNotClaimRunning(): void {
   check("stale lock/dead PID는 RUNNING이 아닌 STALE로 표시", result.state === "STALE");
 }
 
+// ---------------------------------------------------------------------------
+// AutoDev Dashboard 멀티프로젝트 운영센터 개선 — getMultiProjectDashboardSnapshot() 테스트.
+// DASHBOARD_ONLY_ATTRIBUTION_DEFECT의 핵심 검증: N개 project의 event가 같은 파일에
+// 섞여 있어도 project별로 정확히 귀속되고, 서로 오염되지 않는지 확인한다.
+// ---------------------------------------------------------------------------
+
+function writeMultiProjectAdapter(dir: string, projectId: string, projectName: string): string {
+  const projectRoot = join(dir, projectId);
+  mkdirSync(projectRoot, { recursive: true });
+  writeFileSync(join(projectRoot, "state.json"), JSON.stringify({ completedTasks: [] }), "utf-8");
+  const adapterPath = join(projectRoot, "manifest.json");
+  const manifest = {
+    projectId,
+    projectName,
+    targetProjectRoot: ".",
+    statePath: "state.json",
+    taskRegistry: [
+      { id: "T1", phase: 1, taskNumber: 1, title: "예시 작업", prompt: "p", requiredTests: [], allowedPathPrefixes: ["src/"], prohibitedOperations: [] },
+    ],
+    developerInstructions: "test",
+    reviewInstructions: "test",
+    reviewScopeDirs: ["src/"],
+    executionPolicy: { allowedReadPrefixes: ["src/"], allowedWritePrefixes: ["src/"], allowedCommands: [] },
+  };
+  writeFileSync(adapterPath, JSON.stringify(manifest, null, 2), "utf-8");
+  return adapterPath;
+}
+
+function scenarioMultiProjectAttributionNoContamination(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [
+    ev({ eventType: "TASK_STARTED", runId: "run-multi-a", taskId: "TA", projectId: "multi-proj-a" }),
+    ev({ eventType: "REVIEW_APPROVED", runId: "run-multi-a", taskId: "TA", projectId: "multi-proj-a", model: { provider: "fireworks", name: "m1" } }),
+    ev({ eventType: "TASK_STARTED", runId: "run-multi-b", taskId: "TB", projectId: "multi-proj-b" }),
+    ev({ eventType: "REVIEW_BLOCKED", runId: "run-multi-b", taskId: "TB", projectId: "multi-proj-b", model: { provider: "groq", name: "m2" } }),
+  ]);
+  const multi = getMultiProjectDashboardSnapshot(filePath);
+  const a = multi.projects.find((p) => p.projectId === "multi-proj-a");
+  const b = multi.projects.find((p) => p.projectId === "multi-proj-b");
+  check("멀티프로젝트: 2개 project 모두 카드로 존재", a !== undefined && b !== undefined);
+  check("A project: taskId가 A로 정확히 귀속", a?.snapshot?.taskId === "TA");
+  check("B project: taskId가 B로 정확히 귀속(A로 섞이지 않음)", b?.snapshot?.taskId === "TB");
+  check("A project: Reviewer 이력에 fireworks만", a?.reviewerHistory.length === 1 && a.reviewerHistory[0]?.provider === "fireworks");
+  check("B project: Reviewer 이력에 groq만(A와 섞이지 않음)", b?.reviewerHistory.length === 1 && b.reviewerHistory[0]?.provider === "groq");
+}
+
+function scenarioMultiProjectRegisteredEventlessProjectStillShown(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath(); // event 없음(파일 자체를 만들지 않음)
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-multi-registry-"));
+  tempDirs.push(registryDir);
+  const adapterPath = writeMultiProjectAdapter(registryDir, "new-canary", "새 Canary(아직 미실행)");
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: { [DASHBOARD_PROJECT_ADAPTERS_ENV]: JSON.stringify([adapterPath]) } });
+  const entry = multi.projects.find((p) => p.projectId === "new-canary");
+  check("event가 아직 없어도 registry에 등록된 project는 카드로 표시됨", entry !== undefined);
+  check("event 없는 등록 project: status=NO_RUN_YET", entry?.status === "NO_RUN_YET");
+  check("event 없는 등록 project: registered=true", entry?.registered === true);
+  check("event 없는 등록 project: projectProgress는 manifest 기반으로 채워짐", entry?.projectProgress?.totalTasks === 1);
+}
+
+function scenarioMultiProjectUnregisteredButHasEventsStillShown(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [ev({ eventType: "TASK_STARTED", runId: "run-unreg", taskId: "T1", projectId: "unregistered-proj" })]);
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const entry = multi.projects.find((p) => p.projectId === "unregistered-proj");
+  check("registry에 없어도 event만으로 project 카드가 생김", entry !== undefined);
+  check("등록되지 않은 project: registered=false", entry?.registered === false);
+  check("등록되지 않은 project: projectLabel은 projectId 그대로(추측된 이름 없음)", entry?.projectLabel === "unregistered-proj");
+}
+
+function scenarioMultiProjectMaintenancePauseSurfacedSeparately(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [ev({ eventType: "TASK_STARTED", runId: "run-paused", taskId: "T1", projectId: "paused-proj" })]);
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-multi-pause-"));
+  tempDirs.push(registryDir);
+  const adapterPath = writeMultiProjectAdapter(registryDir, "paused-proj", "일시정지된 프로젝트");
+  const logsDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-multi-pause-logs-"));
+  tempDirs.push(logsDir);
+  writeFileSync(
+    maintenancePauseMarkerPath(adapterPath, logsDir),
+    JSON.stringify({ engagedAt: "2026-09-01T00:00:00.000Z", reason: "테스트용 유지보수" }),
+    "utf-8"
+  );
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, {
+    env: { [DASHBOARD_PROJECT_ADAPTERS_ENV]: JSON.stringify([adapterPath]) },
+    logsDir,
+  });
+  const entry = multi.projects.find((p) => p.projectId === "paused-proj");
+  check("Maintenance Pause 마커가 있으면 maintenancePause.active=true", entry?.maintenancePause?.active === true);
+  check("Maintenance Pause: engagedAt/reason이 그대로 노출됨", entry?.maintenancePause?.reason === "테스트용 유지보수");
+}
+
+function scenarioMultiProjectEventsWithoutProjectIdGetOwnBucket(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [
+    ev({ eventType: "TASK_STARTED", runId: "run-noproj", taskId: "T1" }), // projectId 없음
+    ev({ eventType: "TASK_STARTED", runId: "run-withproj", taskId: "T2", projectId: "real-proj" }),
+  ]);
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  check("멀티프로젝트: projectId 없는 event와 있는 event가 서로 다른 카드", multi.projects.length === 2);
+  const real = multi.projects.find((p) => p.projectId === "real-proj");
+  check("projectId 있는 project에 taskId 없는 event가 섞이지 않음", real?.snapshot?.taskId === "T2");
+}
+
 function main(): void {
   try {
     scenarioNoRunYet();
+    scenarioMultiProjectAttributionNoContamination();
+    scenarioMultiProjectRegisteredEventlessProjectStillShown();
+    scenarioMultiProjectUnregisteredButHasEventsStillShown();
+    scenarioMultiProjectMaintenancePauseSurfacedSeparately();
+    scenarioMultiProjectEventsWithoutProjectIdGetOwnBucket();
     scenarioRoundStatusShownWhenMatchesCurrentRunAndTask();
     scenarioRoundStatusHiddenWhenTaskDiffersOrMissing();
     scenarioLatestRunSelected();

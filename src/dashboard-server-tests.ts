@@ -41,7 +41,10 @@ function buildFixtureFile(inputs: AutoDevEventInput[]): string {
 
 async function startServerFor(filePath: string | undefined): Promise<DashboardServerHandle> {
   resetDashboardSnapshotCacheForTests();
-  const handle = await startDashboardServer({ port: 0, eventsFilePath: filePath });
+  // projectRegistryEnv: {} — 실제 개발 환경(예: AUTODEV_PROJECT_ADAPTER가 이미 설정돼
+  // 있을 수 있음)이 fixture 기반 /api/snapshots 테스트에 우연히 섞여 들어오지 않게 격리한다
+  // (§ dashboard-server.ts DashboardServerOptions.projectRegistryEnv).
+  const handle = await startDashboardServer({ port: 0, eventsFilePath: filePath, projectRegistryEnv: {} });
   openHandles.push(handle);
   return handle;
 }
@@ -260,6 +263,32 @@ async function scenarioNoSecretExposure(): Promise<void> {
   await handle.close();
 }
 
+// AutoDev Dashboard 멀티프로젝트 운영센터 개선 — GET /api/snapshots(복수형) 테스트.
+async function scenarioMultiSnapshotApiOk(): Promise<void> {
+  const filePath = buildFixtureFile([
+    ev({ eventType: "TASK_STARTED", runId: "run-multi-1", taskId: "T1", projectId: "server-proj-a" }),
+    ev({ eventType: "TASK_STARTED", runId: "run-multi-2", taskId: "T2", projectId: "server-proj-b" }),
+  ]);
+  const handle = await startServerFor(filePath);
+  const res = await fetch(`${handle.url}/api/snapshots`);
+  const body = (await res.json()) as { generatedAt: string; projects: { projectId: string; snapshot?: { taskId?: string } }[] };
+  check("멀티 snapshot API: HTTP 200", res.status === 200);
+  check("멀티 snapshot API: content-type이 JSON", (res.headers.get("content-type") ?? "").includes("application/json"));
+  check("멀티 snapshot API: 2개 project 모두 반환", body.projects.length === 2);
+  const a = body.projects.find((p) => p.projectId === "server-proj-a");
+  const b = body.projects.find((p) => p.projectId === "server-proj-b");
+  check("멀티 snapshot API: project A의 taskId가 정확히 귀속", a?.snapshot?.taskId === "T1");
+  check("멀티 snapshot API: project B의 taskId가 정확히 귀속(A와 섞이지 않음)", b?.snapshot?.taskId === "T2");
+  await handle.close();
+}
+
+async function scenarioMultiSnapshotWriteEndpointsStillBlocked(): Promise<void> {
+  const handle = await startServerFor(undefined);
+  const post = await fetch(`${handle.url}/api/snapshots`, { method: "POST" });
+  check("멀티 snapshot: POST -> 405(읽기 전용 유지)", post.status === 405);
+  await handle.close();
+}
+
 async function scenarioNoWriteEndpoints(): Promise<void> {
   const handle = await startServerFor(undefined);
   const postSnapshot = await fetch(`${handle.url}/api/snapshot`, { method: "POST" });
@@ -292,6 +321,8 @@ async function main(): Promise<void> {
     await scenarioTokensAndUnknownSubscription();
     await scenarioDegradedIntegrityWarning();
     await scenarioNoSecretExposure();
+    await scenarioMultiSnapshotApiOk();
+    await scenarioMultiSnapshotWriteEndpointsStillBlocked();
     await scenarioNoWriteEndpoints();
   } finally {
     resetDashboardSnapshotCacheForTests();

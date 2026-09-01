@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { getDashboardSnapshot } from "./dashboard-snapshot-provider";
-import type { DashboardSnapshot } from "./dashboard-snapshot-provider";
+import { getDashboardSnapshot, getMultiProjectDashboardSnapshot } from "./dashboard-snapshot-provider";
+import type { DashboardSnapshot, MultiProjectDashboardSnapshot } from "./dashboard-snapshot-provider";
 import { DASHBOARD_HTML } from "./dashboard-html";
 import { appendDashboardLog } from "./dashboard-log";
 import { join } from "node:path";
@@ -10,12 +10,17 @@ import { join } from "node:path";
 //
 // 이 서버는 GET(및 HEAD) 두 method만 처리한다 — POST/PUT/PATCH/DELETE는 어떤 경로로
 // 와도 항상 405다(§ 요구사항: Approve/Reject/Git/Claude/shell 실행/파일 수정/AutoDev 상태
-// 변경 버튼 자체가 없음 — 그런 요청을 받아줄 route가 코드에 아예 없다). 라우트는 두 개뿐이다:
-//   GET /              -> 정적 HTML(dashboard-html.ts, 그 안의 client JS가 /api/snapshot만
+// 변경 버튼 자체가 없음 — 그런 요청을 받아줄 route가 코드에 아예 없다). 라우트는 세 개뿐이다:
+//   GET /              -> 정적 HTML(dashboard-html.ts, 그 안의 client JS가 /api/snapshots만
 //                          polling한다)
-//   GET /api/snapshot  -> G4 AutoDevLiveSnapshot(dashboard-snapshot-provider.ts)을 그대로
-//                          JSON으로 반환 — 이 파일은 응답을 만들기 전에 그 값을 가공/재해석
-//                          하지 않는다.
+//   GET /api/snapshot  -> (단수형, 레거시) 단일 project DashboardSnapshot을 그대로 JSON으로
+//                          반환한다 — 기존 단일 project 배포/테스트와의 호환을 위해 동작을
+//                          바꾸지 않는다.
+//   GET /api/snapshots -> (복수형, AutoDev Dashboard 멀티프로젝트 운영센터 개선) 등록됐거나
+//                          실제로 실행된 적이 있는 모든 project의 DashboardSnapshot을 배열로
+//                          반환한다(dashboard-snapshot-provider.ts의
+//                          getMultiProjectDashboardSnapshot()) — 이 파일은 두 route 모두
+//                          응답을 만들기 전에 그 값을 가공/재해석하지 않는다.
 //
 // 기본 bind host는 항상 127.0.0.1이다 — 이 상수는 옵션으로 노출하지 않는다(0.0.0.0
 // 공개/port forwarding/public tunnel은 이번 Task 범위 밖 — § 요구사항). 포트만 옵션으로
@@ -34,6 +39,12 @@ export interface DashboardServerOptions {
   /** 테스트 전용 — 읽을 event 파일 경로를 override한다. 지정하지 않으면 production 경로
    *  (RUNTIME_EVENT_LOG_PATH)를 그대로 쓴다. */
   eventsFilePath?: string;
+  /** 테스트 전용 — GET /api/snapshots(멀티프로젝트)가 project registry를 읽을 때 쓸
+   *  환경변수를 override한다. 지정하지 않으면 production과 동일하게 실제 process.env를
+   *  그대로 쓴다(§ dashboard-project-registry.ts) — 실제 개발 환경에 이미 설정돼 있을 수
+   *  있는 AUTODEV_PROJECT_ADAPTER 등이 테스트 fixture에 우연히 섞여 들어오는 것을 막기
+   *  위한 격리 seam이다. */
+  projectRegistryEnv?: NodeJS.ProcessEnv;
 }
 
 export interface DashboardServerHandle {
@@ -80,9 +91,25 @@ function trySnapshot(eventsFilePath?: string): SnapshotAttempt {
   }
 }
 
+// AutoDev Dashboard 멀티프로젝트 운영센터 개선 — GET /api/snapshots(복수형, 새 route).
+// 기존 GET /api/snapshot(단수형)은 단일 project 배포/기존 테스트와의 호환을 위해 동작을
+// 전혀 바꾸지 않는다 — 새 멀티프로젝트 화면은 이 새 route만 쓴다. 실패 시 흡수 규칙은 위
+// trySnapshot()과 완전히 동일하다(§ 요구사항: 어떤 요청 하나의 실패도 서버 프로세스 전체를
+// 끌고 내려가서는 안 된다).
+type MultiSnapshotAttempt = { ok: true; snapshot: MultiProjectDashboardSnapshot } | { ok: false; reason: string };
+
+function tryMultiSnapshot(eventsFilePath?: string, projectRegistryEnv?: NodeJS.ProcessEnv): MultiSnapshotAttempt {
+  try {
+    const snapshot = getMultiProjectDashboardSnapshot(eventsFilePath, undefined, { env: projectRegistryEnv });
+    return { ok: true, snapshot };
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.constructor.name : "UNKNOWN_ERROR" };
+  }
+}
+
 const DASHBOARD_LOG_PATH = join(process.cwd(), "logs", "dashboard.log");
 
-function createRequestHandler(eventsFilePath?: string) {
+function createRequestHandler(eventsFilePath?: string, projectRegistryEnv?: NodeJS.ProcessEnv) {
   return (req: IncomingMessage, res: ServerResponse): void => {
     // 클라이언트가 응답 중간에 연결을 끊으면(§ 요구사항 4 시나리오 16) res(ServerResponse)에
     // 'error' 이벤트가 뜰 수 있다 — EventEmitter는 'error' 리스너가 하나도 없으면 그 예외를
@@ -104,6 +131,16 @@ function createRequestHandler(eventsFilePath?: string) {
           sendJson(res, 200, attempt.snapshot);
         } else {
           appendDashboardLog(DASHBOARD_LOG_PATH, { event: "SNAPSHOT_READ_FAILED", reason: attempt.reason });
+          sendJson(res, 500, { status: "DEGRADED", error: "SNAPSHOT_READ_FAILED" });
+        }
+        return;
+      }
+      if (path === "/api/snapshots") {
+        const attempt = tryMultiSnapshot(eventsFilePath, projectRegistryEnv);
+        if (attempt.ok) {
+          sendJson(res, 200, attempt.snapshot);
+        } else {
+          appendDashboardLog(DASHBOARD_LOG_PATH, { event: "MULTI_SNAPSHOT_READ_FAILED", reason: attempt.reason });
           sendJson(res, 500, { status: "DEGRADED", error: "SNAPSHOT_READ_FAILED" });
         }
         return;
@@ -147,7 +184,7 @@ function createRequestHandler(eventsFilePath?: string) {
 export function startDashboardServer(opts: DashboardServerOptions = {}): Promise<DashboardServerHandle> {
   const port = opts.port ?? DEFAULT_PORT;
   return new Promise((resolvePromise, reject) => {
-    const server: Server = createServer(createRequestHandler(opts.eventsFilePath));
+    const server: Server = createServer(createRequestHandler(opts.eventsFilePath, opts.projectRegistryEnv));
     // § 요구사항 5 — startup 실패(예: EADDRINUSE)는 이 Promise를 reject해야 하지만, listen이
     // 이미 성공한 뒤에 발생하는 'error'(드물지만 가능 — 예: accept 단계의 일시적 OS 오류)까지
     // 조용히 삼키면 안 되면서도 프로세스를 죽여서는 안 된다. 이전 코드는 `server.once("error",
