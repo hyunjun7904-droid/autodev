@@ -359,6 +359,72 @@ function scenarioReconcileNoKnownMarkerIsNoop(): void {
   check("Durable-Technical/I) remainingDeferredHumanTasks가 원본 참조와 동일(no-op)", result.remainingDeferredHumanTasks === markers);
 }
 
+const GENERIC_UNKNOWN_MARKER = "SOME_FUTURE_MARKER_FORMAT: not recognized by this file yet";
+
+function scenarioReconcileStagnationWithUnknownMarkerOnlyResolvesStagnation(): void {
+  // STAGNATION + UNKNOWN(이 파일이 전혀 모르는 형식의 marker) → STAGNATION만 독립적으로
+  // resolved되고, unknown marker는 절대 삭제되지 않는다(§ 요구사항 4).
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER, GENERIC_UNKNOWN_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/UNKNOWN) STAGNATION_DETECTED만 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check("Durable-Technical/UNKNOWN) unknown marker는 절대 제거되지 않고 그대로 보존", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === GENERIC_UNKNOWN_MARKER);
+}
+
+function scenarioReconcileConfigEnvStagnationOnlyResolvesStagnation(): void {
+  // CONFIG + ENV + STAGNATION 세 marker가 함께 있는 경우 — STAGNATION만 독립적으로
+  // resolved되고, CONFIG/ENV는 이 함수가 절대 건드리지 않는다(각자의 canonical reconcile
+  // 경로에 맡긴다).
+  const markers: readonly string[] = [GENERIC_CONFIG_MARKER, GENERIC_ENV_MARKER, GENERIC_STAGNATION_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/CONFIG+ENV+STAGNATION) STAGNATION_DETECTED만 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check(
+    "Durable-Technical/CONFIG+ENV+STAGNATION) CONFIG/ENV marker는 순서와 개수 그대로 보존됨",
+    result.remainingDeferredHumanTasks.length === 2 &&
+      result.remainingDeferredHumanTasks[0] === GENERIC_CONFIG_MARKER &&
+      result.remainingDeferredHumanTasks[1] === GENERIC_ENV_MARKER
+  );
+}
+
+function scenarioReconcileMalformedWithStagnationOnlyResolvesStagnation(): void {
+  // malformed(형식이 정확히 일치하지 않는) marker + STAGNATION_DETECTED 정상 marker가 함께
+  // 있는 경우 — STAGNATION만 독립적으로 resolved되고 malformed marker는 그대로 남는다.
+  const markers: readonly string[] = [GENERIC_MALFORMED_STAGNATION_LIKE, GENERIC_STAGNATION_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/malformed+STAGNATION) STAGNATION_DETECTED만 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check(
+    "Durable-Technical/malformed+STAGNATION) malformed marker는 절대 제거되지 않고 그대로 보존",
+    result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === GENERIC_MALFORMED_STAGNATION_LIKE
+  );
+}
+
+function scenarioReconcileUnknownOnlyIsNoop(): void {
+  // unknown marker 단독 → 이 함수가 아는 형식이 전혀 없으므로 완전히 no-op(원본 참조 그대로).
+  const markers: readonly string[] = [GENERIC_UNKNOWN_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/unknown only) resolvedMarkers가 비어있음", result.resolvedMarkers.length === 0);
+  check("Durable-Technical/unknown only) remainingDeferredHumanTasks가 원본 참조와 동일(no-op)", result.remainingDeferredHumanTasks === markers);
+}
+
+function scenarioReconcileIsIdempotentOnRepeatedCalls(): void {
+  // 반복 reconciliation idempotency — 첫 호출로 이미 걸러진 remainingDeferredHumanTasks에
+  // 다시 같은 함수를 호출해도 더 이상 아무것도 제거되지 않고(이미 알려진 기술적 marker가
+  // 남아있지 않으므로) 배열 내용이 정확히 동일하게 유지된다 — 두 번째 호출이 실수로 unknown/
+  // genuine marker까지 제거하는 회귀가 없는지 직접 증명한다.
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER, GENERIC_CONFIG_MARKER, GENERIC_GENUINE_MARKER];
+  const first = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/idempotency) 1차 호출에서 STAGNATION_DETECTED만 resolved됨", first.resolvedMarkers.length === 1 && first.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  const second = reconcileKnownTechnicalDeferredMarkers(first.remainingDeferredHumanTasks);
+  check("Durable-Technical/idempotency) 2차 호출은 아무것도 추가로 resolve하지 않음(no-op)", second.resolvedMarkers.length === 0);
+  check(
+    "Durable-Technical/idempotency) 2차 호출 결과가 1차 결과와 내용까지 동일함(CONFIG/genuine marker 보존)",
+    second.remainingDeferredHumanTasks.length === 2 &&
+      second.remainingDeferredHumanTasks[0] === GENERIC_CONFIG_MARKER &&
+      second.remainingDeferredHumanTasks[1] === GENERIC_GENUINE_MARKER
+  );
+  const third = reconcileKnownTechnicalDeferredMarkers(second.remainingDeferredHumanTasks);
+  check("Durable-Technical/idempotency) 3차 호출도 동일하게 수렴(반복해도 결과가 흔들리지 않음)", third.resolvedMarkers.length === 0 && third.remainingDeferredHumanTasks.length === 2);
+}
+
 function scenarioGenuineAndTechnicalPredicatesAreMutuallyExclusive(): void {
   // 구조적 invariant 회귀: 이 파일이 아는 모든 genuine marker 예시와 모든 기술적 marker
   // 예시가 서로의 predicate에 절대 동시에 매칭되지 않는다 — 그래야
@@ -410,6 +476,11 @@ function main(): void {
   scenarioReconcileMultipleKnownTechnicalMarkersAllResolve();
   scenarioReconcileMalformedStagnationLikeMarkerNeverRemoved();
   scenarioReconcileNoKnownMarkerIsNoop();
+  scenarioReconcileStagnationWithUnknownMarkerOnlyResolvesStagnation();
+  scenarioReconcileConfigEnvStagnationOnlyResolvesStagnation();
+  scenarioReconcileMalformedWithStagnationOnlyResolvesStagnation();
+  scenarioReconcileUnknownOnlyIsNoop();
+  scenarioReconcileIsIdempotentOnRepeatedCalls();
   scenarioGenuineAndTechnicalPredicatesAreMutuallyExclusive();
 
   console.log("\n=== human-gate-policy 테스트 결과 ===");

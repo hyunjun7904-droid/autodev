@@ -2018,6 +2018,125 @@ async function scenarioRunAutodevOnceWaitingHumanStagnationAloneRegressionUnchan
   check("Durable-Technical/E) task가 completedTasks에 기록됨(기존과 동일)", finalState.completedTasks.includes("P1.2"));
 }
 
+// Case F — Mixed-Marker Recovery(WAITING_HUMAN 상태 일반화, 2026-09-01, CRITICAL defect
+// fix) — WAITING_HUMAN + STAGNATION_DETECTED(알려진 기술적 marker) + 아직 실제로 해소되지
+// 않은 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR(cwd 디렉터리가 여전히 존재하지 않음)가
+// 함께 있는 경우. 수정 전에는 이 블록이 배열 전체 단위 aggregate 판정
+// (isTechnicalAutoRecoverableWaitingHuman)만 보고 "genuine marker가 하나도 없다"는 이유로
+// deferredHumanTasks 전체를 통째로 비우고 status를 READY로 강제전환했다 — 아직 해소되지
+// 않은 ENV marker까지 근거 없이 삭제되는 CRITICAL defect였다. 이 시나리오는 수정 후
+// (1) STAGNATION_DETECTED만 독립적으로 제거되고, (2) 아직 해소되지 않은 ENV marker는 그대로
+// 보존되며, (3) 남은 marker가 있으므로 status가 READY로 강제전환되지 않고 WAITING_HUMAN을
+// 유지하며, (4) Developer/Reviewer가 단 한 번도 호출되지 않는다는 것을 함께 증명한다.
+async function scenarioRunAutodevOnceWaitingHumanStagnationAndUnresolvedEnvMarkerPreservesUnresolved(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const registry: TaskDefinition[] = [
+    {
+      id: "G5",
+      phase: 1,
+      taskNumber: 1,
+      title: "fixture task",
+      prompt: "fixture",
+      requiredTests: [{ name: "fixture-check", command: "node", args: ["--version"], cwd: "sub" }],
+      allowedPathPrefixes: ["proj/"],
+      prohibitedOperations: [],
+    },
+  ];
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  // "sub/" 디렉터리를 의도적으로 만들지 않는다 — 환경 결함이 아직 실제로 해소되지 않은
+  // 상태를 재현한다(§ 요구사항 4 — unknown/unresolved marker는 절대 삭제하지 않는다).
+  const unresolvedEnvMarker = `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=G5 requiredTest=fixture-check kind=CWD_NOT_FOUND cwd=sub resolvedPath=${join(repo, "sub")}`;
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    completedTasks: [],
+    // 순서 자체가 결과에 영향을 주면 안 된다 — 아직 해소되지 않은 marker를 먼저 둔다.
+    deferredHumanTasks: [unresolvedEnvMarker, stagnationMarker],
+  });
+  const manifest: ProjectManifest = {
+    projectId: "waiting-human-mixed-marker-unresolved-project",
+    projectName: "WAITING_HUMAN Mixed Marker Unresolved Project",
+    targetProjectRoot: repo,
+    statePath,
+    taskRegistry: registry,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests(registry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))),
+      commandCwdAliases: { sub: "sub" },
+    },
+  };
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Durable-Technical/F) 아직 해소되지 않은 ENV marker가 남아있으므로 WAITING_HUMAN STOP 유지", result.outcome === "STOPPED");
+  check("Durable-Technical/F) Developer/Claude가 단 한 번도 호출되지 않음(불필요한 API/CLI 호출 0)", claudeCalls === 0);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "Durable-Technical/F) STAGNATION_DETECTED는 독립적으로 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("STAGNATION_DETECTED("))
+  );
+  check(
+    "Durable-Technical/F) 아직 해소되지 않은 ENV marker는 절대 삭제되지 않고 그대로 보존됨(CRITICAL defect 수정 검증)",
+    finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === unresolvedEnvMarker
+  );
+  check(
+    "Durable-Technical/F) 남은 marker가 있으므로 status가 READY로 강제전환되지 않고 WAITING_HUMAN 유지",
+    (finalState.status as unknown as string) === "WAITING_HUMAN"
+  );
+  check("Durable-Technical/F) task가 completedTasks에 억지로 추가되지 않음(자동 승인 아님)", !finalState.completedTasks.includes("G5"));
+}
+
+// Case G — 위와 대칭인 CONFIG_ERROR 조합: WAITING_HUMAN + STAGNATION_DETECTED + 아직 해소되지
+// 않은 REQUIRED_TEST_CONFIGURATION_ERROR(npm script가 여전히 미등록). CONFIG 계열 marker도
+// ENV 계열과 동일한 CRITICAL defect에 노출되어 있었다는 것을 독립적으로 증명한다.
+async function scenarioRunAutodevOnceWaitingHumanStagnationAndUnresolvedConfigMarkerPreservesUnresolved(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  // package.json에 해당 npm script를 등록하지 않는다 — 구성 결함이 아직 실제로 해소되지
+  // 않은 상태를 재현한다.
+  const unresolvedConfigMarker = "REQUIRED_TEST_CONFIGURATION_ERROR: task=P1.2 requiredTest=rtp-check missingScript=test:rtp-check";
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    deferredHumanTasks: [stagnationMarker, unresolvedConfigMarker],
+  });
+  const manifest = buildRequiredTestPreflightManifest(repo, statePath);
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Durable-Technical/G) 아직 해소되지 않은 CONFIG marker가 남아있으므로 WAITING_HUMAN STOP 유지", result.outcome === "STOPPED");
+  check("Durable-Technical/G) Developer/Claude가 단 한 번도 호출되지 않음(불필요한 API/CLI 호출 0)", claudeCalls === 0);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "Durable-Technical/G) STAGNATION_DETECTED는 독립적으로 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("STAGNATION_DETECTED("))
+  );
+  check(
+    "Durable-Technical/G) 아직 해소되지 않은 CONFIG marker는 절대 삭제되지 않고 그대로 보존됨(CRITICAL defect 수정 검증)",
+    finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === unresolvedConfigMarker
+  );
+  check(
+    "Durable-Technical/G) 남은 marker가 있으므로 status가 READY로 강제전환되지 않고 WAITING_HUMAN 유지",
+    (finalState.status as unknown as string) === "WAITING_HUMAN"
+  );
+}
+
 // Positive-Provenance-Only Auto-Delete Policy(2026-08-31, JARVIS Task 5.3 Canary 사실검증
 // 후속) — AutoDev는 이 저장소에 "AutoDev가 이 파일을 만들었다"를 증명할 durable action log가
 // 없다는 것이 확인된 이후, scopeViolations에 정확히 나열된 파일이라도(예전 Phase 7이었다면
@@ -3326,6 +3445,8 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceBlockedStagnationStillFailingCorrectlyReBlocksAfterRetry();
     await scenarioRunAutodevOnceBlockedStagnationAndResolvedEnvMarkerBothClearToReady();
     await scenarioRunAutodevOnceWaitingHumanStagnationAloneRegressionUnchanged();
+    await scenarioRunAutodevOnceWaitingHumanStagnationAndUnresolvedEnvMarkerPreservesUnresolved();
+    await scenarioRunAutodevOnceWaitingHumanStagnationAndUnresolvedConfigMarkerPreservesUnresolved();
     await scenarioRunAutodevOnceNeverAutoDeletesScopeViolationLeftoverFiles();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceStopsImmediatelyOnScopeViolationWaitingHuman();

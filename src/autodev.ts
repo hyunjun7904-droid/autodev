@@ -1054,18 +1054,52 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // scope-violation leftover 정리(§ 아래 — 이제는 항상 lastGptDecision.scopeViolations만
     // 본다, Core checkpoint 자신의 독립 판정 목록은 genuine 경로로 넘어가 여기 도달하지 않음)가
     // 이어서 정상 동작한다.
+    //
+    // Mixed-Marker Recovery 수정(2026-09-01, generic defect — 이 블록이 BLOCKED 상태용
+    // 블록(위, § reconcileKnownTechnicalDeferredMarkers)과 달리 여전히 배열 전체 단위
+    // 판정(isTechnicalAutoRecoverableWaitingHuman → classifyWaitingHumanReason)만으로
+    // deferredHumanTasks 전체를 통째로 비우고 있었다는 것이 확인됨) — 이 aggregate 판정은
+    // "genuine marker가 하나도 없는가"만 보고 "모든 marker가 알려진 기술적 marker인가"는
+    // 보지 않는다. 그래서 STAGNATION_DETECTED(알려진 기술적 marker) 하나와 아직 해소되지
+    // 않은 REQUIRED_TEST_CONFIGURATION_ERROR/REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR(위 두
+    // 블록이 실제로는 아직 해소되지 않았다고 판단해 남겨둔 것)나 이 파일이 전혀 모르는
+    // marker가 함께 있으면, 그 marker들이 genuine 목록에 없다는 이유만으로 classifier가
+    // TECHNICAL_AUTO_RECOVERABLE을 반환했고, 이 블록은 그 판정을 근거로 아직 해소되지 않은
+    // marker까지 통째로 삭제하고 status를 READY로 강제전환했다 — 근본 원인이 실제로
+    // 해소됐는지와 무관하게 조용히 재개되는 결함이었다.
+    //
+    // 이제 BLOCKED 블록과 동일하게 reconcileKnownTechnicalDeferredMarkers()로 marker 각각을
+    // 독립적으로 판정한다 — 이 함수가 아는 형식(REVIEW_CYCLE_EXHAUSTED_REASON/
+    // DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX/STAGNATION_DETECTED_MARKER_PREFIX/기술적
+    // CLAUDE_STRUCTURAL_FAILURE)만 제거하고, genuine marker든 이 함수가 모르는 marker(CONFIG/
+    // ENV/malformed/legacy 등)든 항상 그대로 남긴다. state.lastGptDecision.decision이
+    // BLOCK/HUMAN_REQUIRED인 경우(Reviewer 자신의 BLOCK 판정)는 marker 형식으로 저장되지
+    // 않는 별도 기술적 신호이므로, deferredHumanTasks가 이미 완전히 비어 있을 때만(즉 이
+    // decision 외에 다른 미해결 사유가 전혀 없을 때만) 그 자체로 READY 전환의 근거가 될 수
+    // 있다 — deferredHumanTasks에 아직 남은 marker(known이든 unknown이든)가 있으면 이
+    // decision 하나만으로 그 marker들을 무시하고 READY로 넘어가지 않는다. 남은 marker가
+    // 하나라도 있으면 status는 절대 READY로 강제전환되지 않는다(그 남은 marker의 해소는
+    // 각자의 canonical 경로 — 위 CONFIG/ENV 재검사, classifyWaitingHumanReason 등 — 에
+    // 맡긴다).
     if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
-      if (isTechnicalAutoRecoverableWaitingHuman(state)) {
+      const technicalReconciliation = reconcileKnownTechnicalDeferredMarkers(state.deferredHumanTasks);
+      const reviewDecision = state.lastGptDecision?.decision;
+      const hasReviewBlockedWithNoOtherReason = (reviewDecision === "BLOCK" || reviewDecision === "HUMAN_REQUIRED") && state.deferredHumanTasks.length === 0;
+      if (technicalReconciliation.resolvedMarkers.length > 0 || hasReviewBlockedWithNoOtherReason) {
         console.log(
           `[autodev] 기술적 WAITING_HUMAN을 재검사했습니다 — 실제 사람 판단이 필요한 사유가 아니므로 Telegram 승인 없이 자동 복구합니다.`
         );
         log("기술적 WAITING_HUMAN 자동 복구(Canonical Human Gate Policy)", {
           projectId: manifest.projectId,
-          previousDeferredHumanTasks: state.deferredHumanTasks,
-          lastGptDecision: state.lastGptDecision?.decision ?? null,
+          resolvedMarkers: technicalReconciliation.resolvedMarkers,
+          remainingDeferredHumanTasks: technicalReconciliation.remainingDeferredHumanTasks,
+          lastGptDecision: reviewDecision ?? null,
         });
-        state.status = "READY";
-        state.deferredHumanTasks = [];
+        state.deferredHumanTasks = [...technicalReconciliation.remainingDeferredHumanTasks];
+        if (state.deferredHumanTasks.length === 0) {
+          console.log(`[autodev] 남은 사유가 없습니다 — 정상 실행 상태로 자동 복구합니다.`);
+          state.status = "READY";
+        }
         saveState(state, statePath);
       }
     }

@@ -544,10 +544,184 @@ async function scenarioConfigMarkerReconciledViaRealEntrypointWithoutRealDevelop
   }
 }
 
+// ---------------------------------------------------------------------------
+// E2E-3) CRITICAL defect fix — WAITING_HUMAN + STAGNATION_DETECTED(알려진 기술적 marker) +
+//        아직 실제로 해소되지 않은 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR(trusted JDK
+//        미지정 — WRAPPER_NOT_FOUND가 그대로 재현됨) + 아직 실제로 해소되지 않은
+//        REQUIRED_TEST_CONFIGURATION_ERROR(package.json 자체가 없음 — fail-closed로 미해결) +
+//        이 저장소가 전혀 모르는 UNKNOWN 형식의 marker가 함께 있는 조합. 수정 전에는
+//        autodev.ts의 WAITING_HUMAN 전용 블록이 배열 전체 단위 aggregate 판정
+//        (isTechnicalAutoRecoverableWaitingHuman)만으로 "genuine marker가 하나도 없다"고
+//        보고 deferredHumanTasks 전체를 통째로 비운 뒤 status를 READY로 강제전환했다 — 세
+//        marker 모두 아직 실제로 해소되지 않았는데도 근거 없이 삭제되는 CRITICAL defect였다.
+//        이 E2E는 실제 컴파일된 production entrypoint(dist/run.js)로 (1) STAGNATION_DETECTED만
+//        독립적으로 제거되고, (2) 아직 해소되지 않은 ENV/CONFIG/UNKNOWN marker 셋 다 절대
+//        삭제되지 않으며, (3) status가 READY로 강제전환되지 않고 WAITING_HUMAN을 유지하며
+//        (남은 marker 기준으로 classifyWaitingHumanReason이 이제 genuine으로 판정해 실제로
+//        Telegram 승인 대기로 들어감), (4) 실제 Developer/Reviewer가 단 한 번도 호출되지
+//        않는다는 것을 함께 증명한다.
+// ---------------------------------------------------------------------------
+const UNKNOWN_FORMAT_MARKER = "SOME_FUTURE_UNRECOGNIZED_MARKER_FORMAT: fixture — 이 저장소의 어떤 reconciliation 함수도 이 형식을 알지 못함";
+
+function buildStagnationWithUnresolvedMixedMarkersFixture(prefix: string): Fixture {
+  const root = makeGitRepo(`${prefix}-root-`);
+  const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
+  tempDirs.push(configDir);
+  const isolationDir = mkdtempSync(join(tmpdir(), `${prefix}-iso-`));
+  tempDirs.push(isolationDir);
+
+  const moduleAbs = join(root, "android", "wakeword");
+  makeGradleModule(moduleAbs);
+  // package.json을 의도적으로 만들지 않는다 — CONFIG marker가 fail-closed로 절대 해소되지
+  // 않는 상태를 재현한다(§ reconcileStaleRequiredTestConfigurationTasks의 pkg.ok===false
+  // 분기).
+
+  const projectId = `fixture-waiting-human-mixed-unresolved-${randomUUID()}`;
+  const statePath = join(configDir, "project-state.json");
+  const state: CoreState = {
+    currentTask: "fixture task — 아직 세 가지 사유 모두 해소되지 않음",
+    reviewCycle: 3,
+    lastClaudeResult: {
+      success: true,
+      summary: "fixture — 이전 attempt(결함 발생 이전)",
+      changedFiles: ["src/marker.txt"],
+      tests: [{ name: REQUIRED_TEST_NAME, pass: true }],
+      rawOutput: "",
+    },
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "fixture", nextTask: null },
+    status: "WAITING_HUMAN",
+    claudeLimitWaitCount: 0,
+    // 순서 자체가 결과에 영향을 주면 안 된다 — STAGNATION_DETECTED를 가운데 둔다.
+    deferredHumanTasks: [
+      `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${FIXTURE_TASK_ID} requiredTest=${REQUIRED_TEST_NAME} kind=WRAPPER_NOT_FOUND cwd=wakeword resolvedPath=${moduleAbs}`,
+      STAGNATION_MARKER,
+      CONFIG_ERROR_MARKER,
+      UNKNOWN_FORMAT_MARKER,
+    ],
+    completedTasks: [],
+    gitCheckpoint: "",
+    currentPhase: 1,
+  };
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+
+  const adapterPath = join(configDir, "manifest.json");
+  writeFileSync(
+    adapterPath,
+    `${JSON.stringify(
+      {
+        projectId,
+        projectName: projectId,
+        targetProjectRoot: relFromTo(configDir, root),
+        statePath: "project-state.json",
+        taskRegistry: [
+          {
+            id: FIXTURE_TASK_ID,
+            phase: 1,
+            taskNumber: 1,
+            title: "waiting-human mixed unresolved marker e2e fixture task",
+            prompt: "fixture",
+            requiredTests: [{ name: REQUIRED_TEST_NAME, command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }],
+            allowedPathPrefixes: ["src/"],
+            prohibitedOperations: [],
+          },
+        ],
+        developerInstructions: "fixture",
+        reviewInstructions: "fixture",
+        reviewScopeDirs: ["src/"],
+        executionPolicy: {
+          allowedReadPrefixes: ["src/"],
+          allowedWritePrefixes: ["src/"],
+          allowedCommands: [],
+          commandCwdAliases: { wakeword: "android/wakeword" },
+        },
+      },
+      null,
+      2
+    )}\n`,
+    "utf-8"
+  );
+
+  return {
+    root,
+    adapterPath,
+    statePath,
+    approvalStorePath: join(isolationDir, "approvals.json"),
+    eventLogPath: join(isolationDir, "events.jsonl"),
+    telegramRuntimeDir: join(isolationDir, "telegram-runtime"),
+    projectId,
+    moduleAbs,
+  };
+}
+
+async function scenarioWaitingHumanStagnationWithUnresolvedMixedMarkersPreservesAllUnresolved(): Promise<void> {
+  const fixture = buildStagnationWithUnresolvedMixedMarkersFixture("waiting-human-mixed-unresolved");
+  // 의도적으로 AUTODEV_TRUSTED_JAVA_HOME을 지정하지 않는다 — 실행 환경 결함이 실제로
+  // 해소되지 않은 상태를 그대로 유지한다(§ 이 시나리오의 핵심 전제).
+  const env = buildChildEnv({
+    AUTOMATION_DRY_RUN: undefined,
+    AUTODEV_PRODUCTION_RUNTIME: undefined,
+    AUTODEV_TELEGRAM_BOT_TOKEN: undefined,
+    AUTODEV_TELEGRAM_CHAT_ID: undefined,
+    AUTODEV_APPROVAL_STORE_PATH: fixture.approvalStorePath,
+    AUTODEV_EVENT_LOG_PATH: fixture.eventLogPath,
+    AUTODEV_TELEGRAM_CONTROLLER_RUNTIME_DIR: fixture.telegramRuntimeDir,
+    AUTODEV_TRUSTED_JAVA_HOME: undefined,
+    JAVA_HOME: undefined,
+  });
+
+  try {
+    // 남은 marker(ENV/CONFIG/UNKNOWN) 기준으로 classifyWaitingHumanReason()이 이제 genuine으로
+    // 판정하므로(§ 위 주석), run.ts가 controller owner인 동안 Telegram 승인 대기로 무기한
+    // 진입한다 — 그 로그가 찍히는 즉시 child를 종료한다(§ runOneShotAndCaptureUntilMarker
+    // 상단 주석과 동일한 패턴, 그 시점에 이미 state.json durable write는 완료돼 있다).
+    const { stdout, matchedMarker, timedOut } = await runOneShotAndCaptureUntilMarker(fixture, env, [
+      "WAITING_HUMAN — Telegram 승인 대기를 위해 controller를 유지한 채",
+    ]);
+    check("E2E-3) timeout 없이 genuine WAITING_HUMAN 대기 진입 로그를 실제로 관측함(남은 marker 기준으로 재판정됨)", !timedOut && matchedMarker !== undefined);
+    check(
+      "E2E-3) 기술적 자동복구 대상 marker(STAGNATION_DETECTED)가 실제로 재검사되어 제거됨",
+      stdout.includes("기술적 WAITING_HUMAN을 재검사했습니다") || stdout.includes("STAGNATION_DETECTED")
+    );
+    check(
+      "E2E-3) '남은 사유가 없습니다' 로그는 찍히지 않음(ENV/CONFIG/UNKNOWN marker가 여전히 남아있으므로 완전 해소가 아님)",
+      !stdout.includes("남은 사유가 없습니다")
+    );
+    check("E2E-3) 실제 Claude Developer 호출을 시사하는 로그가 전혀 없음(claude CLI가 실제로 spawn되지 않음)", !stdout.includes("[claude-developer]") && !stdout.includes("claude 실행"));
+
+    const finalState = JSON.parse(readFileSync(fixture.statePath, "utf-8")) as CoreState;
+    check(
+      "E2E-3) STAGNATION_DETECTED marker는 더 이상 남아있지 않음(독립적으로 제거됨)",
+      !finalState.deferredHumanTasks.some((t) => t.startsWith("STAGNATION_DETECTED("))
+    );
+    check(
+      "E2E-3) 아직 해소되지 않은 ENV marker는 절대 삭제되지 않고 그대로 보존됨",
+      finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"))
+    );
+    check(
+      "E2E-3) 아직 해소되지 않은 CONFIG marker는 절대 삭제되지 않고 그대로 보존됨",
+      finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_CONFIGURATION_ERROR:"))
+    );
+    check(
+      "E2E-3) 이 저장소가 전혀 모르는 UNKNOWN 형식 marker는 절대 삭제되지 않고 그대로 보존됨(CRITICAL defect 수정의 핵심 검증)",
+      finalState.deferredHumanTasks.includes(UNKNOWN_FORMAT_MARKER)
+    );
+    check("E2E-3) 남은 marker가 3건 그대로 보존됨(ENV/CONFIG/UNKNOWN, STAGNATION만 제거)", finalState.deferredHumanTasks.length === 3);
+    check(
+      "E2E-3) 남은 marker가 있으므로 status가 READY로 강제전환되지 않고 WAITING_HUMAN을 유지함(CRITICAL defect 수정의 핵심 검증)",
+      (finalState.status as unknown as string) === "WAITING_HUMAN"
+    );
+    check("E2E-3) reviewCycle이 임의로 초기화되지 않음(기존 작업물 보존)", finalState.reviewCycle === 3);
+    check("E2E-3) completedTasks에 이 task가 억지로 추가되지 않음(자동 승인 아님)", !finalState.completedTasks.includes(FIXTURE_TASK_ID));
+  } finally {
+    cleanupSharedRuntimeArtifacts(fixture);
+  }
+}
+
 async function main(): Promise<void> {
   try {
     await scenarioMixedMarkersFullyResolveViaRealEntrypointWithoutRealDeveloperCall();
     await scenarioConfigMarkerReconciledViaRealEntrypointWithoutRealDeveloperCall();
+    await scenarioWaitingHumanStagnationWithUnresolvedMixedMarkersPreservesAllUnresolved();
   } finally {
     for (const dir of tempDirs) {
       try {
