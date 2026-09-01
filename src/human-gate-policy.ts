@@ -244,6 +244,96 @@ export function isTechnicalAutoRecoverableWaitingHuman(state: ClassifiableState)
   return classifyWaitingHumanReason(state) === "TECHNICAL_AUTO_RECOVERABLE";
 }
 
+// ---------------------------------------------------------------------------
+// Durable Technical Blocker Recovery — BLOCKED 상태 일반화(2026-09-01, generic defect,
+// JARVIS Task 5.3 실측) — isTechnicalAutoRecoverableWaitingHuman()은 정확히
+// state.status==="WAITING_HUMAN"일 때만 호출되도록 autodev.ts가 이미 강제하고 있었다(§ 그
+// 호출부 주석). 그런데 status==="BLOCKED"에서도 STAGNATION_DETECTED_MARKER_PREFIX/
+// REVIEW_CYCLE_EXHAUSTED_REASON/DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX/기술적
+// CLAUDE_STRUCTURAL_FAILURE처럼 이 파일이 이미 "그 자체로는 사람 판단이 필요하지 않다"고
+// 판정하는 marker가 deferredHumanTasks에 남을 수 있다 — status 문자열이 WAITING_HUMAN이
+// 아니라는 이유만으로 그 marker가 자동복구 자격 자체를 잃는 것은 taxonomy(무엇이 기술적
+// 자동복구 대상인가)보다 status 이름을 우선시하는 것이다(§ 요구사항 B).
+//
+// 아래 두 함수는 classifyWaitingHumanReason()이 이미 배열 전체 단위로 검사하는 것과 정확히
+// 같은 판정을 marker 한 개 단위로 재사용한다 — 새 taxonomy가 아니라 기존 판정의 추출이다.
+// reconcileKnownTechnicalDeferredMarkers()는 classifyWaitingHumanReason()과 달리 "genuine
+// marker가 하나라도 있으면 전체를 건드리지 않는다"는 전체-배열 판정을 쓰지 않는다 — 각
+// marker를 독립적으로 판정한다(§ 요구사항 5 "각 marker는 자기 정책으로만 처리한다",
+// required-test-preflight.ts의 ENV marker 재검사와 동일한 원칙). isKnownGenuineDeferredMarker()
+// 와 isKnownRetryEligibleTechnicalMarker()는 서로 겹치지 않는 배타적 prefix 집합이므로(§
+// 아래 두 함수, 그리고 human-gate-policy-tests.ts의 상호배타성 회귀 테스트), genuine
+// marker는 이 함수가 무엇을 하든 애초에 isKnownRetryEligibleTechnicalMarker에 매칭될 수
+// 없어 절대 제거되지 않는다(요구사항 E) — 그래서 genuine marker가 섞여 있어도 STAGNATION_
+// DETECTED 등 기술적 marker만은 독립적으로 제거될 수 있다: genuine marker는 남아있으므로
+// 호출부가 deferredHumanTasks를 완전히 비우지 못해 READY로 강제전환되지 않는다(요구사항
+// C/D — "자동 READY 금지"는 이 함수가 아니라 호출부의 "완전히 비었을 때만 READY" 규칙이
+// 보장한다).
+//
+// "기술적 자동복구"의 기존 의미는 "이 marker가 가리키는 구체적 실패 조건이 지금 실제로
+// 해소됐는지"를 별도로 검증하지 않는다(§ autodev.ts의 기존 WAITING_HUMAN 전용 호출부 주석 —
+// "자동 복구는 task를 완료로 선언하지 않는다, decideNextAction()이 이 task를 다시 선택해
+// Developer/Reviewer/Required Test/Security Gate를 처음부터 다시 통과시키므로 실제 원인이
+// 아직 해결되지 않았다면 그대로 다시 실패해 관측 가능한 상태로 남는다") — marker를 제거하고
+// 다시 시도하게 하는 것 자체가 "재평가"이며, 재현되면 orchestrator.ts 자신의 stagnation
+// tracker가 다시 감지해 새 STAGNATION_DETECTED marker를 남긴다(무제한 반복은
+// continuous-runner.ts의 MAX_TECHNICAL_RECOVERY_ATTEMPTS가 상한을 둔다). 이 정책을 그대로
+// 재사용할 뿐 새 검증 로직을 만들지 않는다 — STAGNATION_DETECTED marker 문자열 자체가
+// 실패 fingerprint/어떤 requiredTest였는지를 구조적으로 담지 않으므로(§ 위
+// STAGNATION_DETECTED_MARKER_PREFIX 문서 — "reviewCycle=N에서... 반복됨"만 기록), 이 형식만
+// 으로 "동일 조건이 재현되는지"를 fs 판정으로 재확인할 방법이 애초에 없다(REQUIRED_TEST_
+// EXECUTION_ENVIRONMENT_ERROR marker와 다른 점 — 그 marker는 task/requiredTest/kind/cwd/
+// resolvedPath를 전부 구조적으로 담고 있어 재검사가 가능하다).
+/** genuine 판정(§ classifyWaitingHumanReason의 hasGenuineMarker)을 marker 한 개 단위로
+ *  재사용 가능하게 노출한다 — 새 판정을 만들지 않는다. isKnownRetryEligibleTechnicalMarker와의
+ *  상호배타성을 회귀 테스트로 직접 검증할 수 있도록 export한다. */
+export function isKnownGenuineDeferredMarker(marker: string): boolean {
+  return GENUINE_MARKER_PREFIXES.some((prefix) => marker.startsWith(prefix)) || isCheckpointBlockedMarker(marker) || isGenuineClaudeStructuralFailureMarker(marker);
+}
+
+export function isKnownRetryEligibleTechnicalMarker(marker: string): boolean {
+  return (
+    marker.startsWith(`${REVIEW_CYCLE_EXHAUSTED_REASON}:`) ||
+    marker.startsWith(DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX) ||
+    marker.startsWith(STAGNATION_DETECTED_MARKER_PREFIX) ||
+    isTechnicalClaudeStructuralFailureMarker(marker)
+  );
+}
+
+export interface KnownTechnicalMarkerReconciliation {
+  /** 원본 deferredHumanTasks에서, 이 파일이 이미 TECHNICAL_AUTO_RECOVERABLE로 분류하는
+   *  marker(REVIEW_CYCLE_EXHAUSTED_REASON/DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX/
+   *  STAGNATION_DETECTED_MARKER_PREFIX/기술적 CLAUDE_STRUCTURAL_FAILURE)만 제외한 새 배열 —
+   *  genuine marker가 함께 있어도 이 기술적 marker만 독립적으로 제거된다(genuine marker
+   *  자체는 이 형식에 매칭될 수 없으므로 절대 제거되지 않는다, § 위 상호배타성 설명). 이
+   *  형식의 marker가 하나도 없으면 원본과 참조가 동일하다(no-op). ENV/CONFIG 등 이 파일이
+   *  전혀 모르는 형식의 marker는 절대 건드리지 않는다 — 각자의 기존
+   *  reconcileStaleRequiredTest*() 경로에 맡긴다. */
+  remainingDeferredHumanTasks: readonly string[];
+  /** 이번에 제거된 marker 원본 문자열(로그/이벤트 기록용). */
+  resolvedMarkers: string[];
+}
+
+/** state.humanFinalReview가 없을 때만 호출한다(§ 다른 reconcile 계열과 동일한 전제 — 그
+ *  gate는 이 함수가 전혀 모르는 별도의, 사람의 명시적 승인이 필요한 상태다). Developer/
+ *  Claude/GPT 어떤 프로세스도 spawn하지 않는다 — 순수 문자열 판정만 수행한다. 이 함수는
+ *  "이 task를 완료로 선언"하지 않는다 — 제거된 marker가 있어도 호출부가 여전히
+ *  decideNextAction()으로 다음 단계를 정상적으로 결정해야 한다. genuine marker가 함께
+ *  있어도 그 marker는 절대 건드리지 않고 남겨두므로(§ 위 상호배타성), 호출부는
+ *  remainingDeferredHumanTasks가 완전히 비었을 때만 READY로 전환해야 한다 — genuine
+ *  marker가 남아있는 한 항상 non-empty이므로 자동으로 그 규칙을 지킨다. */
+export function reconcileKnownTechnicalDeferredMarkers(deferredHumanTasks: readonly string[]): KnownTechnicalMarkerReconciliation {
+  if (deferredHumanTasks.length === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+  const resolvedMarkers = deferredHumanTasks.filter(isKnownRetryEligibleTechnicalMarker);
+  if (resolvedMarkers.length === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+  const remainingDeferredHumanTasks = deferredHumanTasks.filter((m) => !isKnownRetryEligibleTechnicalMarker(m));
+  return { remainingDeferredHumanTasks, resolvedMarkers };
+}
+
 const UNEXPECTED_FILES_MARKER = " — unexpected: ";
 
 /** autodev.ts가 CHECKPOINT_BLOCKED 마커에 붙여 저장한 `checkpoint.unexpectedFiles` 목록을

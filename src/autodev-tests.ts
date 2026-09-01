@@ -1755,13 +1755,19 @@ async function scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnviron
 
 // Mixed-Marker Recovery 수정(2026-09-01, generic defect — § required-test-preflight.ts
 // reconcileStaleRequiredTestExecutionEnvironmentTasks 상단 주석) — deferredHumanTasks에
-// REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR와 무관한 다른 마커(예: STAGNATION_DETECTED)가
-// 함께 있어도, 환경 결함이 실제로 해소됐다면 그 marker만 제거돼야 한다. 다만 무관한 marker가
-// 남아 있으므로 remainingDeferredHumanTasks가 비지 않고, 그 결과 상태는 여전히 BLOCKED로
-// 남으며 decideNextAction()이 STOP을 반환한다 — 이 시나리오가 runAutodevOnce() 전체
-// 파이프라인에서 (1) 무관한 marker 때문에 env 재검사 자체가 스킵되지 않고, (2) env marker만
-// 제거되며, (3) 무관한 marker는 보존되고, (4) status가 READY로 강제전환되지 않으며, (5)
-// Developer가 단 한 번도 호출되지 않는다는 것을 함께 증명한다.
+// REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR와 무관한 genuine marker(예: CHECKPOINT_BLOCKED —
+// § human-gate-policy.ts isCheckpointBlockedMarker, 이제 전부 genuine)가 함께 있어도, 환경
+// 결함이 실제로 해소됐다면 그 marker만 제거돼야 한다. genuine marker는 어떤 기술적
+// reconciliation으로도 자동 제거/승인되지 않으므로 remainingDeferredHumanTasks가 비지 않고,
+// 그 결과 상태는 여전히 BLOCKED로 남으며 decideNextAction()이 STOP을 반환한다 — 이
+// 시나리오가 runAutodevOnce() 전체 파이프라인에서 (1) genuine marker 때문에 env 재검사
+// 자체가 스킵되지 않고, (2) env marker만 제거되며, (3) genuine marker는 보존되고, (4)
+// status가 READY로 강제전환되지 않으며, (5) Developer가 단 한 번도 호출되지 않는다는 것을
+// 함께 증명한다. (STAGNATION_DETECTED는 § Durable Technical Blocker Recovery 수정 이후
+// BLOCKED 상태에서도 자체적으로 기술적 자동복구 대상이 됐으므로, "genuine marker와 섞여도
+// 자동 제거되지 않는다"를 증명하려면 실제 genuine marker를 써야 한다 — 아래
+// scenarioRunAutodevOnceBlockedStagnationAloneFullyRecoversAndCallsDeveloperOnce()가
+// STAGNATION_DETECTED 자체의 새 복구 경로를 별도로 검증한다.)
 async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker(): Promise<void> {
   const repo = makeTempGitRepo();
   const registry: TaskDefinition[] = [
@@ -1776,13 +1782,13 @@ async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker()
       prohibitedOperations: [],
     },
   ];
-  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const genuineMarker = "CHECKPOINT_BLOCKED(G3): secret detected in staged files — human review required";
   const envMarker = `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=G3 requiredTest=fixture-check kind=CWD_NOT_FOUND cwd=sub resolvedPath=${join(repo, "sub")}`;
   const statePath = makeTempStateFile(repo, {
     status: "BLOCKED",
     completedTasks: [],
     // 순서 자체도 보존되어야 한다 — 무관한 marker가 먼저 와도, 뒤에 와도 결과는 같아야 한다.
-    deferredHumanTasks: [stagnationMarker, envMarker],
+    deferredHumanTasks: [genuineMarker, envMarker],
   });
   const manifest: ProjectManifest = {
     projectId: "mixed-marker-reconcile-project",
@@ -1801,8 +1807,8 @@ async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker()
     },
   };
 
-  // 환경 결함(cwd 디렉터리 부재)은 실제로 해소됐다 — 그러나 STAGNATION_DETECTED는 이 재검사와
-  // 무관하므로 그대로 남아있어야 한다.
+  // 환경 결함(cwd 디렉터리 부재)은 실제로 해소됐다 — 그러나 genuine marker는 어떤 기술적
+  // reconciliation으로도 자동 해제되지 않고 그대로 남아있어야 한다.
   const subDir = join(repo, "sub");
   if (!existsSync(subDir)) mkdirSync(subDir, { recursive: true });
 
@@ -1814,7 +1820,7 @@ async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker()
 
   const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
 
-  check("Mixed-Marker) 무관한 STAGNATION_DETECTED가 있어도 env 재검사가 스킵되지 않고 실행됨(전체 파이프라인)", result.outcome === "STOPPED");
+  check("Mixed-Marker) genuine marker가 있어도 env 재검사가 스킵되지 않고 실행됨(전체 파이프라인)", result.outcome === "STOPPED");
   check("Mixed-Marker) Developer/Claude가 단 한 번도 호출되지 않음(불필요한 API/CLI 호출 0)", claudeCalls === 0);
 
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
@@ -1823,13 +1829,193 @@ async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker()
     !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"))
   );
   check(
-    "Mixed-Marker) 무관한 STAGNATION_DETECTED marker는 그대로 보존됨(임의 삭제 없음)",
-    finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === stagnationMarker
+    "Mixed-Marker) genuine marker는 그대로 보존됨(자동 제거/승인 없음)",
+    finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === genuineMarker
   );
   check(
-    "Mixed-Marker) 무관한 marker가 남아 있으므로 status가 READY로 강제전환되지 않고 BLOCKED 유지",
+    "Mixed-Marker) genuine marker가 남아 있으므로 status가 READY로 강제전환되지 않고 BLOCKED 유지",
     (finalState.status as unknown as string) === "BLOCKED"
   );
+}
+
+// ---------------------------------------------------------------------------
+// Durable Technical Blocker Recovery — BLOCKED 상태 일반화(2026-09-01, generic defect —
+// § human-gate-policy.ts reconcileKnownTechnicalDeferredMarkers 상단 주석). generic
+// fixture만 사용한다(JARVIS/Task 5.3 이름 미사용).
+// ---------------------------------------------------------------------------
+
+// Case A — BLOCKED + STAGNATION_DETECTED 단독(다른 blocker 없음) → 기술적 자동복구가
+// 진행되어 완전히 비워지고 READY로 전환된 뒤, decideNextAction()이 이 task를 정상적으로
+// 다시 선택해 Developer가 실제로 (정당하게) 재호출된다 — "recovery = 재시도 허용"이므로
+// 이 경우 Developer 호출은 낭비가 아니라 이 정책 자체의 의도된 동작이다(§ 요구사항 10).
+async function scenarioRunAutodevOnceBlockedStagnationAloneFullyRecoversAndCallsDeveloperOnce(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const statePath = makeTempStateFile(repo, {
+    status: "BLOCKED",
+    reviewCycle: 2,
+    deferredHumanTasks: [stagnationMarker],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // 다음 task = P1.2
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-recovered.txt", "recovered\n");
+    return {
+      success: true,
+      summary: "테스트: 재시도 성공",
+      changedFiles: ["proj/marker-recovered.txt"],
+      tests: [{ name: "fixture-check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Durable-Technical/A) BLOCKED(STAGNATION_DETECTED 단독)가 재평가되어 checkpoint까지 도달함", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("Durable-Technical/A) Developer가 정확히 1회 호출됨(재시도가 실제로 일어남)", claudeCalls === 1);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("Durable-Technical/A) 최종 status가 BLOCKED가 아님", (finalState.status as unknown as string) !== "BLOCKED");
+  check("Durable-Technical/A) deferredHumanTasks에서 STAGNATION_DETECTED marker가 제거됨", !finalState.deferredHumanTasks.some((t) => t.startsWith("STAGNATION_DETECTED(")));
+  check("Durable-Technical/A) task가 completedTasks에 정상적으로 기록됨(정당한 진행, 억지 승인 아님)", finalState.completedTasks.includes("P1.2"));
+}
+
+// Case B — BLOCKED + STAGNATION_DETECTED 단독 상태에서 재시도를 허용했지만, 동일한 required
+// test 실패가 재시도에서도 여전히 재현되는 경우: marker를 지우고 재시도를 "허용"하는 것이
+// "완료로 승인"하는 것과 다르다는 것을 증명한다 — task는 completedTasks에 들어가지 않고,
+// 기존(이번 수정이 전혀 건드리지 않은) orchestrator.ts deterministic-repeat-exhaustion
+// 경로(blockOnDurableWaitRetryExhausted)를 통해 다시 기술적 BLOCKED로 정확히 수렴한다 —
+// 무한 재시도도, 거짓 완료도 없다(§ 요구사항 8-B/8-H).
+async function scenarioRunAutodevOnceBlockedStagnationStillFailingCorrectlyReBlocksAfterRetry(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const statePath = makeTempStateFile(repo, { status: "BLOCKED", deferredHumanTasks: [stagnationMarker] });
+  const manifest = buildPlannerManifest(repo, statePath); // 다음 task = P1.2
+
+  let claudeCallCount = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCallCount += 1;
+    return {
+      success: true,
+      summary: "테스트: required test 항상 동일하게 실패(재시도해도 여전히 동일 조건)",
+      changedFiles: [],
+      tests: [{ name: "proj:check", pass: false }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({
+    manifest,
+    orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer(), sleep: async () => {}, now: () => Date.now() },
+  });
+
+  check("Durable-Technical/B) BLOCKED를 벗어나 실제로 재시도가 일어남(Developer 호출 발생)", claudeCallCount > 0);
+  check("Durable-Technical/B) 동일 실패가 계속되면 checkpoint까지 도달하지 않음(거짓 완료 없음)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("Durable-Technical/B) task가 completedTasks에 없음", !finalState.completedTasks.includes("P1.2"));
+  check(
+    "Durable-Technical/B) 무한 재시도로 새지 않고 다시 기술적 BLOCKED로 수렴함(genuine WAITING_HUMAN으로 조기 승격되지 않는 기존 정책 그대로)",
+    (finalState.status as unknown as string) === "BLOCKED"
+  );
+}
+
+// Case C — BLOCKED + STAGNATION_DETECTED + 실제로 해결 가능한 REQUIRED_TEST_EXECUTION_
+// ENVIRONMENT_ERROR marker가 함께 있는 경우: 두 marker가 각자의 독립적인 reconciliation
+// 경로로 모두 해소되어 최종적으로 READY 전환 + Developer 정상 호출까지 이어진다(§ 요구사항
+// 5 — "각 marker는 자기 정책으로만 처리한다"가 결과적으로 둘 다 해소될 수도 있음을 보여준다).
+async function scenarioRunAutodevOnceBlockedStagnationAndResolvedEnvMarkerBothClearToReady(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const registry: TaskDefinition[] = [
+    {
+      id: "G4",
+      phase: 1,
+      taskNumber: 1,
+      title: "fixture task",
+      prompt: "fixture",
+      requiredTests: [{ name: "fixture-check", command: "node", args: ["--version"], cwd: "sub" }],
+      allowedPathPrefixes: ["proj/"],
+      prohibitedOperations: [],
+    },
+  ];
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const envMarker = `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=G4 requiredTest=fixture-check kind=CWD_NOT_FOUND cwd=sub resolvedPath=${join(repo, "sub")}`;
+  const statePath = makeTempStateFile(repo, {
+    status: "BLOCKED",
+    completedTasks: [],
+    deferredHumanTasks: [stagnationMarker, envMarker],
+  });
+  const manifest: ProjectManifest = {
+    projectId: "mixed-marker-both-resolve-project",
+    projectName: "Mixed Marker Both Resolve Project",
+    targetProjectRoot: repo,
+    statePath,
+    taskRegistry: registry,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests(registry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))),
+      commandCwdAliases: { sub: "sub" },
+    },
+  };
+
+  const subDir = join(repo, "sub");
+  if (!existsSync(subDir)) mkdirSync(subDir, { recursive: true });
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-g4.txt", "marker\n");
+    return { success: true, summary: "테스트: 두 marker 모두 해소된 뒤 정상 진행", changedFiles: ["proj/marker-g4.txt"], tests: [{ name: "fixture-check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Durable-Technical/C) 두 marker 모두 해소되어 checkpoint까지 도달함", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("Durable-Technical/C) Developer가 정확히 1회 호출됨", claudeCalls === 1);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("Durable-Technical/C) deferredHumanTasks가 완전히 비워짐(두 marker 모두 제거)", finalState.deferredHumanTasks.length === 0);
+  check("Durable-Technical/C) 최종 status가 BLOCKED가 아님", (finalState.status as unknown as string) !== "BLOCKED");
+}
+
+// Case E — WAITING_HUMAN + STAGNATION_DETECTED 단독(기존 동작 회귀 없음 확인). 이번 수정은
+// status==="BLOCKED"에만 새 블록을 추가했을 뿐 기존 WAITING_HUMAN 전용
+// isTechnicalAutoRecoverableWaitingHuman 블록은 전혀 건드리지 않았다 — 이 시나리오가 그
+// 기존 동작이 그대로임을 직접 증명한다.
+async function scenarioRunAutodevOnceWaitingHumanStagnationAloneRegressionUnchanged(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const statePath = makeTempStateFile(repo, {
+    status: "WAITING_HUMAN",
+    deferredHumanTasks: [stagnationMarker],
+  });
+  const manifest = buildPlannerManifest(repo, statePath); // 다음 task = P1.2
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/marker-waiting-human.txt", "recovered\n");
+    return {
+      success: true,
+      summary: "테스트: WAITING_HUMAN 기존 자동복구 회귀 없음",
+      changedFiles: ["proj/marker-waiting-human.txt"],
+      tests: [{ name: "fixture-check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Durable-Technical/E) WAITING_HUMAN+STAGNATION_DETECTED 기존 자동복구 회귀 없음(checkpoint까지 도달)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("Durable-Technical/E) Developer가 정확히 1회 호출됨(기존과 동일)", claudeCalls === 1);
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("Durable-Technical/E) task가 completedTasks에 기록됨(기존과 동일)", finalState.completedTasks.includes("P1.2"));
 }
 
 // Positive-Provenance-Only Auto-Delete Policy(2026-08-31, JARVIS Task 5.3 Canary 사실검증
@@ -3136,6 +3322,10 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment();
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnvironmentBlocked();
     await scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker();
+    await scenarioRunAutodevOnceBlockedStagnationAloneFullyRecoversAndCallsDeveloperOnce();
+    await scenarioRunAutodevOnceBlockedStagnationStillFailingCorrectlyReBlocksAfterRetry();
+    await scenarioRunAutodevOnceBlockedStagnationAndResolvedEnvMarkerBothClearToReady();
+    await scenarioRunAutodevOnceWaitingHumanStagnationAloneRegressionUnchanged();
     await scenarioRunAutodevOnceNeverAutoDeletesScopeViolationLeftoverFiles();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceStopsImmediatelyOnScopeViolationWaitingHuman();

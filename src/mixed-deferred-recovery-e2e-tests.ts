@@ -9,15 +9,19 @@ import { resolveUsageLedgerFilePath, RUNTIME_USAGE_LEDGER_DIR } from "./usage-le
 
 // Mixed-Marker Recovery Defect — 실제 production entrypoint(dist/run.js) child-process E2E
 // (2026-09-01, generic defect — § required-test-preflight.ts
-// reconcileStaleRequiredTestExecutionEnvironmentTasks 상단 주석, § autodev-tests.ts
-// scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker의 함수 레벨 회귀와
+// reconcileStaleRequiredTestExecutionEnvironmentTasks 상단 주석, § human-gate-policy.ts
+// reconcileKnownTechnicalDeferredMarkers 상단 주석, § autodev-tests.ts의 함수 레벨 회귀와
 // 동일한 시나리오를 실제 컴파일된 run.js child process로도 증명한다).
 //
 // 이 파일은 어떤 특정 프로젝트도 언급하지 않는다 — 전부 generic fixture(taskId "T1" 등)다.
-// 실제 Claude/GPT/Telegram API를 전혀 호출하지 않는다: 이 시나리오는 항상 status="BLOCKED"로
-// 남아야 하므로(무관한 STAGNATION_DETECTED marker가 남아있다) decideNextAction()이
-// 곧바로 STOP을 반환하고 Developer 호출 지점 자체에 도달하지 않는다 — 그래서 실제 `claude`
-// CLI/네트워크 credential 없이도 안전하게 실제 production entrypoint를 검증할 수 있다.
+// 실제 Claude/GPT/Telegram API를 전혀 호출하지 않는다: Durable Technical Blocker Recovery
+// 수정(2026-09-01) 이후로는 이 fixture의 STAGNATION_DETECTED marker도 BLOCKED 상태에서
+// env marker와 함께 독립적으로 해소되어 decideNextAction()이 이 task를 실제로 재선택하지만,
+// 이 generic fixture는 gradlew requiredTest에 대응하는 allowedCommands 항목을 의도적으로
+// 비워뒀으므로 Developer 호출 직전의 별도 기존 기술적 게이트(execution-contract.ts
+// EXECUTION_CONTRACT_MISMATCH)가 먼저 걸려 실제 Developer는 호출되지 않는다 — 그래서 실제
+// `claude` CLI/네트워크 credential 없이도 안전하게 실제 production entrypoint의 전체
+// reconciliation 체인을 검증할 수 있다.
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -243,15 +247,24 @@ function runOneShotToCompletion(fixture: Fixture, env: NodeJS.ProcessEnv, timeou
 }
 
 // ---------------------------------------------------------------------------
-// E2E) BLOCKED + mixed deferredHumanTasks(무관한 STAGNATION_DETECTED + 실제로는 이미 해소된
+// E2E) BLOCKED + mixed deferredHumanTasks(STAGNATION_DETECTED + 실제로는 이미 해소된
 //      REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR) 상태에서 실제 `node dist/run.js` one-shot을
-//      실행했을 때: (1) env marker 재검사가 무관한 marker 때문에 스킵되지 않고 실제로
-//      수행되며, (2) 해소된 env marker만 제거되고, (3) 무관한 marker는 그대로 보존되며,
-//      (4) status가 READY로 강제전환되지 않고 BLOCKED로 남고, (5) Developer가 단 한 번도
-//      호출되지 않는다(항상 이 프로세스는 API 호출 없이 안전하게 종료된다)는 것을 실제
-//      컴파일된 production entrypoint로 증명한다.
+//      실행했을 때: (1) env marker 재검사가 다른 marker 때문에 스킵되지 않고 실제로
+//      수행되어 제거되고, (2) Durable Technical Blocker Recovery 수정(2026-09-01) 이후로는
+//      STAGNATION_DETECTED도 genuine marker가 전혀 없으므로 독립적으로 함께 제거되어
+//      deferredHumanTasks가 완전히 비고 READY로 전환되며, (3) decideNextAction()이 이 task를
+//      정상적으로 다시 선택하지만, 이 generic fixture는 gradlew requiredTest에 대응하는
+//      allowedCommands 항목을 의도적으로 비워뒀으므로(§ execution-contract.ts) Developer를
+//      호출하기 직전의 별도 기존 기술적 게이트(EXECUTION_CONTRACT_MISMATCH)가 먼저 걸려
+//      실제 Developer/Claude CLI는 단 한 번도 호출되지 않고 안전하게 다시 BLOCKED로
+//      수렴한다는 것을, 실제 컴파일된 production entrypoint로 증명한다. (STAGNATION_DETECTED
+//      단독으로 완전히 성공 checkpoint까지 도달하는 경로는 autodev-tests.ts
+//      scenarioRunAutodevOnceBlockedStagnationAloneFullyRecoversAndCallsDeveloperOnce가
+//      실제 Claude CLI 호출 없이 fake claudeRunner로 이미 검증한다 — 이 E2E는 실제 child
+//      process 수준에서 "재현혼합 marker 재검사가 스킵되지 않는다 + 실제 Developer 호출은
+//      없다"만 안전하게 함께 증명한다.)
 // ---------------------------------------------------------------------------
-async function scenarioMixedMarkersResolveOnlyEnvMarkerViaRealEntrypoint(): Promise<void> {
+async function scenarioMixedMarkersFullyResolveViaRealEntrypointWithoutRealDeveloperCall(): Promise<void> {
   const fixture = buildFixture("mixed-marker-recovery");
   const fakeJdkHome = makeFakeTrustedJdk();
   const env = buildChildEnv({
@@ -272,27 +285,33 @@ async function scenarioMixedMarkersResolveOnlyEnvMarkerViaRealEntrypoint(): Prom
   try {
     const { stdout, exitCode } = await runOneShotToCompletion(fixture, env);
     check("E2E) 실제 child process가 timeout 없이 정상 종료함", exitCode !== null);
-    check("E2E) STOP(BLOCKED) 로그를 실제로 출력함 — Developer 호출 경로에 진입하지 않음", stdout.includes("이미 BLOCKED 상태"));
-    check("E2E) STOP 로그가 '근본 원인이 해소되지 않는 한'이라는 기존 문구를 그대로 유지함(회귀 없음)", stdout.includes("근본 원인이 해소되지 않는 한"));
     check(
-      "E2E) env marker 부분 해소 로그를 실제로 출력함(무관한 marker 때문에 스킵되지 않음)",
+      "E2E) env marker 재검사가 실제로 실행되어 제거됨(무관한 marker 때문에 스킵되지 않음)",
       stdout.includes("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR marker") && stdout.includes("해당 marker만 제거합니다")
     );
-    check("E2E) '남은 사유가 없습니다' 로그(전체 해소 시에만 찍힘)는 출력되지 않음 — 부분 해소이므로 READY 전환 로그가 없어야 함", !stdout.includes("남은 사유가 없습니다"));
+    check(
+      "E2E) STAGNATION_DETECTED도 BLOCKED 상태에서 독립적으로 재검사되어 제거됨(이번 수정의 핵심)",
+      stdout.includes("기술적 자동복구 대상 marker") && stdout.includes("STAGNATION_DETECTED")
+    );
+    check("E2E) 두 marker 모두 해소되어 '남은 사유가 없습니다' 로그(완전 해소 시에만 찍힘)를 실제로 출력함", stdout.includes("남은 사유가 없습니다"));
+    check(
+      "E2E) 그 다음 decideNextAction()이 이 task를 실제로 재선택하지만, Developer 호출 직전 기존 EXECUTION_CONTRACT_MISMATCH 게이트가 대신 걸려 Developer를 호출하지 않음",
+      stdout.includes("EXECUTION_CONTRACT_MISMATCH") && stdout.includes("Developer를 부르지 않고")
+    );
+    check("E2E) 실제 Claude Developer 호출을 시사하는 로그가 전혀 없음(claude CLI가 실제로 spawn되지 않음)", !stdout.includes("[claude-developer]") && !stdout.includes("claude 실행"));
 
     const finalState = JSON.parse(readFileSync(fixture.statePath, "utf-8")) as CoreState;
     check(
-      "E2E) 실행 환경 결함(env marker)만 실제로 제거됨",
-      !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"))
+      "E2E) 원래의 env marker/STAGNATION_DETECTED marker는 더 이상 남아있지 않음(둘 다 제거됨)",
+      !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:") || t.startsWith("STAGNATION_DETECTED("))
     );
     check(
-      "E2E) 무관한 STAGNATION_DETECTED marker는 실제 파일에서도 그대로 보존됨(임의 삭제 없음)",
-      finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === STAGNATION_MARKER
+      "E2E) 최종 status가 다시 BLOCKED(EXECUTION_CONTRACT_MISMATCH라는 별개의 기존 기술적 사유로) — READY로 남아있지 않음",
+      (finalState.status as unknown as string) === "BLOCKED"
     );
-    check("E2E) 최종 status가 여전히 BLOCKED(READY로 강제전환되지 않음)", (finalState.status as unknown as string) === "BLOCKED");
     check("E2E) reviewCycle이 임의로 초기화되지 않음(기존 작업물 보존)", finalState.reviewCycle === 3);
     check(
-      "E2E) lastClaudeResult(이전 성공 결과)가 임의로 삭제되지 않음(기존 작업물 보존)",
+      "E2E) lastClaudeResult(이전 성공 결과)가 임의로 삭제되지 않음(기존 작업물 보존, Developer가 실제로 재호출되지 않았으므로 갱신되지도 않음)",
       finalState.lastClaudeResult !== null && finalState.lastClaudeResult.success === true
     );
     check("E2E) completedTasks에 이 task가 억지로 추가되지 않음(자동 승인 아님)", !finalState.completedTasks.includes(FIXTURE_TASK_ID));
@@ -304,7 +323,7 @@ async function scenarioMixedMarkersResolveOnlyEnvMarkerViaRealEntrypoint(): Prom
 
 async function main(): Promise<void> {
   try {
-    await scenarioMixedMarkersResolveOnlyEnvMarkerViaRealEntrypoint();
+    await scenarioMixedMarkersFullyResolveViaRealEntrypointWithoutRealDeveloperCall();
   } finally {
     for (const dir of tempDirs) {
       try {

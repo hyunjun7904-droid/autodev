@@ -1,7 +1,15 @@
-import { classifyWaitingHumanReason, isTechnicalAutoRecoverableWaitingHuman, extractCheckpointScopeViolationFiles } from "./human-gate-policy";
+import {
+  classifyWaitingHumanReason,
+  isTechnicalAutoRecoverableWaitingHuman,
+  extractCheckpointScopeViolationFiles,
+  reconcileKnownTechnicalDeferredMarkers,
+  isKnownGenuineDeferredMarker,
+  isKnownRetryEligibleTechnicalMarker,
+} from "./human-gate-policy";
 import { CHECKPOINT_SCOPE_VIOLATION_REASON } from "./approval";
 import { REVIEW_CYCLE_EXHAUSTED_REASON } from "./review-policy";
 import { STAGNATION_DETECTED_MARKER_PREFIX } from "./failure-stagnation";
+import { DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX } from "./claude-developer";
 import {
   MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX,
   CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX,
@@ -271,6 +279,113 @@ function scenarioExtractCheckpointScopeViolationFiles(): void {
   check("무관한 마커가 섞여 있어도 scope-violation 마커만 추출", mixed.length === 1 && mixed[0] === "a/b.txt");
 }
 
+// ---------------------------------------------------------------------------
+// Durable Technical Blocker Recovery — reconcileKnownTechnicalDeferredMarkers() /
+// isKnownGenuineDeferredMarker() / isKnownRetryEligibleTechnicalMarker() (2026-09-01,
+// generic defect — BLOCKED 상태에서도 STAGNATION_DETECTED 등이 자동복구 자격을 잃지 않아야
+// 한다). generic fixture만 사용한다 — JARVIS/Task 5.3 이름을 쓰지 않는다.
+// ---------------------------------------------------------------------------
+
+const GENERIC_STAGNATION_MARKER = `${STAGNATION_DETECTED_MARKER_PREFIX}IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨`;
+const GENERIC_REVIEW_CYCLE_EXHAUSTED_MARKER = `${REVIEW_CYCLE_EXHAUSTED_REASON}: 5회 REVISE 소진`;
+const GENERIC_DEVELOPER_TRANSIENT_RETRY_MARKER = `${DEVELOPER_TRANSIENT_RETRY_EXHAUSTED_PREFIX}TIMEOUT)`;
+const GENERIC_GENUINE_MARKER = "CHECKPOINT_BLOCKED(T1): secret detected — human review required";
+const GENERIC_ENV_MARKER = "REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=T1 requiredTest=unit kind=WRAPPER_NOT_FOUND cwd=mod resolvedPath=/tmp/mod";
+const GENERIC_CONFIG_MARKER = "REQUIRED_TEST_CONFIGURATION_ERROR: task=T1 requiredTest=unit missingScript=test:unit";
+const GENERIC_MALFORMED_STAGNATION_LIKE = "STAGNATION_DETECTED IMPLEMENTATION reviewCycle=2에서 동일한 실패가 반복됨"; // 여는 괄호 누락
+
+function scenarioReconcileEmptyIsNoop(): void {
+  const empty: readonly string[] = [];
+  const result = reconcileKnownTechnicalDeferredMarkers(empty);
+  check("Durable-Technical/H) 빈 배열은 no-op(resolvedMarkers 비어있음)", result.resolvedMarkers.length === 0);
+  check("Durable-Technical/H) 빈 배열은 원본 참조와 동일", result.remainingDeferredHumanTasks === empty);
+}
+
+function scenarioReconcileStagnationAloneResolves(): void {
+  // A) STAGNATION_DETECTED 단독 → 제거되어 완전히 빈 배열이 됨(호출부가 이걸 근거로 READY
+  // 전환 가능).
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/A) STAGNATION_DETECTED 단독 marker가 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check("Durable-Technical/A) 남은 marker가 완전히 없음", result.remainingDeferredHumanTasks.length === 0);
+}
+
+function scenarioReconcileMixedWithEnvMarkerOnlyResolvesStagnation(): void {
+  // C) STAGNATION_DETECTED + 이미 해결된 것으로 가정한 ENV marker(이 함수 자신은 ENV marker의
+  // 해결 여부를 판정하지 않는다 — 그건 reconcileStaleRequiredTestExecutionEnvironmentTasks의
+  // 몫이다. 여기서는 "이 함수가 ENV marker 자체를 절대 건드리지 않는다"만 검증한다).
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER, GENERIC_ENV_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/C) STAGNATION_DETECTED만 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check("Durable-Technical/C) ENV marker는 이 함수가 전혀 건드리지 않고 그대로 보존", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === GENERIC_ENV_MARKER);
+}
+
+function scenarioReconcileMixedWithGenuineMarkerResolvesStagnationButKeepsGenuine(): void {
+  // D) STAGNATION_DETECTED + GENUINE_HUMAN_MARKER → STAGNATION_DETECTED는 독립적으로
+  // resolved되지만 genuine marker는 이 함수가 알 수 있는 어떤 marker 형식에도 매칭되지
+  // 않으므로 항상 그대로 남는다 — 호출부가 remainingDeferredHumanTasks를 완전히 비우지
+  // 못해 자동 READY 전환이 구조적으로 불가능해진다.
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER, GENERIC_GENUINE_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/D) genuine marker와 섞여 있어도 STAGNATION_DETECTED는 독립적으로 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === GENERIC_STAGNATION_MARKER);
+  check("Durable-Technical/D) genuine marker는 자동 제거/승인되지 않고 그대로 보존됨", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === GENERIC_GENUINE_MARKER);
+}
+
+function scenarioReconcileMultipleKnownTechnicalMarkersAllResolve(): void {
+  // 알려진 기술적 marker 여러 종류(STAGNATION_DETECTED/REVIEW_CYCLE_EXHAUSTED/
+  // DEVELOPER_TRANSIENT_RETRY_EXHAUSTED)가 함께 있어도 전부 독립적으로 resolved됨 —
+  // classifyWaitingHumanReason()이 이 셋을 전부 TECHNICAL_AUTO_RECOVERABLE로 보는 것과
+  // 동일한 taxonomy를 재사용한다는 것을 직접 증명한다.
+  const markers: readonly string[] = [GENERIC_STAGNATION_MARKER, GENERIC_REVIEW_CYCLE_EXHAUSTED_MARKER, GENERIC_DEVELOPER_TRANSIENT_RETRY_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical) 알려진 기술적 marker 3종 전부 resolved됨", result.resolvedMarkers.length === 3);
+  check("Durable-Technical) 남은 marker가 완전히 없음", result.remainingDeferredHumanTasks.length === 0);
+}
+
+function scenarioReconcileMalformedStagnationLikeMarkerNeverRemoved(): void {
+  // G) STAGNATION_DETECTED_MARKER_PREFIX("STAGNATION_DETECTED(")와 정확히 일치하지 않는
+  // (여는 괄호가 없는) 자유 문장 — fail-closed로 절대 제거되지 않는다.
+  const markers: readonly string[] = [GENERIC_MALFORMED_STAGNATION_LIKE];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/G) 형식이 정확히 일치하지 않는 marker는 절대 제거되지 않음", result.resolvedMarkers.length === 0);
+  check("Durable-Technical/G) remainingDeferredHumanTasks가 원본과 동일", result.remainingDeferredHumanTasks === markers);
+}
+
+function scenarioReconcileNoKnownMarkerIsNoop(): void {
+  // I) 이 함수가 아는 형식의 marker가 전혀 없으면(ENV/CONFIG만 있으면) no-op.
+  const markers: readonly string[] = [GENERIC_ENV_MARKER, GENERIC_CONFIG_MARKER];
+  const result = reconcileKnownTechnicalDeferredMarkers(markers);
+  check("Durable-Technical/I) 알려진 기술적 marker가 없으면 resolvedMarkers가 비어있음", result.resolvedMarkers.length === 0);
+  check("Durable-Technical/I) remainingDeferredHumanTasks가 원본 참조와 동일(no-op)", result.remainingDeferredHumanTasks === markers);
+}
+
+function scenarioGenuineAndTechnicalPredicatesAreMutuallyExclusive(): void {
+  // 구조적 invariant 회귀: 이 파일이 아는 모든 genuine marker 예시와 모든 기술적 marker
+  // 예시가 서로의 predicate에 절대 동시에 매칭되지 않는다 — 그래야
+  // reconcileKnownTechnicalDeferredMarkers()가 genuine marker를 실수로 제거할 구조적
+  // 가능성 자체가 없다고 보장할 수 있다(요구사항 E).
+  const genuineExamples = [
+    "AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT(disk full)",
+    "REMOTE_GIT_CHANGED_DURING_RUN(origin/main advanced)",
+    "GPT_RAW_CALL_LIMIT_EXCEEDED: 100회 초과",
+    "BUDGET_EXCEEDED: $50 초과",
+    "AUTH_ERROR: invalid api key",
+    "QUOTA_EXCEEDED: rate limit",
+    "PROVIDER_SECURITY_BLOCKED: policy violation",
+    `${MAX_GPT_CALLS_EXCEEDED_MARKER_PREFIX}10회 초과)`,
+    `${DETERMINISTIC_REVIEW_CYCLE_EXHAUSTED_MARKER_PREFIX}STAGNATION_DETECTED와 동시 발생)`,
+    GENERIC_GENUINE_MARKER,
+    `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}AUTH_REQUIRED)`,
+  ];
+  const technicalExamples = [GENERIC_STAGNATION_MARKER, GENERIC_REVIEW_CYCLE_EXHAUSTED_MARKER, GENERIC_DEVELOPER_TRANSIENT_RETRY_MARKER, `${CLAUDE_STRUCTURAL_FAILURE_MARKER_PREFIX}PROTOCOL_ERROR)`];
+
+  const genuineLeaksIntoTechnical = genuineExamples.filter((m) => isKnownRetryEligibleTechnicalMarker(m));
+  check("Durable-Technical) genuine marker 예시가 기술적 predicate에 매칭되지 않음(상호배타성)", genuineLeaksIntoTechnical.length === 0);
+
+  const technicalLeaksIntoGenuine = technicalExamples.filter((m) => isKnownGenuineDeferredMarker(m));
+  check("Durable-Technical) 기술적 marker 예시가 genuine predicate에 매칭되지 않음(상호배타성)", technicalLeaksIntoGenuine.length === 0);
+}
+
 function main(): void {
   scenarioHumanFinalReviewGateAlwaysGenuine();
   scenarioReviewCycleExhaustedIsTechnical();
@@ -287,6 +402,15 @@ function main(): void {
   scenarioClaudeStructuralFailureProtocolErrorIsTechnical();
   scenarioUnknownReasonDefaultsToGenuine();
   scenarioExtractCheckpointScopeViolationFiles();
+
+  scenarioReconcileEmptyIsNoop();
+  scenarioReconcileStagnationAloneResolves();
+  scenarioReconcileMixedWithEnvMarkerOnlyResolvesStagnation();
+  scenarioReconcileMixedWithGenuineMarkerResolvesStagnationButKeepsGenuine();
+  scenarioReconcileMultipleKnownTechnicalMarkersAllResolve();
+  scenarioReconcileMalformedStagnationLikeMarkerNeverRemoved();
+  scenarioReconcileNoKnownMarkerIsNoop();
+  scenarioGenuineAndTechnicalPredicatesAreMutuallyExclusive();
 
   console.log("\n=== human-gate-policy 테스트 결과 ===");
   for (const r of results) console.log(r);

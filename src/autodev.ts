@@ -66,7 +66,7 @@ import { log } from "./logger";
 import { getWorkingTreeChanges } from "./git-changes";
 import { isPathWithinAllowedPrefixes } from "./claude-developer";
 import type { CoreState, ClaudeResult, HumanFinalReviewGate } from "./types";
-import { isTechnicalAutoRecoverableWaitingHuman, isCheckpointBlockedMarker } from "./human-gate-policy";
+import { isTechnicalAutoRecoverableWaitingHuman, isCheckpointBlockedMarker, reconcileKnownTechnicalDeferredMarkers } from "./human-gate-policy";
 
 // AutoDev Core — "project-state 읽기 → 다음 Task 자동 결정(task-registry.ts 엔진 +
 // manifest.taskRegistry 데이터) → Claude 실제 개발 → targeted tests(AutoDev가 직접
@@ -983,6 +983,39 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
           remainingDeferredHumanTasks: envReconciliation.remainingDeferredHumanTasks,
         });
         state.deferredHumanTasks = [...envReconciliation.remainingDeferredHumanTasks];
+        if (state.deferredHumanTasks.length === 0) {
+          console.log(`[autodev] 남은 사유가 없습니다 — 정상 실행 상태로 자동 복구합니다.`);
+          state.status = "READY";
+        }
+        saveState(state, statePath);
+      }
+    }
+
+    // Durable Technical Blocker Recovery — BLOCKED 상태 일반화(2026-09-01, generic defect,
+    // JARVIS Task 5.3 실측 — § human-gate-policy.ts reconcileKnownTechnicalDeferredMarkers
+    // 상단 주석) — STAGNATION_DETECTED_MARKER_PREFIX 등은 이미 TECHNICAL_AUTO_RECOVERABLE로
+    // 분류돼 있었지만, 그 자동복구(아래 isTechnicalAutoRecoverableWaitingHuman 블록)는
+    // status==="WAITING_HUMAN"일 때만 적용됐다 — status==="BLOCKED"이면 그 marker가
+    // deferredHumanTasks에 남아 있어도 decideNextAction()이 재평가 없이 곧바로 STOP하므로
+    // 영구 정체될 수 있었다. WAITING_HUMAN 전용 기존 블록(아래)은 전혀 건드리지 않는다
+    // (회귀 없음, § 요구사항 E) — 이 블록은 status==="BLOCKED"에만 적용되는 별도 추가다.
+    // genuine marker가 하나라도 섞여 있으면 reconcileKnownTechnicalDeferredMarkers() 자신이
+    // fail-closed로 아무것도 하지 않는다(§ 요구사항 E — genuine marker 자동 제거/승인 금지).
+    // ENV/CONFIG 등 이 함수가 모르는 형식의 marker는 위 두 블록의 몫으로 그대로 남는다 — 이
+    // 블록은 그 marker를 절대 지우지 않는다(§ 요구사항 5 — 각 marker는 자기 정책으로만
+    // 처리).
+    if ((state.status as unknown as string) === "BLOCKED" && !state.humanFinalReview) {
+      const technicalReconciliation = reconcileKnownTechnicalDeferredMarkers(state.deferredHumanTasks);
+      if (technicalReconciliation.resolvedMarkers.length > 0) {
+        console.log(
+          `[autodev] 기술적 자동복구 대상 marker ${technicalReconciliation.resolvedMarkers.length}건(STAGNATION_DETECTED 등)을 제거하고 재시도를 허용합니다 — 근본 원인이 해소됐다고 증명하는 것이 아니라, 원인이 아직 남아있다면 재시도 중 다시 감지됩니다.`
+        );
+        log("BLOCKED 상태의 기술적 자동복구 marker 제거(Durable Technical Blocker Recovery)", {
+          projectId: manifest.projectId,
+          resolvedMarkers: technicalReconciliation.resolvedMarkers,
+          remainingDeferredHumanTasks: technicalReconciliation.remainingDeferredHumanTasks,
+        });
+        state.deferredHumanTasks = [...technicalReconciliation.remainingDeferredHumanTasks];
         if (state.deferredHumanTasks.length === 0) {
           console.log(`[autodev] 남은 사유가 없습니다 — 정상 실행 상태로 자동 복구합니다.`);
           state.status = "READY";
