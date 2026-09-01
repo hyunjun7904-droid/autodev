@@ -291,66 +291,162 @@ function scenarioMultiplePrefixesNeverUseSingleFileFallback(): void {
 
 // ---------------------------------------------------------------------------
 // C) reconcileStaleRequiredTestConfigurationTasks — 오래된 REQUIRED_TEST_CONFIGURATION_ERROR
-//    WAITING_HUMAN 재검사(Phase 5).
+//    WAITING_HUMAN 재검사(Phase 5). Mixed-Marker Recovery 수정(2026-09-01, § M 섹션과 동일한
+//    generic defect/동일한 수정 원칙) 이후에는 배열 전체를 단일 단위로 판정하지 않고, marker별로
+//    독립적으로 재검사한다.
 // ---------------------------------------------------------------------------
+function configErrorMarker(taskId: string, requiredTestName: string, missingScript: string): string {
+  return `REQUIRED_TEST_CONFIGURATION_ERROR: task=${taskId} requiredTest=${requiredTestName} missingScript=${missingScript}`;
+}
+
 function scenarioReconcileResolvedWhenAllScriptsNowRegistered(): void {
-  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs", "test:device-trust-revocation": "node backend/device-trust/device-trust-revocation.test.mjs" });
+  // A) 해소된 단일 CONFIG_ERROR marker → 제거되고 기존 정책상 정상 recovery(remaining이 빈 배열).
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
   try {
-    const result = reconcileStaleRequiredTestConfigurationTasks(
-      [
-        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
-        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-revocation-tests missingScript=test:device-trust-revocation",
-      ],
-      root
-    );
-    check("C) 전부 REQUIRED_TEST_CONFIGURATION_ERROR 형태 + 전부 등록됨 → resolved=true", result.resolved === true);
+    const marker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const result = reconcileStaleRequiredTestConfigurationTasks([marker], root);
+    check("C/A) 해소된 CONFIG_ERROR marker가 resolvedMarkers에 포함됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === marker);
+    check("C/A) marker가 이것 하나뿐이었으므로 remainingDeferredHumanTasks가 빈 배열", result.remainingDeferredHumanTasks.length === 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
 function scenarioReconcileNotResolvedWhenStillMissing(): void {
-  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
-  try {
-    const result = reconcileStaleRequiredTestConfigurationTasks(
-      [
-        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
-        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-revocation-tests missingScript=test:device-trust-revocation",
-      ],
-      root
-    );
-    check("C) 일부만 등록됨 → resolved=false(전부 해소돼야만 안전하게 복구)", result.resolved === false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-function scenarioReconcileFailClosedOnUnrelatedReason(): void {
-  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
-  try {
-    const result = reconcileStaleRequiredTestConfigurationTasks(
-      [
-        "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests missingScript=test:device-trust-registration",
-        "HUMAN_FINAL_REVIEW_PENDING(2.1): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다.",
-      ],
-      root
-    );
-    check(
-      "C) 실제 사람 판단이 필요한 다른 사유가 섞여 있으면 fail-closed로 resolved=false(자동 해제 안 함)",
-      result.resolved === false
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-function scenarioReconcileEmptyIsNotResolved(): void {
+  // G) config 문제가 아직 해소되지 않았으면 marker를 그대로 보존한다(BLOCKED/WAITING_HUMAN 유지).
   const root = makeProjectRoot({});
   try {
-    const result = reconcileStaleRequiredTestConfigurationTasks([], root);
-    check("C) deferredHumanTasks가 비어 있으면 resolved=false(재검사할 대상 자체가 없음)", result.resolved === false);
+    const marker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const result = reconcileStaleRequiredTestConfigurationTasks([marker], root);
+    check("C/G) 아직 미등록이면 resolvedMarkers가 비어 있음(아무것도 제거하지 않음)", result.resolvedMarkers.length === 0);
+    check("C/G) remainingDeferredHumanTasks가 원본과 동일(marker 보존)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === marker);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileMixedWithStagnationDetectedOnlyRemovesConfigMarker(): void {
+  // B) [STAGNATION_DETECTED, CONFIG_ERROR] — config 해결 → CONFIG만 제거, STAGNATION은 독립
+  // 보존(이 함수가 임의로 삭제하지 않음, 그 marker의 recovery는 자신의 기존 canonical 경로에
+  // 맡긴다).
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const stagnation = genericStagnationDetectedMarker();
+    const configMarker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const result = reconcileStaleRequiredTestConfigurationTasks([stagnation, configMarker], root);
+    check("C/B) 무관한 STAGNATION_DETECTED가 섞여 있어도 config marker 재검사가 스킵되지 않고 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === configMarker);
+    check("C/B) STAGNATION_DETECTED marker는 그대로 보존됨(임의 삭제 없음)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === stagnation);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileMixedWithGenuineMarkerOnlyRemovesConfigMarker(): void {
+  // C) [genuine marker, CONFIG_ERROR] — config 해결 → CONFIG만 제거, genuine은 반드시 보존되고
+  // 자동 승인/삭제되지 않는다(호출부가 remainingDeferredHumanTasks가 비어있지 않으므로 READY로
+  // 강제 전환하지 않는다).
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const genuine = genericGenuineMarker("2.1");
+    const configMarker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const result = reconcileStaleRequiredTestConfigurationTasks([genuine, configMarker], root);
+    check("C/C) 사람 판단이 필요한 genuine marker가 섞여 있어도 config marker는 독립적으로 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === configMarker);
+    check("C/C) genuine marker는 이 함수가 절대 지우지 않음(자동 READY 강제전환 금지의 전제)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === genuine);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileMixedWithEnvMarkerOnlyRemovesConfigMarker(): void {
+  // D) [ENV_ERROR, CONFIG_ERROR] — config 해결 → CONFIG만 제거, ENV marker는 보존(자신의 기존
+  // reconcileStaleRequiredTestExecutionEnvironmentTasks 경로에 맡긴다).
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const envMarker = envErrorMarker("2.1", "wakeword-unit", join(root, "android", "wakeword"));
+    const configMarker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const result = reconcileStaleRequiredTestConfigurationTasks([envMarker, configMarker], root);
+    check("C/D) 다른 종류의 기술적 마커(ENV_ERROR)와 섞여 있어도 config marker는 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === configMarker);
+    check("C/D) ENV_ERROR marker는 이 함수가 임의로 제거하지 않음", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === envMarker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcilePartialAcrossTwoConfigMarkersOnlyResolvedRemoved(): void {
+  // E) CONFIG_ERROR 2개 — 하나는 해결됐고 하나는 여전히 미등록. 해결된 것만 제거되고 미해결은
+  // 유지되어야 한다.
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const resolvedMarker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const unresolvedMarker = configErrorMarker("2.1", "device-trust-revocation-tests", "test:device-trust-revocation");
+    const result = reconcileStaleRequiredTestConfigurationTasks([resolvedMarker, unresolvedMarker], root);
+    check("C/E) 해결된 CONFIG_ERROR marker만 제거됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === resolvedMarker);
+    check("C/E) 아직 해결되지 않은 CONFIG_ERROR marker는 유지됨", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === unresolvedMarker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileFailClosedOnMalformedConfigLikeEntry(): void {
+  // F) "REQUIRED_TEST_CONFIGURATION_ERROR:"로 시작하지만 정확한 필드 형식과 다른 marker(예:
+  // missingScript= 필드 누락) — 정규식이 매칭하지 않으므로 이 함수는 이걸 아예 파싱하지 않고
+  // 그대로 보존해야 한다(임의로 "비슷하니까 지워도 되겠지"라고 추측하지 않는다).
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const malformed = "REQUIRED_TEST_CONFIGURATION_ERROR: task=2.1 requiredTest=device-trust-registration-tests"; // missingScript= 필드 누락
+    const result = reconcileStaleRequiredTestConfigurationTasks([malformed], root);
+    check("C/F) 형식이 정확히 일치하지 않는 marker는 절대 제거되지 않음(fail-closed)", result.resolvedMarkers.length === 0);
+    check("C/F) remainingDeferredHumanTasks가 원본과 동일", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === malformed);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileNoConfigMarkerLeavesEntriesUntouched(): void {
+  // H) CONFIG marker가 전혀 없으면(무관한 항목만 있으면) 아무것도 재검사하지 않고 원본을 그대로
+  // 참조 동일성까지 보존한다.
+  const root = makeProjectRoot({});
+  try {
+    const unrelated: readonly string[] = [genericStagnationDetectedMarker(), genericGenuineMarker("2.1")];
+    const result = reconcileStaleRequiredTestConfigurationTasks(unrelated, root);
+    check("C/H) config marker가 없으면 resolvedMarkers가 비어 있음", result.resolvedMarkers.length === 0);
+    check("C/H) remainingDeferredHumanTasks가 원본 참조와 동일(unrelated entries 변경 없음)", result.remainingDeferredHumanTasks === unrelated);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileIdempotentAcrossRepeatedCalls(): void {
+  // I) reconciliation 반복 실행 → idempotent, 무한 상태변경 없음. 첫 호출로 해소된 marker를
+  // 제거한 뒤(remaining) 그 결과를 다시 넣고 재호출해도 더 이상 아무것도 변하지 않아야 한다.
+  const root = makeProjectRoot({ "test:device-trust-registration": "node backend/device-trust/device-trust-registration.test.mjs" });
+  try {
+    const resolvedMarker = configErrorMarker("2.1", "device-trust-registration-tests", "test:device-trust-registration");
+    const unresolvedMarker = configErrorMarker("2.1", "device-trust-revocation-tests", "test:device-trust-revocation");
+    const genuine = genericGenuineMarker("2.1");
+    const first = reconcileStaleRequiredTestConfigurationTasks([resolvedMarker, unresolvedMarker, genuine], root);
+    check("C/I) 첫 호출에서 해결된 marker만 제거됨", first.resolvedMarkers.length === 1 && first.resolvedMarkers[0] === resolvedMarker);
+    const second = reconcileStaleRequiredTestConfigurationTasks(first.remainingDeferredHumanTasks, root);
+    check("C/I) 같은 입력을 다시 재검사해도 더 이상 제거되는 marker가 없음(idempotent)", second.resolvedMarkers.length === 0);
+    check(
+      "C/I) 두 번째 호출의 remainingDeferredHumanTasks가 첫 번째 결과와 동일(무한 상태변경 없음)",
+      second.remainingDeferredHumanTasks.length === first.remainingDeferredHumanTasks.length &&
+        second.remainingDeferredHumanTasks.every((v, i) => v === first.remainingDeferredHumanTasks[i])
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioReconcileEmptyIsNoop(): void {
+  const task_root = makeProjectRoot({});
+  try {
+    const empty: readonly string[] = [];
+    const result = reconcileStaleRequiredTestConfigurationTasks(empty, task_root);
+    check("C) deferredHumanTasks가 비어 있으면 resolvedMarkers도 비어 있음(재검사할 대상 자체가 없음)", result.resolvedMarkers.length === 0);
+    check("C) remainingDeferredHumanTasks가 원본 참조와 동일(no-op)", result.remainingDeferredHumanTasks === empty);
+  } finally {
+    rmSync(task_root, { recursive: true, force: true });
   }
 }
 
@@ -1311,8 +1407,14 @@ function main(): void {
   scenarioMultiplePrefixesNeverUseSingleFileFallback();
   scenarioReconcileResolvedWhenAllScriptsNowRegistered();
   scenarioReconcileNotResolvedWhenStillMissing();
-  scenarioReconcileFailClosedOnUnrelatedReason();
-  scenarioReconcileEmptyIsNotResolved();
+  scenarioReconcileMixedWithStagnationDetectedOnlyRemovesConfigMarker();
+  scenarioReconcileMixedWithGenuineMarkerOnlyRemovesConfigMarker();
+  scenarioReconcileMixedWithEnvMarkerOnlyRemovesConfigMarker();
+  scenarioReconcilePartialAcrossTwoConfigMarkersOnlyResolvedRemoved();
+  scenarioReconcileFailClosedOnMalformedConfigLikeEntry();
+  scenarioReconcileNoConfigMarkerLeavesEntriesUntouched();
+  scenarioReconcileIdempotentAcrossRepeatedCalls();
+  scenarioReconcileEmptyIsNoop();
   scenarioDeclaredRegistrationValidAndRegistered();
   scenarioUnknownScriptNameRejected();
   scenarioOutsideWritablePathRejected();

@@ -407,16 +407,35 @@ export function checkRequiredTestExecutionEnvironment(
 // 사유가 *지금도* 유효한지 재확인한다. 사람의 판단이 필요한 다른 어떤 사유(SECURITY_BLOCKED/
 // REVIEW_CYCLE_EXHAUSTED/REVIEW_BLOCKED/CHECKPOINT_SCOPE_VIOLATION/HUMAN_FINAL_REVIEW_PENDING/
 // AUDIT_STORE_UNAVAILABLE_BEFORE_CHECKPOINT/REMOTE_GIT_CHANGED_DURING_RUN 등)는 이 정규식과
-// 전혀 다른 문자열이므로 매칭되지 않는다 — 배열 안에 이 형태가 아닌 항목이 단 하나라도 섞여
-// 있으면 fail-closed로 전체를 "해소되지 않음"으로 취급한다(어떤 실제 사람 판단 필요 상태도
-// 이 재검사로 조용히 해제되지 않는다).
+// 전혀 다른 문자열이므로 매칭되지 않는다 — 이 형태가 아닌 항목은 아래에서 절대 건드리지
+// 않고 그대로 남긴다(어떤 실제 사람 판단 필요 상태도 이 재검사로 조용히 해제되지 않는다).
+//
+// Mixed-Marker Recovery 수정(2026-09-01, JARVIS Task 5.3 실측 — generic defect, §
+// reconcileStaleRequiredTestExecutionEnvironmentTasks 상단 주석과 동일한 결함/동일한 수정
+// 원칙) — 예전에는 deferredHumanTasks 배열 "전체"가 이 마커 형식이어야만(단 하나라도 다른
+// 형태가 섞이면 즉시 fail-closed) 재검사 자체를 수행했다. 그 결과 무관한 오래된 marker
+// (STAGNATION_DETECTED, ENV marker, genuine human marker 등) 하나만 함께 섞여 있어도 실제로
+// npm script 등록 문제가 이미 해소됐는지 재확인 자체가 영구히 스킵되어, configuration을
+// 완전히 고쳐도 복구되지 않는 deadlock이 될 수 있었다. 이제는 배열 전체를 하나의 단위로
+// 판정하지 않고, 이 마커 형식과 일치하는 항목만 독립적으로 선별해 각각이 가리키는 npm
+// script가 지금도 package.json에 없는지만 개별 재확인한다 — 이 형식과 일치하지 않는 항목
+// (다른 종류의 기술적 marker든 genuine marker든 malformed marker든)은 이 함수가 절대
+// 건드리지 않는다. 그 marker들의 존재/제거는 각자의 기존 canonical
+// classification/reconciliation(§ human-gate-policy.ts classifyWaitingHumanReason,
+// reconcileStaleRequiredTestExecutionEnvironmentTasks 등)에 맡긴다.
 const REQUIRED_TEST_CONFIG_ERROR_ENTRY_PATTERN = /^REQUIRED_TEST_CONFIGURATION_ERROR: task=\S+ requiredTest=\S+ missingScript=(\S+)$/;
 
 export interface StaleRequiredTestConfigReconciliation {
-  /** true면 deferredHumanTasks 전체가 REQUIRED_TEST_CONFIGURATION_ERROR 형태였고, 그
-   *  각각이 가리키는 npm script가 지금은 전부 package.json에 등록돼 있다 — 호출부가
-   *  안전하게 WAITING_HUMAN을 해제하고 이 배열을 비울 수 있다. */
-  resolved: boolean;
+  /** 원본 deferredHumanTasks에서, 이번 재검사로 npm script가 지금은 package.json에 등록돼
+   *  있음이 확인된 REQUIRED_TEST_CONFIGURATION_ERROR marker만 제외한 새 배열. 원본 순서를
+   *  그대로 보존하며, 이 마커 형식이 아닌 항목/아직 해소되지 않은 항목은 전부 그대로 남는다.
+   *  제거된 marker가 하나도 없으면(관련 marker가 없거나 전부 미해결이거나 package.json 자체를
+   *  읽을 수 없음) 원본 배열과 참조가 동일하다(호출부가 불필요한 재할당/재저장을 피할 수
+   *  있다). */
+  remainingDeferredHumanTasks: readonly string[];
+  /** 이번 재검사로 실제로 해소가 확인되어 제거된 marker 원본 문자열 목록(로그/이벤트 기록용).
+   *  비어 있으면 이번 호출이 아무것도 바꾸지 않았다는 뜻이다. */
+  resolvedMarkers: string[];
 }
 
 /** state.status==="WAITING_HUMAN"이고 state.humanFinalReview가 없을 때만 호출한다(그 gate는
@@ -426,17 +445,50 @@ export function reconcileStaleRequiredTestConfigurationTasks(
   deferredHumanTasks: readonly string[],
   projectRoot: string
 ): StaleRequiredTestConfigReconciliation {
-  if (deferredHumanTasks.length === 0) return { resolved: false };
-  const scripts: string[] = [];
-  for (const entry of deferredHumanTasks) {
-    const m = REQUIRED_TEST_CONFIG_ERROR_ENTRY_PATTERN.exec(entry);
-    if (!m) return { resolved: false };
-    scripts.push(m[1]);
+  if (deferredHumanTasks.length === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
   }
+
+  interface ParsedConfigMarkerEntry {
+    index: number;
+    entry: string;
+    missingScript: string;
+  }
+  const parsed: ParsedConfigMarkerEntry[] = [];
+  for (let i = 0; i < deferredHumanTasks.length; i++) {
+    const entry = deferredHumanTasks[i];
+    const m = REQUIRED_TEST_CONFIG_ERROR_ENTRY_PATTERN.exec(entry);
+    if (!m) continue; // 이 형식이 아닌 항목(다른 기술적 marker든 genuine marker든) — 절대 건드리지 않는다.
+    parsed.push({ index: i, entry, missingScript: m[1] });
+  }
+
+  if (parsed.length === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+
+  // 기존 checkRequiredTestScriptRegistration()이 "script 등록됨"을 판정하는 것과 동일한
+  // 단일 소스(readPackageJsonScripts + hasOwnProperty)로 재확인한다 — 판정 로직 복제 없음.
   const pkg = readPackageJsonScripts(projectRoot);
-  if (!pkg.ok) return { resolved: false };
-  const allRegistered = scripts.every((s) => Object.prototype.hasOwnProperty.call(pkg.scripts, s));
-  return { resolved: allRegistered };
+  if (!pkg.ok) {
+    // package.json 자체를 읽을 수 없으면 이 재검사 대상 marker 중 어떤 것도 해소를 증명할 수
+    // 없다 — fail-closed로 전부 그대로 남긴다(조용히 제거하지 않는다).
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+
+  const resolvedIndices = new Set<number>();
+  const resolvedMarkers: string[] = [];
+  for (const p of parsed) {
+    if (!Object.prototype.hasOwnProperty.call(pkg.scripts, p.missingScript)) continue;
+    resolvedIndices.add(p.index);
+    resolvedMarkers.push(p.entry);
+  }
+
+  if (resolvedIndices.size === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+
+  const remainingDeferredHumanTasks = deferredHumanTasks.filter((_, i) => !resolvedIndices.has(i));
+  return { remainingDeferredHumanTasks, resolvedMarkers };
 }
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening(2026-08-30,

@@ -926,22 +926,36 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // 별도로 수행하고, 필요하면 이 state 객체만 갱신한다. state.humanFinalReview가 있으면
     // (사람이 이미 이 정확한 checkpoint에 명시적으로 APPROVE해야만 넘어갈 수 있는 별도
     // gate — § decideNextAction의 RESUME_APPROVED_CHECKPOINT) 이 재검사는 절대 개입하지
-    // 않는다. deferredHumanTasks 전체가 REQUIRED_TEST_CONFIGURATION_ERROR 고정 템플릿
-    // 문자열이 아니면(다른 실제 사람 판단 필요 사유가 하나라도 섞여 있으면)
-    // reconcileStaleRequiredTestConfigurationTasks()가 fail-closed로 resolved=false를
-    // 반환하므로 이 블록은 아무것도 하지 않는다.
+    // 않는다.
+    //
+    // Mixed-Marker Recovery 수정(2026-09-01, JARVIS Task 5.3 실측 — generic defect, §
+    // required-test-preflight.ts reconcileStaleRequiredTestConfigurationTasks 상단 주석) —
+    // 예전에는 deferredHumanTasks 전체가 REQUIRED_TEST_CONFIGURATION_ERROR 고정 템플릿
+    // 문자열이어야만 재검사를 수행해서, 무관한 오래된 marker(STAGNATION_DETECTED, ENV
+    // marker, genuine human marker 등) 하나만 섞여 있어도 실제 configuration 문제가
+    // 해소됐는지 재확인 자체가 영구히 스킵됐다. 이제 그 함수는 이 마커 형식과 일치하는
+    // 항목만 독립적으로 재검사해 해소된 것만 골라 제거한 remainingDeferredHumanTasks를
+    // 반환한다 — 무관한 marker/아직 해소되지 않은 marker는 그 배열에 그대로 남는다. 이
+    // 블록은 "이 마커 형식이 아닌 다른 사유"를 스스로 판정하거나 지우지 않는다 —
+    // remainingDeferredHumanTasks가 완전히 비었을 때만(더 이상 어떤 사유도 남지 않았을
+    // 때만) READY로 전환한다. 다른 marker가 남아 있으면 status는 WAITING_HUMAN으로 그대로
+    // 유지되고, 그 남은 marker의 해소는 각자의 기존 canonical 경로에 맡긴다.
     if ((state.status as unknown as string) === "WAITING_HUMAN" && !state.humanFinalReview) {
       const reconciliation = reconcileStaleRequiredTestConfigurationTasks(state.deferredHumanTasks, executorContext.projectRoot);
-      if (reconciliation.resolved) {
+      if (reconciliation.resolvedMarkers.length > 0) {
         console.log(
-          `[autodev] 오래된 WAITING_HUMAN(REQUIRED_TEST_CONFIGURATION_ERROR)을 재검사했습니다 — package.json에 필요한 npm script가 이미 등록되어 원인이 해소됨을 확인, 정상 실행 상태로 자동 복구합니다.`
+          `[autodev] REQUIRED_TEST_CONFIGURATION_ERROR marker ${reconciliation.resolvedMarkers.length}건을 재검사했습니다 — package.json에 필요한 npm script가 이미 등록되어 원인이 해소됨을 확인, 해당 marker만 제거합니다.`
         );
-        log("오래된 REQUIRED_TEST_CONFIGURATION_ERROR WAITING_HUMAN 자동 복구", {
+        log("REQUIRED_TEST_CONFIGURATION_ERROR marker 부분 해소", {
           projectId: manifest.projectId,
-          previousDeferredHumanTasks: state.deferredHumanTasks,
+          resolvedMarkers: reconciliation.resolvedMarkers,
+          remainingDeferredHumanTasks: reconciliation.remainingDeferredHumanTasks,
         });
-        state.status = "READY";
-        state.deferredHumanTasks = [];
+        state.deferredHumanTasks = [...reconciliation.remainingDeferredHumanTasks];
+        if (state.deferredHumanTasks.length === 0) {
+          console.log(`[autodev] 남은 사유가 없습니다 — 정상 실행 상태로 자동 복구합니다.`);
+          state.status = "READY";
+        }
         saveState(state, statePath);
       }
     }
@@ -1025,9 +1039,9 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     }
 
     // AutoDev / JARVIS 신뢰성 보완(2026-08-27) — Canonical Human Gate Policy 기반 기술적
-    // WAITING_HUMAN 자동 복구. 위 REQUIRED_TEST_CONFIGURATION_ERROR 전용 재검사가 이미
-    // 해소했다면(reconciliation.resolved) state.status는 이미 "READY"이므로 이 블록은
-    // 자연히 아무 것도 하지 않는다(중복 판정 없음). humanFinalReview가 있으면
+    // WAITING_HUMAN 자동 복구. 위 REQUIRED_TEST_CONFIGURATION_ERROR 전용 재검사가 남은 marker
+    // 없이 이미 해소했다면 state.status는 이미 "READY"이므로 이 블록은 자연히 아무 것도 하지
+    // 않는다(중복 판정 없음). humanFinalReview가 있으면
     // classifyWaitingHumanReason() 자체가 항상 GENUINE_HUMAN_JUDGMENT를 반환하므로 그
     // gate는 여기서도 절대 건드리지 않는다(§ human-gate-policy.ts).
     //

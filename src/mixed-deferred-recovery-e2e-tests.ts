@@ -321,9 +321,233 @@ async function scenarioMixedMarkersFullyResolveViaRealEntrypointWithoutRealDevel
   }
 }
 
+interface MarkerRunResult {
+  stdout: string;
+  stderr: string;
+  matchedMarker: string | undefined;
+  timedOut: boolean;
+}
+
+/** run-durable-approval-e2e-tests.ts의 runOneShotAndCaptureUntilMarker()와 동일한 패턴(로직
+ *  복제가 아니라 각 E2E 파일이 독립적으로 소유하는 fixture harness — 이 파일도 이미 그
+ *  패턴을 위 runOneShotToCompletion()에 쓴다). genuine WAITING_HUMAN으로 끝나는 시나리오는
+ *  run.ts가 controller owner인 동안 waitWhileWaitingHuman()으로 무기한 대기하므로(§ run.ts
+ *  "WAITING_HUMAN — Telegram 승인 대기를 위해 controller를 유지한 채..."), stdout에 markers
+ *  중 하나가 나타나면(그 시점에 이미 state.json durable write는 완료된 뒤다) 그 즉시 child를
+ *  종료시킨다 — 자연 종료를 기다리지 않는다(무기한 대기가 정상 production 동작이므로). */
+function runOneShotAndCaptureUntilMarker(
+  fixture: Fixture,
+  env: NodeJS.ProcessEnv,
+  markers: string[],
+  timeoutMs = 30_000
+): Promise<MarkerRunResult> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [RUN_JS, "--project", fixture.adapterPath], { env });
+    let stdout = "";
+    let stderr = "";
+    let resolved = false;
+
+    const overallTimer = setTimeout(() => finish(undefined, true), timeoutMs);
+
+    function finish(matchedMarker: string | undefined, timedOut: boolean): void {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(overallTimer);
+      try {
+        child.kill();
+      } catch {
+        /* 이미 종료됨 */
+      }
+      const fallback = setTimeout(() => resolve({ stdout, stderr, matchedMarker, timedOut }), 5_000);
+      child.once("close", () => {
+        clearTimeout(fallback);
+        resolve({ stdout, stderr, matchedMarker, timedOut });
+      });
+    }
+
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString();
+      if (resolved) return;
+      const hit = markers.find((m) => stdout.includes(m));
+      if (hit) finish(hit, false);
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+    child.on("error", () => finish(undefined, false));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// E2E-2) WAITING_HUMAN + mixed deferredHumanTasks(genuine AUTH_ERROR marker + 실제로는
+//        이미 해소된 REQUIRED_TEST_CONFIGURATION_ERROR) — Mixed-Marker Recovery 수정
+//        (2026-09-01, § required-test-preflight.ts reconcileStaleRequiredTestConfigurationTasks
+//        상단 주석)이 이 파일 상단의 ENV/STAGNATION 시나리오와 대칭적으로 다루는 generic
+//        defect의 CONFIG_ERROR 쪽 재현이다: 예전에는 genuine marker가 단 하나만 섞여 있어도
+//        배열 전체가 fail-closed로 취급되어 이미 해소된 npm script 등록 문제조차 영구히
+//        재검사되지 않았다. 실제 `node dist/run.js` one-shot으로 (1) CONFIG marker 재검사가
+//        genuine marker 때문에 스킵되지 않고 실제로 수행되어 그 marker만 제거되고, (2) genuine
+//        AUTH_ERROR marker는 이 함수도 WAITING_HUMAN 전체 자동복구 정책도 절대 자동으로
+//        지우거나 승인하지 않으며(§ human-gate-policy.ts classifyWaitingHumanReason —
+//        AUTH_ERROR:는 GENUINE_MARKER_PREFIXES에 있다), (3) 그래서 최종 상태는 여전히
+//        WAITING_HUMAN으로 남아(남은 blocker 기준 판정) decideNextAction()이 STOP하고 실제
+//        Developer/Reviewer가 단 한 번도 호출되지 않는다는 것을, 실제 컴파일된 production
+//        entrypoint로 증명한다.
+// ---------------------------------------------------------------------------
+const CONFIG_REQUIRED_TEST_NAME = "config-check-tests";
+const CONFIG_MISSING_SCRIPT = "test:config-check";
+const CONFIG_ERROR_MARKER = `REQUIRED_TEST_CONFIGURATION_ERROR: task=${FIXTURE_TASK_ID} requiredTest=${CONFIG_REQUIRED_TEST_NAME} missingScript=${CONFIG_MISSING_SCRIPT}`;
+const GENUINE_AUTH_ERROR_MARKER = "AUTH_ERROR: fixture — 실제 사람 로그인이 필요한 상태(generic fixture, 자동 복구 대상 아님)";
+
+function buildConfigFixture(prefix: string): Fixture {
+  const root = makeGitRepo(`${prefix}-root-`);
+  const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
+  tempDirs.push(configDir);
+  const isolationDir = mkdtempSync(join(tmpdir(), `${prefix}-iso-`));
+  tempDirs.push(isolationDir);
+
+  // 구성 문제 해소: package.json에 필요한 npm script가 이미 등록돼 있다 — 다만
+  // project-state.json은 아직 그 사실을 반영하지 못한 채 WAITING_HUMAN에 머물러 있는 상태를
+  // 재현한다(§ 요구사항 "configuration 문제를 해소하고 실행한다").
+  writeFileSync(
+    join(root, "package.json"),
+    `${JSON.stringify({ name: "fixture", scripts: { [CONFIG_MISSING_SCRIPT]: "node src/config-check.test.mjs" } }, null, 2)}\n`,
+    "utf-8"
+  );
+  spawnSync("git", ["add", "--", "package.json"], { cwd: root });
+  spawnSync("git", ["commit", "-q", "-m", "package.json"], { cwd: root });
+
+  const projectId = `fixture-config-mixed-marker-${randomUUID()}`;
+  const statePath = join(configDir, "project-state.json");
+  const state: CoreState = {
+    currentTask: "fixture task — 이미 구현 완료, npm script 미등록으로만 막혀 있었음",
+    reviewCycle: 3,
+    lastClaudeResult: {
+      success: true,
+      summary: "fixture — 이미 성공한 이전 attempt(구성 결함 발생 이전)",
+      changedFiles: ["src/marker.txt"],
+      tests: [{ name: CONFIG_REQUIRED_TEST_NAME, pass: true }],
+      rawOutput: "",
+    },
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "fixture", nextTask: null },
+    status: "WAITING_HUMAN",
+    claudeLimitWaitCount: 0,
+    // 순서 자체가 결과에 영향을 주면 안 된다는 것도 함께 검증한다 — genuine marker를 먼저 둔다.
+    deferredHumanTasks: [GENUINE_AUTH_ERROR_MARKER, CONFIG_ERROR_MARKER],
+    completedTasks: [],
+    gitCheckpoint: "",
+    currentPhase: 1,
+  };
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+
+  const adapterPath = join(configDir, "manifest.json");
+  writeFileSync(
+    adapterPath,
+    `${JSON.stringify(
+      {
+        projectId,
+        projectName: projectId,
+        targetProjectRoot: relFromTo(configDir, root),
+        statePath: "project-state.json",
+        taskRegistry: [
+          {
+            id: FIXTURE_TASK_ID,
+            phase: 1,
+            taskNumber: 1,
+            title: "config mixed marker recovery e2e fixture task",
+            prompt: "fixture",
+            requiredTests: [],
+            allowedPathPrefixes: ["src/"],
+            prohibitedOperations: [],
+          },
+        ],
+        developerInstructions: "fixture",
+        reviewInstructions: "fixture",
+        reviewScopeDirs: ["src/"],
+        executionPolicy: {
+          allowedReadPrefixes: ["src/"],
+          allowedWritePrefixes: ["src/"],
+          allowedCommands: [],
+        },
+      },
+      null,
+      2
+    )}\n`,
+    "utf-8"
+  );
+
+  return {
+    root,
+    adapterPath,
+    statePath,
+    approvalStorePath: join(isolationDir, "approvals.json"),
+    eventLogPath: join(isolationDir, "events.jsonl"),
+    telegramRuntimeDir: join(isolationDir, "telegram-runtime"),
+    projectId,
+    moduleAbs: root,
+  };
+}
+
+async function scenarioConfigMarkerReconciledViaRealEntrypointWithoutRealDeveloperCall(): Promise<void> {
+  const fixture = buildConfigFixture("config-mixed-marker-recovery");
+  const env = buildChildEnv({
+    AUTOMATION_DRY_RUN: undefined,
+    AUTODEV_PRODUCTION_RUNTIME: undefined,
+    AUTODEV_TELEGRAM_BOT_TOKEN: undefined,
+    AUTODEV_TELEGRAM_CHAT_ID: undefined,
+    AUTODEV_APPROVAL_STORE_PATH: fixture.approvalStorePath,
+    AUTODEV_EVENT_LOG_PATH: fixture.eventLogPath,
+    AUTODEV_TELEGRAM_CONTROLLER_RUNTIME_DIR: fixture.telegramRuntimeDir,
+  });
+
+  try {
+    // 최종 상태가 genuine WAITING_HUMAN으로 남으므로(§ 아래 검증), run.ts가 controller owner인
+    // 동안 Telegram 승인을 기다리며 무기한 대기한다(§ run.ts) — 이것이 정상 production 동작이라
+    // 자연 종료를 기다리지 않고, 그 대기에 진입했다는 로그가 찍히는 즉시 child를 종료한다(§
+    // runOneShotAndCaptureUntilMarker 상단 주석 — 그 시점에 이미 state.json durable write는
+    // 완료돼 있다).
+    const { stdout, matchedMarker, timedOut } = await runOneShotAndCaptureUntilMarker(fixture, env, [
+      "WAITING_HUMAN — Telegram 승인 대기를 위해 controller를 유지한 채",
+    ]);
+    check("E2E-2) timeout 없이 genuine WAITING_HUMAN 대기 진입 로그를 실제로 관측함", !timedOut && matchedMarker !== undefined);
+    check(
+      "E2E-2) config marker 재검사가 실제로 수행되어 제거됨(무관한 genuine marker 때문에 스킵되지 않음)",
+      stdout.includes("REQUIRED_TEST_CONFIGURATION_ERROR marker") && stdout.includes("해당 marker만 제거합니다")
+    );
+    check(
+      "E2E-2) '남은 사유가 없습니다' 로그는 찍히지 않음(genuine marker가 남아있으므로 완전 해소가 아님)",
+      !stdout.includes("남은 사유가 없습니다")
+    );
+    check("E2E-2) 실제 Claude Developer 호출을 시사하는 로그가 전혀 없음(claude CLI가 실제로 spawn되지 않음)", !stdout.includes("[claude-developer]") && !stdout.includes("claude 실행"));
+
+    const finalState = JSON.parse(readFileSync(fixture.statePath, "utf-8")) as CoreState;
+    check(
+      "E2E-2) 해결된 CONFIG marker만 제거됨(더 이상 남아있지 않음)",
+      !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_CONFIGURATION_ERROR:"))
+    );
+    check(
+      "E2E-2) genuine AUTH_ERROR marker는 자동으로 지워지거나 승인되지 않고 그대로 보존됨",
+      finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === GENUINE_AUTH_ERROR_MARKER
+    );
+    check(
+      "E2E-2) 상태는 remaining blocker(genuine marker) 기준으로 결정되어 여전히 WAITING_HUMAN(자동 READY 강제전환 금지)",
+      (finalState.status as unknown as string) === "WAITING_HUMAN"
+    );
+    check("E2E-2) reviewCycle이 임의로 초기화되지 않음(기존 작업물 보존)", finalState.reviewCycle === 3);
+    check(
+      "E2E-2) lastClaudeResult(이전 성공 결과)가 임의로 삭제되지 않음(기존 작업물 보존, Developer가 실제로 재호출되지 않았으므로 갱신되지도 않음)",
+      finalState.lastClaudeResult !== null && finalState.lastClaudeResult.success === true
+    );
+    check("E2E-2) completedTasks에 이 task가 억지로 추가되지 않음(자동 승인 아님)", !finalState.completedTasks.includes(FIXTURE_TASK_ID));
+  } finally {
+    cleanupSharedRuntimeArtifacts(fixture);
+  }
+}
+
 async function main(): Promise<void> {
   try {
     await scenarioMixedMarkersFullyResolveViaRealEntrypointWithoutRealDeveloperCall();
+    await scenarioConfigMarkerReconciledViaRealEntrypointWithoutRealDeveloperCall();
   } finally {
     for (const dir of tempDirs) {
       try {
