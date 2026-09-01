@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, realpathSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -13,6 +13,7 @@ import {
   classifyPrerequisiteFeasibility,
 } from "./required-test-preflight";
 import type { RequiredTestCommand, TaskDefinition } from "./task-registry";
+import type { GradleWrapperResolveTestDeps } from "./gradle-capability";
 
 const results: string[] = [];
 function check(label: string, cond: boolean): void {
@@ -998,124 +999,296 @@ function envErrorMarker(taskId: string, requiredTestName: string, resolvedPath: 
   return `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=${taskId} requiredTest=${requiredTestName} kind=WRAPPER_NOT_FOUND cwd=wakeword resolvedPath=${resolvedPath}`;
 }
 
+// Mixed-Marker Recovery 회귀 테스트용 generic fixture marker(§ human-gate-policy.ts와 동일한
+// 실제 저장 형식) — 특정 프로젝트/Task 이름을 쓰지 않는다.
+function genericStagnationDetectedMarker(): string {
+  return "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+}
+function genericGenuineMarker(taskId: string): string {
+  return `HUMAN_FINAL_REVIEW_PENDING(${taskId}): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다.`;
+}
+function genericUnrelatedTechnicalMarker(taskId: string): string {
+  return `REQUIRED_TEST_CONFIGURATION_ERROR: task=${taskId} requiredTest=other-unit missingScript=test:other`;
+}
+
 function scenarioEnvReconcileResolvedWhenWrapperNowPresent(): void {
-  // § 실제 JARVIS Task 5.2 재현: 이전엔 wrapper가 없어 WAITING_HUMAN이 됐고, 그 뒤 공식
+  // A) § 실제 JARVIS Task 5.2 재현: 이전엔 wrapper가 없어 WAITING_HUMAN이 됐고, 그 뒤 공식
   // Gradle wrapper 생성 절차로 wrapper가 복구됐다 — 같은 검사를 다시 돌리면 이제 green이어야
-  // 한다.
+  // 한다. marker가 이것 하나뿐이면 전부 제거되어 remaining이 빈 배열이 된다.
   const root = makeExecutionEnvRoot();
   try {
     const moduleAbs = join(root, "android", "wakeword");
     makeGradleModule(moduleAbs);
-    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
-    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
-      [task],
-      makeExecutor(root, { wakeword: "android/wakeword" }),
-      POSIX_OVERRIDE
-    );
-    check("M) wrapper가 실제로 복구된 뒤 재검사하면 resolved=true", result.resolved === true);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const marker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([marker], [task], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M/A) wrapper가 실제로 복구된 뒤 재검사하면 해당 marker가 resolvedMarkers에 포함됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === marker);
+    check("M/A) marker가 이것 하나뿐이었으므로 remainingDeferredHumanTasks가 빈 배열", result.remainingDeferredHumanTasks.length === 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
 function scenarioEnvReconcileNotResolvedWhenStillMissing(): void {
+  // G) 환경 결함이 아직 재현되면 marker를 그대로 보존하고 BLOCKED/WAITING_HUMAN을 유지한다.
   const root = makeExecutionEnvRoot();
   try {
     const moduleAbs = join(root, "android", "wakeword");
     // wrapper를 만들지 않는다 — 결함이 아직 그대로 남아있는 상태.
-    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
-    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
-      [task],
-      makeExecutor(root, { wakeword: "android/wakeword" }),
-      POSIX_OVERRIDE
-    );
-    check("M) wrapper가 여전히 없으면 resolved=false(안전하게 WAITING_HUMAN 유지)", result.resolved === false);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const marker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([marker], [task], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M/G) wrapper가 여전히 없으면 resolvedMarkers가 비어 있음(아무것도 제거하지 않음)", result.resolvedMarkers.length === 0);
+    check("M/G) remainingDeferredHumanTasks가 원본과 동일(marker 보존)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === marker);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-function scenarioEnvReconcileFailClosedOnUnrelatedGenuineReason(): void {
+function scenarioEnvReconcileMixedWithStagnationDetectedOnlyRemovesEnvMarker(): void {
+  // B) Generic mixed-marker defect의 실제 재현 형태: [STAGNATION_DETECTED, ENV] — 예전에는
+  // all-or-nothing 조건 때문에 이 배열 전체가 재검사조차 되지 않았다. 이제는 STAGNATION_
+  // DETECTED는 건드리지 않고 ENV marker만 독립적으로 재검사/제거되어야 한다.
   const root = makeExecutionEnvRoot();
   try {
     const moduleAbs = join(root, "android", "wakeword");
     makeGradleModule(moduleAbs);
-    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const stagnation = genericStagnationDetectedMarker();
+    const envMarker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
     const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      [
-        envErrorMarker("5.2", "wakeword-unit", moduleAbs),
-        "HUMAN_FINAL_REVIEW_PENDING(5.2): reviewer APPROVED — checkpoint 전 사람의 최종 승인이 필요합니다.",
-      ],
+      [stagnation, envMarker],
       [task],
       makeExecutor(root, { wakeword: "android/wakeword" }),
       POSIX_OVERRIDE
     );
+    check("M/B) 무관한 STAGNATION_DETECTED가 섞여 있어도 env marker 재검사가 스킵되지 않고 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === envMarker);
+    check("M/B) STAGNATION_DETECTED marker는 그대로 보존됨(임의 삭제 없음)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === stagnation);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileMixedWithGenuineMarkerOnlyRemovesEnvMarker(): void {
+  // C) [genuine marker, ENV] — env marker만 제거되고 genuine marker는 반드시 보존되어야
+  // 한다(호출부가 remainingDeferredHumanTasks가 비어있지 않으므로 READY로 전환하지 않는다 —
+  // 이 함수 자체는 상태 전이를 하지 않지만, 반환값이 그 판단을 가능하게 해야 한다).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const genuine = genericGenuineMarker("T1");
+    const envMarker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([genuine, envMarker], [task], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M/C) 사람 판단이 필요한 genuine marker가 섞여 있어도 env marker는 독립적으로 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === envMarker);
+    check("M/C) genuine marker는 이 함수가 절대 지우지 않음(READY 강제전환 금지의 전제)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === genuine);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileMixedWithUnrelatedTechnicalMarkerPreservesIt(): void {
+  // D) [무관한 다른 기술적 마커(REQUIRED_TEST_CONFIGURATION_ERROR), ENV] — env marker만
+  // 제거되고, 그 다른 기술적 마커는 이 함수가 건드리지 않는다(자신의 기존 reconciliation
+  // 경로에 맡긴다).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const unrelatedTechnical = genericUnrelatedTechnicalMarker("T1");
+    const envMarker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [unrelatedTechnical, envMarker],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M/D) 다른 종류의 기술적 마커(REQUIRED_TEST_CONFIGURATION_ERROR)와 섞여 있어도 env marker는 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === envMarker);
+    check("M/D) 무관한 기술적 마커는 이 함수가 임의로 제거하지 않음", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === unrelatedTechnical);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcilePartialWithinSameTaskOnlyResolvedRemoved(): void {
+  // E) 같은 task에 env marker 2개(서로 다른 requiredTest) — 하나는 wrapper가 복구됐고 다른
+  // 하나는 여전히 없다. 해결된 것만 제거되고 미해결 blocker는 유지되어야 한다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const okModuleAbs = join(root, "android", "wakeword");
+    const stillMissingModuleAbs = join(root, "android", "conversation");
+    makeGradleModule(okModuleAbs);
+    // conversation 모듈은 디렉터리만 만들고 wrapper는 만들지 않는다 — 여전히 결함.
+    mkdirSync(stillMissingModuleAbs, { recursive: true });
+    const task = makeMinimalTask("T1", [
+      { name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" },
+      { name: "conversation-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "conversation" },
+    ]);
+    const resolvedMarker = envErrorMarker("T1", "wakeword-unit", okModuleAbs);
+    const unresolvedMarker = envErrorMarker("T1", "conversation-unit", stillMissingModuleAbs);
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [resolvedMarker, unresolvedMarker],
+      [task],
+      makeExecutor(root, { wakeword: "android/wakeword", conversation: "android/conversation" }),
+      POSIX_OVERRIDE
+    );
+    check("M/E) 같은 task 안에서 해결된 requiredTest의 marker만 제거됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === resolvedMarker);
+    check("M/E) 아직 해결되지 않은 requiredTest의 marker는 유지됨", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === unresolvedMarker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileFailClosedOnMalformedEnvLikeEntry(): void {
+  // F) "REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"로 시작하지만 정확한 필드 형식과 다른
+  // marker(예: kind= 필드 누락) — 정규식이 매칭하지 않으므로 이 함수는 이걸 아예 파싱하지
+  // 않고 그대로 보존해야 한다(임의로 "비슷하니까 지워도 되겠지"라고 추측하지 않는다).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const malformed = `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=T1 requiredTest=wakeword-unit cwd=wakeword resolvedPath=${moduleAbs}`; // kind= 필드 누락
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([malformed], [task], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M/F) 형식이 정확히 일치하지 않는 marker는 절대 제거되지 않음(fail-closed)", result.resolvedMarkers.length === 0);
+    check("M/F) remainingDeferredHumanTasks가 원본과 동일", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === malformed);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileFailClosedOnFreeTextEntry(): void {
+  // 정규식 패턴과 전혀 무관한 자유 문장 — 이 형식으로 시작조차 하지 않으므로 당연히 매칭되지
+  // 않아야 한다(§ M/F와 별개로, "이 형식 접두어조차 없는" 가장 단순한 케이스도 명시적으로 커버).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const freeText = "some unrelated free-text marker that is not the expected template";
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([freeText], [task], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M) 정규식과 전혀 무관한 자유 문장은 절대 매칭시키지 않고 그대로 보존", result.resolvedMarkers.length === 0 && result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === freeText);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileUnknownTaskIdSingleGroupNotResolved(): void {
+  // taskRegistry에서 해당 taskId를 찾지 못하면(레지스트리가 그 사이 바뀐 경우 등) 추측해서
+  // 통과시키지 않는다 — marker가 이것 하나뿐이어도 그대로 보존된다.
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const marker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    // taskRegistry에 "T1"이 없다.
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([marker], [], makeExecutor(root, { wakeword: "android/wakeword" }), POSIX_OVERRIDE);
+    check("M) taskRegistry에서 해당 taskId를 찾지 못하면 fail-closed로 보존됨(추측 없음)", result.resolvedMarkers.length === 0 && result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === marker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function scenarioEnvReconcileEmptyIsNoop(): void {
+  // H) deferredHumanTasks가 비어 있으면 아무 것도 하지 않는다(mutation 없음).
+  const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+  const empty: readonly string[] = [];
+  const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(empty, [task], makeExecutor(process.cwd(), {}), POSIX_OVERRIDE);
+  check("M/H) deferredHumanTasks가 비어 있으면 resolvedMarkers도 비어 있음", result.resolvedMarkers.length === 0);
+  check("M/H) remainingDeferredHumanTasks가 원본 참조와 동일(no-op)", result.remainingDeferredHumanTasks === empty);
+}
+
+function scenarioEnvReconcileNoEnvMarkerLeavesEntriesUntouched(): void {
+  // I) env marker가 전혀 없으면(무관한 항목만 있으면) 아무것도 재검사하지 않고 그대로 통과.
+  const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+  const unrelated: readonly string[] = [genericStagnationDetectedMarker(), genericGenuineMarker("T1")];
+  const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(unrelated, [task], makeExecutor(process.cwd(), {}), POSIX_OVERRIDE);
+  check("M/I) env marker가 없으면 resolvedMarkers가 비어 있음", result.resolvedMarkers.length === 0);
+  check("M/I) remainingDeferredHumanTasks가 원본 참조와 동일(byte/semantic 동일)", result.remainingDeferredHumanTasks === unrelated);
+}
+
+function scenarioEnvReconcileDifferentTaskIdsHandledIndependently(): void {
+  // 서로 다른 taskId를 가리키는 env marker는 예전처럼 서로를 fail-closed로 막지 않고 각자
+  // 독립적으로 판정된다: taskRegistry에 있는 taskId는 재검사되어 해결되면 제거되고,
+  // taskRegistry에 없는 taskId는 그 자신만 fail-closed로 보존된다(다른 task의 판정에
+  // 영향을 주지 않는다).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const knownTask = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const knownMarker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const unknownTaskMarker = envErrorMarker("T2", "other-unit", moduleAbs); // "T2"는 registry에 없음
+    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
+      [knownMarker, unknownTaskMarker],
+      [knownTask],
+      makeExecutor(root, { wakeword: "android/wakeword" }),
+      POSIX_OVERRIDE
+    );
+    check("M) registry에 있는 taskId(T1)의 marker는 독립적으로 resolved됨", result.resolvedMarkers.length === 1 && result.resolvedMarkers[0] === knownMarker);
+    check("M) registry에 없는 taskId(T2)의 marker는 추측 없이 fail-closed로 보존됨(다른 task 판정에 영향받지 않음)", result.remainingDeferredHumanTasks.length === 1 && result.remainingDeferredHumanTasks[0] === unknownTaskMarker);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// 이번 재검사에서만 쓰는 fake trusted-JDK 위치 — 실제 OS temp 디렉터리 밖의 합성 경로다
+// (checkRequiredTestExecutionEnvironment가 excludedRootsForJava에 항상 tmpdir()을 포함시켜
+// temp 경로의 java를 신뢰하지 않기 때문에, 우리 fixture root(mkdtempSync 기반)를 그대로
+// java 위치로 쓸 수 없다 — 실제 프로덕션 신뢰 모델과 동일한 이유). 실제 디스크에 이 경로를
+// 만들지 않는다 — existsSync/statSync/realpathSync를 이 경로에 대해서만 가로채고, 그 외
+// 모든 경로는 진짜 fs로 그대로 위임한다(fixture root의 실제 wrapper 파일 검증은 그대로
+// 정직하게 수행된다).
+const FAKE_TRUSTED_JAVA_HOME = join("C:", "fixture-trusted-jdk-mixed-marker-recovery");
+const FAKE_TRUSTED_JAVA_EXE = join(FAKE_TRUSTED_JAVA_HOME, "bin", "java.exe");
+
+function makeWin32TrustedJavaTestDeps(javaPresent: boolean): GradleWrapperResolveTestDeps {
+  return {
+    existsSyncImpl: (p) => (p === FAKE_TRUSTED_JAVA_EXE ? javaPresent : existsSync(p)),
+    statSyncImpl: (p) => (p === FAKE_TRUSTED_JAVA_EXE ? { isFile: () => true } : statSync(p)),
+    realpathSyncImpl: (p) => (p === FAKE_TRUSTED_JAVA_EXE ? FAKE_TRUSTED_JAVA_EXE : realpathSync(p)),
+    envOverride: { AUTODEV_TRUSTED_JAVA_HOME: FAKE_TRUSTED_JAVA_HOME, JAVA_HOME: undefined },
+  };
+}
+
+function scenarioEnvReconcileWin32RequiresTrustedJavaBeforeMarkerResolves(): void {
+  // § Task 요구사항 8 — 실제 execution environment 재검증: gradlew wrapper 파일 자체(§
+  // makeGradleModule)는 처음부터 실제로 존재하지만, win32에서는 그것만으로 부족하고
+  // trusted Java(JAVA_HOME/AUTODEV_TRUSTED_JAVA_HOME)가 별도로 필요하다(§
+  // gradle-capability.ts resolveTrustedGradleWrapper). 처음엔 trusted Java가 없어 env
+  // marker가 유지되고, trusted Java 환경이 제공된 뒤 재실행하면 그 marker만 해소되어야
+  // 한다 — 그 사이 섞여 있는 무관한 STAGNATION_DETECTED marker는 두 재검사 모두에서 항상
+  // 그대로 보존되어야 한다(외부 API/Claude 호출 없이, 순수 fs 판정만으로 검증).
+  const root = makeExecutionEnvRoot();
+  try {
+    const moduleAbs = join(root, "android", "wakeword");
+    makeGradleModule(moduleAbs);
+    const task = makeMinimalTask("T1", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
+    const stagnation = genericStagnationDetectedMarker();
+    const envMarker = envErrorMarker("T1", "wakeword-unit", moduleAbs);
+    const executor = makeExecutor(root, { wakeword: "android/wakeword" });
+
+    const before = reconcileStaleRequiredTestExecutionEnvironmentTasks([stagnation, envMarker], [task], executor, {
+      platform: "win32",
+      gradleTestDeps: makeWin32TrustedJavaTestDeps(false),
+    });
+    check("M/win32) trusted Java가 아직 없으면 env marker가 유지됨(resolvedMarkers 비어있음)", before.resolvedMarkers.length === 0);
     check(
-      "M) wrapper는 복구됐어도 실제 사람 판단이 필요한 다른 사유가 섞여 있으면 fail-closed로 resolved=false",
-      result.resolved === false
+      "M/win32) trusted Java 없음 단계에서도 무관한 STAGNATION_DETECTED는 보존됨",
+      before.remainingDeferredHumanTasks.length === 2 && before.remainingDeferredHumanTasks.includes(stagnation) && before.remainingDeferredHumanTasks.includes(envMarker)
     );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
 
-function scenarioEnvReconcileFailClosedOnMixedTaskIds(): void {
-  const root = makeExecutionEnvRoot();
-  try {
-    const moduleAbs = join(root, "android", "wakeword");
-    makeGradleModule(moduleAbs);
-    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
-    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      [envErrorMarker("5.2", "wakeword-unit", moduleAbs), envErrorMarker("5.3", "other-unit", moduleAbs)],
-      [task],
-      makeExecutor(root, { wakeword: "android/wakeword" }),
-      POSIX_OVERRIDE
+    const after = reconcileStaleRequiredTestExecutionEnvironmentTasks([stagnation, envMarker], [task], executor, {
+      platform: "win32",
+      gradleTestDeps: makeWin32TrustedJavaTestDeps(true),
+    });
+    check("M/win32) trusted Java 환경 제공 후 재실행하면 env marker만 해소됨", after.resolvedMarkers.length === 1 && after.resolvedMarkers[0] === envMarker);
+    check(
+      "M/win32) trusted Java 제공 후에도 무관한 STAGNATION_DETECTED marker는 그대로 보존됨",
+      after.remainingDeferredHumanTasks.length === 1 && after.remainingDeferredHumanTasks[0] === stagnation
     );
-    check("M) 서로 다른 taskId를 가리키는 마커가 섞여 있으면 fail-closed로 resolved=false(다른 task 상태를 건드리지 않음)", result.resolved === false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-function scenarioEnvReconcileEmptyIsNotResolved(): void {
-  const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
-  const result = reconcileStaleRequiredTestExecutionEnvironmentTasks([], [task], makeExecutor(process.cwd(), {}), POSIX_OVERRIDE);
-  check("M) deferredHumanTasks가 비어 있으면 resolved=false(재검사할 대상 자체가 없음)", result.resolved === false);
-}
-
-function scenarioEnvReconcileUnknownTaskIdNotResolved(): void {
-  const root = makeExecutionEnvRoot();
-  try {
-    const moduleAbs = join(root, "android", "wakeword");
-    makeGradleModule(moduleAbs);
-    // taskRegistry에 "5.2"가 없다 — 추측해서 통과시키지 않는다.
-    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      [envErrorMarker("5.2", "wakeword-unit", moduleAbs)],
-      [],
-      makeExecutor(root, { wakeword: "android/wakeword" }),
-      POSIX_OVERRIDE
-    );
-    check("M) taskRegistry에서 해당 taskId를 찾지 못하면 resolved=false(fail-closed, 추측 없음)", result.resolved === false);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-}
-
-function scenarioEnvReconcileFailClosedOnMalformedEntry(): void {
-  const root = makeExecutionEnvRoot();
-  try {
-    const moduleAbs = join(root, "android", "wakeword");
-    makeGradleModule(moduleAbs);
-    const task = makeMinimalTask("5.2", [{ name: "wakeword-unit", command: "gradlew", args: ["testDebugUnitTest"], cwd: "wakeword" }]);
-    const result = reconcileStaleRequiredTestExecutionEnvironmentTasks(
-      ["some unrelated free-text marker that is not the expected template"],
-      [task],
-      makeExecutor(root, { wakeword: "android/wakeword" }),
-      POSIX_OVERRIDE
-    );
-    check("M) 정규식과 맞지 않는 임의 문자열은 절대 매칭시키지 않고 resolved=false", result.resolved === false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1171,11 +1344,17 @@ function main(): void {
 
   scenarioEnvReconcileResolvedWhenWrapperNowPresent();
   scenarioEnvReconcileNotResolvedWhenStillMissing();
-  scenarioEnvReconcileFailClosedOnUnrelatedGenuineReason();
-  scenarioEnvReconcileFailClosedOnMixedTaskIds();
-  scenarioEnvReconcileEmptyIsNotResolved();
-  scenarioEnvReconcileUnknownTaskIdNotResolved();
-  scenarioEnvReconcileFailClosedOnMalformedEntry();
+  scenarioEnvReconcileMixedWithStagnationDetectedOnlyRemovesEnvMarker();
+  scenarioEnvReconcileMixedWithGenuineMarkerOnlyRemovesEnvMarker();
+  scenarioEnvReconcileMixedWithUnrelatedTechnicalMarkerPreservesIt();
+  scenarioEnvReconcilePartialWithinSameTaskOnlyResolvedRemoved();
+  scenarioEnvReconcileFailClosedOnMalformedEnvLikeEntry();
+  scenarioEnvReconcileFailClosedOnFreeTextEntry();
+  scenarioEnvReconcileUnknownTaskIdSingleGroupNotResolved();
+  scenarioEnvReconcileEmptyIsNoop();
+  scenarioEnvReconcileNoEnvMarkerLeavesEntriesUntouched();
+  scenarioEnvReconcileDifferentTaskIdsHandledIndependently();
+  scenarioEnvReconcileWin32RequiresTrustedJavaBeforeMarkerResolves();
 
   scenarioPrerequisiteFeasibilityExpectedGreenfield();
   scenarioPrerequisiteFeasibilityMissingPrerequisite();

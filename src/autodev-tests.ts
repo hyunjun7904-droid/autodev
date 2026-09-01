@@ -1753,6 +1753,85 @@ async function scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnviron
   );
 }
 
+// Mixed-Marker Recovery 수정(2026-09-01, generic defect — § required-test-preflight.ts
+// reconcileStaleRequiredTestExecutionEnvironmentTasks 상단 주석) — deferredHumanTasks에
+// REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR와 무관한 다른 마커(예: STAGNATION_DETECTED)가
+// 함께 있어도, 환경 결함이 실제로 해소됐다면 그 marker만 제거돼야 한다. 다만 무관한 marker가
+// 남아 있으므로 remainingDeferredHumanTasks가 비지 않고, 그 결과 상태는 여전히 BLOCKED로
+// 남으며 decideNextAction()이 STOP을 반환한다 — 이 시나리오가 runAutodevOnce() 전체
+// 파이프라인에서 (1) 무관한 marker 때문에 env 재검사 자체가 스킵되지 않고, (2) env marker만
+// 제거되며, (3) 무관한 marker는 보존되고, (4) status가 READY로 강제전환되지 않으며, (5)
+// Developer가 단 한 번도 호출되지 않는다는 것을 함께 증명한다.
+async function scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const registry: TaskDefinition[] = [
+    {
+      id: "G3",
+      phase: 1,
+      taskNumber: 1,
+      title: "fixture task",
+      prompt: "fixture",
+      requiredTests: [{ name: "fixture-check", command: "node", args: ["--version"], cwd: "sub" }],
+      allowedPathPrefixes: ["proj/"],
+      prohibitedOperations: [],
+    },
+  ];
+  const stagnationMarker = "STAGNATION_DETECTED(IMPLEMENTATION): reviewCycle=2에서 동일한 required test 실패가 2회 연속 반복됨";
+  const envMarker = `REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=G3 requiredTest=fixture-check kind=CWD_NOT_FOUND cwd=sub resolvedPath=${join(repo, "sub")}`;
+  const statePath = makeTempStateFile(repo, {
+    status: "BLOCKED",
+    completedTasks: [],
+    // 순서 자체도 보존되어야 한다 — 무관한 marker가 먼저 와도, 뒤에 와도 결과는 같아야 한다.
+    deferredHumanTasks: [stagnationMarker, envMarker],
+  });
+  const manifest: ProjectManifest = {
+    projectId: "mixed-marker-reconcile-project",
+    projectName: "Mixed Marker Reconcile Project",
+    targetProjectRoot: repo,
+    statePath,
+    taskRegistry: registry,
+    developerInstructions: "허용 범위: proj/**.",
+    reviewInstructions: "proj/** 범위 밖 변경이 있으면 반드시 REVISE하세요.",
+    reviewScopeDirs: ["proj/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["proj/"],
+      allowedWritePrefixes: ["proj/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests(registry.map((t) => ({ taskId: t.id, requiredTests: t.requiredTests }))),
+      commandCwdAliases: { sub: "sub" },
+    },
+  };
+
+  // 환경 결함(cwd 디렉터리 부재)은 실제로 해소됐다 — 그러나 STAGNATION_DETECTED는 이 재검사와
+  // 무관하므로 그대로 남아있어야 한다.
+  const subDir = join(repo, "sub");
+  if (!existsSync(subDir)) mkdirSync(subDir, { recursive: true });
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    return { success: true, summary: "호출되면 안 됨", changedFiles: [], tests: [], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: fakePassReviewer() } });
+
+  check("Mixed-Marker) 무관한 STAGNATION_DETECTED가 있어도 env 재검사가 스킵되지 않고 실행됨(전체 파이프라인)", result.outcome === "STOPPED");
+  check("Mixed-Marker) Developer/Claude가 단 한 번도 호출되지 않음(불필요한 API/CLI 호출 0)", claudeCalls === 0);
+
+  const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check(
+    "Mixed-Marker) 해소된 env marker만 제거됨",
+    !finalState.deferredHumanTasks.some((t) => t.startsWith("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR:"))
+  );
+  check(
+    "Mixed-Marker) 무관한 STAGNATION_DETECTED marker는 그대로 보존됨(임의 삭제 없음)",
+    finalState.deferredHumanTasks.length === 1 && finalState.deferredHumanTasks[0] === stagnationMarker
+  );
+  check(
+    "Mixed-Marker) 무관한 marker가 남아 있으므로 status가 READY로 강제전환되지 않고 BLOCKED 유지",
+    (finalState.status as unknown as string) === "BLOCKED"
+  );
+}
+
 // Positive-Provenance-Only Auto-Delete Policy(2026-08-31, JARVIS Task 5.3 Canary 사실검증
 // 후속) — AutoDev는 이 저장소에 "AutoDev가 이 파일을 만들었다"를 증명할 durable action log가
 // 없다는 것이 확인된 이후, scopeViolations에 정확히 나열된 파일이라도(예전 Phase 7이었다면
@@ -3056,6 +3135,7 @@ async function main(): Promise<void> {
     await scenarioRunAutodevOncePassesPreviousFailureEvidenceToNextDeveloper();
     await scenarioRunAutodevOnceBlocksOnBrokenRequiredTestExecutionEnvironment();
     await scenarioRunAutodevOnceReconcilesStaleRequiredTestExecutionEnvironmentBlocked();
+    await scenarioRunAutodevOnceMixedDeferredMarkersOnlyResolvesEnvMarker();
     await scenarioRunAutodevOnceNeverAutoDeletesScopeViolationLeftoverFiles();
     await scenarioRunAutodevOnceReconcilesStaleReviewCycleExhaustedWaitingHuman();
     await scenarioRunAutodevOnceStopsImmediatelyOnScopeViolationWaitingHuman();

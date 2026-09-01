@@ -948,16 +948,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
 
     // AutoDev / JARVIS 신뢰성 보완(2026-08-30, JARVIS Task 5.2 실측; P0-4 하드닝으로
     // status를 BLOCKED로 변경) — Stale REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR
-    // Reconciliation. 위 REQUIRED_TEST_CONFIGURATION_ERROR 재검사와 정확히 같은 원칙(같은
-    // deterministic 검사로 "그 결함이 지금도 재현되는가"만 재확인, 다른 사유가 하나라도
-    // 섞여 있으면 fail-closed)을 WRAPPER_NOT_FOUND 등 required-test 실행 환경 결함에도
-    // 적용한다 — reconciliation.resolved가 true라면 이미 state.status가 "READY"이므로 이
-    // 블록은 자연히 아무 것도 하지 않는다(중복 판정 없음, 위와 동일한 관례). status가
-    // "BLOCKED"인 경우도 함께 확인한다(§ P0-4 — 이 결함은 이제 WAITING_HUMAN이 아니라
-    // BLOCKED로 저장된다) — reconcileStaleRequiredTestExecutionEnvironmentTasks() 자신이
-    // deferredHumanTasks 내용을 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 마커로만 엄격히
-    // 제한하므로, MID_FLIGHT_CRASH_LOOP_DETECTED 등 다른 이유로 BLOCKED된 상태를 실수로
-    // 되돌릴 위험은 없다(마커 형식이 다르면 fail-closed로 resolved:false).
+    // Reconciliation. status가 "BLOCKED"인 경우도 함께 확인한다(§ P0-4 — 이 결함은 이제
+    // WAITING_HUMAN이 아니라 BLOCKED로 저장된다).
+    //
+    // Mixed-Marker Recovery 수정(2026-09-01, JARVIS Task 5.3 실측 — generic defect, §
+    // required-test-preflight.ts reconcileStaleRequiredTestExecutionEnvironmentTasks 상단
+    // 주석) — 예전에는 deferredHumanTasks 전체가 이 마커 형식이어야만 재검사를 수행해서,
+    // 무관한 오래된 마커(예: STAGNATION_DETECTED) 하나만 섞여 있어도 실제 환경 결함이
+    // 해소됐는지 재확인 자체가 영구히 스킵됐다. 이제 그 함수는 이 마커 형식과 일치하는
+    // 항목만 taskId/requiredTest 단위로 독립적으로 재검사해 해소된 것만 골라 제거한
+    // remainingDeferredHumanTasks를 반환한다 — 무관한 마커/아직 해소되지 않은 마커/taskId를
+    // 찾지 못한 마커는 그 배열에 그대로 남는다. 이 블록은 "이 마커 형식이 아닌 다른 사유"를
+    // 스스로 판정하거나 지우지 않는다 — remainingDeferredHumanTasks가 완전히 비었을 때만
+    // (더 이상 어떤 사유도 남지 않았을 때만) READY로 전환한다. 다른 마커가 남아 있으면
+    // status는 그대로 유지되고(이미 BLOCKED/WAITING_HUMAN이었던 값), 그 남은 마커의 해소는
+    // 각자의 기존 canonical 경로(§ 위 REQUIRED_TEST_CONFIGURATION_ERROR 재검사,
+    // classifyWaitingHumanReason 등)에 맡긴다 — 이 블록이 임의로 지우지 않는다.
     if (
       ((state.status as unknown as string) === "WAITING_HUMAN" || (state.status as unknown as string) === "BLOCKED") &&
       !state.humanFinalReview
@@ -967,16 +973,20 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
         manifest.taskRegistry,
         executorContext
       );
-      if (envReconciliation.resolved) {
+      if (envReconciliation.resolvedMarkers.length > 0) {
         console.log(
-          `[autodev] 오래된 BLOCKED(REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR)를 재검사했습니다 — required test 실행 환경 결함이 더 이상 재현되지 않음을 확인, 정상 실행 상태로 자동 복구합니다.`
+          `[autodev] REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR marker ${envReconciliation.resolvedMarkers.length}건을 재검사했습니다 — 실행 환경 결함이 더 이상 재현되지 않음을 확인, 해당 marker만 제거합니다.`
         );
-        log("오래된 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR BLOCKED 자동 복구", {
+        log("REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR marker 부분 해소", {
           projectId: manifest.projectId,
-          previousDeferredHumanTasks: state.deferredHumanTasks,
+          resolvedMarkers: envReconciliation.resolvedMarkers,
+          remainingDeferredHumanTasks: envReconciliation.remainingDeferredHumanTasks,
         });
-        state.status = "READY";
-        state.deferredHumanTasks = [];
+        state.deferredHumanTasks = [...envReconciliation.remainingDeferredHumanTasks];
+        if (state.deferredHumanTasks.length === 0) {
+          console.log(`[autodev] 남은 사유가 없습니다 — 정상 실행 상태로 자동 복구합니다.`);
+          state.status = "READY";
+        }
         saveState(state, statePath);
       }
     }

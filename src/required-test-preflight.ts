@@ -440,34 +440,53 @@ export function reconcileStaleRequiredTestConfigurationTasks(
 }
 
 // AutoDev / JARVIS Unattended Continuous Development Reliability Hardening(2026-08-30,
-// JARVIS Task 5.2 실측) — Stale REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN
-// Reconciliation. checkRequiredTestExecutionEnvironment()가 WRAPPER_NOT_FOUND 등을 이유로
-// state.deferredHumanTasks에 남긴 고정 템플릿 문자열(§ autodev.ts BLOCKED_REQUIRED_TEST_
-// EXECUTION_ENVIRONMENT 분기)을 다시 파싱해, 그 실행 환경 결함이 *지금도* 재현되는지
-// 동일한 checkRequiredTestExecutionEnvironment()로 재확인한다 — 이 파일이 만드는 것은 그
-// 하나뿐이다: "같은 원인으로 남은 WAITING_HUMAN을 같은 deterministic 검사로 다시 확인"이지,
-// WRAPPER_NOT_FOUND류 결함을 스스로 고치는 어떤 자동복구도 아니다(그런 로직은 이 함수에
-// 없다). reconcileStaleRequiredTestConfigurationTasks()(§ 위)와 완전히 동일한 fail-closed
-// 설계를 그대로 재사용한다 — 배열 안에 이 마커 형식이 아닌 항목이 하나라도 섞여 있거나,
-// 서로 다른 taskId를 가리키는 마커가 섞여 있으면 절대 resolved로 판정하지 않는다(어떤
-// genuine 사람 판단 필요 상태도, 그리고 다른 task의 상태도 이 재검사로 조용히 해제되지
-// 않는다). taskRegistry에서 taskId를 찾지 못해도(레지스트리가 그 사이 바뀐 경우 등) 추측하지
-// 않고 resolved:false로 fail-closed한다.
+// JARVIS Task 5.2 실측) — Stale REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR WAITING_HUMAN/
+// BLOCKED Reconciliation. checkRequiredTestExecutionEnvironment()가 WRAPPER_NOT_FOUND 등을
+// 이유로 state.deferredHumanTasks에 남긴 고정 템플릿 문자열(§ autodev.ts
+// BLOCKED_REQUIRED_TEST_EXECUTION_ENVIRONMENT 분기)을 다시 파싱해, 그 실행 환경 결함이
+// *지금도* 재현되는지 동일한 checkRequiredTestExecutionEnvironment()로 재확인한다 — 이
+// 파일이 만드는 것은 그 하나뿐이다: "같은 원인으로 남은 blocker를 같은 deterministic
+// 검사로 다시 확인"이지, WRAPPER_NOT_FOUND류 결함을 스스로 고치는 어떤 자동복구도 아니다
+// (그런 로직은 이 함수에 없다).
+//
+// Mixed-Marker Recovery 수정(2026-09-01, JARVIS Task 5.3 실측 — § .claude/CLAUDE.md 보안
+// 섹션에 기록된 generic defect) — 예전에는 deferredHumanTasks 배열 "전체"가 이 마커
+// 형식이어야만(그리고 전부 같은 taskId를 가리켜야만) 재검사 자체를 수행했다. 그 결과 오래된
+// 무관한 마커(예: STAGNATION_DETECTED — 그 자체로는 genuine 사유가 아니다, §
+// human-gate-policy.ts) 단 하나만 함께 섞여 있어도 실제 환경 결함이 이미 해소됐는지 재확인
+// 자체가 스킵되어, 환경을 완전히 고쳐도 영구히 복구되지 않는 deadlock이 될 수 있었다(실제
+// 재현 확인됨). 이제는 배열 전체를 하나의 단위로 판정하지 않고, 이 마커 형식과 일치하는
+// 항목만 taskId별로 선별해 그 taskId의 실제 requiredTests를 재확인한다 — 마커별로
+// requiredTest 이름까지 대조해 "그 특정 required test가 지금도 실패하는가"만 독립적으로
+// 판정한다(§ 아래 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN — requiredTest
+// 캡처 그룹 추가). 이 형식과 일치하지 않는 항목(다른 종류의 기술적 마커든 genuine 마커든)은
+// 이 함수가 절대 건드리지 않는다 — 그 마커들의 존재/제거는 각자의 기존 canonical
+// classification/reconciliation(§ human-gate-policy.ts classifyWaitingHumanReason,
+// reconcileStaleRequiredTestConfigurationTasks 등)에 맡긴다. taskRegistry에서 taskId를
+// 찾지 못하면(레지스트리가 그 사이 바뀐 경우 등) 그 taskId에 속한 마커만 추측 없이
+// fail-closed로 남긴다(다른 taskId의 판정에는 영향을 주지 않는다).
 const REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN =
-  /^REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=(\S+) requiredTest=\S+ kind=\S+ cwd=\S+ resolvedPath=.+$/;
+  /^REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR: task=(\S+) requiredTest=(\S+) kind=\S+ cwd=\S+ resolvedPath=.+$/;
 
 export interface StaleRequiredTestExecutionEnvironmentReconciliation {
-  /** true면 deferredHumanTasks 전체가 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR 형태였고
-   *  전부 같은 taskId를 가리켰으며, 그 task의 required tests에 대해
-   *  checkRequiredTestExecutionEnvironment()를 다시 실행한 결과 더 이상 어떤 issue도 없다
-   *  — 호출부가 안전하게 WAITING_HUMAN을 해제하고 이 배열을 비울 수 있다. */
-  resolved: boolean;
+  /** 원본 deferredHumanTasks에서, 이번 재검사로 실행 환경 결함이 더 이상 재현되지 않음이
+   *  확인된 REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR marker만 제외한 새 배열. 원본 순서를
+   *  그대로 보존하며, 이 마커 형식이 아닌 항목/아직 해소되지 않은 항목/taskId를 찾을 수 없는
+   *  항목은 전부 그대로 남는다. 제거된 marker가 하나도 없으면(관련 marker가 없거나 전부
+   *  미해결) 원본 배열과 참조가 동일하다(호출부가 불필요한 재할당/재저장을 피할 수 있다). */
+  remainingDeferredHumanTasks: readonly string[];
+  /** 이번 재검사로 실제로 해소가 확인되어 제거된 marker 원본 문자열 목록(로그/이벤트 기록용).
+   *  비어 있으면 이번 호출이 아무것도 바꾸지 않았다는 뜻이다. */
+  resolvedMarkers: string[];
 }
 
-/** state.status==="WAITING_HUMAN"이고 state.humanFinalReview가 없을 때만 호출한다(§
- *  reconcileStaleRequiredTestConfigurationTasks와 동일한 호출 전제). Developer/Claude/GPT
- *  어떤 프로세스도 spawn하지 않는다 — checkRequiredTestExecutionEnvironment()와 동일하게
- *  순수 fs/실행파일 resolve 판정만 수행한다. */
+/** state.status==="WAITING_HUMAN" 또는 "BLOCKED"이고 state.humanFinalReview가 없을 때만
+ *  호출한다(§ reconcileStaleRequiredTestConfigurationTasks와 동일한 호출 전제). Developer/
+ *  Claude/GPT 어떤 프로세스도 spawn하지 않는다 — checkRequiredTestExecutionEnvironment()와
+ *  동일하게 순수 fs/실행파일 resolve 판정만 수행하며, taskId별로 최대 한 번만 재확인한다
+ *  (같은 taskId를 가리키는 marker가 여럿이어도 checkRequiredTestExecutionEnvironment 호출은
+ *  taskId 그룹당 1회로 충분하다 — 그 결과의 issues 목록에서 marker별 requiredTest 이름을
+ *  대조한다). */
 export function reconcileStaleRequiredTestExecutionEnvironmentTasks(
   deferredHumanTasks: readonly string[],
   taskRegistry: readonly TaskDefinition[],
@@ -476,19 +495,52 @@ export function reconcileStaleRequiredTestExecutionEnvironmentTasks(
    *  동일 파라미터 주석). production 호출부(autodev.ts)는 이 값을 지정하지 않는다. */
   gradleTestOverrides?: { platform?: NodeJS.Platform; gradleTestDeps?: GradleWrapperResolveTestDeps }
 ): StaleRequiredTestExecutionEnvironmentReconciliation {
-  if (deferredHumanTasks.length === 0) return { resolved: false };
-  let taskId: string | undefined;
-  for (const entry of deferredHumanTasks) {
-    const m = REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN.exec(entry);
-    if (!m) return { resolved: false };
-    if (taskId === undefined) taskId = m[1];
-    else if (taskId !== m[1]) return { resolved: false };
+  if (deferredHumanTasks.length === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
   }
-  if (taskId === undefined) return { resolved: false };
-  const taskDef = findTaskById(taskRegistry, taskId);
-  if (!taskDef) return { resolved: false };
-  const recheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executor, taskDef.allowedPathPrefixes, gradleTestOverrides);
-  return { resolved: recheck.ok };
+
+  interface ParsedEnvMarkerEntry {
+    index: number;
+    entry: string;
+    requiredTestName: string;
+  }
+  const entriesByTaskId = new Map<string, ParsedEnvMarkerEntry[]>();
+  for (let i = 0; i < deferredHumanTasks.length; i++) {
+    const entry = deferredHumanTasks[i];
+    const m = REQUIRED_TEST_EXECUTION_ENVIRONMENT_ERROR_ENTRY_PATTERN.exec(entry);
+    if (!m) continue; // 이 형식이 아닌 항목(다른 기술적 마커든 genuine 마커든) — 절대 건드리지 않는다.
+    const taskId = m[1];
+    const requiredTestName = m[2];
+    const list = entriesByTaskId.get(taskId) ?? [];
+    list.push({ index: i, entry, requiredTestName });
+    entriesByTaskId.set(taskId, list);
+  }
+
+  if (entriesByTaskId.size === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+
+  const resolvedIndices = new Set<number>();
+  const resolvedMarkers: string[] = [];
+
+  for (const [taskId, entries] of entriesByTaskId) {
+    const taskDef = findTaskById(taskRegistry, taskId);
+    if (!taskDef) continue; // 이 taskId를 찾지 못하면 추측하지 않는다 — 이 그룹의 marker는 전부 미해결로 남는다.
+    const recheck = checkRequiredTestExecutionEnvironment(taskDef.requiredTests, executor, taskDef.allowedPathPrefixes, gradleTestOverrides);
+    const stillFailingRequiredTestNames = new Set(recheck.issues.map((issue) => issue.requiredTestName));
+    for (const parsed of entries) {
+      if (stillFailingRequiredTestNames.has(parsed.requiredTestName)) continue;
+      resolvedIndices.add(parsed.index);
+      resolvedMarkers.push(parsed.entry);
+    }
+  }
+
+  if (resolvedIndices.size === 0) {
+    return { remainingDeferredHumanTasks: deferredHumanTasks, resolvedMarkers: [] };
+  }
+
+  const remainingDeferredHumanTasks = deferredHumanTasks.filter((_, i) => !resolvedIndices.has(i));
+  return { remainingDeferredHumanTasks, resolvedMarkers };
 }
 
 const IGNORED_DIR_NAMES = new Set(["node_modules", ".git", "dist", "build"]);
