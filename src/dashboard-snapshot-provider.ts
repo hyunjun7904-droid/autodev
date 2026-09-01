@@ -269,7 +269,13 @@ export function getDashboardSnapshot(
     return { status: "NO_RUN_YET", generatedAt: new Date(now).toISOString() };
   }
   const lastEvent = result.events[result.events.length - 1];
-  const snapshot = buildAutoDevLiveSnapshot(result, { runId, projectId: lastEvent.projectId, now });
+  // Dashboard 운영 UX 정리 · 성능 — historicalProjectId를 지정하지 않으면
+  // aggregateHistoricalSummary()가 이 project 하나만 볼 때도 store 전체(모든 project의 모든
+  // runId)를 훑는다(§ live-snapshot.ts의 기존 계약 — 새로 만든 옵션이 아니다, 그동안 이
+  // 호출부가 쓰지 않았을 뿐이다). 실측: 이 한 줄을 빠뜨리면 이 project 하나의 호출만으로도
+  // 전체 store(4028 events/1547 distinct runId)를 재훑어 호출당 150~250ms가 소요된다(§
+  // getMultiProjectDashboardSnapshot 주석에 기록된 실측치와 동일 원인).
+  const snapshot = buildAutoDevLiveSnapshot(result, { runId, projectId: lastEvent.projectId, now, historicalProjectId: lastEvent.projectId });
 
   // run.ts가 이미 쓰는 것과 완전히 동일한 project config 경로(§ project-adapter-loader.ts) —
   // 새 설정 방식을 만들지 않는다. 설정돼 있지 않으면 projectProgress는 undefined로 남는다.
@@ -401,19 +407,40 @@ export function getMultiProjectDashboardSnapshot(
   const registryByProjectId = new Map(registry.projects.map((p) => [p.projectId, p]));
   const logsDir = options.logsDir ?? join(process.cwd(), "logs");
 
-  const idsFromEvents = new Set(result.events.map((e) => e.projectId ?? UNASSIGNED_PROJECT_ID));
-  const allIds = new Set<string>([...idsFromEvents, ...registryByProjectId.keys()]);
+  // Dashboard 성능(§ project별 전체 event 반복 계산 제거) — 전체 store를 project 수만큼
+  // 반복해서 filter()하지 않고, 한 번의 순회로 projectId별 event 목록을 미리 나눠 둔다(원래
+  // .filter()가 보장하던 원본 순서를 그대로 보존한다 — 다른 판정 로직은 전혀 바꾸지 않는다,
+  // 순수 조회 성능 최적화). 실측(§ getMultiProjectDashboardSnapshot 상단): 이 partition 자체의
+  // 비용은 이미 미미했다(event 4028건 기준 1ms 미만) — 실제 지배적 비용은 아래
+  // buildAutoDevLiveSnapshot() 호출의 historicalProjectId 누락이었다(같은 커밋에서 함께 수정).
+  const eventsByProjectId = new Map<string, QueryResult["events"]>();
+  for (const e of result.events) {
+    const key = e.projectId ?? UNASSIGNED_PROJECT_ID;
+    const bucket = eventsByProjectId.get(key);
+    if (bucket) bucket.push(e);
+    else eventsByProjectId.set(key, [e]);
+  }
+
+  const allIds = new Set<string>([...eventsByProjectId.keys(), ...registryByProjectId.keys()]);
 
   const projects: ProjectDashboardEntry[] = [];
   for (const projectId of allIds) {
     const registered = registryByProjectId.get(projectId);
     const eventsKey = projectId === UNASSIGNED_PROJECT_ID ? undefined : projectId;
-    const projectEvents = result.events.filter((e) => (projectId === UNASSIGNED_PROJECT_ID ? e.projectId === undefined : e.projectId === projectId));
+    const projectEvents = eventsByProjectId.get(projectId) ?? [];
     const lastEvent = projectEvents.length > 0 ? projectEvents[projectEvents.length - 1] : undefined;
 
     let snapshot: AutoDevLiveSnapshot | undefined;
     if (lastEvent) {
-      snapshot = buildAutoDevLiveSnapshot(result, { runId: lastEvent.runId, projectId: eventsKey, now });
+      // § 위 getDashboardSnapshot()과 동일한 이유로 historicalProjectId를 반드시 넘긴다 —
+      // 넘기지 않으면 이 22개 project 각각의 호출마다 store 전체(모든 project의 historical
+      // 이력)를 다시 훑는다. 실측(현재 production events.jsonl, 4028 events/22 project):
+      // 이 옵션 없이 전체 루프 3340ms(project당 평균 150ms, 최대 230ms, project 자신의 event
+      // 수와 무관하게 거의 균일 — store 전체의 distinct runId 1547개를 매번 다시 훑기
+      // 때문) → 이 옵션을 넘기면 140ms(각 project는 자신의 historical 이력만 훑는다). 새
+      // 옵션을 만들지 않았다 — live-snapshot.ts의 기존 계약(BuildLiveSnapshotOptions.
+      // historicalProjectId)을 그동안 이 호출부가 쓰지 않았을 뿐이다.
+      snapshot = buildAutoDevLiveSnapshot(result, { runId: lastEvent.runId, projectId: eventsKey, now, historicalProjectId: eventsKey });
     }
 
     const rawRoundStatus = readRoundStatus(roundStatusFilePath);

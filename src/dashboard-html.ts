@@ -209,6 +209,20 @@ export const DASHBOARD_HTML = `<!doctype html>
     font-size: 13px; cursor: pointer;
   }
   .chatbox .hint { padding: 6px 10px; font-size: 11px; color: var(--muted); border-top: 1px dashed var(--border); }
+  .collapse-header {
+    background: none; border: none; color: var(--text); font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.04em; padding: 0; cursor: pointer; display: block; width: 100%; text-align: left;
+  }
+  .collapse-header .arrow { color: var(--muted); display: inline-block; width: 14px; }
+  .collapse-teaser { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .collapse-teaser .value { color: var(--text); font-weight: 600; }
+  .collapse-body { margin-top: 10px; }
+  .lifecycle-row { display: flex; align-items: center; gap: 6px; font-size: 14px; flex-wrap: wrap; }
+  .lifecycle-row .stage { display: flex; align-items: center; gap: 4px; color: var(--gray); }
+  .lifecycle-row .stage.done { color: var(--green); font-weight: 600; }
+  .lifecycle-row .stage.current { color: var(--accent); font-weight: 700; }
+  .lifecycle-row .stage.pending { color: var(--muted); }
+  .lifecycle-row .arrow { color: var(--border); }
 </style>
 </head>
 <body>
@@ -337,6 +351,23 @@ export const DASHBOARD_HTML = `<!doctype html>
     return '<span class="pill value ' + (tone || "GRAY") + '">' + esc(text) + "</span>";
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 15/20/21) — 활동 기록/사용량·호출/Git/기준선을
+  // 기본 접힘으로 표시하는 공용 wrapper. teaserHtml(선택)은 접힌 상태에서도 항상 보이는
+  // 한 줄 요약이다(예: 활동 기록의 "개발 N회/검토 N회/..."). bodyHtml은 펼쳤을 때만 그린다 —
+  // 접힌 상태에서는 아예 DOM에 넣지 않는다(§ 요구사항 3 "CSS display:none 금지" — project
+  // 계산 자체가 아니라 렌더링 비용 얘기지만, 같은 원칙으로 불필요한 큰 표를 접힌 상태에서
+  // 매 polling마다 다시 그리지 않는다).
+  function collapsibleSection(key, title, teaserHtml, bodyHtml) {
+    var open = isOpen(key);
+    var html = '<div class="card wide collapsible">' +
+      '<button type="button" class="collapse-header" data-collapse-key="' + esc(key) + '">' +
+      '<span class="arrow">' + (open ? "▼" : "▶") + "</span> " + esc(title) + "</button>";
+    if (teaserHtml) html += '<div class="collapse-teaser">' + teaserHtml + "</div>";
+    if (open) html += '<div class="collapse-body">' + bodyHtml + "</div>";
+    html += "</div>";
+    return html;
+  }
+
   // ---------------------------------------------------------------------
   // Maintenance Pause / 지연·blocker 판정(§ 요구사항 7) — 임의 시간 기준 하나로 뭉뚱그리지
   // 않고, 실제로 관측 가능한 근거를 각각 구분해서 보여준다. 의도적 Maintenance Pause는
@@ -374,8 +405,17 @@ export const DASHBOARD_HTML = `<!doctype html>
     // 임의로 바뀌지 않는다.
     registryFilter: "REGISTERED",
     // 운영 질문창은 기본 접힘 상태로 시작한다(§ 요구사항 9) — 버튼으로만 연다.
-    chatOpen: false
+    chatOpen: false,
+    // Dashboard 운영 UX 최종 정리(§ 요구사항 15/20/21) — 활동 기록/사용량·호출/Git/Baseline은
+    // 전부 기본 접힘이다. key가 없으면(초기 상태) 접힘으로 취급한다 — true로 명시된 key만
+    // 펼쳐진 것으로 본다.
+    collapsedOpen: {},
+    activityFilter: "전체",
+    activityShowAll: false
   };
+  function isOpen(key) {
+    return state.collapsedOpen[key] === true;
+  }
 
   // ---------------------------------------------------------------------
   // Dashboard 운영 UX 정리 — 대표 상태 6종 단순화(§ 요구사항 6). 내부 enum
@@ -455,6 +495,40 @@ export const DASHBOARD_HTML = `<!doctype html>
     });
     html += "</div>";
     return html;
+  }
+
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 13 "현재 작업 흐름 단순화") — 개발→테스트→검토→
+  // 저장 4단계를 실제 lifecycle 데이터로만 판정한다(가짜 진행 상태 금지). 각 단계는 실제로
+  // 관측된 값(호출 여부/검사 결과/검토 판정/checkpoint 생성 여부)이 있으면 done, 없고
+  // taskStatus가 그 단계를 가리키면 current, 그 외에는 pending이다 — REVISING(수정 중)은
+  // Developer가 다시 작업 중이라는 뜻이므로 "개발" 단계의 current로 되돌린다.
+  var WORKFLOW_CURRENT_STAGE_BY_STATUS = { RUNNING: "개발", REVISING: "개발", TESTING: "테스트", REVIEWING: "검토", CHECKPOINTING: "저장" };
+  function workflowStages(p) {
+    var snap = p.snapshot;
+    if (!snap) return null;
+    var currentKey = WORKFLOW_CURRENT_STAGE_BY_STATUS[snap.taskStatus];
+    var defs = [
+      { key: "개발", done: snap.development.callCount > 0 },
+      { key: "테스트", done: snap.tests.status !== "UNKNOWN" },
+      { key: "검토", done: !!snap.review.decision },
+      { key: "저장", done: snap.safety.checkpointStatus === "CREATED" }
+    ];
+    return defs.map(function (d) {
+      var state2 = d.done ? "done" : (d.key === currentKey ? "current" : "pending");
+      return { key: d.key, state: state2 };
+    });
+  }
+  function renderWorkflowStages(p) {
+    var stages = workflowStages(p);
+    if (!stages) return card("현재 작업 흐름", '<div class="empty">이 프로젝트는 아직 실행된 적이 없습니다.</div>');
+    var marks = { done: "✓", current: "●", pending: "○" };
+    var html = '<div class="lifecycle-row">';
+    stages.forEach(function (s, i) {
+      if (i > 0) html += '<span class="arrow">→</span>';
+      html += '<span class="stage ' + s.state + '">' + esc(s.key) + " " + marks[s.state] + "</span>";
+    });
+    html += "</div>";
+    return card("현재 작업 흐름", html);
   }
 
   function projectDensityClass(count) {
@@ -668,25 +742,19 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("지금 한눈에", '<div class="quickgrid">' + html + "</div>");
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 14 "프로젝트 진행률") — 현재 단계/전체 단계,
+  // 완료 작업/전체 작업, 전체 진행률로만 제한한다. "다음 진행 예정"/"그 다음 작업"은
+  // renderTaskSummaryCard의 "다음 작업"(§ deriveTaskDisplay)과 중복이라 여기서는 뺀다(§
+  // 요구사항: 중복되는 프로젝트 진행 상황 카드가 여러 군데 있으면 통합).
   function renderProjectProgress(p) {
     var pr = p.projectProgress;
     if (!pr) {
       return card("프로젝트 진행 상황", '<div class="empty">' + (p.registered ? "task-registry/project-state를 읽지 못했습니다." : "이 project는 registry에 등록되지 않아 전체 진행률을 알 수 없습니다(event 기반 정보만 표시).") + "</div>");
     }
     var rows =
-      row("프로젝트 이름", orDash(pr.projectName)) +
-      row("전체 단계 수", fmtNum(pr.totalPhases)) +
-      row("전체 작업 수", fmtNum(pr.totalTasks)) +
-      row("완료 작업 수", fmtNum(pr.completedTaskCount)) +
-      // Dashboard 운영 UX 정리(§ 요구사항 5) — 여기서 말하는 "다음 진행 예정"은 task-registry
-      // 상 아직 완료되지 않은 첫 task(pr.currentTaskId)다 — 실제로 지금 실행 중이라는 뜻이
-      // 아니다(그건 대표 상태/§ deriveTaskDisplay의 "현재 작업"만 주장할 수 있다). 혼동을
-      // 피하기 위해 "현재 작업"이라고 부르지 않는다.
-      row("다음 진행 예정", pr.currentTaskId ? esc(pr.currentTaskId) + (pr.currentTaskTitle ? " · " + esc(pr.currentTaskTitle) : "") : "없음(전체 완료)") +
-      row("그 다음 작업", pr.nextTaskId ? esc(pr.nextTaskId) + (pr.nextTaskTitle ? " · " + esc(pr.nextTaskTitle) : "") : "없음");
-    var bars =
-      progressBar(pr.overallProgressPercent, "전체 진행률") +
-      (typeof pr.currentPhaseProgressPercent === "number" ? progressBar(pr.currentPhaseProgressPercent, "현재 단계 진행률") : "");
+      row("현재 단계", (typeof pr.currentTaskPhase === "number" ? pr.currentTaskPhase : NOT_AVAILABLE) + " / " + fmtNum(pr.totalPhases)) +
+      row("완료 작업", fmtNum(pr.completedTaskCount) + " / " + fmtNum(pr.totalTasks));
+    var bars = progressBar(pr.overallProgressPercent, "전체 진행률");
     return card("프로젝트 진행 상황", rows + bars);
   }
 
@@ -722,92 +790,54 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("실제 작업시간", rows);
   }
 
-  function renderLiveOperations(snap) {
-    var rows =
-      row("개발 담당 상태", snap.development.callCount > 0 ? "호출 " + snap.development.callCount + "회" : "호출 없음") +
-      row("검사 상태", TEST_STATUS_LABEL_KO[snap.tests.status] || snap.tests.status, snap.tests.status === "PASS" ? "GREEN" : snap.tests.status === "FAIL" ? "RED" : "GRAY") +
-      row("검토 상태", snap.review.decision ? (REVIEW_DECISION_LABEL_KO[snap.review.decision] || snap.review.decision) : "없음") +
-      row("검토 반복 횟수", String(snap.review.reviewCycle)) +
-      row("저장 지점 상태", snap.safety.checkpointStatus === "CREATED" ? "생성됨" : "없음", snap.safety.checkpointStatus === "CREATED" ? "GREEN" : "GRAY");
-    return card("실시간 작업", rows);
-  }
-
-  // § 요구사항 5 — Developer 생애주기(시작/종료/실행시간/attempt/종료상태·사유).
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 19 "Developer 표시 축소") — 기본 화면에는 가장
+  // 최근 시도 하나만 보여준다. 전체 attempt 이력은 "개발 이력" 라벨을 그대로 유지한 채
+  // 아래 활동 기록(§ renderActivityLog, "개발" 필터)에서 볼 수 있다 — 데이터/판정 로직은
+  // 그대로 재사용할 뿐 새로 만들지 않는다.
   function renderDeveloperLifecycle(p) {
     var lc = p.developerLifecycle;
     if (!lc || lc.attempts.length === 0) {
       return card("개발 이력", '<div class="empty">이 작업에 대한 개발 담당 호출 기록이 아직 없습니다.</div>');
     }
-    var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
-      "<th>시도</th><th>시작</th><th>종료</th><th>실행시간</th><th>종료 상태</th><th>종료 사유</th>" +
-      "</tr></thead><tbody>";
-    lc.attempts.slice().reverse().forEach(function (a) {
-      var outcomeLabel = DEVELOPER_OUTCOME_LABEL_KO[a.outcome] || a.outcome;
-      var outcomeTone = DEVELOPER_OUTCOME_TONE[a.outcome] || "GRAY";
-      var reason = a.exitReason ? esc(a.exitReason) : (a.exitDetail ? esc(a.exitDetail) : (a.outcome === "RUNNING" ? "아직 없음" : "—"));
-      html += "<tr><td>" + a.attemptNumber + "회</td><td>" + esc(fmtDateTime(a.startedAt)) + "</td><td>" +
-        (a.endedAt ? esc(fmtDateTime(a.endedAt)) : "아직 없음") + "</td><td>" +
-        (a.durationMs !== undefined ? fmtDuration(a.durationMs) : "—") + '</td><td class="value ' + outcomeTone + '">' +
-        esc(outcomeLabel) + "</td><td>" + reason + "</td></tr>";
-    });
-    html += "</tbody></table></div>";
-    return card("개발 이력(현재 작업)", html, true);
+    var latest = lc.latest || lc.attempts[lc.attempts.length - 1];
+    var outcomeLabel = DEVELOPER_OUTCOME_LABEL_KO[latest.outcome] || latest.outcome;
+    var outcomeTone = DEVELOPER_OUTCOME_TONE[latest.outcome] || "GRAY";
+    var rows =
+      row(latest.attemptNumber + "번째 시도", esc(outcomeLabel), outcomeTone) +
+      row("시작", esc(fmtDateTime(latest.startedAt))) +
+      row("실행시간", latest.durationMs !== undefined ? fmtDuration(latest.durationMs) : (latest.outcome === "RUNNING" ? "진행 중" : "—")) +
+      row("전체 시도 횟수", String(lc.attempts.length));
+    return card("개발 이력(최근)", rows);
   }
 
-  // § 요구사항 6 — Reviewer 호출 이력(provider/model/결과/순번/escalation 관측 여부).
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 18 "Reviewer 표시 축소") — 최근 호출 1건만 표시.
+  // 전체 호출 이력(provider/model/순번/cycle)은 활동 기록("검토" 필터)에서 그대로 확인할 수
+  // 있다.
   function renderReviewerHistory(p) {
     var history = p.reviewerHistory || [];
     if (history.length === 0) {
       return card("검토 이력", '<div class="empty">아직 검토 담당이 호출된 적이 없습니다.</div>');
     }
-    var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
-      "<th>순번</th><th>시각</th><th>작업</th><th>서비스</th><th>모델</th><th>결과</th><th>검토 cycle</th><th>비고</th>" +
-      "</tr></thead><tbody>";
-    history.slice().reverse().forEach(function (r) {
-      var tone = REVIEWER_CALL_RESULT_TONE[r.result] || "GRAY";
-      var note = r.providerChangedFromPrevious ? "이전 호출과 다른 provider" : "";
-      html += "<tr><td>#" + r.sequenceNumber + "</td><td>" + esc(fmtDateTime(r.timestamp)) + "</td><td>" + orDash(r.taskId) +
-        "</td><td>" + esc(r.service) + "</td><td>" + orDash(r.model) + '</td><td class="value ' + tone + '">' +
-        esc(REVIEWER_CALL_RESULT_LABEL_KO[r.result] || r.result) + "</td><td>" + orDash(r.reviewCycle) + "</td><td>" + esc(note) + "</td></tr>";
-    });
-    html += "</tbody></table></div>";
-    return card("검토 이력(호출 " + history.length + "회)", html, true);
+    var last = history[history.length - 1];
+    var tone = REVIEWER_CALL_RESULT_TONE[last.result] || "GRAY";
+    var rows =
+      row("서비스", esc(last.service)) +
+      row("모델", orDash(last.model)) +
+      row("결과", esc(REVIEWER_CALL_RESULT_LABEL_KO[last.result] || last.result), tone) +
+      row("전체 호출 횟수", String(history.length));
+    return card("검토 이력(최근)", rows);
   }
 
-  // § 요구사항 7 — 지연/blocker 근거를 항목별로 구분해서 표시.
-  function renderDelayEvidence(p) {
-    var evidence = delayEvidence(p);
-    if (evidence.length === 0) {
-      return card("지연/Blocker 근거", '<div class="empty">현재 관측된 지연/장애 근거가 없습니다.</div>');
-    }
-    var html = evidence.map(function (e) {
-      return row(e.label, e.detail ? esc(e.detail) : "관측됨", e.tone);
-    }).join("");
-    return card("지연/Blocker 근거", html);
+  function usageTotalsRows(t) {
+    return (
+      row("입력 토큰", fmtNum(t.totals.inputTokens)) +
+      row("출력 토큰", fmtNum(t.totals.outputTokens)) +
+      row("전체 토큰", fmtNum(t.totals.totalTokens)) +
+      row("외부 인공지능 호출 횟수", fmtNum(t.totals.callCount))
+    );
   }
-
-  function renderUsage(p) {
-    var u = p.usageOverview;
-    if (!u) return card("사용량", '<div class="empty">' + NO_DATA + "</div>");
-    function totalsRows(t) {
-      return (
-        row("입력 토큰", fmtNum(t.totals.inputTokens)) +
-        row("출력 토큰", fmtNum(t.totals.outputTokens)) +
-        row("전체 토큰", fmtNum(t.totals.totalTokens)) +
-        row("외부 인공지능 호출 횟수", fmtNum(t.totals.callCount))
-      );
-    }
-    var html = subheading("전체 누적") + totalsRows(u.allTime);
-    html += subheading("현재 작업") + (u.currentTask ? totalsRows(u.currentTask) : '<div class="empty">현재 작업 없음</div>');
-    return card("사용량", html);
-  }
-
-  function renderServiceUsage(p) {
-    var u = p.usageOverview;
-    var list = u ? u.allTime.byService : [];
-    if (!list || list.length === 0) {
-      return card("서비스별 호출량", '<div class="empty">아직 호출된 외부 인공지능 서비스가 없습니다.</div>');
-    }
+  function serviceUsageTableHtml(list) {
+    if (!list || list.length === 0) return '<div class="empty">아직 호출된 외부 인공지능 서비스가 없습니다.</div>';
     var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
       "<th>서비스</th><th>모델</th><th>호출 횟수</th><th>입력 토큰</th><th>출력 토큰</th><th>전체 토큰</th>" +
       "</tr></thead><tbody>";
@@ -816,14 +846,10 @@ export const DASHBOARD_HTML = `<!doctype html>
         fmtNum(u2.inputTokens) + "</td><td>" + fmtNum(u2.outputTokens) + "</td><td>" + fmtNum(u2.totalTokens) + "</td></tr>";
     });
     html += "</tbody></table></div>";
-    return card("서비스별 호출량", html, true);
+    return html;
   }
-
-  function renderRecentCalls(p) {
-    var calls = p.recentCalls || [];
-    if (calls.length === 0) {
-      return card("최근 외부 인공지능 호출 기록", '<div class="empty">아직 호출 기록이 없습니다.</div>');
-    }
+  function recentCallsTableHtml(calls) {
+    if (!calls || calls.length === 0) return '<div class="empty">아직 호출 기록이 없습니다.</div>';
     var html = '<div class="tablewrap"><table class="calls"><thead><tr>' +
       "<th>시각</th><th>작업</th><th>목적</th><th>서비스</th><th>모델</th><th>전체 토큰</th><th>성공</th>" +
       "</tr></thead><tbody>";
@@ -835,75 +861,183 @@ export const DASHBOARD_HTML = `<!doctype html>
         fmtNum(c.totalTokens) + '</td><td class="value ' + successTone + '">' + successLabel + "</td></tr>";
     });
     html += "</tbody></table></div>";
-    return card("최근 외부 인공지능 호출 기록", html, true);
+    return html;
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 20 "사용량 / 호출") — 기존 4개 카드(사용량/
+  // 서비스별 호출량/최근 호출 기록/비용)를 하나의 접힌 섹션으로 묶는다. 데이터는 삭제하지
+  // 않는다 — 펼쳤을 때만 계산 없이 그대로 다시 보여준다(집계 로직 재사용, 새로 만들지 않음).
+  function renderUsageSection(p) {
+    var u = p.usageOverview;
+    var snap = p.snapshot;
+    var body = "";
+    if (!u) {
+      body += subheading("사용량") + '<div class="empty">' + NO_DATA + "</div>";
+    } else {
+      body += subheading("전체 누적") + usageTotalsRows(u.allTime);
+      body += subheading("현재 작업") + (u.currentTask ? usageTotalsRows(u.currentTask) : '<div class="empty">현재 작업 없음</div>');
+      body += subheading("서비스별 호출량") + serviceUsageTableHtml(u.allTime.byService);
+    }
+    body += subheading("최근 외부 인공지능 호출 기록") + recentCallsTableHtml(p.recentCalls);
+    if (snap) {
+      var actual = fmtUsd(snap.usage.actualCostUsd);
+      var estimated = fmtUsd(snap.usage.estimatedCostUsd);
+      if (actual !== null || estimated !== null) {
+        var costRows = (actual !== null ? row("실제 비용", actual) : "") + (estimated !== null ? row("예상 비용", estimated) : "");
+        body += subheading("비용") + costRows;
+      }
+    }
+    return collapsibleSection("usage", "사용량 / 호출", null, body);
+  }
+
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 17 "작업 성공/실패 기록") — 수십 건짜리 표를 기본
+  // 화면에 그대로 두지 않는다. 성공/실패 총계와 가장 최근 실패 한 줄만 보여주고, 상세 목록은
+  // 아래 활동 기록("실패" 필터, § renderActivityLog)에서 확인하게 한다 — 같은 데이터를 두
+  // 곳에서 서로 다른 형태로 유지하지 않는다.
   function renderAttemptOutcomes(p) {
     var ao = p.attemptOutcomes;
     if (!ao || (ao.successCount === 0 && ao.failureCount === 0)) {
-      return card("작업 시도 결과(성공/실패 사례)", '<div class="empty">아직 확정된 시도(checkpoint 성공 또는 최종 차단)가 없습니다.</div>');
+      return card("작업 시도 결과(성공/실패)", '<div class="empty">아직 확정된 시도(checkpoint 성공 또는 최종 차단)가 없습니다.</div>');
     }
-    var html = row("성공 사례", fmtNum(ao.successCount), ao.successCount > 0 ? "GREEN" : "GRAY") +
-      row("실패 사례", fmtNum(ao.failureCount), ao.failureCount > 0 ? "YELLOW" : "GRAY");
+    var html = row("성공", fmtNum(ao.successCount), ao.successCount > 0 ? "GREEN" : "GRAY") +
+      row("실패", fmtNum(ao.failureCount), ao.failureCount > 0 ? "YELLOW" : "GRAY");
     var recent = ao.recent || [];
-    if (recent.length > 0) {
-      html += '<div class="tablewrap"><table class="calls"><thead><tr>' +
-        "<th>시각</th><th>작업</th><th>결과</th><th>사유</th>" +
-        "</tr></thead><tbody>";
-      recent.forEach(function (a) {
-        var tone = a.result === "SUCCESS" ? "GREEN" : "RED";
-        var label = a.result === "SUCCESS" ? "성공" : "실패";
-        html += "<tr><td>" + esc(fmtDateTime(a.occurredAt)) + "</td><td>" + orDash(a.taskId) + '</td><td class="value ' + tone + '">' +
-          label + "</td><td>" + esc(orDash(a.reason)) + "</td></tr>";
-      });
-      html += "</tbody></table></div>";
+    var latestFailure = recent.filter(function (a) { return a.result !== "SUCCESS"; })[0];
+    if (latestFailure) {
+      html += row("최근 실패", orDash(latestFailure.taskId) + " · " + esc(orDash(latestFailure.reason)));
     }
-    return card("작업 시도 결과(성공/실패 사례)", html, true);
+    if (ao.failureCount > 0) {
+      html += '<div class="pc-blocker" style="border-top:none;padding-top:0;color:var(--muted);">상세 목록은 아래 "활동 기록 → 실패"에서 확인할 수 있습니다.</div>';
+    }
+    return card("작업 시도 결과(성공/실패)", html);
   }
 
   // Dashboard 운영 UX 정리(§ 요구사항 8 상세 패널 Git) — 새 기록 경로를 만들지 않는다.
   // attemptOutcomes.recent(이미 CHECKPOINT_CREATED event만 근거로 삼는 기존 집계, §
   // dashboard-attempt-outcomes.ts)에서 가장 최근 SUCCESS 항목의 commitHash를 그대로
   // 노출할 뿐이다 — commitHash가 기록돼 있지 않으면 추측하지 않고 확인 불가로 남긴다.
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 21) — 기본 접힘.
   function renderGitInfo(p) {
     var recent = (p.attemptOutcomes && p.attemptOutcomes.recent) || [];
     var latestSuccess = recent.filter(function (a) { return a.result === "SUCCESS" && a.commitHash; })[0];
-    if (!latestSuccess) {
-      return card("Git", '<div class="empty">최근 checkpoint commit 기록이 없습니다.</div>');
-    }
-    return card("Git", row("최근 checkpoint", latestSuccess.commitHash) + row("작업", orDash(latestSuccess.taskId)));
+    var body = latestSuccess
+      ? row("최근 checkpoint", latestSuccess.commitHash) + row("작업", orDash(latestSuccess.taskId))
+      : '<div class="empty">최근 checkpoint commit 기록이 없습니다.</div>';
+    return collapsibleSection("git", "Git", null, body);
   }
 
   // Dashboard 운영 UX 정리(§ 요구사항 12 Baseline/Telemetry) — dashboard-baseline.ts가
   // 계산한 "현재 task의 실측치"를 그대로 보여준다. 비교할 이전 기준을 어디에도 저장하지
   // 않으므로(§ dashboard-baseline.ts 주석) 가짜 %/증감을 만들지 않고 "기준 데이터 없음"을
-  // 그대로 표시한다 — 원시 수치만 보조 정보로 함께 보여준다.
+  // 그대로 표시한다 — 원시 수치만 보조 정보로 함께 보여준다. Dashboard 운영 UX 최종
+  // 정리(§ 요구사항 21) — 기본 접힘. Baseline 기능 자체는 삭제하지 않는다(Graphify A/B에서
+  // 다시 쓴다).
   function renderBaseline(p) {
     var b = p.baseline;
-    if (!b) {
-      return card("기준(Baseline)", '<div class="empty">현재 작업에 대한 실측 자료가 아직 없습니다.</div>');
-    }
-    var html =
-      row("기준 대비", "기준 데이터 없음") +
-      row("개발 담당 호출(현재 작업)", fmtNum(b.developerCallCount)) +
-      row("검토 담당 호출(현재 작업)", fmtNum(b.reviewerCallCount)) +
-      row("작업시간(현재 작업)", fmtDuration(b.taskDurationMs)) +
-      row("수정 요청(REVISE) 횟수", fmtNum(b.reviseCount));
-    return card("기준(Baseline)", html);
+    var body = !b
+      ? '<div class="empty">현재 작업에 대한 실측 자료가 아직 없습니다.</div>'
+      : row("기준 대비", "기준 데이터 없음") +
+        row("개발 담당 호출(현재 작업)", fmtNum(b.developerCallCount)) +
+        row("검토 담당 호출(현재 작업)", fmtNum(b.reviewerCallCount)) +
+        row("작업시간(현재 작업)", fmtDuration(b.taskDurationMs)) +
+        row("수정 요청(REVISE) 횟수", fmtNum(b.reviseCount));
+    return collapsibleSection("baseline", "기준(Baseline)", null, body);
   }
 
-  function renderCost(snap) {
-    var u = snap.usage;
-    var actual = fmtUsd(u.actualCostUsd);
-    var estimated = fmtUsd(u.estimatedCostUsd);
-    if (actual === null && estimated === null) {
-      return card("비용", '<div class="empty">비용 계산 자료 없음</div>');
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 15/16 "활동 기록 통합") — developerLifecycle/
+  // reviewerHistory/recentCalls/attemptOutcomes(전부 기존 read model, 새 집계 로직 없음)를
+  // 실제 timestamp 기준으로 하나의 시간순 목록으로 합친다(네 소스 모두 실제 ISO timestamp
+  // 필드를 갖고 있어 억지로 섞는 게 아니다). recentCalls/attemptOutcomes.recent는
+  // 백엔드에서 이미 최근 20건으로 제한돼 있다(§ dashboard-snapshot-provider.ts
+  // RECENT_CALLS_LIMIT, dashboard-attempt-outcomes.ts RECENT_LIMIT) — "외부 호출" 총
+  // 횟수는 그래서 이 목록 길이가 아니라 usageOverview.allTime.totals.callCount(누적 실제
+  // 호출 수)로 표시한다.
+  var ACTIVITY_TYPE_LABEL_KO = { dev: "개발", review: "검토", call: "외부 호출", fail: "실패" };
+  var ACTIVITY_FILTER_TABS = ["전체", "개발", "검토", "외부 호출", "실패"];
+  var ACTIVITY_DEFAULT_COUNT = 8;
+  function buildActivityItems(p, filterKey) {
+    var items = [];
+    var lc = p.developerLifecycle;
+    if (lc && (filterKey === "전체" || filterKey === "개발")) {
+      lc.attempts.forEach(function (a) {
+        items.push({
+          type: "dev",
+          time: a.startedAt,
+          text: a.attemptNumber + "번째 시도 · " + esc(DEVELOPER_OUTCOME_LABEL_KO[a.outcome] || a.outcome),
+          tone: DEVELOPER_OUTCOME_TONE[a.outcome] || "GRAY"
+        });
+      });
     }
-    var rows = "";
-    if (actual !== null) rows += row("실제 비용", actual);
-    if (estimated !== null) rows += row("예상 비용", estimated);
-    return card("비용", rows);
+    var rh = p.reviewerHistory || [];
+    if (filterKey === "전체" || filterKey === "검토") {
+      rh.forEach(function (r) {
+        items.push({
+          type: "review",
+          time: r.timestamp,
+          text: "#" + r.sequenceNumber + " · " + esc(r.service) + (r.model ? " · " + esc(r.model) : "") + " · " + esc(REVIEWER_CALL_RESULT_LABEL_KO[r.result] || r.result),
+          tone: REVIEWER_CALL_RESULT_TONE[r.result] || "GRAY"
+        });
+      });
+    }
+    var calls = p.recentCalls || [];
+    if (filterKey === "전체" || filterKey === "외부 호출") {
+      calls.forEach(function (c) {
+        items.push({
+          type: "call",
+          time: c.timestamp,
+          text: esc(c.purpose) + " · " + esc(c.service) + (c.model ? " · " + esc(c.model) : ""),
+          tone: c.success ? "GREEN" : "RED"
+        });
+      });
+    }
+    var ao = (p.attemptOutcomes && p.attemptOutcomes.recent) || [];
+    if (filterKey === "전체" || filterKey === "실패") {
+      ao.filter(function (a) { return a.result !== "SUCCESS"; }).forEach(function (a) {
+        items.push({ type: "fail", time: a.occurredAt, text: orDash(a.taskId) + " · " + esc(orDash(a.reason)), tone: "RED" });
+      });
+    }
+    items.sort(function (x, y) { return Date.parse(y.time || 0) - Date.parse(x.time || 0); });
+    return items;
   }
+  function renderActivityLog(p) {
+    var devCount = (p.developerLifecycle && p.developerLifecycle.attempts.length) || 0;
+    var revCount = (p.reviewerHistory && p.reviewerHistory.length) || 0;
+    var callCount = p.usageOverview ? p.usageOverview.allTime.totals.callCount : 0;
+    var successCount = (p.attemptOutcomes && p.attemptOutcomes.successCount) || 0;
+    var failureCount = (p.attemptOutcomes && p.attemptOutcomes.failureCount) || 0;
+    var teaser =
+      '<span>개발 <span class="value">' + devCount + '회</span></span>' +
+      '<span>검토 <span class="value">' + revCount + '회</span></span>' +
+      '<span>외부 호출 <span class="value">' + fmtNum(callCount) + '회</span></span>' +
+      '<span>성공 <span class="value GREEN">' + successCount + '</span></span>' +
+      '<span>실패 <span class="value ' + (failureCount > 0 ? "YELLOW" : "GRAY") + '">' + failureCount + "</span></span>";
+
+    if (!isOpen("activity")) {
+      return collapsibleSection("activity", "활동 기록", teaser, "");
+    }
+    var filterKey = state.activityFilter;
+    var items = buildActivityItems(p, filterKey);
+    var tabsHtml = '<div class="filtertabs">' + ACTIVITY_FILTER_TABS.map(function (f) {
+      return '<button type="button" class="filtertab' + (filterKey === f ? " active" : "") + '" data-activity-filter="' + esc(f) + '">' + esc(f) + "</button>";
+    }).join("") + "</div>";
+    var body;
+    if (items.length === 0) {
+      body = tabsHtml + '<div class="empty">이 분류에 기록이 없습니다.</div>';
+    } else {
+      var showAll = state.activityShowAll;
+      var visible = showAll ? items : items.slice(0, ACTIVITY_DEFAULT_COUNT);
+      var listHtml = '<div class="tablewrap"><table class="calls"><thead><tr><th>시각</th><th>구분</th><th>내용</th></tr></thead><tbody>' +
+        visible.map(function (it) {
+          return "<tr><td>" + esc(fmtDateTime(it.time)) + "</td><td>" + esc(ACTIVITY_TYPE_LABEL_KO[it.type]) + '</td><td class="value ' + it.tone + '">' + it.text + "</td></tr>";
+        }).join("") + "</tbody></table></div>";
+      var moreBtn = !showAll && items.length > ACTIVITY_DEFAULT_COUNT
+        ? '<button type="button" class="chat-toggle-btn" id="activity-show-all" style="margin-top:8px;">전체 기록 보기(' + items.length + "건)</button>"
+        : "";
+      body = tabsHtml + listHtml + moreBtn;
+    }
+    return collapsibleSection("activity", "활동 기록", teaser, body);
+  }
+
 
   function renderQuality(p) {
     var snap = p.snapshot;
@@ -913,6 +1047,7 @@ export const DASHBOARD_HTML = `<!doctype html>
     var ps = p.problemSolving;
     var rows =
       row("첫 검토 통과율", typeof hist.firstPassApprovalRate === "number" ? fmtPercent(hist.firstPassApprovalRate * 100) : NO_DATA) +
+      row("현재 작업 검토 반복 횟수", String(snap.review.reviewCycle)) +
       row("현재 작업 수정 횟수", String(q.reviseCount)) +
       row("첫 검토 통과 여부(현재 작업)", fp, q.firstPassApproved === true ? "GREEN" : q.firstPassApproved === false ? "YELLOW" : "GRAY") +
       row("검사 상태", TEST_STATUS_LABEL_KO[snap.tests.status] || snap.tests.status, snap.tests.status === "PASS" ? "GREEN" : snap.tests.status === "FAIL" ? "RED" : "GRAY") +
@@ -929,10 +1064,20 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("개발 품질", rows);
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 11/12 "현재 문제 해결 상황 최우선 이동 +
+  // 지연/Blocker 카드 통합") — 기존에 별도 카드였던 지연/Blocker 근거(delayEvidence)를 이
+  // 카드 하나로 합친다("현재 Blocker" 행). 의도적 Maintenance Pause는 여기서도 blocker로
+  // 취급하지 않는다 — delayEvidence()가 이미 그 항목을 GRAY 톤의 "의도적" 항목으로만 담고,
+  // 대표 상태 판정(representativeStatus)도 별도로 "일시정지"를 최우선 처리한다(§ 요구사항 6).
   function renderProblemSolving(p) {
     var ps = p.problemSolving;
+    var evidence = delayEvidence(p);
+    var blockerRow = row("현재 Blocker", evidence.length > 0 ? esc(evidence[0].label) + (evidence[0].detail ? " — " + esc(evidence[0].detail) : "") : "없음", evidence.length > 0 ? evidence[0].tone : "GREEN");
     if (!ps || !ps.currentProblem) {
-      return card("현재 문제 해결 상황", '<div class="empty">현재 진행 중인 문제 없음</div>');
+      if (evidence.length === 0) {
+        return card("현재 문제 해결 상황", '<div class="empty">현재 문제 없음</div>');
+      }
+      return card("현재 문제 해결 상황", blockerRow);
     }
     var cp = ps.currentProblem;
     var ce = p.callEfficiency;
@@ -941,11 +1086,12 @@ export const DASHBOARD_HTML = `<!doctype html>
       row("문제 유형", ERROR_TYPE_LABEL_KO[cp.errorType] || cp.errorType) +
       row("실패한 검사", orDash(cp.failedCheck)) +
       row("같은 오류 반복 횟수", String(cp.repeatedFailureCount)) +
+      blockerRow +
+      row("해결 상태", cp.resolved ? "해결됨" : "진행 중", cp.resolved ? "GREEN" : "YELLOW") +
+      row("마지막 관측 시각", esc(fmtDateTime(cp.lastSeenAt))) +
       row("과거 유사 사례 수", String(ps.similarPastCasesCount)) +
       row("과거 해결책 재사용 여부", ps.similarPastCasesCount > 0 ? "재사용 가능한 사례 있음" : "없음") +
-      row("자동 복구 상태(현재 작업)", localRecoveryLabel) +
-      row("해결 상태", cp.resolved ? "해결됨" : "진행 중", cp.resolved ? "GREEN" : "YELLOW") +
-      row("마지막 관측 시각", esc(fmtDateTime(cp.lastSeenAt)));
+      row("자동 복구 상태(현재 작업)", localRecoveryLabel);
     return card("현재 문제 해결 상황", rows);
   }
 
@@ -990,13 +1136,17 @@ export const DASHBOARD_HTML = `<!doctype html>
     return card("요약", rows);
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 8 "메인 화면 정보 순서") — 상세 패널 카드 순서를
+  // "요약 → 현재 문제 해결 상황 → 현재 작업 흐름 → 진행률 → 품질/최근 검토 → 접힌 상세
+  // 기록"으로 고정한다. 판정 로직은 전혀 바꾸지 않는다 — 이미 존재하는 render 함수들을
+  // 재배치/재구성했을 뿐이다.
   function renderProjectDetail(p) {
     if (!p) return "";
     if (p.status === "NO_RUN_YET" || !p.snapshot) {
       return (
         '<div class="section-title">' + esc(p.projectLabel) + " 상세" + "</div>" +
         renderMaintenanceBanner(p) +
-        '<div class="grid">' + renderTaskSummaryCard(p) + renderProjectProgress(p) + card("실행 이력", '<div class="empty">이 프로젝트는 아직 실행된 적이 없습니다(NO_RUN_YET).</div>') + "</div>"
+        '<div class="grid">' + renderTaskSummaryCard(p) + renderProblemSolving(p) + renderProjectProgress(p) + card("실행 이력", '<div class="empty">이 프로젝트는 아직 실행된 적이 없습니다(NO_RUN_YET).</div>') + "</div>"
       );
     }
     var snap = p.snapshot;
@@ -1009,24 +1159,27 @@ export const DASHBOARD_HTML = `<!doctype html>
     html += '<div class="banner badge-' + tone + '"><span>오토데브 ' + esc(bannerStatus.label) +
       '</span><span class="sub">' + esc(orDash(snap.taskId)) + "</span></div>";
     html += '<div class="grid">' +
+      // 1) 요약
       renderTaskSummaryCard(p) +
+      // 2) 현재 문제 해결 상황(+ 지연/Blocker 통합, § 요구사항 11/12)
+      renderProblemSolving(p) +
+      // 3) 현재 작업 흐름(§ 요구사항 13) + 그 흐름을 뒷받침하는 상세 상태
+      renderWorkflowStages(p) +
       renderQuickGlance(p) +
-      renderProjectProgress(p) +
       renderCurrentStatus(p) +
       renderActualWorkTime(p) +
-      renderDelayEvidence(p) +
-      renderLiveOperations(snap) +
-      renderDeveloperLifecycle(p) +
+      // 4) 프로젝트 진행률(§ 요구사항 14)
+      renderProjectProgress(p) +
+      // 5) 품질 / 최근 검토(§ 요구사항 6)
+      renderQuality(p) +
       renderReviewerHistory(p) +
+      renderDeveloperLifecycle(p) +
+      renderAttemptOutcomes(p) +
+      // 6) 접힌 상세 기록(§ 요구사항 7) — 활동 기록/사용량·호출/Git/Baseline
+      renderActivityLog(p) +
+      renderUsageSection(p) +
       renderGitInfo(p) +
       renderBaseline(p) +
-      renderUsage(p) +
-      renderServiceUsage(p) +
-      renderRecentCalls(p) +
-      renderAttemptOutcomes(p) +
-      renderCost(snap) +
-      renderQuality(p) +
-      renderProblemSolving(p) +
       renderCallEfficiency(p) +
       renderAdvisory(snap) +
       "</div>";
@@ -1188,12 +1341,39 @@ export const DASHBOARD_HTML = `<!doctype html>
         if (filterEl) filterEl.focus({ preventScroll: true });
       });
     });
-    document.querySelectorAll(".filtertab").forEach(function (el) {
+    document.querySelectorAll(".filtertab[data-filter-key]").forEach(function (el) {
       el.addEventListener("click", function () {
         state.registryFilter = el.getAttribute("data-filter-key");
         render(data);
       });
     });
+    // Dashboard 운영 UX 최종 정리(§ 요구사항 15/16) — 활동 기록 필터 탭. registry 필터 탭과
+    // 같은 .filtertab 시각 스타일을 재사용하되 data-activity-filter로 구분한다(§ 요구사항:
+    // 새 CSS를 중복 정의하지 않는다).
+    document.querySelectorAll(".filtertab[data-activity-filter]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        state.activityFilter = el.getAttribute("data-activity-filter");
+        state.activityShowAll = false;
+        render(data);
+      });
+    });
+    // Dashboard 운영 UX 최종 정리(§ 요구사항 15/20/21) — 활동 기록/사용량·호출/Git/Baseline
+    // 공용 접힘 토글. isOpen()이 유일한 진실 출처다.
+    document.querySelectorAll(".collapse-header[data-collapse-key]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        var key = el.getAttribute("data-collapse-key");
+        state.collapsedOpen[key] = !isOpen(key);
+        if (key === "activity") state.activityShowAll = false;
+        render(data);
+      });
+    });
+    var activityShowAllBtn = document.getElementById("activity-show-all");
+    if (activityShowAllBtn) {
+      activityShowAllBtn.addEventListener("click", function () {
+        state.activityShowAll = true;
+        render(data);
+      });
+    }
     var filterInput = document.getElementById("project-filter");
     if (filterInput) {
       filterInput.addEventListener("input", function () {
@@ -1211,12 +1391,23 @@ export const DASHBOARD_HTML = `<!doctype html>
     footer.textContent = "마지막 갱신: " + fmtDateTime(data ? data.generatedAt : undefined) + " (" + (REFRESH_MS / 1000) + "초마다 자동 갱신, 읽기 전용, " + state.projects.length + "개 프로젝트)";
   }
 
+  // Dashboard 운영 UX 최종 정리(§ 요구사항 7 "frontend polling 점검") — snapshot 계산
+  // 시간이 polling 주기(REFRESH_MS)보다 길어지면 이전 fetch가 끝나기 전에 다음 fetch가
+  // 나가 요청이 계속 쌓일 수 있다(scheduler/Core와 무관한, 이 client script만의 안전장치).
+  // requestInFlight === true면 다음 tick을 건너뛴다 — 서버가 일시적으로 느려져도 요청
+  // backlog가 스스로 커지지 않는다.
+  var requestInFlight = false;
   function tick() {
+    if (requestInFlight) return;
+    requestInFlight = true;
     fetch("/api/snapshots", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(render)
       .catch(function () {
         document.getElementById("content").innerHTML = '<div class="empty">데이터를 불러오지 못했습니다. 대시보드 서버 상태를 확인하세요.</div>';
+      })
+      .then(function () {
+        requestInFlight = false;
       });
   }
 
