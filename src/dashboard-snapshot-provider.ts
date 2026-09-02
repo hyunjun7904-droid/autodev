@@ -24,7 +24,7 @@ import { buildReviewerHistory } from "./dashboard-reviewer-history";
 import type { ReviewerCallEntry } from "./dashboard-reviewer-history";
 import { buildDeveloperLifecycle } from "./dashboard-developer-lifecycle";
 import type { DeveloperLifecycle } from "./dashboard-developer-lifecycle";
-import { loadProjectRegistry, readMaintenancePauseStatus } from "./dashboard-project-registry";
+import { loadCombinedProjectRegistry, readMaintenancePauseStatus } from "./dashboard-project-registry";
 import type { MaintenancePauseStatus, ProjectRegistryLoadIssue } from "./dashboard-project-registry";
 import { buildTaskBaseline } from "./dashboard-baseline";
 import type { TaskBaselineRecord } from "./dashboard-baseline";
@@ -341,9 +341,13 @@ export function getDashboardSnapshot(
 // buildProblemSolvingSnapshot/aggregateCallEfficiency)를 그대로 재호출할 뿐이다.
 //
 // project 목록은 두 출처의 합집합이다: (1) event log에 실제로 나타난 projectId(등록 여부와
-// 무관하게 실제로 실행된 적이 있으면 반드시 보여야 한다), (2) dashboard-project-registry.ts에
-// 등록된 project(아직 한 번도 실행되지 않았어도 — 예: 새로 만든 Canary — task-registry 자체는
-// 보여줄 수 있어야 한다). event에 projectId가 아예 없는 레거시/self-dev 기록은
+// 무관하게 실제로 실행된 적이 있으면 반드시 보여야 한다), (2)
+// dashboard-project-registry.ts의 loadCombinedProjectRegistry()가 반환하는 등록 project —
+// 이 자체가 다시 두 하위 출처의 합집합이다: (2-a) 환경변수로 명시 등록된 project(아직 한 번도
+// 실행되지 않았어도 — 예: 새로 만든 Canary — task-registry 자체는 보여줄 수 있어야 한다),
+// (2-b) RUN_STARTED event가 실어온 manifest.adapterPath로 자동 발견된 project(§ Dashboard
+// Project Auto-Discovery, 2026-09-03 — 사람이 등록하지 않아도 정식 실행이 시작되면 자동으로
+// "등록됨"이 된다, Revenue OS 사례). event에 projectId가 아예 없는 레거시/self-dev 기록은
 // UNASSIGNED_PROJECT_ID로 별도 묶어 다른 project와 섞지 않는다(추측으로 특정 project에
 // 붙이지 않는다).
 
@@ -403,7 +407,10 @@ export function getMultiProjectDashboardSnapshot(
 ): MultiProjectDashboardSnapshot {
   const result = readQueryResult(filePath);
   const now = Date.now();
-  const registry = loadProjectRegistry(options.env ?? process.env);
+  // events.jsonl은 이미 이 호출 한 번에 필요해 파싱했으므로(위 readQueryResult, 파일 재읽기
+  // 없음) 자동 발견도 이 결과를 그대로 재사용한다 — registry 갱신을 위한 별도 polling/파일
+  // 접근을 추가하지 않는다.
+  const registry = loadCombinedProjectRegistry(options.env ?? process.env, result.events);
   const registryByProjectId = new Map(registry.projects.map((p) => [p.projectId, p]));
   const logsDir = options.logsDir ?? join(process.cwd(), "logs");
 

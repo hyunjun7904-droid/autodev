@@ -376,6 +376,105 @@ function scenarioMultiProjectMaintenancePauseSurfacedSeparately(): void {
   check("Maintenance Pause: engagedAt/reason이 그대로 노출됨", entry?.maintenancePause?.reason === "테스트용 유지보수");
 }
 
+// Dashboard Project Auto-Discovery(2026-09-03, Revenue OS 실제 운영 결함) — RUN_STARTED가
+// manifest.adapterPath를 metadata로 실으면, 환경변수로 아무것도 등록하지 않아도(env: {})
+// registered:true로 표시돼야 한다(§ dashboard-project-registry.ts discoverProjectsFromEvents).
+function scenarioMultiProjectAutoDiscoveredFromRunStartedEventWithoutManualRegistration(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-autodiscover-"));
+  tempDirs.push(registryDir);
+  const adapterPath = writeMultiProjectAdapter(registryDir, "auto-discovered-proj", "자동 발견 프로젝트");
+  appendAll(store, [
+    ev({ eventType: "RUN_STARTED", runId: "run-auto", projectId: "auto-discovered-proj", metadata: { adapterPath } }),
+    ev({ eventType: "TASK_STARTED", runId: "run-auto", taskId: "T1", projectId: "auto-discovered-proj" }),
+  ]);
+  // env를 전혀 설정하지 않는다 — 이 project는 어디에도 수동으로 등록되지 않았다.
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const entry = multi.projects.find((p) => p.projectId === "auto-discovered-proj");
+  check("사람이 등록하지 않아도 RUN_STARTED만으로 registered=true가 됨(Revenue OS 결함 재현/검증)", entry?.registered === true);
+  check("자동 발견: projectLabel이 manifest의 실제 이름으로 채워짐(추측 아님)", entry?.projectLabel === "자동 발견 프로젝트");
+  check("자동 발견: taskId도 정확히 귀속됨", entry?.snapshot?.taskId === "T1");
+}
+
+// 같은 projectId가 다시 실행돼도(재시작/재배포) 중복 카드가 아니라 기존 카드 하나만 갱신돼야
+// 한다(§ 요구사항 F) — event store에 RUN_STARTED가 두 번 쌓여도 결과는 항상 project 1개다.
+function scenarioMultiProjectSameProjectIdRerunDoesNotDuplicateCard(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-autodiscover-rerun-"));
+  tempDirs.push(registryDir);
+  const adapterPath = writeMultiProjectAdapter(registryDir, "rerun-auto-proj", "재실행 자동 발견");
+  appendAll(store, [
+    ev({ eventType: "RUN_STARTED", runId: "run-first", projectId: "rerun-auto-proj", metadata: { adapterPath } }),
+    ev({ eventType: "RUN_COMPLETED", runId: "run-first", projectId: "rerun-auto-proj" }),
+    ev({ eventType: "RUN_STARTED", runId: "run-second", projectId: "rerun-auto-proj", metadata: { adapterPath } }),
+  ]);
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const matches = multi.projects.filter((p) => p.projectId === "rerun-auto-proj");
+  check("동일 projectId 재실행: 카드가 정확히 1개(중복 생성 없음)", matches.length === 1);
+}
+
+// 두 project(예: JARVIS/Revenue OS)가 서로 다른 프로세스로 동시에 실행돼도 각각 독립 카드로
+// 자동 등록돼야 한다(§ 요구사항 H) — 새 격리 로직이 아니라 이미 검증된 projectId 귀속(§
+// scenarioMultiProjectAttributionNoContamination)에 자동 발견을 얹었을 뿐임을 확인한다.
+function scenarioMultiProjectTwoConcurrentAutoDiscoveredProjectsBothShown(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-autodiscover-concurrent-"));
+  tempDirs.push(registryDir);
+  const adapterA = writeMultiProjectAdapter(registryDir, "concurrent-a", "동시 실행 A");
+  const adapterB = writeMultiProjectAdapter(registryDir, "concurrent-b", "동시 실행 B");
+  appendAll(store, [
+    ev({ eventType: "RUN_STARTED", runId: "run-a", projectId: "concurrent-a", metadata: { adapterPath: adapterA } }),
+    ev({ eventType: "RUN_STARTED", runId: "run-b", projectId: "concurrent-b", metadata: { adapterPath: adapterB } }),
+  ]);
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const a = multi.projects.find((p) => p.projectId === "concurrent-a");
+  const b = multi.projects.find((p) => p.projectId === "concurrent-b");
+  check("두 project가 동시에 실행돼도 둘 다 registered=true로 독립 표시됨", a?.registered === true && b?.registered === true);
+}
+
+// 과거 canary/fixture(event만 있고 adapterPath metadata가 없는 오래된 기록)는 이번 변경으로
+// 사라지거나 합쳐지지 않는다(§ 요구사항 I) — 여전히 registered:false 미등록 카드로 남는다.
+function scenarioMultiProjectLegacyEventOnlyProjectStillUnregistered(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  appendAll(store, [ev({ eventType: "RUN_STARTED", runId: "run-legacy", projectId: "legacy-canary-proj" })]); // adapterPath metadata 없음(과거 기록)
+  const multi = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const entry = multi.projects.find((p) => p.projectId === "legacy-canary-proj");
+  check("adapterPath metadata가 없는 과거 event 기록은 삭제/병합되지 않고 그대로 미등록 카드로 남음", entry !== undefined && entry.registered === false);
+}
+
+// Stale Discovered-Registration Reconciliation(2026-09-03, 실제 production Dashboard 재현
+// 결함) — E2E 검증용 임시 project(§ scenarioMultiProjectAutoDiscoveredFromRunStartedEventWithoutManualRegistration와
+// 동일한 모양)를 만든 뒤 manifest 디렉터리 전체를 지우고, getMultiProjectDashboardSnapshot()을
+// 두 번 연속 호출(연속 polling 재현)해도 REGISTRY_ISSUE가 쌓이지 않고, 그 project는 여전히
+// 과거 기록(미등록 카드)으로 조회 가능한지 확인한다.
+function scenarioMultiProjectStaleDiscoveredManifestDoesNotProduceIssueOnRepeatedPolls(): void {
+  resetDashboardSnapshotCacheForTests();
+  const filePath = makeEventFilePath();
+  const store = createFileEventStore(filePath);
+  const registryDir = mkdtempSync(join(tmpdir(), "autodev-dashboard-stale-discover-"));
+  tempDirs.push(registryDir);
+  const adapterPath = writeMultiProjectAdapter(registryDir, "stale-discovered-proj", "정리된 임시 프로젝트");
+  appendAll(store, [ev({ eventType: "RUN_STARTED", runId: "run-stale", projectId: "stale-discovered-proj", metadata: { adapterPath } })]);
+  // 프로젝트 종료 후 정리(테스트 fixture 삭제, 또는 실제 project 디렉터리 정리)를 재현한다.
+  rmSync(registryDir, { recursive: true, force: true });
+
+  const firstPoll = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+  const secondPoll = getMultiProjectDashboardSnapshot(filePath, undefined, { env: {} });
+
+  check("manifest가 사라진 뒤 첫 poll: registryIssues에 남지 않음", firstPoll.registryIssues.length === 0);
+  check("manifest가 사라진 뒤 반복 poll: 두 번째 요청에도 registryIssues가 쌓이지 않음(무한 재발 없음)", secondPoll.registryIssues.length === 0);
+  const entry = secondPoll.projects.find((p) => p.projectId === "stale-discovered-proj");
+  check("manifest가 사라져도 project 자체는 과거 기록(미등록 카드)으로 계속 조회됨(데이터 손실 없음)", entry !== undefined && entry.registered === false);
+}
+
 function scenarioMultiProjectEventsWithoutProjectIdGetOwnBucket(): void {
   resetDashboardSnapshotCacheForTests();
   const filePath = makeEventFilePath();
@@ -418,6 +517,11 @@ function main(): void {
     scenarioMultiProjectBaselineScopedPerProject();
     scenarioMultiProjectRegisteredEventlessProjectStillShown();
     scenarioMultiProjectUnregisteredButHasEventsStillShown();
+    scenarioMultiProjectAutoDiscoveredFromRunStartedEventWithoutManualRegistration();
+    scenarioMultiProjectSameProjectIdRerunDoesNotDuplicateCard();
+    scenarioMultiProjectTwoConcurrentAutoDiscoveredProjectsBothShown();
+    scenarioMultiProjectLegacyEventOnlyProjectStillUnregistered();
+    scenarioMultiProjectStaleDiscoveredManifestDoesNotProduceIssueOnRepeatedPolls();
     scenarioMultiProjectMaintenancePauseSurfacedSeparately();
     scenarioMultiProjectEventsWithoutProjectIdGetOwnBucket();
     scenarioRoundStatusShownWhenMatchesCurrentRunAndTask();

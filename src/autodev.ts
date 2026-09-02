@@ -831,7 +831,22 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
       });
     }
 
-    emitEvent(events, { eventType: "RUN_STARTED", runId, projectId: manifest.projectId, executionPhase: "task_selection", outcome: "PENDING" });
+    emitEvent(events, {
+      eventType: "RUN_STARTED",
+      runId,
+      projectId: manifest.projectId,
+      executionPhase: "task_selection",
+      outcome: "PENDING",
+      // Dashboard Project Auto-Discovery(§ dashboard-project-registry.ts
+      // discoverProjectsFromEvents) — 이 시점(validateProjectManifest 통과 + project lock
+      // 획득 성공 직후)은 "AutoDev가 정식 manifest로 실제 실행을 시작함"이 확정된 유일한
+      // 지점이다. manifest.adapterPath(§ project-manifest.ts, Multi-Project Approval
+      // Isolation과 동일한 단일 출처 — 새 필드를 만들지 않는다)를 그대로 실어, Dashboard가
+      // 이미 매 요청마다 읽는 공유 EventStore 안에 "이 project를 어디서 다시 검증할 수
+      // 있는지"가 자동으로 기록되게 한다 — 별도 registry 파일/수동 등록 없이 Dashboard가
+      // 재시작 없이 새 project를 발견할 수 있는 근거가 된다.
+      ...(manifest.adapterPath ? { metadata: { adapterPath: manifest.adapterPath } } : {}),
+    });
 
     const state = loadState(statePath);
 
