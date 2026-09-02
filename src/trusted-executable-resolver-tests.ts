@@ -381,8 +381,8 @@ async function scenarioGitShadowResistantInRealRunCommand(): Promise<void> {
     writeMarkerScript(fakeDir, process.platform === "win32" ? "git.exe" : "git", markerPath);
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "git", args: ["status", "--short"] }],
     };
     configureSafeExecutor(root, policy);
@@ -407,8 +407,8 @@ async function scenarioNodeIgnoresPathShadowInRealRunCommand(): Promise<void> {
     writeMarkerScript(fakeDir, process.platform === "win32" ? "node.exe" : "node", markerPath);
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "node", args: ["--version"] }],
     };
     configureSafeExecutor(root, policy);
@@ -443,8 +443,8 @@ async function scenarioNpmIgnoresPathShadowInRealRunCommand(): Promise<void> {
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0", scripts: { build: buildScript } }));
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "npm", args: ["run", "build"] }],
     };
     configureSafeExecutor(root, policy);
@@ -475,8 +475,8 @@ async function scenarioCwdLocalFakeExecutableIsExcluded(): Promise<void> {
     writeMarkerScript(root, process.platform === "win32" ? "git.exe" : "git", markerPath);
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "git", args: ["status", "--short"] }],
     };
     configureSafeExecutor(root, policy);
@@ -552,8 +552,8 @@ async function scenarioTrustedTscRealExecution(): Promise<void> {
     return;
   }
   const policy: ProjectExecutionPolicy = {
-    allowedReadPrefixes: ["./"],
-    allowedWritePrefixes: ["./"],
+    allowedReadPrefixes: ["package.json"],
+    allowedWritePrefixes: ["package.json"],
     allowedCommands: [{ cwd: "root", command: "tsc", args: ["--version"] }],
   };
   configureSafeExecutor(REPO_ROOT, policy);
@@ -576,8 +576,8 @@ async function scenarioTrustedNpxRealExecution(): Promise<void> {
     return;
   }
   const policy: ProjectExecutionPolicy = {
-    allowedReadPrefixes: ["./"],
-    allowedWritePrefixes: ["./"],
+    allowedReadPrefixes: ["package.json"],
+    allowedWritePrefixes: ["package.json"],
     allowedCommands: [{ cwd: "root", command: "npx", args: ["tsc", "--version"] }],
   };
   configureSafeExecutor(REPO_ROOT, policy);
@@ -591,8 +591,8 @@ async function scenarioTscMissingFailsClosed(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "trust-resolver-notsc-"));
   try {
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "tsc", args: ["--version"] }],
     };
     configureSafeExecutor(root, policy);
@@ -623,8 +623,8 @@ async function scenarioTscSpoofedPackageWithoutLockfileFailsClosed(): Promise<vo
     // project를 흉내낸다.
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "tsc", args: ["--version"] }],
     };
     configureSafeExecutor(root, policy);
@@ -666,8 +666,8 @@ async function scenarioTscVersionMismatchFailsClosed(): Promise<void> {
     );
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
       allowedCommands: [{ cwd: "root", command: "tsc", args: ["--version"] }],
     };
     configureSafeExecutor(root, policy);

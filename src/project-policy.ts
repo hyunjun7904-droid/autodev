@@ -16,9 +16,9 @@ export interface AllowedCommandSpec {
 }
 
 export interface ProjectExecutionPolicy {
-  /** POSIX 상대경로 prefix(trailing "/") — Safe Executor read 허용 범위. */
+  /** POSIX project-relative scope — 디렉터리 prefix는 trailing "/", 루트/개별 파일은 exact path. */
   allowedReadPrefixes: string[];
-  /** POSIX 상대경로 prefix(trailing "/") — Safe Executor write 허용 범위. */
+  /** POSIX project-relative scope — 디렉터리 prefix는 trailing "/", 루트/개별 파일은 exact path. */
   allowedWritePrefixes: string[];
   /** allowedWritePrefixes 안에서도 항상 write를 금지할 프로젝트별 추가 패턴(예: MOVAN의
    *  immutable migration 파일, README.md) — Core의 DENY_PATH_PATTERNS/SECRET_NAME_PATTERNS
@@ -30,19 +30,41 @@ export interface ProjectExecutionPolicy {
   allowedCommands: AllowedCommandSpec[];
 }
 
-function isRelativeDirPrefix(value: unknown): value is string {
+const WINDOWS_RESERVED_DEVICE_NAME_RE = /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|COM[1-9¹²³]|LPT[1-9¹²³])(\.[^/]*)?$/i;
+const CONTROL_CHAR_RE = /[\x00-\x1f]/;
+const WINDOWS_FORBIDDEN_CHAR_RE = /[<>"|?*]/;
+
+/**
+ * ProjectExecutionPolicy에 들어가는 project-relative 경로를 단일 규칙으로 검증한다.
+ * - 디렉터리 범위: `src/`처럼 trailing slash
+ * - exact file 범위: `package.json`, `.nvmrc`처럼 trailing slash 없음
+ * - backslash/절대경로/UNC/ADS/traversal/Win32 예약장치/후행 점·공백은 fail-closed
+ */
+function isSafeRelativeProjectPath(value: unknown, opts: { requireTrailingSlash?: boolean } = {}): value is string {
   if (typeof value !== "string" || value.length === 0) return false;
-  if (!value.endsWith("/")) return false;
-  if (value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value)) return false;
-  if (value.split("/").includes("..")) return false;
+  if (value.includes("\\") || value.startsWith("/") || value.includes(":")) return false;
+  if (opts.requireTrailingSlash && !value.endsWith("/")) return false;
+  if (CONTROL_CHAR_RE.test(value) || WINDOWS_FORBIDDEN_CHAR_RE.test(value)) return false;
+
+  const rawSegments = value.split("/");
+  const hasTrailingSlash = value.endsWith("/");
+  const contentSegments = hasTrailingSlash ? rawSegments.slice(0, -1) : rawSegments;
+  if (contentSegments.length === 0) return false;
+  for (const seg of contentSegments) {
+    if (seg.length === 0 || seg === "." || seg === "..") return false;
+    const trimmed = seg.replace(/[ .]+$/, "");
+    if (trimmed !== seg || trimmed.length === 0 || trimmed === "." || trimmed === "..") return false;
+    if (WINDOWS_RESERVED_DEVICE_NAME_RE.test(seg)) return false;
+  }
   return true;
 }
 
+function isRelativeScope(value: unknown): value is string {
+  return isSafeRelativeProjectPath(value);
+}
+
 function isRelativePath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0) return false;
-  if (value.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(value)) return false;
-  if (value.split(/[\\/]/).includes("..")) return false;
-  return true;
+  return isSafeRelativeProjectPath(value);
 }
 
 /**
@@ -56,17 +78,17 @@ export function validateProjectExecutionPolicy(policy: ProjectExecutionPolicy, p
   if (!Array.isArray(policy.allowedReadPrefixes) || policy.allowedReadPrefixes.length === 0) {
     throw new Error(`Invalid ProjectExecutionPolicy(${projectLabel}): allowedReadPrefixes가 비어있습니다.`);
   }
-  if (!policy.allowedReadPrefixes.every(isRelativeDirPrefix)) {
+  if (!policy.allowedReadPrefixes.every(isRelativeScope)) {
     throw new Error(
-      `Invalid ProjectExecutionPolicy(${projectLabel}): allowedReadPrefixes는 "/"로 끝나는 상대경로여야 합니다(절대경로/".." 금지).`
+      `Invalid ProjectExecutionPolicy(${projectLabel}): allowedReadPrefixes는 안전한 project-relative 디렉터리 prefix("dir/") 또는 exact 파일 경로여야 합니다.`
     );
   }
   if (!Array.isArray(policy.allowedWritePrefixes) || policy.allowedWritePrefixes.length === 0) {
     throw new Error(`Invalid ProjectExecutionPolicy(${projectLabel}): allowedWritePrefixes가 비어있습니다.`);
   }
-  if (!policy.allowedWritePrefixes.every(isRelativeDirPrefix)) {
+  if (!policy.allowedWritePrefixes.every(isRelativeScope)) {
     throw new Error(
-      `Invalid ProjectExecutionPolicy(${projectLabel}): allowedWritePrefixes는 "/"로 끝나는 상대경로여야 합니다(절대경로/".." 금지).`
+      `Invalid ProjectExecutionPolicy(${projectLabel}): allowedWritePrefixes는 안전한 project-relative 디렉터리 prefix("dir/") 또는 exact 파일 경로여야 합니다.`
     );
   }
   if (policy.writeDenyPatterns !== undefined) {

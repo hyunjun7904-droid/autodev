@@ -70,6 +70,8 @@ const COMMIT_IDENTITY = { name: "AutoDev SI-3.3 Test", email: "si33-test@example
 // ---------------------------------------------------------------------------
 const FIXTURE_FC_001_TEXT = "The database provider is PostgreSQL and must not be changed.";
 const FIXTURE_FC_002_TEXT = "No paid third-party services may be used without human approval.";
+const ALL_FIXTURE_REQ_IDS = Array.from({ length: 11 }, (_, i) => `REQ-${String(i + 1).padStart(3, "0")}`);
+const PHASE2_FIXTURE_REQ_IDS = ALL_FIXTURE_REQ_IDS.slice(1);
 
 function buildMasterSpecContent(): string {
   return [
@@ -177,7 +179,7 @@ function buildGoodPhasePlanRaw(identity: { projectId: string; specVersion: strin
         name: "Foundation",
         objective: "Implement core account features",
         dependsOnSequence: [] as number[],
-        reqIds: ["REQ-001", "REQ-002"],
+        reqIds: [...ALL_FIXTURE_REQ_IDS],
         acIds: ["AC-001", "AC-002"],
         completionCriteria: ["all must-have requirements implemented"],
       },
@@ -191,7 +193,7 @@ function buildTwoPhasePlanRaw(identity: { projectId: string; specVersion: string
     specVersion: identity.specVersion,
     phases: [
       { sequence: 1, name: "Phase A", objective: "Account creation", dependsOnSequence: [] as number[], reqIds: ["REQ-001"], acIds: ["AC-001"], completionCriteria: ["done"] },
-      { sequence: 2, name: "Phase B", objective: "Password reset", dependsOnSequence: [1], reqIds: ["REQ-002"], acIds: ["AC-002"], completionCriteria: ["done"] },
+      { sequence: 2, name: "Phase B", objective: "Password reset and remaining requirements", dependsOnSequence: [1], reqIds: [...PHASE2_FIXTURE_REQ_IDS], acIds: ["AC-002"], completionCriteria: ["done"] },
     ],
   };
 }
@@ -228,7 +230,7 @@ function buildGoodTaskPlanRaw(identity: { projectId: string; specVersion: string
         expectedModules: ["src/auth"],
         requiredTests: [{ name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" }],
         acceptanceCriteria: ["AC-002"],
-        reqIds: ["REQ-002"],
+        reqIds: [...PHASE2_FIXTURE_REQ_IDS],
         securityConsiderations: ["send reset link via email provider"],
         completionGate: "unit tests pass",
       },
@@ -257,7 +259,7 @@ function buildSingleTaskPlanRaw(
         expectedModules: ["src/auth"],
         requiredTests: [{ name: "unit", command: "npm", args: ["run", "test:unit"], cwd: "root" }],
         acceptanceCriteria: [opts.acId],
-        reqIds: [opts.reqId],
+        reqIds: phaseId === "2" && opts.reqId === "REQ-002" ? [...PHASE2_FIXTURE_REQ_IDS] : [opts.reqId],
         securityConsiderations: [] as string[],
         completionGate: "unit tests pass",
       },
@@ -853,7 +855,7 @@ async function scenarioValidatorRejectsUnsafeOutputs(): Promise<void> {
   }, "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED");
   await runWithPhasePlanMutation(content, "21-phase-missing-must-have-coverage", (raw) => {
     raw.phases[0].reqIds = [];
-  }, "MISSING_MUST_HAVE_COVERAGE");
+  }, "MISSING_REQUIREMENT_COVERAGE");
   await runWithPhasePlanMutation(content, "22-phase-missing-ac-coverage", (raw) => {
     raw.phases[0].acIds = [];
   }, "MISSING_ACCEPTANCE_CRITERIA_COVERAGE");
@@ -918,7 +920,7 @@ async function scenarioGlobalTraceabilityCatchesTaskLevelCoverageGap(): Promise<
 
   await run("traceability-missing-req-global", (t) => {
     t.tasks[0].reqIds = [];
-  }, "MISSING_MUST_HAVE_COVERAGE");
+  }, "MISSING_REQUIREMENT_COVERAGE");
   await run("traceability-missing-ac-global", (t) => {
     t.tasks[0].acceptanceCriteria = [];
   }, "MISSING_ACCEPTANCE_CRITERIA_COVERAGE");
@@ -2380,7 +2382,7 @@ function scenarioPhaseAndTaskCountLimitsAreEnforced(): void {
       name: `Phase ${i + 1}`,
       objective: "o",
       dependsOnSequence: [] as number[],
-      reqIds: i === 0 ? ["REQ-001", "REQ-002"] : [],
+      reqIds: i === 0 ? [...ALL_FIXTURE_REQ_IDS] : [],
       acIds: i === 0 ? ["AC-001", "AC-002"] : [],
       completionCriteria: ["done"],
     })),
@@ -2399,7 +2401,7 @@ function scenarioPhaseAndTaskCountLimitsAreEnforced(): void {
       name: `Phase ${i + 1}`,
       objective: "o",
       dependsOnSequence: [] as number[],
-      reqIds: i === 0 ? ["REQ-001", "REQ-002"] : [],
+      reqIds: i === 0 ? [...ALL_FIXTURE_REQ_IDS] : [],
       acIds: i === 0 ? ["AC-001", "AC-002"] : [],
       completionCriteria: ["done"],
     })),
@@ -2483,7 +2485,7 @@ async function scenarioPhaseLocalRequirementScopeIsEnforced(): Promise<void> {
       raw.tasks[0].reqIds = [];
       return raw;
     },
-    "MISSING_MUST_HAVE_COVERAGE"
+    "MISSING_REQUIREMENT_COVERAGE"
   );
   await runTwoPhase(
     "phase-ac-coverage-missing",
@@ -3148,6 +3150,34 @@ async function scenarioPartialGenerationIsDetected(): Promise<void> {
 // SI-3.7(Execution Contract Closure) — EP-1/EP-2 회귀 테스트.
 // ---------------------------------------------------------------------------
 
+// Execution Policy Closure: STAGE 1 policy에 없던 exact root file이 Task scope에 등장해도
+// 최종 project-wide policy가 deterministic union으로 닫혀 실제 Task 1부터 실행 가능해야 한다.
+async function scenarioTaskScopeClosesIntoExecutionPolicy(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("scope-closure) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const tasks = buildGoodTaskPlanRaw(identity, "1");
+  tasks.tasks[0].scope = ["package.json", "src/"];
+  const source = buildMultiStageGoodSource(normalized, identity, { task: () => fixedSource(tasks) });
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("scope-closure) root exact file task scope가 있어도 READY_FOR_AUTODEV", result.status === "READY_FOR_AUTODEV");
+  if (result.status !== "READY_FOR_AUTODEV") return;
+  const policy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  check("scope-closure) final allowedWritePrefixes에 package.json exact scope 포함", policy.allowedWritePrefixes.includes("package.json"));
+  check("scope-closure) architecture baseline src/도 보존", policy.allowedWritePrefixes.includes("src/"));
+}
+
+async function scenarioUnsafeTaskScopeRejectedBeforeCheckpoint(): Promise<void> {
+  const content = buildMasterSpecContent();
+  await runWithTaskMutation(content, "unsafe-task-scope", (raw) => {
+    raw.tasks[0].scope = ["../escape.txt"];
+  }, "UNSAFE_TASK_SCOPE");
+}
+
 // EP-1: requiredTest 명령이 Core Command Safety Gate를 통과하지 못하면(예: shell wrapper)
 // 최종 조립 전에 즉시 BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)되어야 한다 — READY_FOR_AUTODEV/
 // HUMAN_REVIEW_REQUIRED를 만들지 않는다.
@@ -3159,14 +3189,23 @@ async function scenarioRequiredTestUnsupportedCommandBlocksAssembly(): Promise<v
     return;
   }
   const normalized = normalizeMasterSpec(content);
-  const badTasks = buildGoodTaskPlanRaw(identity, "1");
-  badTasks.tasks[0].requiredTests = [{ name: "shell", command: "bash", args: ["-c", "echo hi"], cwd: "root" }];
-  const source = buildMultiStageGoodSource(normalized, identity, { task: () => fixedSource(badTasks) });
+  let taskCalls = 0;
+  const source = buildMultiStageGoodSource(normalized, identity, {
+    task: () => async () => {
+      taskCalls += 1;
+      const tasks = buildGoodTaskPlanRaw(identity, "1");
+      if (taskCalls === 1) {
+        tasks.tasks[0].requiredTests = [{ name: "shell", command: "bash", args: ["-c", "echo hi"], cwd: "root" }];
+      }
+      return { ok: true, rawOutput: JSON.stringify(tasks) };
+    },
+  });
   const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
   check(
-    "si37-unsupported-command) Core Command Safety Gate를 통과하지 못하는 requiredTest는 BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)",
-    result.status === "BLOCKED" && result.code === "REQUIRED_TEST_NOT_EXECUTABLE"
+    "si37-unsupported-command) 실행 불가능 requiredTest는 같은 Phase에서 즉시 correction 후 최종 READY_FOR_AUTODEV",
+    result.status === "READY_FOR_AUTODEV"
   );
+  check("si37-unsupported-command) 첫 잘못된 Task Plan이 checkpoint되기 전에 correction 재호출됨", taskCalls === 2);
 }
 
 // EP-1 실제 수정: STAGE 1이 제안한 executionPolicy.allowedCommands에는 없는 명령(npx tsc)을
@@ -3246,7 +3285,10 @@ async function scenarioGradleDangerousVariantsBlockAssembly(): Promise<void> {
     mutate(tasks);
     const source = buildMultiStageGoodSource(normalized, identity, { architecture: fixedSource(architecture), task: () => fixedSource(tasks) });
     const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
-    check(`${label}) BLOCKED(REQUIRED_TEST_NOT_EXECUTABLE)`, result.status === "BLOCKED" && result.code === "REQUIRED_TEST_NOT_EXECUTABLE");
+    check(
+      `${label}) Task-stage에서 REJECTED(REQUIRED_TEST_NOT_EXECUTABLE)되어 invalid checkpoint 저장을 막음`,
+      result.status === "REJECTED" && result.issues.some((i) => i.code === "REQUIRED_TEST_NOT_EXECUTABLE")
+    );
   }
 
   await expectBlocked("si37-gradle-dotslash) \"./gradlew\" 형태", (t) => {
@@ -3541,6 +3583,8 @@ async function main(): Promise<void> {
     await scenarioLongLlmCallRevalidatesTrustedInput();
     await scenarioPartialGenerationIsDetected();
 
+    await scenarioTaskScopeClosesIntoExecutionPolicy();
+    await scenarioUnsafeTaskScopeRejectedBeforeCheckpoint();
     await scenarioRequiredTestUnsupportedCommandBlocksAssembly();
     await scenarioRequiredTestAutoDerivesIntoAllowedCommands();
     await scenarioGradleRequiredTestSucceeds();

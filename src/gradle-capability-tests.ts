@@ -78,7 +78,7 @@ function makeTestDeps(existingFiles: readonly string[], opts: { realOverrides?: 
     existsSyncImpl: (p: string) => fileSet.has(p.toLowerCase()),
     statSyncImpl: (p: string) => ({ isFile: () => fileSet.has(p.toLowerCase()) }),
     realpathSyncImpl: (p: string) => opts.realOverrides?.[p] ?? p,
-    envOverride: opts.envOverride,
+    envOverride: { AUTODEV_TRUSTED_JAVA_HOME: undefined, JAVA_HOME: undefined, ...(opts.envOverride ?? {}) },
   };
 }
 

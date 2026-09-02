@@ -611,11 +611,18 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
     return { ok: true, abs, rel: toRelPosix(abs) };
   }
 
+  function scopeAllowsPath(rel: string, scope: string): boolean {
+    // trailing slash는 디렉터리 prefix, 그 외는 exact file/path scope다. exact scope에 startsWith를
+    // 쓰지 않아 `package.json.bak`가 `package.json` 권한을 상속받는 식의 경계 확장을 막는다.
+    if (scope.endsWith("/")) return rel === scope.slice(0, -1) || rel.startsWith(scope);
+    return rel === scope;
+  }
+
   function validateReadPath(candidate: string): ResolveOk | ResolveFail {
     const r = resolveSafe(candidate);
     if (!r.ok) return r;
     const { rel } = r;
-    if (!policy.allowedReadPrefixes.some((p) => rel === p.slice(0, -1) || rel.startsWith(p))) {
+    if (!policy.allowedReadPrefixes.some((scope) => scopeAllowsPath(rel, scope))) {
       return { ok: false, reason: `허용된 read 범위(${policy.allowedReadPrefixes.join(", ")}) 밖` };
     }
     if (DENY_PATH_PATTERNS.some((p) => p.test(rel))) return { ok: false, reason: "DENY 패턴 매칭(env/git/node_modules 등)" };
@@ -627,7 +634,7 @@ function buildContext(projectRoot: string, projectRootReal: string, policy: Proj
     const r = resolveSafe(candidate);
     if (!r.ok) return r;
     const { rel } = r;
-    if (!policy.allowedWritePrefixes.some((p) => rel.startsWith(p))) {
+    if (!policy.allowedWritePrefixes.some((scope) => scopeAllowsPath(rel, scope))) {
       return { ok: false, reason: `허용된 write 범위(${policy.allowedWritePrefixes.join(", ")}) 밖` };
     }
     if (

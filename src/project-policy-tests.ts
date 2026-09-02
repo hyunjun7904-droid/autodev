@@ -38,8 +38,8 @@ function main(): void {
     throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedReadPrefixes: ["/etc/"] }))
   );
   check(
-    "allowedReadPrefixes에 trailing '/' 없음 → 실패",
-    throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedReadPrefixes: ["src"] }))
+    "allowedReadPrefixes에 exact root file 경로(package.json) → 통과",
+    !throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedReadPrefixes: ["package.json"] }))
   );
   check(
     "allowedReadPrefixes에 '..' 포함 → 실패(위험하게 전체 filesystem 허용 방지)",
@@ -50,6 +50,19 @@ function main(): void {
   check(
     "allowedWritePrefixes에 malformed 값(빈 문자열) → 실패",
     throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedWritePrefixes: [""] }))
+  );
+
+  check(
+    "allowedWritePrefixes에 exact root file 경로(package.json) → 통과",
+    !throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedWritePrefixes: ["package.json"] }))
+  );
+  check(
+    "allowedWritePrefixes에 backslash/traversal → 실패",
+    throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedWritePrefixes: ["a\\..\\b"] }))
+  );
+  check(
+    "allowedWritePrefixes exact file은 sibling prefix 확장이 아님(정책 shape 자체는 통과)",
+    !throws(() => validateProjectExecutionPolicy({ ...validPolicy(), allowedWritePrefixes: ["package.json"] }))
   );
 
   check(

@@ -332,6 +332,28 @@ function scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolat
   }
 }
 
+
+function scenarioExactRootFileScopes(isolatedRealisticRoot: string): void {
+  const root = mkdtempSync(join(tmpdir(), "safe-executor-exact-root-file-"));
+  try {
+    writeFileSync(join(root, "package.json"), "{}\n", "utf-8");
+    writeFileSync(join(root, "package.json.bak"), "{}\n", "utf-8");
+    const policy: ProjectExecutionPolicy = {
+      allowedReadPrefixes: ["package.json"],
+      allowedWritePrefixes: ["package.json"],
+      allowedCommands: [],
+    };
+    configureSafeExecutor(root, policy);
+    check("[EP-root-1] exact root file package.json read → ALLOW", validateReadPath("package.json").ok);
+    check("[EP-root-2] exact root file package.json write → ALLOW", validateWritePath("package.json").ok);
+    check("[EP-root-3] sibling package.json.bak read → BLOCK", !validateReadPath("package.json.bak").ok);
+    check("[EP-root-4] sibling package.json.bak write → BLOCK", !validateWritePath("package.json.bak").ok);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    configureSafeExecutor(isolatedRealisticRoot, REALISTIC_EXECUTION_POLICY);
+  }
+}
+
 // Phase B Task B2/B3 — 이 파일 전용 격리된 임시 git repo(web/ 포함, REALISTIC_EXECUTION_POLICY
 // 값은 그대로 사용)를 만들어 주입한다 — 검증하는 정책 내용은 바뀌지 않고, "어디에 실제로
 // 쓰는가"만 항상 안전한 isolated temp 경로로 격리된다(실제 프로젝트 repo는 절대 건드리지
@@ -366,8 +388,8 @@ async function scenarioGitConfigDrivenExternalDiffIsNeutralized(isolatedRealisti
     spawnSync("git", ["config", "diff.external", `"${scriptPath}"`], { cwd: root });
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["tracked.txt"],
+      allowedWritePrefixes: ["tracked.txt"],
       allowedCommands: [{ cwd: "root", command: "git", args: ["diff"] }],
     };
     configureSafeExecutor(root, policy);
@@ -414,8 +436,8 @@ async function scenarioGitConfigDrivenTextconvIsNeutralized(isolatedRealisticRoo
     spawnSync("git", ["config", "diff.malicious-textconv-driver.textconv", `"${scriptPath}"`], { cwd: root });
 
     const policy: ProjectExecutionPolicy = {
-      allowedReadPrefixes: ["./"],
-      allowedWritePrefixes: ["./"],
+      allowedReadPrefixes: ["tracked.bin", ".gitattributes"],
+      allowedWritePrefixes: ["tracked.bin", ".gitattributes"],
       allowedCommands: [{ cwd: "root", command: "git", args: ["diff"] }],
     };
     configureSafeExecutor(root, policy);
@@ -869,6 +891,9 @@ async function main(): Promise<void> {
   // executable(예: "/tmp/git")을 allowedCommands에 정확히 등록해도 Core Command Safety
   // Gate가 여전히 BLOCK함을 증명 ----
   scenarioProjectPolicyCannotRegisterPathQualifiedExecutable(isolatedRealisticRoot);
+
+  // ---- Execution Policy root exact-file scope 회귀 ----
+  scenarioExactRootFileScopes(isolatedRealisticRoot);
 
   // ---- Phase B Task B1 — Fixture 프로젝트 정책 범용성 증명(§ 요구사항 8) ----
   scenarioFixtureProjectPolicyWorksWithoutRealisticPolicyKnowledge(isolatedRealisticRoot);

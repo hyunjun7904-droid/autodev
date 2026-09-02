@@ -339,6 +339,7 @@ export type PlannerValidationIssueCode =
   | "MISSING_DEPENDENCY"
   | "DEPENDENCY_CYCLE"
   | "MISSING_MUST_HAVE_COVERAGE"
+  | "MISSING_REQUIREMENT_COVERAGE"
   | "MISSING_ACCEPTANCE_CRITERIA_COVERAGE"
   | "UNKNOWN_REQUIREMENT_REFERENCE"
   | "DEFERRED_OR_OUT_OF_SCOPE_REFERENCED"
@@ -354,7 +355,9 @@ export type PlannerValidationIssueCode =
   | "REQUIREMENT_OUTSIDE_PHASE_SCOPE"
   | "ACCEPTANCE_CRITERIA_OUTSIDE_PHASE_SCOPE"
   | "TOO_MANY_PHASES"
-  | "TOO_MANY_TASKS_IN_PHASE";
+  | "TOO_MANY_TASKS_IN_PHASE"
+  | "UNSAFE_TASK_SCOPE"
+  | "REQUIRED_TEST_NOT_EXECUTABLE";
 
 export interface PlannerValidationIssue {
   code: PlannerValidationIssueCode;
@@ -452,7 +455,9 @@ function isSafeProjectRelativePath(value: unknown, opts: { requireTrailingSlash:
 }
 
 function isSafeScopePrefix(value: unknown): value is string {
-  return isSafeProjectRelativePath(value, { requireTrailingSlash: true });
+  // Planner scope는 디렉터리 prefix(`src/`) 또는 exact root/file path(`package.json`)를 허용한다.
+  // Safe Executor도 동일하게 trailing slash 여부로 prefix/exact 의미를 구분한다.
+  return isSafeProjectRelativePath(value, { requireTrailingSlash: false });
 }
 
 function isSafeCommandCwdAliasValue(value: unknown): value is string {
@@ -930,7 +935,7 @@ export function buildArchitecturePrompt(normalized: NormalizedMasterSpec, truste
       '  "architecturalBoundaries": string[], "dependencyRelationships": string[], "majorConstraints": string[],',
       '  "securityRequirementsSummary": string[], "testingRequirementsSummary": string[], "deliveryConstraintsSummary": string[],',
       '  "fixedConstraintAcknowledgement": [{"id":string,"value":string}] (모든 Fixed Constraint id를 원문 그대로 echo),',
-      '  "executionPolicy": {"allowedReadPrefixes":["dir/"],"allowedWritePrefixes":["dir/"],"allowedCommands":[{"cwd":"root","command":string,"args":string[]}],',
+      '  "executionPolicy": {"allowedReadPrefixes":["dir/","exact-file"],"allowedWritePrefixes":["dir/","exact-file"],"allowedCommands":[{"cwd":"root","command":string,"args":string[]}],',
       '    "commandCwdAliases": {"alias-name": "project-relative-dir"} (선택 — cwd로 "root"가 아닌 하위 디렉터리가 필요할 때만 추가, 불필요하면 이 key 자체를 생략)} }',
     ].join("\n"),
     [
@@ -1143,13 +1148,11 @@ export function validatePhasePlanRawOutput(
       }
     }
   }
-  // 조기 fail-fast — 어떤 phase에도 배정되지 않은 must-have REQ/AC는 STAGE 3(Phase별
-  // Task 생성) 프롬프트 어디에도 등장하지 못해 영원히 누락되므로, 여기서 즉시 잡는다
-  // (STAGE 4 Global Traceability는 "phase는 배정됐지만 실제 task가 안 만든" 누락을 잡는
-  // 두 번째 방어선이다 — 서로 다른 실패 시점을 담당한다).
+  // 조기 fail-fast — Master Spec의 모든 NOW requirement는 어떤 phase엔가 배정돼야 한다.
+  // Must-have만 강제하면 functional/security/data 같은 일반 requirement가 조용히 누락될 수 있다.
   for (const req of normalized.requirements) {
-    if (req.mustHave && !reqUnion.has(req.id)) {
-      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `Must-have requirement(${req.id})가 어떤 phase에도 배정되지 않았습니다.` });
+    if (!reqUnion.has(req.id)) {
+      issues.push({ code: "MISSING_REQUIREMENT_COVERAGE", detail: `Requirement(${req.id})가 어떤 phase에도 배정되지 않았습니다.` });
     }
   }
   for (const ac of normalized.acceptanceCriteria) {
@@ -1342,6 +1345,16 @@ export function validatePhaseTaskRawOutput(
     checkRequiredString(`tasks[${idx}]`, tObj, "objective", issues);
     checkRequiredString(`tasks[${idx}]`, tObj, "completionGate", issues);
     checkRequiredStringArray(`tasks[${idx}]`, tObj, "scope", issues);
+    if (isStringArray(tObj.scope)) {
+      for (const scope of tObj.scope) {
+        if (!isSafeScopePrefix(scope)) {
+          issues.push({
+            code: "UNSAFE_TASK_SCOPE",
+            detail: `tasks[${idx}].scope에 안전하지 않은 project-relative 범위가 있습니다: ${safeEchoValue(scope)}`,
+          });
+        }
+      }
+    }
     checkRequiredStringArray(`tasks[${idx}]`, tObj, "constraints", issues);
     checkRequiredStringArray(`tasks[${idx}]`, tObj, "dependsOn", issues);
     checkRequiredStringArray(`tasks[${idx}]`, tObj, "expectedModules", issues);
@@ -1449,13 +1462,10 @@ export function validatePhaseTaskRawOutput(
       }
     }
   }
-  // "해당 Phase에 배정된 Must-have REQ/AC는 그 Phase의 Task들에 실제로 coverage되어야 한다" —
-  // AC는 must-have 구분이 없으므로(§ validateCoverageCompleteness와 동일 기준) phase에
-  // 배정된 acIds 전부, REQ는 그중 must-have만 이 phase 안에서 커버돼야 한다.
-  const mustHaveReqIds = new Set(normalized.requirements.filter((r) => r.mustHave).map((r) => r.id));
+  // 이 Phase에 배정된 모든 requirement/AC는 실제 Task에 coverage되어야 한다.
   for (const reqId of phase.reqIds) {
-    if (mustHaveReqIds.has(reqId) && !reqCoverageInThisPhase.has(reqId)) {
-      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 must-have requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+    if (!reqCoverageInThisPhase.has(reqId)) {
+      issues.push({ code: "MISSING_REQUIREMENT_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
     }
   }
   for (const acId of phase.acIds) {
@@ -1519,7 +1529,7 @@ export function buildPhaseTaskPrompt(
       "# Output — 반드시 아래 JSON 구조만 반환(다른 텍스트 금지):",
       `{ "projectId": string, "specVersion": string, "phaseId": "${phase.phaseId}",`,
       '  "tasks": [{"sequence": number(1부터 시작 — 이 응답 안에서만 고유하면 됨. 실제 taskId는 Core가 부여합니다),',
-      '    "title": string, "objective": string, "scope": ["dir/"], "constraints": string[],',
+      '    "title": string, "objective": string, "scope": ["dir/ 또는 exact/file"], "constraints": string[],',
       '    "dependsOn": string[](다른 phase의 이미 확정된 taskId만, 위 목록에서 선택), "dependsOnSequenceInPhase": number[](같은 응답 안의 다른 task의 sequence만),',
       '    "expectedModules": string[], "requiredTests": [{"name":string,"command":string,"args":string[],"cwd":"root"}],',
       '    "acceptanceCriteria": string[], "reqIds": string[], "securityConsiderations": string[], "completionGate": string}] }',
@@ -1746,7 +1756,6 @@ function validateTaskReferenceIntegrity(
   const outOfScopeIds = new Set(normalized.outOfScope.map((o) => o.id));
   const requirementIds = new Set(normalized.requirements.map((r) => r.id));
   const acIdSet = new Set(normalized.acceptanceCriteria.map((a) => a.id));
-  const mustHaveReqIds = new Set(normalized.requirements.filter((r) => r.mustHave).map((r) => r.id));
   const reqCoverageByPhase = new Map<string, Set<string>>();
   const acCoverageByPhase = new Map<string, Set<string>>();
   for (const t of allTasks) {
@@ -1815,19 +1824,16 @@ function validateTaskReferenceIntegrity(
   }
   if (hasCycle([...taskIds], taskEdges)) issues.push({ code: "DEPENDENCY_CYCLE", detail: "task 의존성 그래프에 사이클이 있습니다(global)." });
 
-  // phase 단위 coverage 재확인 — "이 데이터셋에 해당 phase의 task가 하나라도 존재하면"
-  // (STAGE 3는 한 phase의 task 전체를 원자적으로 한 번에 checkpoint하므로, 정상 부분 resume
-  // 에서는 어떤 phase든 task가 "전부 있거나 전혀 없다") 그 phase가 배정받은 must-have
-  // REQ/전체 AC가 실제로 커버됐는지 재확인한다. 아직 생성되지 않은 뒤 phase는 건너뛴다
-  // (§ validateResumedPhasePlanAndKnownTasks 상단 주석 — 정상적인 부분 resume을 오탐하지 않음).
+  // phase 단위 coverage 재확인 — 해당 phase의 task가 이미 생성됐다면 그 phase가 배정받은
+  // 모든 REQ/AC가 실제 Task에 coverage되어야 한다. 아직 생성되지 않은 뒤 phase는 건너뛴다.
   const phasesWithTasks = new Set(allTasks.map((t) => t.phaseId));
   for (const phase of phasePlan) {
     if (!phasesWithTasks.has(phase.phaseId)) continue;
     const reqCov = reqCoverageByPhase.get(phase.phaseId) ?? new Set<string>();
     const acCov = acCoverageByPhase.get(phase.phaseId) ?? new Set<string>();
     for (const reqId of phase.reqIds) {
-      if (mustHaveReqIds.has(reqId) && !reqCov.has(reqId)) {
-        issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 must-have requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
+      if (!reqCov.has(reqId)) {
+        issues.push({ code: "MISSING_REQUIREMENT_COVERAGE", detail: `phase ${phase.phaseId}에 배정된 requirement(${reqId})가 이 phase의 어떤 task에도 매핑되지 않았습니다.` });
       }
     }
     for (const acId of phase.acIds) {
@@ -1848,8 +1854,8 @@ function validateCoverageCompleteness(normalized: NormalizedMasterSpec, allTasks
     for (const a of t.acceptanceCriteria) acCoverage.add(a);
   }
   for (const req of normalized.requirements) {
-    if (req.mustHave && !reqCoverage.has(req.id)) {
-      issues.push({ code: "MISSING_MUST_HAVE_COVERAGE", detail: `Must-have requirement(${req.id})가 어떤 task에도 매핑되지 않았습니다.` });
+    if (!reqCoverage.has(req.id)) {
+      issues.push({ code: "MISSING_REQUIREMENT_COVERAGE", detail: `Requirement(${req.id})가 어떤 task에도 매핑되지 않았습니다.` });
     }
   }
   for (const ac of normalized.acceptanceCriteria) {
@@ -1873,6 +1879,13 @@ function validateCheckpointShapeStrictness(phasePlan: readonly ValidatedPlannerP
     const tObj = t as unknown as Record<string, unknown>;
     checkExactKeys(`task "${t.taskId}"(checkpoint)`, tObj, PLANNER_RAW_TASK_KEYS, issues);
     validateRequiredTestsArray(`task "${t.taskId}"(checkpoint).requiredTests`, tObj.requiredTests, issues);
+    if (isStringArray(t.scope)) {
+      for (const scope of t.scope) {
+        if (!isSafeScopePrefix(scope)) {
+          issues.push({ code: "UNSAFE_TASK_SCOPE", detail: `task "${t.taskId}"(checkpoint).scope가 안전하지 않습니다: ${safeEchoValue(scope)}` });
+        }
+      }
+    }
   }
   return issues;
 }
@@ -2104,12 +2117,29 @@ function describeExecutionContractIssues(issues: readonly ExecutionContractIssue
 // 호출 순서) 최소 명령을 더해 최종 allowedCommands를 만든다 — task-registry.requiredTests와
 // execution-policy.allowedCommands가 서로 다른 stage의 독립적인 LLM 출력이라 어긋날 수
 // 있었던 구조적 원인(EP-1)을 "requiredTests가 곧 allowedCommands의 근거"로 만들어 제거한다.
+function collapseExecutionScopes(scopes: readonly string[]): string[] {
+  const unique = [...new Set(scopes)];
+  // broad directory scope가 이미 있으면 그 아래 exact/child scope는 제거해 policy를 최소화한다.
+  return unique.filter((scope, idx, all) =>
+    !all.some((other, otherIdx) => {
+      if (idx === otherIdx || !other.endsWith("/")) return false;
+      return scope === other.slice(0, -1) || scope.startsWith(other);
+    })
+  );
+}
+
 function buildExecutionPolicy(raw: PlannerRawOutput): ProjectExecutionPolicy {
   const safeAuthoredCommands = filterAllowedCommandsByCoreCapability(raw.executionPolicy.allowedCommands, raw.executionPolicy.commandCwdAliases);
   const derivedFromRequiredTests = deriveAllowedCommandsFromRequiredTests(toRequiredTestOwners(raw.tasks));
+  // STAGE 1 executionPolicy는 Task가 존재하기 전에 만들어지므로 root 파일/apps/supabase 등 실제
+  // Task scope를 완전히 알 수 없다. 최종 정책은 검증된 모든 Task scope의 union을 deterministic하게
+  // 합쳐 "Task는 허용됐지만 Project-wide Safe Executor가 거부"하는 실행계약 gap을 닫는다.
+  const taskScopes = raw.tasks.flatMap((t) => t.scope);
+  const allowedReadPrefixes = collapseExecutionScopes([...raw.executionPolicy.allowedReadPrefixes, ...taskScopes]);
+  const allowedWritePrefixes = collapseExecutionScopes([...raw.executionPolicy.allowedWritePrefixes, ...taskScopes]);
   return {
-    allowedReadPrefixes: raw.executionPolicy.allowedReadPrefixes,
-    allowedWritePrefixes: raw.executionPolicy.allowedWritePrefixes,
+    allowedReadPrefixes,
+    allowedWritePrefixes,
     commandCwdAliases: raw.executionPolicy.commandCwdAliases,
     allowedCommands: mergeAllowedCommands(safeAuthoredCommands, derivedFromRequiredTests),
   };
@@ -3374,7 +3404,24 @@ async function runPlannerLocked(
         phase.phaseId,
         () => buildPhaseTaskPrompt(normalized, identity, architecture, phase, priorPhases, knownTasks),
         (issues) => buildPhaseTaskCorrectionPrompt(normalized, identity, architecture, phase, priorPhases, knownTasks, issues),
-        (rawText) => validatePhaseTaskRawOutput(rawText, normalized, identity, phase, knownTaskIds),
+        (rawText) => {
+          const validated = validatePhaseTaskRawOutput(rawText, normalized, identity, phase, knownTaskIds);
+          if (!validated.ok) return validated;
+          const contractIssues = validateRequiredTestExecutionContract(
+            toRequiredTestOwners(validated.value),
+            architecture.executionPolicy.commandCwdAliases
+          );
+          if (contractIssues.length > 0) {
+            return {
+              ok: false as const,
+              issues: contractIssues.map((i) => ({
+                code: "REQUIRED_TEST_NOT_EXECUTABLE" as const,
+                detail: i.reason,
+              })),
+            };
+          }
+          return validated;
+        },
         config.onDiagnostic
       );
       if (outcome.kind === "transport_failed") {
