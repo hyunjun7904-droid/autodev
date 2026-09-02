@@ -191,6 +191,59 @@ function scenarioLockfileMissing(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 4-A) 신규 bootstrap package.json이 dependency 없이 scripts/private만 갖는 경우 lockfile 없이 PASS.
+// ---------------------------------------------------------------------------
+function scenarioNewManifestWithoutDependenciesDoesNotRequireLockfile(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(
+      repo,
+      "package.json",
+      JSON.stringify({ private: true, scripts: { "verify:root": "node scripts/verify-root.cjs" } }, null, 2) + "\n"
+    );
+    let auditCalls = 0;
+    const result = scanChangesForDependencyRisk([change("package.json")], repo, {
+      vulnerabilityAuditSource: () => {
+        auditCalls += 1;
+        return { ok: false, reason: "scripts-only 변경에는 호출되면 안 됨" };
+      },
+    });
+    check("신규 dependency 없는 package.json: lockfile 없이 PASS", result.verdict === "PASS");
+    check("신규 dependency 없는 package.json: findings 없음", result.findings.length === 0);
+    check("신규 dependency 없는 package.json: npm audit 호출 없음", auditCalls === 0);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4-B) 기존 package.json의 dependency 선언이 그대로이고 scripts만 바뀌면 lockfile/audit 재검사 생략.
+// ---------------------------------------------------------------------------
+function scenarioExistingManifestScriptsOnlyChangeDoesNotRescanDependencies(): void {
+  const repo = makeTempGitRepo();
+  try {
+    const baseline = JSON.stringify({ private: true, scripts: { test: "node old.cjs" } }, null, 2) + "\n";
+    writeFile(repo, "package.json", baseline);
+    spawnSync("git", ["add", "--", "package.json"], { cwd: repo });
+    spawnSync("git", ["commit", "-q", "-m", "baseline package manifest"], { cwd: repo });
+
+    writeFile(repo, "package.json", JSON.stringify({ private: true, scripts: { test: "node new.cjs" } }, null, 2) + "\n");
+    let auditCalls = 0;
+    const result = scanChangesForDependencyRisk([change("package.json", "modified")], repo, {
+      vulnerabilityAuditSource: () => {
+        auditCalls += 1;
+        return { ok: false, reason: "scripts-only 변경에는 호출되면 안 됨" };
+      },
+    });
+    check("기존 scripts-only package.json 변경: lockfile 없이 PASS", result.verdict === "PASS");
+    check("기존 scripts-only package.json 변경: findings 없음", result.findings.length === 0);
+    check("기존 scripts-only package.json 변경: npm audit 호출 없음", auditCalls === 0);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 5) insecure http source 탐지.
 // ---------------------------------------------------------------------------
 function scenarioInsecureHttpSource(): void {
@@ -613,6 +666,41 @@ function scenarioCheckpointUnrelatedChangeNotAffected(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 15-A) 실제 Canary 회귀: dependency 없는 신규 root package.json + scripts 변경은 checkpoint 가능.
+// ---------------------------------------------------------------------------
+function scenarioCheckpointAllowsNewScriptsOnlyManifestWithoutLockfile(): void {
+  const repo = makeTempGitRepo();
+  try {
+    writeFile(
+      repo,
+      "package.json",
+      JSON.stringify({ private: true, scripts: { "verify:root": "node scripts/verify-root.cjs" } }, null, 2) + "\n"
+    );
+    writeFile(repo, "scripts/verify-root.cjs", "process.exit(0);\n");
+    const before = gitLogCount(repo);
+    let auditCalls = 0;
+    const outcome = performTaskCheckpoint(
+      fakeTask({ allowedPathPrefixes: ["package.json", "scripts/"] }),
+      {
+        decision: "PASS",
+        severity: { critical: 0, high: 0, medium: 0 },
+        requiredTestsAllPassed: true,
+        cwd: repo,
+        dependencyVulnerabilityAuditSource: () => {
+          auditCalls += 1;
+          return { ok: false, reason: "dependency 없는 신규 manifest에서는 호출되면 안 됨" };
+        },
+      }
+    );
+    check("checkpoint canary regression: 신규 dependency 없는 root package.json은 ok=true", outcome.ok === true);
+    check("checkpoint canary regression: product commit 1건 생성", gitLogCount(repo) === before + 1);
+    check("checkpoint canary regression: npm audit 호출 없음", auditCalls === 0);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 16) Project Policy로 Core gate 우회 불가.
 // ---------------------------------------------------------------------------
 function scenarioProjectPolicyCannotBypassDependencyScanner(): void {
@@ -662,6 +750,8 @@ function main(): void {
   scenarioNormalDependencyPasses();
   scenarioManifestLockfileMismatch();
   scenarioLockfileMissing();
+  scenarioNewManifestWithoutDependenciesDoesNotRequireLockfile();
+  scenarioExistingManifestScriptsOnlyChangeDoesNotRescanDependencies();
   scenarioInsecureHttpSource();
   scenarioGitSourceDistinguishesPinning();
   scenarioFileAndWorkspaceLinkSources();
@@ -676,6 +766,7 @@ function main(): void {
   scenarioCheckpointBlocksOnCriticalVulnerability();
   scenarioCheckpointPassesCleanDependencyChange();
   scenarioCheckpointUnrelatedChangeNotAffected();
+  scenarioCheckpointAllowsNewScriptsOnlyManifestWithoutLockfile();
   scenarioProjectPolicyCannotBypassDependencyScanner();
 
   console.log("\n=== dependency-scanner 테스트 결과 ===");

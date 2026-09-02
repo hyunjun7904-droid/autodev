@@ -403,19 +403,22 @@ export function scanChangesForDependencyRisk(
   cwd: string,
   opts: DependencyScanOptions = {}
 ): DependencyScanResult {
-  const relevantDirs = new Set<string>();
+  const relevantDirs = new Map<string, { manifestChanged: boolean; lockfileChanged: boolean }>();
   for (const c of changes) {
     if (c.status === "deleted") continue;
     const base = c.path.split("/").pop();
-    if (base === MANIFEST_BASENAME || base === LOCKFILE_BASENAME) {
-      relevantDirs.add(dirOf(c.path));
-    }
+    if (base !== MANIFEST_BASENAME && base !== LOCKFILE_BASENAME) continue;
+    const dir = dirOf(c.path);
+    const entry = relevantDirs.get(dir) ?? { manifestChanged: false, lockfileChanged: false };
+    if (base === MANIFEST_BASENAME) entry.manifestChanged = true;
+    if (base === LOCKFILE_BASENAME) entry.lockfileChanged = true;
+    relevantDirs.set(dir, entry);
   }
   if (relevantDirs.size === 0) return { verdict: "PASS", findings: [] };
 
   const findings: DependencyFinding[] = [];
 
-  for (const dir of relevantDirs) {
+  for (const [dir, changed] of relevantDirs) {
     const manifestRel = dir ? `${dir}/${MANIFEST_BASENAME}` : MANIFEST_BASENAME;
     const lockRel = dir ? `${dir}/${LOCKFILE_BASENAME}` : LOCKFILE_BASENAME;
 
@@ -427,6 +430,39 @@ export function scanChangesForDependencyRisk(
       continue;
     }
 
+    const manifestParsed = parseManifestJson(manifestRaw);
+    if (!manifestParsed.ok) {
+      findings.push({ file: manifestRel, kind: "manifest-parse-error", severity: "block", detail: manifestParsed.reason });
+      continue;
+    }
+
+    // package.json의 모든 변경을 dependency 변경으로 오인하지 않는다.
+    // scripts/private/workspaces 등 dependency 선언과 무관한 metadata만 바뀐 경우에는
+    // lockfile 및 npm audit 검사가 필요하지 않다. 신규 bootstrap package.json도
+    // dependencies/devDependencies가 비어 있으면 package-lock.json 없이 정상 checkpoint 가능하다.
+    // 실제 dependency 선언이 HEAD 대비 달라졌거나 lockfile 자체가 변경된 경우에는
+    // 기존 fail-closed 공급망 검사를 그대로 수행한다.
+    if (changed.manifestChanged && !changed.lockfileChanged) {
+      const oldManifestRaw = readHeadFileContent(cwd, manifestRel);
+      if (oldManifestRaw === null) {
+        if (
+          Object.keys(manifestParsed.data.dependencies).length === 0 &&
+          Object.keys(manifestParsed.data.devDependencies).length === 0
+        ) {
+          continue;
+        }
+      } else {
+        const oldManifestParsed = parseManifestJson(oldManifestRaw);
+        if (
+          oldManifestParsed.ok &&
+          depsEqual(manifestParsed.data.dependencies, oldManifestParsed.data.dependencies) &&
+          depsEqual(manifestParsed.data.devDependencies, oldManifestParsed.data.devDependencies)
+        ) {
+          continue;
+        }
+      }
+    }
+
     let lockRaw: string;
     try {
       lockRaw = readFileSync(join(cwd, ...lockRel.split("/")), "utf-8");
@@ -435,16 +471,11 @@ export function scanChangesForDependencyRisk(
         file: lockRel,
         kind: "lockfile-missing",
         severity: "block",
-        detail: "package.json 변경과 함께 있어야 할 package-lock.json이 없음 — lockfile 없이는 의존성 무결성/출처를 검증할 수 없음",
+        detail: "dependency 선언 또는 package-lock.json 변경을 검증해야 하지만 package-lock.json이 없음 — lockfile 없이는 의존성 무결성/출처를 검증할 수 없음",
       });
       continue;
     }
 
-    const manifestParsed = parseManifestJson(manifestRaw);
-    if (!manifestParsed.ok) {
-      findings.push({ file: manifestRel, kind: "manifest-parse-error", severity: "block", detail: manifestParsed.reason });
-      continue;
-    }
     const lockParsed = parseLockfileJson(lockRaw);
     if (!lockParsed.ok) {
       findings.push({ file: lockRel, kind: "lockfile-parse-error", severity: "block", detail: lockParsed.reason });
