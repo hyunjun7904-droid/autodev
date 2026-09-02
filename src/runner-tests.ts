@@ -254,6 +254,86 @@ async function main(): Promise<void> {
     );
   }
 
+  // Two-Tier Round Timeout(2026-09-03) — noProgressTimeoutMs를 지정하지 않으면(기존 모든
+  // 호출부) 기존과 완전히 동일한 단일 hard-cap 동작이고 timeoutKind는 항상 undefined다.
+  {
+    const outcome = await runSubprocessWithTimeout(
+      "powershell",
+      ["-NoProfile", "-Command", "Start-Sleep -Seconds 5"],
+      500
+    );
+    check(
+      "Two-Tier Timeout: noProgressTimeoutMs 미지정 시 기존과 동일한 단일 hard-cap timeout(timedOut=true)",
+      outcome.timedOut === true
+    );
+    check(
+      "Two-Tier Timeout: noProgressTimeoutMs 미지정이어도 hard cap timer가 유발한 종료는 HARD_CAP으로 정확히 반영됨",
+      outcome.timeoutKind === "HARD_CAP"
+    );
+  }
+
+  // no-progress timeout — hard cap은 훨씬 멀리 있어도(8초) stdout/stderr에 전혀 활동이
+  // 없으면 no-progress 상한(400ms)에서 먼저 종료돼야 한다.
+  {
+    const startedAt = Date.now();
+    const outcome = await runSubprocessWithTimeout(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000);"],
+      8_000,
+      undefined,
+      undefined,
+      undefined,
+      400
+    );
+    const elapsedMs = Date.now() - startedAt;
+    check("Two-Tier Timeout: 무활동 프로세스는 no-progress 상한에서 종료됨(timedOut=true)", outcome.timedOut === true);
+    check("Two-Tier Timeout: 무활동 프로세스의 timeoutKind=NO_PROGRESS(hard cap이 아님)", outcome.timeoutKind === "NO_PROGRESS");
+    check(
+      "Two-Tier Timeout: hard cap(8초)이 아니라 no-progress 상한(400ms) 근처에서 실제로 종료됨",
+      elapsedMs < 4_000
+    );
+  }
+
+  // 활동이 있으면 no-progress 타이머가 리셋된다 — no-progress 상한(400ms)보다 짧은 간격
+  // (150ms)으로 계속 stdout을 쓰면, 총 실행시간(~900ms)이 no-progress 상한을 여러 번 넘어도
+  // 절대 죽지 않고 정상 종료돼야 한다.
+  {
+    const activeScript =
+      "let n=0; const t=setInterval(() => { process.stdout.write('.'); n++; if(n>=6){clearInterval(t); process.exit(0);} }, 150);";
+    const outcome = await runSubprocessWithTimeout(
+      process.execPath,
+      ["-e", activeScript],
+      8_000,
+      undefined,
+      undefined,
+      undefined,
+      400
+    );
+    check(
+      "Two-Tier Timeout: no-progress 상한보다 짧은 간격으로 계속 활동하면 타이머가 리셋되어 정상 종료됨(timedOut=false)",
+      outcome.timedOut === false && outcome.code === 0
+    );
+  }
+
+  // hard cap은 활동 여부와 무관한 절대 상한이다 — no-progress 상한(5초)이 멀리 있어도, 계속
+  // 활동 중인 프로세스가 hard cap(500ms)에 도달하면 그대로 강제종료돼야 한다.
+  {
+    const startedAt = Date.now();
+    const outcome = await runSubprocessWithTimeout(
+      process.execPath,
+      ["-e", "setInterval(() => process.stdout.write('.'), 100);"],
+      500,
+      undefined,
+      undefined,
+      undefined,
+      5_000
+    );
+    const elapsedMs = Date.now() - startedAt;
+    check("Two-Tier Timeout: 계속 활동 중이어도 hard cap에서 강제종료됨(timedOut=true)", outcome.timedOut === true);
+    check("Two-Tier Timeout: hard cap으로 종료된 경우 timeoutKind=HARD_CAP(no-progress가 아님)", outcome.timeoutKind === "HARD_CAP");
+    check("Two-Tier Timeout: no-progress 상한(5초)이 아니라 hard cap(500ms) 근처에서 종료됨", elapsedMs < 4_000);
+  }
+
   console.log("\n=== runner 단위 테스트 결과 ===");
   for (const r of results) console.log(r);
   const passCount = results.filter((r) => r.startsWith("[PASS]")).length;

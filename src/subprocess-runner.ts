@@ -30,6 +30,13 @@ export interface SubprocessOutcome {
    *  코드/timeout과는 다른 실패 단계다. */
   spawnErrorCode?: string;
   spawnErrorMessage?: string;
+  /** AutoDev Core Maintenance — Two-Tier Round Timeout(2026-09-03, § 요구사항 "10분
+   *  no-progress + 30분 hard cap"). timedOut===true일 때만 의미가 있고, 항상 어느 타이머가
+   *  실제로 강제종료를 유발했는지 정확히 반영한다(hard cap timer는 noProgressTimeoutMs
+   *  지정 여부와 무관하게 항상 존재하므로, 지정하지 않은 호출부도 timedOut=true면 항상
+   *  "HARD_CAP"을 받는다 — 새 필드를 추가했을 뿐 기존 timedOut/code/stdout/stderr 등 다른
+   *  필드의 동작은 전혀 바꾸지 않았으므로 하위 호환에 영향 없다). */
+  timeoutKind?: "HARD_CAP" | "NO_PROGRESS";
 }
 
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // stdout/stderr 각각 2MB로 제한
@@ -59,7 +66,15 @@ export function runSubprocessWithTimeout(
    *  timeout과 동일하게 child를 SIGKILL로 종료하지만(§ 이 파일이 이미 갖고 있던 유일한 종료
    *  수단을 재사용 — 새 종료 경로를 만들지 않는다), outcome.aborted=true로 timeout과
    *  구분한다. */
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  /** AutoDev Core Maintenance — Two-Tier Round Timeout(2026-09-03). 지정하면 timeoutMs는
+   *  "hard cap"(절대 상한, 진행 여부와 무관하게 이 시간이 지나면 무조건 종료)의 의미가 되고,
+   *  이 값은 "no-progress" 상한이 된다 — stdout/stderr에 새 데이터가 도착할 때마다 이 타이머만
+   *  리셋된다(hard cap 타이머는 활동과 무관하게 그대로 진행). 즉 실제로 진행 중인 호출은 계속
+   *  살아있고, 정말 응답이 끊긴(hang) 호출만 이 no-progress 상한에서 먼저 종료된다. 지정하지
+   *  않으면(undefined, 기존 모든 호출부의 기본값) 기존과 완전히 동일한 단일 hard-cap timer
+   *  동작이다 — 이 파라미터를 추가했다는 사실만으로 기존 호출부의 동작이 바뀌지 않는다. */
+  noProgressTimeoutMs?: number
 ): Promise<SubprocessOutcome> {
   return new Promise((resolve) => {
     let child;
@@ -83,11 +98,28 @@ export function runSubprocessWithTimeout(
     let settled = false;
     let timedOut = false;
     let aborted = false;
+    let timeoutKind: "HARD_CAP" | "NO_PROGRESS" | undefined;
 
-    const timer = setTimeout(() => {
+    const hardCapTimer = setTimeout(() => {
       timedOut = true;
+      timeoutKind = "HARD_CAP";
       child.kill("SIGKILL");
     }, timeoutMs);
+
+    // no-progress timer는 noProgressTimeoutMs가 지정됐을 때만 존재한다 — 매 stdout/stderr
+    // data 이벤트마다 clearTimeout 후 재설정("활동이 있으면 리셋")한다. hard cap timer와
+    // 완전히 독립적으로 동작하며 둘 중 먼저 발동하는 쪽이 child를 종료한다.
+    let noProgressTimer: ReturnType<typeof setTimeout> | undefined;
+    const armNoProgressTimer = (): void => {
+      if (noProgressTimeoutMs === undefined) return;
+      if (noProgressTimer) clearTimeout(noProgressTimer);
+      noProgressTimer = setTimeout(() => {
+        timedOut = true;
+        timeoutKind = "NO_PROGRESS";
+        child.kill("SIGKILL");
+      }, noProgressTimeoutMs);
+    };
+    armNoProgressTimer();
 
     const onAbort = (): void => {
       if (settled) return;
@@ -102,24 +134,28 @@ export function runSubprocessWithTimeout(
     child.on("error", (err: NodeJS.ErrnoException) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(hardCapTimer);
+      if (noProgressTimer) clearTimeout(noProgressTimer);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
       resolve({ timedOut: false, code: null, stdout, stderr, spawnErrorCode: err.code, spawnErrorMessage: err.message });
     });
 
     child.stdout?.on("data", (chunk: Buffer) => {
       if (stdout.length < MAX_OUTPUT_BYTES) stdout += chunk.toString("utf-8");
+      armNoProgressTimer();
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk.toString("utf-8");
+      armNoProgressTimer();
     });
 
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(hardCapTimer);
+      if (noProgressTimer) clearTimeout(noProgressTimer);
       if (abortSignal) abortSignal.removeEventListener("abort", onAbort);
-      resolve({ timedOut, aborted, code, stdout, stderr });
+      resolve({ timedOut, aborted, code, stdout, stderr, ...(timeoutKind ? { timeoutKind } : {}) });
     });
   });
 }

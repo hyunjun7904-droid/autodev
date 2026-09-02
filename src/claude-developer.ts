@@ -201,7 +201,12 @@ export interface DeveloperResult {
 }
 
 export interface DeveloperTaskOptions {
+  /** Two-Tier Round Timeout(2026-09-03)의 hard cap(절대 상한) — 기본 DEVELOPER_ROUND_HARD_CAP_MS. */
   timeoutPerRoundMs?: number;
+  /** Two-Tier Round Timeout(2026-09-03)의 no-progress 상한(stdout/stderr 활동이 있으면 리셋) —
+   *  기본 DEVELOPER_ROUND_NO_PROGRESS_MS. hard cap보다 항상 짧아야 의미가 있다(호출부가 그 관계를
+   *  검증하지는 않는다 — 두 상수 기본값 관계로 이미 보장된다). */
+  noProgressTimeoutMs?: number;
   /** 테스트 전용 override — 기본은 항상 실제 claude CLI 호출(callClaude). 운용 코드는 절대 바꾸지 않는다. */
   claudeCaller?: (input: string, timeoutMs: number) => ReturnType<typeof callClaude>;
   /**
@@ -298,6 +303,17 @@ export interface DeveloperTaskOptions {
 
 const MAX_INTERNAL_ROUNDS = 20;
 const MAX_TRANSCRIPT_CHARS = 120_000;
+// AutoDev Core Maintenance — Two-Tier Round Timeout(2026-09-03, § 요구사항 "300초 고정 →
+// 10분 no-progress + 30분 hard cap"). 기존 단일 300_000ms 고정 timeout은 "Claude가 실제로
+// 오래 작업 중인 라운드"와 "진짜 응답이 끊긴(hang) 라운드"를 구분하지 못해, 전자를 억울하게
+// 죽이고 처음부터 다시 시도하게 만들었다(§ 요구사항 배경 — 실측 round 3/4 TIMEOUT). hard cap은
+// "무슨 일이 있어도 이 이상은 잡지 않는다"는 절대 상한(기존 timeoutPerRoundMs override 관례
+// 그대로 유지), no-progress는 "stdout/stderr에 새 데이터가 없는 채로 이만큼 지나면 진짜 hang으로
+// 간주한다"는 상한이다(subprocess-runner.ts가 활동마다 리셋). no-progress가 hard cap보다 항상
+// 먼저 걸리므로 실질적으로 "최대 10분 무응답이면 종료, 그래도 계속 진행 중이면 최대 30분까지는
+// 살려둔다"가 된다.
+const DEVELOPER_ROUND_NO_PROGRESS_MS = 10 * 60 * 1000;
+const DEVELOPER_ROUND_HARD_CAP_MS = 30 * 60 * 1000;
 // USAGE_LIMIT(Claude 계정 세션/사용량 제한)은 developer task의 "실패"가 아니라 "일시정지"로
 // 취급한다 — 실제 3차 E2E에서 orchestrator가 USAGE_LIMIT마다 이 함수를 처음부터 다시
 // 호출해 transcript/round/discovery/lock 상태를 전부 잃어버리는 문제가 실제로 발생했다
@@ -606,7 +622,14 @@ async function runRequiredTests(
   return results;
 }
 
-async function callClaude(input: string, timeoutMs: number, systemPrompt: string, projectRoot?: string, abortSignal?: AbortSignal) {
+async function callClaude(
+  input: string,
+  timeoutMs: number,
+  systemPrompt: string,
+  projectRoot?: string,
+  abortSignal?: AbortSignal,
+  noProgressTimeoutMs?: number
+) {
   // 프롬프트를 CLI 인자로 넘기지 않고 stdin으로 전달한다 — 라운드가 쌓여 프롬프트가 커지면
   // OS 명령행 길이 제한(Windows에서 실제로 ENAMETOOLONG 발생 확인)에 걸리기 때문이다.
   // "claude -p"(positional prompt 생략)가 stdin에서 읽는 것은 실제 호출로 직접 검증했다.
@@ -633,7 +656,19 @@ async function callClaude(input: string, timeoutMs: number, systemPrompt: string
   // 읽어들이므로, 실제 개발 대상(JARVIS 등)과 무관한 AutoDev Core 자신의 CLAUDE.md/rules가
   // 매 호출마다 섞여 들어갈 수 있다(§ 실측: JARVIS Task 5.2). projectRoot가 없으면(테스트 등
   // 기존 호출부) 기존과 동일하게 상속된 cwd를 그대로 쓴다.
-  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input, projectRoot, abortSignal);
+  const outcome = await runSubprocessWithTimeout(trusted.command, args, timeoutMs, input, projectRoot, abortSignal, noProgressTimeoutMs);
+  // Two-Tier Round Timeout(2026-09-03) — 어느 타이머가 종료를 유발했는지는 진단 목적으로만
+  // 남긴다(classifySubprocessOutcome의 기존 TIMEOUT 분류/메시지 형식은 바꾸지 않는다 — 기존
+  // 회귀 테스트가 그 형식에 의존한다). "실제 진행 중이던 호출이 hard cap에 걸렸는지" vs
+  // "정말 응답이 끊겨 no-progress로 걸렸는지"를 로그로 구분해두면, 반복되는 TIMEOUT이 진짜
+  // hang인지 그냥 오래 걸리는 작업인지 나중에 조사할 수 있다.
+  if (outcome.timedOut && outcome.timeoutKind) {
+    log(`developer round timeout 종류: ${outcome.timeoutKind}`, {
+      timeoutKind: outcome.timeoutKind,
+      hardCapMs: timeoutMs,
+      noProgressMs: noProgressTimeoutMs,
+    });
+  }
   return classifySubprocessOutcome(outcome, timeoutMs);
 }
 
@@ -726,7 +761,8 @@ export async function runDeveloperTaskViaSafeExecutor(
   attempt: number,
   opts: DeveloperTaskOptions = {}
 ): Promise<DeveloperResult> {
-  const timeoutMs = opts.timeoutPerRoundMs ?? 300_000;
+  const timeoutMs = opts.timeoutPerRoundMs ?? DEVELOPER_ROUND_HARD_CAP_MS;
+  const noProgressTimeoutMs = opts.noProgressTimeoutMs ?? DEVELOPER_ROUND_NO_PROGRESS_MS;
   const changeScopeDirs = opts.changeScopeDirs ?? NO_SCOPE_CONFIGURED;
   const projectContext = opts.projectContext ?? DEFAULT_PROJECT_CONTEXT;
   const systemPrompt = buildProtocolSystemPrompt(projectContext);
@@ -738,7 +774,14 @@ export async function runDeveloperTaskViaSafeExecutor(
   const claudeCall =
     opts.claudeCaller ??
     ((input: string, callTimeoutMs: number) =>
-      callClaude(input, callTimeoutMs, systemPrompt, opts.executor?.projectRoot ?? PROJECT_ROOT, opts.abortSignal));
+      callClaude(
+        input,
+        callTimeoutMs,
+        systemPrompt,
+        opts.executor?.projectRoot ?? PROJECT_ROOT,
+        opts.abortSignal,
+        noProgressTimeoutMs
+      ));
   const sleepFn = opts.sleep ?? defaultDeveloperSleep;
   // AutoDev Core Maintenance — Canonical Stop Path(2026-08-31). abortSignal이 이미
   // 발동된 채로 들어오면(예: 여러 quick retry 사이 abort) claude CLI를 한 번도 더 부르지
