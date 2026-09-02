@@ -3268,6 +3268,67 @@ async function scenarioGradleRequiredTestSucceeds(): Promise<void> {
   check("si37-gradle-ok) commandCwdAliases.android가 보존됨", executionPolicy.commandCwdAliases?.android === "android/");
 }
 
+// Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+// incident, end-to-end 회귀) — task scope가 root package.json을 포함하면(npm workspaces
+// bootstrap 등), Planner 전체 파이프라인이 실제로 생성하는 execution-policy.json에 lockfile
+// 생성 전용 안전 명령(npm install --package-lock-only --ignore-scripts)이 STAGE 1 LLM
+// 출력과 무관하게 deterministic하게 포함돼야 한다 — Revenue OS Task 1.1에서 이 명령이
+// 처음부터 없어 dependency-scanner.ts(C5)의 lockfile-missing BLOCK을 구조적으로 벗어날
+// 방법이 없었던 것과 정확히 같은 조건을 재현한다.
+async function scenarioPackageJsonScopeDerivesLockfileInstallCommand(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-npm-lockfile-derive) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const tasks = buildGoodTaskPlanRaw(identity, "1");
+  // Revenue OS Task 1.1과 동일한 조건 — STAGE 1 executionPolicy도, task의 requiredTests도
+  // "npm install"을 전혀 요청하지 않는다(그런 requiredTest는 존재조차 하지 않는다). 오직
+  // task.scope에 root "package.json"이 있다는 사실 하나만으로 derive되는지 확인한다.
+  tasks.tasks[0].scope = ["package.json", "src/"];
+  const source = buildMultiStageGoodSource(normalized, identity, { task: () => fixedSource(tasks) });
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("si37-npm-lockfile-derive) package.json scope task는 READY_FOR_AUTODEV로 성공", result.status === "READY_FOR_AUTODEV");
+  if (result.status !== "READY_FOR_AUTODEV") return;
+  const executionPolicy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  const commands: { cwd: string; command: string; args: string[] }[] = executionPolicy.allowedCommands;
+  check(
+    "si37-npm-lockfile-derive) execution-policy.json에 npm install --package-lock-only --ignore-scripts(root)이 자동 파생되어 포함됨",
+    commands.some(
+      (c) =>
+        c.cwd === "root" && c.command === "npm" && JSON.stringify(c.args) === JSON.stringify(["install", "--package-lock-only", "--ignore-scripts"])
+    )
+  );
+  check(
+    "si37-npm-lockfile-derive) STAGE 1/requiredTest가 제안한 npm run test:unit도 그대로 함께 보존됨",
+    commands.some((c) => c.command === "npm" && JSON.stringify(c.args) === JSON.stringify(["run", "test:unit"]))
+  );
+}
+
+// 반대 방향 회귀 — package.json을 전혀 쓰지 않는(기본 fixture) 프로젝트에는 이 npm install
+// 명령이 조용히 끼어들지 않아야 한다(최소 권한 — 불필요한 capability를 부여하지 않는다).
+async function scenarioNoPackageJsonScopeDoesNotDeriveLockfileInstallCommand(): Promise<void> {
+  const content = buildMasterSpecContentNoFixedConstraints();
+  const { outcome, identity } = runFullBootstrap(content);
+  if (outcome.status !== "COMPLETE") {
+    check("si37-npm-lockfile-no-derive) setup) bootstrap COMPLETE", false);
+    return;
+  }
+  const normalized = normalizeMasterSpec(content);
+  const source = buildMultiStageGoodSource(normalized, identity);
+  const result = await runPlanner(outcome.projectRoot, identity, { rawOutputSource: source });
+  check("si37-npm-lockfile-no-derive) 기본 fixture(package.json scope 없음)는 READY_FOR_AUTODEV로 성공", result.status === "READY_FOR_AUTODEV");
+  if (result.status !== "READY_FOR_AUTODEV") return;
+  const executionPolicy = JSON.parse(readFileSync(result.executionPolicyPath, "utf-8"));
+  const commands: { cwd: string; command: string; args: string[] }[] = executionPolicy.allowedCommands;
+  check(
+    "si37-npm-lockfile-no-derive) package.json scope가 없으면 npm install 명령이 끼어들지 않음(최소 권한)",
+    !commands.some((c) => c.command === "npm" && c.args[0] === "install")
+  );
+}
+
 // EP-2: 임의 ./gradlew, 외부 path, custom init script 등은 여전히 거부되어야 한다.
 async function scenarioGradleDangerousVariantsBlockAssembly(): Promise<void> {
   const content = buildMasterSpecContentNoFixedConstraints();
@@ -3589,6 +3650,8 @@ async function main(): Promise<void> {
     await scenarioRequiredTestAutoDerivesIntoAllowedCommands();
     await scenarioGradleRequiredTestSucceeds();
     await scenarioGradleDangerousVariantsBlockAssembly();
+    await scenarioPackageJsonScopeDerivesLockfileInstallCommand();
+    await scenarioNoPackageJsonScopeDoesNotDeriveLockfileInstallCommand();
     await scenarioStaleCheckpointContractViolationDetectedOnReload();
     await scenarioReassembleFixesStaleCompletedCheckpoint();
     await scenarioReassembleTamperedArchitectureIsBlocked();

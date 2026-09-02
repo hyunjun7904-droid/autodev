@@ -32,6 +32,7 @@ import {
   deriveAllowedCommandsFromRequiredTests,
   mergeAllowedCommands,
   filterAllowedCommandsByCoreCapability,
+  deriveDependencyResolutionCommands,
 } from "./execution-contract";
 import type { ExecutionContractIssue, RequiredTestOwner } from "./execution-contract";
 
@@ -2137,11 +2138,16 @@ function buildExecutionPolicy(raw: PlannerRawOutput): ProjectExecutionPolicy {
   const taskScopes = raw.tasks.flatMap((t) => t.scope);
   const allowedReadPrefixes = collapseExecutionScopes([...raw.executionPolicy.allowedReadPrefixes, ...taskScopes]);
   const allowedWritePrefixes = collapseExecutionScopes([...raw.executionPolicy.allowedWritePrefixes, ...taskScopes]);
+  // § execution-contract.ts deriveDependencyResolutionCommands 주석(Dependency/Lockfile
+  // Bootstrap Gap Closure) — 위에서 이미 확정된 최종 allowedWritePrefixes(STAGE 1 policy +
+  // 모든 task scope의 union)에 root package.json이 있을 때만, lockfile을 생성할 수 있는
+  // 고정 안전 명령 하나를 더한다.
+  const derivedDependencyResolution = deriveDependencyResolutionCommands(allowedWritePrefixes);
   return {
     allowedReadPrefixes,
     allowedWritePrefixes,
     commandCwdAliases: raw.executionPolicy.commandCwdAliases,
-    allowedCommands: mergeAllowedCommands(safeAuthoredCommands, derivedFromRequiredTests),
+    allowedCommands: mergeAllowedCommands(safeAuthoredCommands, derivedFromRequiredTests, derivedDependencyResolution),
   };
 }
 

@@ -70,6 +70,7 @@
     "test:task-change-baseline": "npm run build && node dist/task-change-baseline-tests.js",
     "test:secret-scanner": "npm run build && node dist/secret-scanner-tests.js",
     "test:dependency-scanner": "npm run build && node dist/dependency-scanner-tests.js",
+    "test:dependency-bootstrap-recovery": "npm run build && node dist/dependency-bootstrap-recovery-tests.js",
     "test:capability-resolver": "npm run build && node dist/capability-resolver-tests.js",
     "test:candidate-evidence": "npm run build && node dist/candidate-evidence-tests.js",
     "test:source-adapter": "npm run build && node dist/source-adapter-tests.js",

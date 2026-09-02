@@ -432,8 +432,26 @@ function hasNodeEvalFlag(args: string[]): boolean {
 // "npx tsc"뿐이므로 그 형태만 허용하고 나머지는 전부 차단한다 — args[0]를 고정된
 // allow-set으로 제한하면 "--package="처럼 args[0] 자리에 오는 우회 플래그도 그 자체로
 // allow-set에 없어 함께 차단된다(별도 플래그 목록을 나열할 필요가 없다).
-const NPM_ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set(["run", "test"]);
+//
+// Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+// incident) — dependency-scanner.ts(C5)는 package.json이 dependency를 선언했는데
+// package-lock.json이 없으면 무결성/출처를 검증할 수 없다는 이유로 항상 commit을 BLOCK한다
+// (의도된 정상 동작, § dependency-scanner.ts — 이 BLOCK 자체은 절대 완화하지 않는다). 그런데
+// 그 lockfile을 만드는 유일한 표준 방법(`npm install`)이 지금까지 NPM_ALLOWED_SUBCOMMANDS에
+// 전혀 없어, npm workspaces를 쓰는 모든 프로젝트가 최초 bootstrap task에서 구조적으로 이
+// BLOCK을 벗어날 방법이 없었다(Developer가 lockfile을 만들 command 자체를 실행할 수 없음).
+// "npm install"을 통째로 허용하면 임의 패키지 설치/설치 스크립트 실행(postinstall 등 —
+// node eval 플래그와 동일한 클래스의 임의 코드 실행 위험)이 다시 열리므로, 그 전체를 여는
+// 대신 install 서브커맨드 전용으로 "정확히 이 세 토큰"만 허용한다(NPM_INSTALL_SAFE_ARGS)
+// — `--package-lock-only`(node_modules에 실제 패키지를 풀지 않고 package-lock.json만
+// 갱신 — 임의 패키지 코드가 디스크에 존재하게 되는 경로 자체를 없앤다)와
+// `--ignore-scripts`(pre/post-install lifecycle script를 실행하지 않음 — supply-chain
+// RCE의 표준 진입점을 차단). 인자가 이 세 토큰과 순서까지 정확히 일치하지 않으면(패키지
+// 이름 추가, 플래그 순서/철자 변경, 다른 플래그 추가 등) 전부 거부된다 — npx의
+// NPX_ALLOWED_PACKAGE_NAMES와 동일한 "고정된 정확한 형태만" 원칙.
+const NPM_ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set(["run", "test", "install"]);
 const NPX_ALLOWED_PACKAGE_NAMES: ReadonlySet<string> = new Set(["tsc"]);
+const NPM_INSTALL_SAFE_ARGS: readonly string[] = ["install", "--package-lock-only", "--ignore-scripts"];
 
 /**
  * RUN_COMMAND의 Core Command Safety Gate — validateCommand()가 policy.allowedCommands를
@@ -445,9 +463,12 @@ const NPX_ALLOWED_PACKAGE_NAMES: ReadonlySet<string> = new Set(["tsc"]);
  *   2) 대상이 node/nodejs이고 인자에 코드/표현식을 즉시 실행하거나 모듈을 preload하는 플래그
  *      (-c/-e/-r/-p/--eval/--print/--require/--import/--loader 등)가 있으면 무조건
  *      거부한다(위 설명).
- *   2-1) 대상이 npm이면 첫 인자가 NPM_ALLOWED_SUBCOMMANDS(run/test) 밖일 때, 대상이 npx면
+ *   2-1) 대상이 npm이면 첫 인자가 NPM_ALLOWED_SUBCOMMANDS(run/test/install) 밖일 때, 대상이 npx면
  *      첫 인자가 NPX_ALLOWED_PACKAGE_NAMES(tsc) 밖일 때 무조건 거부한다(위 설명 — npm
  *      exec/x, npx의 임의 패키지 실행은 node의 eval 플래그와 같은 클래스의 위험이다).
+ *   2-2) 대상이 npm이고 첫 인자가 install이면, 전체 인자가 NPM_INSTALL_SAFE_ARGS("install
+ *      --package-lock-only --ignore-scripts")와 순서까지 정확히 일치하지 않는 한 무조건
+ *      거부한다(위 설명 — lockfile 생성 전용, 임의 패키지 설치/lifecycle script 실행 불가).
  *   3) 대상이 git이면 read-only 서브커맨드가 아닌 한 무조건 거부(위 설명).
  *   3-1) 대상이 gradlew면 coreGradleCommandSafetyGate(정확히 하나의 allow-listed Gradle
  *      task 인자만 허용, § gradle-capability.ts)를 통과하지 못하는 한 무조건 거부한다(SI-3.7).
@@ -505,8 +526,21 @@ export function coreCommandSafetyGate(command: string, args: string[]): { ok: bo
     return {
       ok: false,
       reason:
-        "Core Command Safety Gate: npm은 run/test 서브커맨드만 허용됩니다 — exec/x 등 인자로 지정한 " +
-        "임의 코드·패키지를 즉시 실행하는 형태는 어떤 프로젝트 정책으로도 허용되지 않습니다.",
+        "Core Command Safety Gate: npm은 run/test/install(lockfile-only) 서브커맨드만 허용됩니다 — exec/x 등 " +
+        "인자로 지정한 임의 코드·패키지를 즉시 실행하는 형태는 어떤 프로젝트 정책으로도 허용되지 않습니다.",
+    };
+  }
+  if (
+    base === "npm" &&
+    args[0] === "install" &&
+    !(args.length === NPM_INSTALL_SAFE_ARGS.length && args.every((a, i) => a === NPM_INSTALL_SAFE_ARGS[i]))
+  ) {
+    return {
+      ok: false,
+      reason:
+        `Core Command Safety Gate: npm install은 정확히 "npm ${NPM_INSTALL_SAFE_ARGS.join(" ")}" 형태(lockfile ` +
+        "생성 전용, lifecycle script 미실행, 임의 패키지 설치 불가)만 허용됩니다 — 그 외 어떤 패키지 이름/" +
+        "플래그 조합도 어떤 프로젝트 정책으로도 허용되지 않습니다.",
     };
   }
   if (base === "npx" && (args.length === 0 || !NPX_ALLOWED_PACKAGE_NAMES.has(args[0]))) {

@@ -521,6 +521,87 @@ function scenarioOutsideWritablePathRejected(): void {
   }
 }
 
+// Task-Scoped Script Registration False-Positive Closure(2026-09-02, Revenue OS Task 1.2
+// 실제 운영 incident) — package.json이 scope 밖인 task가 이 채널로 정상적인 ".js"/".mjs"/
+// ".cjs" 검증 스크립트를 등록할 수 있는지(더 이상 ".test.mjs" 하나로만 제한되지 않는지),
+// 그리고 그 외 확장자는 여전히 거부되는지(닫힌 allow-list가 실제로 닫혀 있는지) 확인한다.
+function scenarioBroadenedExtensionAllowList(): void {
+  const requiredTests = [npmRun("version-baseline-tests", "test:version-baseline")];
+
+  // H) 일반 ".js" 검증 스크립트(Task 1.1이 실제로 쓴 관례와 동일) → 이제 정상 등록된다.
+  {
+    const root = makeProjectRoot({});
+    try {
+      mkdirSync(join(root, "packages", "version-baseline", "scripts"), { recursive: true });
+      writeFileSync(join(root, "packages", "version-baseline", "scripts", "verify-version-baseline.js"), "// fixture\n", "utf-8");
+      const validation = validateRequiredTestRegistrationRequest(
+        { scriptName: "test:version-baseline", runner: "node", target: "packages/version-baseline/scripts/verify-version-baseline.js" },
+        requiredTests,
+        ["packages/"],
+        root,
+        ["packages/version-baseline/scripts/verify-version-baseline.js"]
+      );
+      check("H) 일반 .js 검증 스크립트는 이제 통과함(Revenue OS Task 1.2 실제 재현)", validation.ok === true);
+      if (validation.ok) {
+        const outcome = registerValidatedRequiredTestScripts(
+          [{ scriptName: "test:version-baseline", runner: "node", target: "packages/version-baseline/scripts/verify-version-baseline.js" }],
+          requiredTests,
+          ["packages/"],
+          root,
+          ["packages/version-baseline/scripts/verify-version-baseline.js"]
+        );
+        check("H) 실제로 package.json에 등록됨", outcome.outcomes[0]?.outcome === "REGISTERED");
+        const pkgAfter = JSON.parse(readFileSync(join(root, "package.json"), "utf-8"));
+        check(
+          "H) 등록된 값이 정확히 node <target>",
+          pkgAfter.scripts["test:version-baseline"] === "node packages/version-baseline/scripts/verify-version-baseline.js"
+        );
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // I) ".mjs"/".cjs"도 허용됨(닫힌 목록 안).
+  for (const ext of [".mjs", ".cjs"]) {
+    const root = makeProjectRoot({});
+    try {
+      mkdirSync(join(root, "packages", "x"), { recursive: true });
+      writeFileSync(join(root, "packages", "x", `verify${ext}`), "// fixture\n", "utf-8");
+      const validation = validateRequiredTestRegistrationRequest(
+        { scriptName: "test:version-baseline", runner: "node", target: `packages/x/verify${ext}` },
+        requiredTests,
+        ["packages/"],
+        root,
+        [`packages/x/verify${ext}`]
+      );
+      check(`I) ${ext} 검증 스크립트도 통과함`, validation.ok === true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // J) 그 외 확장자(.sh/.py/확장자 없음)는 여전히 거부됨 — 닫힌 allow-list가 실제로 닫혀
+  // 있는지 확인(임의 확장자 전체 허용으로 조용히 넓어지지 않았는지).
+  for (const target of ["packages/x/evil.sh", "packages/x/evil.py", "packages/x/evil.exe", "packages/x/noext"]) {
+    const root = makeProjectRoot({});
+    try {
+      mkdirSync(join(root, "packages", "x"), { recursive: true });
+      writeFileSync(join(root, ...target.split("/")), "// fixture\n", "utf-8");
+      const validation = validateRequiredTestRegistrationRequest(
+        { scriptName: "test:version-baseline", runner: "node", target },
+        requiredTests,
+        ["packages/"],
+        root,
+        [target]
+      );
+      check(`J) 허용 목록 밖 확장자(${target})는 여전히 거부됨(닫힌 allow-list 유지)`, validation.ok === false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}
+
 function scenarioAbsoluteDotDotUncRejected(): void {
   // G) absolute/../UNC path → 거부.
   const root = makeProjectRoot({});
@@ -1418,6 +1499,7 @@ function main(): void {
   scenarioDeclaredRegistrationValidAndRegistered();
   scenarioUnknownScriptNameRejected();
   scenarioOutsideWritablePathRejected();
+  scenarioBroadenedExtensionAllowList();
   scenarioAbsoluteDotDotUncRejected();
   scenarioShellInjectionRejected();
   scenarioConflictingTargetIsDriftNotOverwrite();

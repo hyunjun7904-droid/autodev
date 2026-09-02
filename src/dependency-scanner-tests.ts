@@ -74,8 +74,14 @@ function change(path: string, status: WorkingTreeChange["status"] = "untracked")
   return { path, status };
 }
 
-function manifestJson(deps: Record<string, string>, devDeps: Record<string, string> = {}): string {
-  return JSON.stringify({ name: "fixture", version: "0.0.0", dependencies: deps, devDependencies: devDeps }, null, 2) + "\n";
+function manifestJson(deps: Record<string, string>, devDeps: Record<string, string> = {}, workspaces: string[] = []): string {
+  return (
+    JSON.stringify(
+      { name: "fixture", version: "0.0.0", dependencies: deps, devDependencies: devDeps, ...(workspaces.length > 0 ? { workspaces } : {}) },
+      null,
+      2
+    ) + "\n"
+  );
 }
 
 function lockfileJson(
@@ -329,6 +335,174 @@ function scenarioFileAndWorkspaceLinkSources(): void {
 }
 
 // ---------------------------------------------------------------------------
+// 7-A) 1st-party npm Workspace False-Positive Closure(2026-09-02, Revenue OS Task 1.1 실제
+// 운영 incident) — 검증된 1st-party workspace 멤버는 PASS, 그 외 모든 위장/불일치/탈출
+// 시도는 여전히 기존과 동일하게 human_review로 남는지 확인한다.
+// ---------------------------------------------------------------------------
+
+/** 검증 가능한 최소 1st-party workspace 픽스처를 만든다 — package.json(workspaces 선언) +
+ *  실제 디스크 위의 packages/shared-kernel/package.json + 그 둘을 반영한 lockfile 두 entry
+ *  (local 자기 자신 + node_modules alias)까지 전부 일관되게 맞춘다. 개별 테스트가 이 중
+ *  하나만 의도적으로 깨뜨려(이름 다르게/경로 다르게/파일 누락 등) 각 검증 조건을 개별
+ *  확인한다. */
+function verifiedWorkspaceFixture(overrides: {
+  workspaceGlob?: string;
+  localDirKey?: string;
+  localDeclaredName?: string;
+  onDiskPackageName?: string;
+  skipOnDiskFile?: boolean;
+  nodeModulesResolved?: string;
+  nodeModulesKey?: string;
+  extraLockPackages?: Record<string, unknown>;
+}): { repo: string; manifest: string; lock: string } {
+  const workspaceGlob = overrides.workspaceGlob ?? "packages/*";
+  const localDirKey = overrides.localDirKey ?? "packages/shared-kernel";
+  const declaredName = overrides.localDeclaredName ?? "@fixture/shared-kernel";
+  const onDiskName = overrides.onDiskPackageName ?? declaredName;
+  const nodeModulesKey = overrides.nodeModulesKey ?? `node_modules/${declaredName}`;
+  const nodeModulesResolved = overrides.nodeModulesResolved ?? localDirKey;
+
+  const manifest = manifestJson({}, { typescript: "^5.7.0" }, [workspaceGlob]);
+  const lockPackages: Record<string, unknown> = {
+    "node_modules/typescript": safeRegistryPkg("typescript", "5.9.3", { dev: true }),
+    [nodeModulesKey]: { resolved: nodeModulesResolved, link: true },
+    [localDirKey]: { name: declaredName, version: "0.1.0" },
+    ...(overrides.extraLockPackages ?? {}),
+  };
+  const lock = lockfileJson({}, { typescript: "^5.7.0" }, lockPackages);
+
+  const repo = makeTempGitRepo();
+  writeFile(repo, "package.json", manifest);
+  writeFile(repo, "package-lock.json", lock);
+  if (!overrides.skipOnDiskFile) {
+    writeFile(repo, `${localDirKey}/package.json`, JSON.stringify({ name: onDiskName, version: "0.1.0" }, null, 2) + "\n");
+  }
+  return { repo, manifest, lock };
+}
+
+function scenarioFirstPartyWorkspaceVerification(): void {
+  // Case 1 — 모든 조건이 일치하는 정상 1st-party workspace: PASS, finding 없음.
+  {
+    const { repo } = verifiedWorkspaceFixture({});
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check("검증된 1st-party workspace: verdict=PASS", result.verdict === "PASS");
+      check("검증된 1st-party workspace: workspace-link finding 없음", !result.findings.some((f) => f.kind === "non-standard-source-workspace-link"));
+      check("검증된 1st-party workspace: integrity-missing finding 없음", !result.findings.some((f) => f.kind === "integrity-missing"));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 2 — node_modules alias 이름과 실제 package.json name이 다름(위장 시도) → 여전히 human_review.
+  {
+    const { repo } = verifiedWorkspaceFixture({ onDiskPackageName: "@fixture/totally-different-name" });
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "name 불일치: 여전히 workspace-link finding 유지(위장 차단)",
+        result.findings.some((f) => f.kind === "non-standard-source-workspace-link")
+      );
+      check("name 불일치: verdict=HUMAN_REVIEW_REQUIRED(자동 PASS 아님)", result.verdict === "HUMAN_REVIEW_REQUIRED");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 3 — root manifest.workspaces glob과 실제 디렉터리가 매칭되지 않음 → 여전히 human_review.
+  {
+    const { repo } = verifiedWorkspaceFixture({ workspaceGlob: "other-dir/*" });
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "workspace glob 불일치: 여전히 workspace-link finding 유지",
+        result.findings.some((f) => f.kind === "non-standard-source-workspace-link")
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 4 — lockfile은 workspace 멤버를 선언하지만 실제 디스크에 그 package.json이 없음
+  // (선언과 실물 불일치) → 확인할 수 없으므로 fail-closed, 여전히 human_review.
+  {
+    const { repo } = verifiedWorkspaceFixture({ skipOnDiskFile: true });
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "실제 파일 없음: 확인 불가로 fail-closed, workspace-link finding 유지",
+        result.findings.some((f) => f.kind === "non-standard-source-workspace-link")
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 5 — resolved가 ".."로 repo 밖을 가리키려는 path traversal 시도 → 여전히 human_review
+  // (경로 형태 검사만으로 즉시 거부 — 파일시스템 접근조차 하지 않음).
+  {
+    const { repo } = verifiedWorkspaceFixture({
+      localDirKey: "packages/shared-kernel",
+      nodeModulesResolved: "../../outside-repo",
+      extraLockPackages: { "../../outside-repo": { name: "@fixture/shared-kernel", version: "0.1.0" } },
+    });
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "path traversal(resolved=\"../../outside-repo\"): 여전히 workspace-link finding 유지",
+        result.findings.some((f) => f.kind === "non-standard-source-workspace-link")
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 6 — node_modules alias가 resolved로 가리키는 local entry 자체가 lockfile에 없음
+  // (dangling reference) → 여전히 human_review.
+  {
+    const repo = makeTempGitRepo();
+    try {
+      const manifest = manifestJson({}, {}, ["packages/*"]);
+      const lock = lockfileJson({}, {}, {
+        "node_modules/@fixture/shared-kernel": { resolved: "packages/shared-kernel", link: true },
+      });
+      writeFile(repo, "package.json", manifest);
+      writeFile(repo, "package-lock.json", lock);
+      writeFile(repo, "packages/shared-kernel/package.json", JSON.stringify({ name: "@fixture/shared-kernel", version: "0.1.0" }) + "\n");
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "dangling local entry(lockfile에 local entry 자체가 없음): 여전히 workspace-link finding 유지",
+        result.findings.some((f) => f.kind === "non-standard-source-workspace-link")
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+
+  // Case 7 — 검증된 workspace 멤버와 정말 위험한 외부 dependency(git 미고정 참조)가 같은
+  // lockfile에 공존 — workspace는 PASS로 스킵되지만 git finding은 그대로 살아남아야 한다
+  // (이 검증이 "관련 없는 다른 finding까지 함께 삼키지" 않는지 확인).
+  {
+    const { repo } = verifiedWorkspaceFixture({
+      extraLockPackages: {
+        "node_modules/risky-git-dep": { resolved: "git+https://github.com/example/risky#main" },
+      },
+    });
+    try {
+      const result = scanChangesForDependencyRisk([change("package.json"), change("package-lock.json")], repo);
+      check(
+        "workspace는 PASS로 스킵되지만, 공존하는 git 미고정 참조 finding은 그대로 유지됨",
+        result.findings.some((f) => f.kind === "non-standard-source-git-unpinned")
+      );
+      check("workspace-link finding은 여전히 없음(검증된 workspace는 계속 스킵됨)", !result.findings.some((f) => f.kind === "non-standard-source-workspace-link"));
+      check("git 미고정 참조가 있으므로 verdict=BLOCK", result.verdict === "BLOCK");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 8) 신뢰된 registry 밖의 tarball URL — 비표준 source로 사람 확인.
 // ---------------------------------------------------------------------------
 function scenarioNonStandardTarballHost(): void {
@@ -529,7 +703,7 @@ function scenarioPureFunctionUnitChecks(): void {
   check(
     "checkManifestLockfileConsistency: 일치하면 findings 없음",
     checkManifestLockfileConsistency(
-      { dependencies: { a: "^1.0.0" }, devDependencies: {} },
+      { dependencies: { a: "^1.0.0" }, devDependencies: {}, workspaces: [] },
       { lockfileVersion: 3, packages: { "": { dependencies: { a: "^1.0.0" }, devDependencies: {} } } }
     ).length === 0
   );
@@ -755,6 +929,7 @@ function main(): void {
   scenarioInsecureHttpSource();
   scenarioGitSourceDistinguishesPinning();
   scenarioFileAndWorkspaceLinkSources();
+  scenarioFirstPartyWorkspaceVerification();
   scenarioNonStandardTarballHost();
   scenarioIntegrityIssues();
   scenarioInstallScriptNewDependencyFlagged();

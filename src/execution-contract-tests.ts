@@ -4,6 +4,7 @@ import {
   deriveAllowedCommandsFromRequiredTests,
   mergeAllowedCommands,
   filterAllowedCommandsByCoreCapability,
+  deriveDependencyResolutionCommands,
 } from "./execution-contract";
 import type { RequiredTestOwner } from "./execution-contract";
 import type { RequiredTestCommand } from "./task-registry";
@@ -189,6 +190,39 @@ function scenarioFilter(): void {
   );
 }
 
+// Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+// incident) — package.json을 쓰는 프로젝트에만, 그 lockfile을 생성할 수 있는 고정된 안전
+// 명령 하나를 deterministic하게 더하는지/그 값이 항상 정확히 같은지/package.json을 쓰지
+// 않는 프로젝트에는 아무것도 더하지 않는지 확인한다.
+function scenarioDeriveDependencyResolution(): void {
+  const withPackageJson = deriveDependencyResolutionCommands(["package.json", "scripts/", "packages/"]);
+  check("derive-dep) root package.json이 있으면 정확히 1개 command를 derive함", withPackageJson.length === 1);
+  check(
+    "derive-dep) derive된 command가 정확히 npm install --package-lock-only --ignore-scripts(root)",
+    withPackageJson[0]?.cwd === "root" &&
+      withPackageJson[0]?.command === "npm" &&
+      JSON.stringify(withPackageJson[0]?.args) === JSON.stringify(["install", "--package-lock-only", "--ignore-scripts"])
+  );
+
+  const withoutPackageJson = deriveDependencyResolutionCommands(["scripts/", "packages/", "docs/"]);
+  check("derive-dep) root package.json이 없으면 아무것도 derive하지 않음(최소 권한)", withoutPackageJson.length === 0);
+
+  const nestedOnly = deriveDependencyResolutionCommands(["apps/api/package.json"]);
+  check(
+    "derive-dep) root exact \"package.json\"이 아닌 nested package.json만으로는 derive하지 않음(root 전용)",
+    nestedOnly.length === 0
+  );
+
+  check(
+    "derive-dep) 이 command는 safe-executor.ts coreCommandSafetyGate가 실행 시점에도 그대로 허용하는 정확히 같은 형태다(회귀 방지)",
+    JSON.stringify(withPackageJson[0]?.args) === JSON.stringify(["install", "--package-lock-only", "--ignore-scripts"])
+  );
+
+  const repeat1 = deriveDependencyResolutionCommands(["package.json"]);
+  const repeat2 = deriveDependencyResolutionCommands(["package.json"]);
+  check("derive-dep) 동일 입력에 항상 동일 출력(결정론적)", JSON.stringify(repeat1) === JSON.stringify(repeat2));
+}
+
 async function main(): Promise<void> {
   scenarioCwdValidity();
   scenarioCoreCommandSafetyDelegation();
@@ -196,6 +230,7 @@ async function main(): Promise<void> {
   scenarioDerive();
   scenarioMerge();
   scenarioFilter();
+  scenarioDeriveDependencyResolution();
 
   for (const r of results) console.log(r);
   const fail = results.filter((r) => r.startsWith("[FAIL]")).length;

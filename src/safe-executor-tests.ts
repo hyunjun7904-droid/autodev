@@ -756,8 +756,40 @@ async function main(): Promise<void> {
   check("coreCommandSafetyGate: npm exec -- bash -c '...' → BLOCK(npm exec는 임의 코드 실행 위임)", !coreCommandSafetyGate("npm", ["exec", "--", "bash", "-c", "rm -rf /"]).ok);
   check("coreCommandSafetyGate: npm x cowsay hi → BLOCK(npm x는 exec의 별칭)", !coreCommandSafetyGate("npm", ["x", "cowsay", "hi"]).ok);
   check("coreCommandSafetyGate: npm publish → BLOCK(run/test 밖 서브커맨드)", !coreCommandSafetyGate("npm", ["publish"]).ok);
-  check("coreCommandSafetyGate: npm install → BLOCK(run/test 밖 서브커맨드, AutoDev 실제 사용례 아님)", !coreCommandSafetyGate("npm", ["install"]).ok);
+  check("coreCommandSafetyGate: npm install(인자 없음, lockfile-only 형태 아님) → BLOCK", !coreCommandSafetyGate("npm", ["install"]).ok);
   check("coreCommandSafetyGate: npm(인자 없음) → BLOCK", !coreCommandSafetyGate("npm", []).ok);
+
+  // ---- Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+  // incident) — npm install은 정확히 "install --package-lock-only --ignore-scripts" 형태만
+  // 허용된다(lockfile 생성 전용, 임의 패키지 설치/lifecycle script 실행 불가). ----
+  check(
+    "coreCommandSafetyGate: npm install --package-lock-only --ignore-scripts → ALLOW(lockfile 생성 전용 고정 형태)",
+    coreCommandSafetyGate("npm", ["install", "--package-lock-only", "--ignore-scripts"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm install some-malicious-pkg --package-lock-only --ignore-scripts → BLOCK(임의 패키지 이름 추가)",
+    !coreCommandSafetyGate("npm", ["install", "some-malicious-pkg", "--package-lock-only", "--ignore-scripts"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm install --package-lock-only → BLOCK(--ignore-scripts 누락, lifecycle script 실행 가능해짐)",
+    !coreCommandSafetyGate("npm", ["install", "--package-lock-only"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm install --ignore-scripts → BLOCK(--package-lock-only 누락, node_modules에 실제 코드가 풀림)",
+    !coreCommandSafetyGate("npm", ["install", "--ignore-scripts"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm install --ignore-scripts --package-lock-only → BLOCK(순서 불일치, 고정 형태만 허용)",
+    !coreCommandSafetyGate("npm", ["install", "--ignore-scripts", "--package-lock-only"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm install --package-lock-only --ignore-scripts --force → BLOCK(추가 플래그)",
+    !coreCommandSafetyGate("npm", ["install", "--package-lock-only", "--ignore-scripts", "--force"]).ok
+  );
+  check(
+    "coreCommandSafetyGate: npm i --package-lock-only --ignore-scripts → BLOCK(install의 축약형은 별도 허용하지 않음)",
+    !coreCommandSafetyGate("npm", ["i", "--package-lock-only", "--ignore-scripts"]).ok
+  );
   check("coreCommandSafetyGate: npx cowsay hi → BLOCK(tsc 외 임의 패키지 실행)", !coreCommandSafetyGate("npx", ["cowsay", "hi"]).ok);
   check(
     "coreCommandSafetyGate: npx --package=evil-pkg tsc → BLOCK(--package= 우회, args[0] allow-set 밖)",

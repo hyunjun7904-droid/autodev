@@ -189,3 +189,35 @@ export function filterAllowedCommandsByCoreCapability(
     return coreCommandSafetyGate(c.command, c.args).ok;
   });
 }
+
+/** safe-executor.ts의 NPM_INSTALL_SAFE_ARGS와 정확히 같은 값 — coreCommandSafetyGate가
+ *  이 형태만 허용하므로, 여기서 다른 형태를 derive해도 실행 시점에 항상 거부된다(그래서
+ *  이 상수는 project별로 달라질 수 없는 고정값이다. § 아래 deriveDependencyResolutionCommands). */
+const NPM_INSTALL_LOCKFILE_ONLY_COMMAND: AllowedCommandSpec = {
+  cwd: "root",
+  command: "npm",
+  args: ["install", "--package-lock-only", "--ignore-scripts"],
+};
+
+/**
+ * Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+ * incident) — deriveAllowedCommandsFromRequiredTests()는 각 task의 requiredTests에서만
+ * allowedCommands를 파생하므로, "package.json에 dependency를 선언하는" task가 있어도 그
+ * dependency의 실제 설치/lockfile 생성 자체는 어떤 requiredTest에도 나타나지 않아
+ * allowedCommands에 절대 포함되지 않았다. 그런데 dependency-scanner.ts(C5)는 package.json이
+ * dependency를 선언했는데 package-lock.json이 없으면 항상 commit을 BLOCK한다(의도된 정상
+ * 동작 — 완화하지 않는다) — 그 결과 npm workspaces를 쓰는 모든 프로젝트가 최초 bootstrap
+ * task에서 구조적으로 이 BLOCK을 벗어날 방법이 없었다.
+ *
+ * 이 함수는 프로젝트가 root package.json을 실제로 쓴다는 사실이 이미 확정된 시점(최종
+ * allowedWritePrefixes에 exact "package.json"이 있음 — STAGE 1 policy든 어떤 task의 scope
+ * 든)에만, 그 lockfile을 생성할 수 있는 이 하나의 고정된 안전 명령(NPM_INSTALL_LOCKFILE_
+ * ONLY_COMMAND — lockfile 생성 전용, lifecycle script 미실행, 임의 패키지 설치 불가, §
+ * safe-executor.ts NPM_INSTALL_SAFE_ARGS 주석)을 deterministic하게 더한다. package.json을
+ * 전혀 쓰지 않는 프로젝트에는 아무것도 더하지 않는다(최소 권한 — 불필요한 npm capability를
+ * 열지 않는다). project별 customize는 불가능하다(project-agnostic Core 규칙, 어떤
+ * ProjectExecutionPolicy 입력도 이 반환값을 바꿀 수 없다).
+ */
+export function deriveDependencyResolutionCommands(allowedWritePrefixes: readonly string[]): AllowedCommandSpec[] {
+  return allowedWritePrefixes.includes("package.json") ? [NPM_INSTALL_LOCKFILE_ONLY_COMMAND] : [];
+}

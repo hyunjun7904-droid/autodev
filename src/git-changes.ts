@@ -171,13 +171,38 @@ export function getCurrentBranch(cwd: string = PROJECT_ROOT): string | undefined
   return branch.length > 0 && branch !== "HEAD" ? branch : undefined;
 }
 
+/** prefix가 정확히 "package.json"이거나 "<dir>/package.json"이면, 그 옆에 나란히 놓이는
+ *  npm lockfile 경로("package-lock.json"/"<dir>/package-lock.json")를 반환한다 — 그 외
+ *  prefix에는 undefined(companion 없음). package.json이 exact-file scope로 허용된 task는
+ *  거의 항상 그 자리에서 dependency를 선언하므로, npm이 만드는 lockfile은 그 manifest와
+ *  분리해서 생각할 수 없는 하나의 짝이다(§ 아래 isPathInScope 주석). */
+function npmLockfileCompanionOf(prefix: string): string | undefined {
+  if (prefix === "package.json") return "package-lock.json";
+  if (prefix.endsWith("/package.json")) return `${prefix.slice(0, -"package.json".length)}package-lock.json`;
+  return undefined;
+}
+
 /** relPath가 allowedPathPrefixes(예: task-registry.ts TaskDefinition.allowedPathPrefixes)
  *  중 하나에 속하는지 판정한다 — checkpoint.ts(commit 대상 판정)와 gpt-reviewer.ts(review
- *  payload 범위/scope-violation 판정)가 이 하나의 구현만 공유한다(중복 구현 금지). */
+ *  payload 범위/scope-violation 판정)가 이 하나의 구현만 공유한다(중복 구현 금지).
+ *
+ *  Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+ *  incident) — package.json이 exact-file scope로 허용됐는데 그 옆의 package-lock.json은
+ *  scope 밖으로 취급되면, dependency-scanner.ts(C5)가 항상 요구하는 lockfile을 aTask가
+ *  구조적으로 commit할 방법이 없어진다(§ safe-executor.ts NPM_INSTALL_SAFE_ARGS 주석 — 같은
+ *  incident의 다른 쪽 절반). Task가 이 companion을 commit할 수 있으려면, npm install
+ *  자체를 실행할 권한(위 주석)과 그 산출물을 scope 안으로 인정하는 이 규칙 둘 다 필요하다.
+ *  npm/package.json의 lockfile은 manifest와 독립적으로 존재할 수
+ *  없는 근본적으로 하나인 산출물이므로, "그 자리의 package.json이 허용됐다"는 사실 자체가
+ *  "그 자리의 package-lock.json도 허용된다"를 이미 함의한다고 본다 — 이 규칙은 npm
+ *  lockfile 하나에만 좁게 적용되며(yarn.lock/pnpm-lock.yaml 등으로 확장하지 않음, §
+ *  dependency-scanner.ts가 실제로 검증하는 형식과 일치), 어떤 project별 policy 설정도
+ *  필요/가능하지 않다(project-agnostic Core 규칙). */
 export function isPathInScope(relPath: string, allowedPathPrefixes: string[]): boolean {
   return allowedPathPrefixes.some((prefix) => {
     const normalized = prefix.endsWith("/") ? prefix : `${prefix}/`;
-    return relPath === prefix || relPath.startsWith(normalized);
+    if (relPath === prefix || relPath.startsWith(normalized)) return true;
+    return relPath === npmLockfileCompanionOf(prefix);
   });
 }
 

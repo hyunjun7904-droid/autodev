@@ -10,6 +10,7 @@ import {
   isBinaryContent,
   readFileSmartly,
   classifyGeneratedCacheArtifact,
+  isPathInScope,
 } from "./git-changes";
 import { PROJECT_ROOT, configureSafeExecutor } from "./safe-executor";
 import type { ProjectExecutionPolicy } from "./project-policy";
@@ -406,11 +407,57 @@ function scenarioBoundedFileSnapshotTruncation(): void {
   check("Case4) 동일 입력을 두 번 호출해도 완전히 동일한 snapshot을 생성함(결정론적)", repeat1.content === repeat2.content && repeat1.truncated === repeat2.truncated);
 }
 
+// Dependency/Lockfile Bootstrap Gap Closure(2026-09-02, Revenue OS Task 1.1 실제 운영
+// incident) — package.json이 exact-file scope로 허용된 task는 그 옆의 package-lock.json도
+// scope 안으로 인정돼야 dependency-scanner.ts(C5)가 요구하는 lockfile을 commit할 수 있다
+// (§ git-changes.ts isPathInScope/npmLockfileCompanionOf 주석). 이 규칙이 의도한 파일만
+// 정확히 좁게 허용하고 다른 경계(yarn.lock/pnpm-lock.yaml, 무관한 파일, 기존 디렉터리
+// prefix 동작)는 전혀 건드리지 않는지 확인한다.
+function scenarioIsPathInScopeNpmLockfileCompanion(): void {
+  check(
+    "root package.json이 exact scope면 root package-lock.json도 in-scope(companion 규칙)",
+    isPathInScope("package-lock.json", ["package.json", "scripts/"])
+  );
+  check(
+    "nested <dir>/package.json이 exact scope면 같은 dir의 package-lock.json도 in-scope",
+    isPathInScope("apps/api/package-lock.json", ["apps/api/package.json"])
+  );
+  check(
+    "companion 규칙은 회귀 없음 — package.json 자신은 여전히 in-scope",
+    isPathInScope("package.json", ["package.json"])
+  );
+  check(
+    "companion 규칙은 회귀 없음 — 기존 디렉터리 prefix(예: scripts/) 동작은 그대로 유지",
+    isPathInScope("scripts/verify-workspaces.js", ["package.json", "scripts/"])
+  );
+  check(
+    "package.json이 scope에 없으면 package-lock.json도 in-scope 아님(companion이 독립 권한을 만들지 않음)",
+    !isPathInScope("package-lock.json", ["scripts/"])
+  );
+  check(
+    "npm 외 lockfile(yarn.lock)은 companion 규칙 대상 아님 — package.json만 scope여도 out-of-scope",
+    !isPathInScope("yarn.lock", ["package.json"])
+  );
+  check(
+    "npm 외 lockfile(pnpm-lock.yaml)도 companion 규칙 대상 아님",
+    !isPathInScope("pnpm-lock.yaml", ["package.json"])
+  );
+  check(
+    "package.json이 디렉터리 prefix(\"packages/\")로만 허용된 경우 — 그 디렉터리 자체는 이미 prefix로 in-scope(companion 불필요)",
+    isPathInScope("packages/shared-kernel/package-lock.json", ["packages/"])
+  );
+  check(
+    "무관한 파일(package.json.bak)은 exact-match 경계를 그대로 유지 — companion도 만들지 않음",
+    !isPathInScope("package.json.bak", ["package.json"])
+  );
+}
+
 function main(): void {
   // 순수 함수 시나리오 — git/Safe Executor 불필요, 격리된 root 설정 이전에 바로 실행한다.
   scenarioBoundedFileSnapshotTruncation();
   scenarioBinaryContentDetection();
   scenarioGeneratedCacheArtifactClassification();
+  scenarioIsPathInScopeNpmLockfileCompanion();
 
   // scenarioReadUntrackedFilesContentAndTruncation()이 readUntrackedFiles()를 통해 실제
   // Safe Executor(validateReadPath)를 호출한다 — configureSafeExecutor()로 명시적으로

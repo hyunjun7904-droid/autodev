@@ -17,6 +17,7 @@ import { checkRemoteSafeToStart, checkRemoteUnchangedSince } from "./remote-git-
 import type { RemoteGitSnapshot } from "./remote-git-safety";
 import { createSafeExecutorContext } from "./safe-executor";
 import { performTaskCheckpoint, commitProjectStateOnly } from "./checkpoint";
+import { attemptDependencyBootstrapRecovery } from "./dependency-bootstrap-recovery";
 import type { CheckpointOutcome } from "./checkpoint";
 import { buildAdvisoryRoutingPlan } from "./agent-registry";
 import type { AdvisorySignals } from "./agent-registry";
@@ -2441,7 +2442,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   }
 
   const stateRelPath = computeStateRelPath(statePath, cwd);
-  const checkpoint = performTaskCheckpoint(taskDef, {
+  const checkpointOptions = {
     decision: finalState.lastGptDecision?.decision ?? "REVISE",
     severity: finalState.lastGptDecision?.severity ?? { critical: 0, high: 0, medium: 0 },
     requiredTestsAllPassed,
@@ -2453,7 +2454,30 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // task-change-baseline.ts). finalState는 orchestrator 실행 결과(RESUME_APPROVED_CHECKPOINT
     // 경로에서는 loadState() 그대로)이므로 항상 이 필드를 그대로 갖고 있다.
     baseline: finalState.taskChangeBaseline,
-  });
+  };
+  let checkpoint = performTaskCheckpoint(taskDef, checkpointOptions);
+
+  // Dependency Bootstrap Technical Auto-Recovery(§ dependency-bootstrap-recovery.ts 상단
+  // 주석) — checkpoint 실패가 정확히 "lockfile-missing 단독"이고 execution-policy가 이미
+  // 그 복구 명령을 승인해 뒀을 때만, 정확히 한 번 그 명령을 실행하고 checkpoint를 다시
+  // 시도한다. 그 외 모든 경우(다른 finding이 섞여 있거나/명령이 승인돼 있지 않거나/명령
+  // 실행이나 재시도가 실패하면) 아래 기존 genuine Human Gate 분기로 그대로 흘러간다 —
+  // Developer/Reviewer를 다시 부르지 않고, 어떤 새 arbitrary 권한도 만들지 않는다.
+  if (!checkpoint.ok && checkpoint.dependencyScanVerdict) {
+    const recovery = await attemptDependencyBootstrapRecovery(
+      checkpoint.dependencyScanVerdict,
+      checkpoint.dependencyFindings,
+      manifest.executionPolicy,
+      executorContext
+    );
+    if (recovery.attempted) {
+      log("dependency bootstrap 기술적 자동복구 시도", { taskId: taskDef.id, ...recovery });
+      if (recovery.commandSucceeded) {
+        checkpoint = performTaskCheckpoint(taskDef, checkpointOptions);
+        log("dependency bootstrap 자동복구 후 checkpoint 재시도", { taskId: taskDef.id, ok: checkpoint.ok });
+      }
+    }
+  }
 
   if (!checkpoint.ok) {
     // Phase G Task G1 — Secret/Dependency Scanner Gate(Core, checkpoint.ts)가 실제로 걸린

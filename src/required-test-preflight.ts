@@ -875,6 +875,28 @@ export type RequiredTestRegistrationValidation =
 // 이 채널에서 등록할 수 없다(새 위험한 실행 형태를 열지 않는다).
 const ALLOWED_TEST_RUNNERS: ReadonlySet<string> = new Set(["node"]);
 
+// Task-Scoped Script Registration False-Positive Closure(2026-09-02, Revenue OS Task 1.2
+// 실제 운영 incident) — 이 채널의 target 확장자 검사(§ validateRequiredTestRegistrationRequest
+// 검사 10)는 지금까지 CANDIDATE_TEST_FILE_SUFFIX(".test.mjs") 하나로만 고정돼 있었다. 이
+// 확장자 자체는 어떤 보안 경계도 아니다 — runner가 이미 ALLOWED_TEST_RUNNERS로 "node"
+// 하나만 허용되므로(node는 확장자와 무관하게 그대로 실행한다), 그리고 다른 9개 검사(shell
+// metacharacter/경로 traversal/절대경로/UNC 차단, lifecycle hook 이름 금지, target이 이
+// task의 allowedPathPrefixes 안에 있어야 함, target이 실제 존재하는 regular file이어야 함,
+// symlink 금지, 이번 attempt에서 실제로 변경된 파일이어야 함)가 이미 실행 안전성을 전부
+// 담당한다 — 이 확장자 제한은 순전히 "다른(별개) 메커니즘(§ CANDIDATE_TEST_FILE_SUFFIX 기반
+// glob 복구)과의 네이밍 일관성"용이었을 뿐이다.
+//
+// 그런데 package.json이 자신의 allowedPathPrefixes 밖인 task(이 저장소 기준 199개 중
+// 195개, § 실제 Revenue OS 조사)는 이 채널을 통해서만 required-test npm script를 등록할 수
+// 있고, Task 1.1처럼 package.json이 scope 안인 task가 실제로 이미 검증한 관례(예:
+// "scripts/verify-node-version.js")는 일반 ".js" 파일이라 이 제한에 항상 걸렸다 — Developer가
+// 정상적으로 검증 스크립트를 만들어도 매 attempt마다 REJECTED되어 같은 이유로 무한히
+// 반복(STAGNATION_DETECTED)될 뿐, genuine Human Gate로도 승격되지 않아 조용히 API 호출만
+// 소모했다. node가 실제로 entry point로 직접 실행 가능한 표준 확장자(.js/.mjs/.cjs, 그리고
+// 기존 .test.* 변형)로 넓혀 이 gap을 닫는다 — 그 외 확장자(.sh/.py/.exe/확장자 없음 등)는
+// 여전히 전부 거부된다(닫힌 allow-list, 임의 확장자 전체 허용 아님).
+const ALLOWED_TEST_TARGET_EXTENSIONS: readonly string[] = [".test.mjs", ".test.cjs", ".test.js", ".mjs", ".cjs", ".js"];
+
 // npm/yarn lifecycle hook 이름 — scriptName이 canonical requiredTests 목록에 정확히
 // 일치해야 한다는 검증만으로도 구조적으로 막히지만(task-registry.ts가 이런 이름을 절대
 // requiredTests로 선언하지 않는다), 방어적으로 한 번 더 명시적으로 거부한다.
@@ -953,9 +975,13 @@ export function validateRequiredTestRegistrationRequest(
   if (!allowedPathPrefixes.some((prefix) => normalizedTarget.startsWith(prefix))) {
     return { ok: false, reason: `target이 이 task의 allowedPathPrefixes 밖: ${normalizedTarget}` };
   }
-  // 10 — 확장자/형식이 기존 repository 정책(§ CANDIDATE_TEST_FILE_SUFFIX)과 일치해야 한다.
-  if (!normalizedTarget.endsWith(CANDIDATE_TEST_FILE_SUFFIX)) {
-    return { ok: false, reason: `target이 ${CANDIDATE_TEST_FILE_SUFFIX} 확장자가 아님: ${normalizedTarget}` };
+  // 10 — 확장자/형식이 node가 entry point로 직접 실행 가능한 표준 확장자여야 한다(§
+  // ALLOWED_TEST_TARGET_EXTENSIONS 상단 주석 — 보안 경계가 아니라 닫힌 allow-list일 뿐).
+  if (!ALLOWED_TEST_TARGET_EXTENSIONS.some((ext) => normalizedTarget.endsWith(ext))) {
+    return {
+      ok: false,
+      reason: `target이 허용된 확장자(${ALLOWED_TEST_TARGET_EXTENSIONS.join("/")}) 중 어느 것도 아님: ${normalizedTarget}`,
+    };
   }
   // 8 — target 파일이 실제로 존재해야 한다(추측으로 아직 없는 파일을 등록하지 않는다).
   const absTarget = join(projectRoot, ...normalizedTarget.split("/"));
