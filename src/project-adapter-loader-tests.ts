@@ -801,6 +801,154 @@ async function scenarioHumanFinalReviewPolicyVisibleToRunAutodevOnce(): Promise<
   check("Y) [E2E] 사람 APPROVE 후 resume outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
 }
 
+// ---------------------------------------------------------------------------
+// Z) AutoDev Core Maintenance(2026-09-03, RevenueOS Task 2.5 실전 재발 방지) —
+//    task-registry.ts TaskDefinition.requiresHumanReview Passthrough Fix.
+//    buildTaskDefinitionFromData()가 이 필드를 알려진 key 목록에 추가하지 않아 조용히
+//    드롭했다 — task-registry.json에 requiresHumanReview:true를 직접 지정해도 실제
+//    production 경로(project-adapter-loader.ts → runAutodevOnce)에서는 항상 undefined로
+//    도착했다(§ M~T RemoteGitSafety Passthrough Fix와 정확히 같은 클래스의 data-path
+//    gap — 이번엔 실제 RevenueOS 운영 환경에서 재현됨: task-registry.json에는
+//    requiresHumanReview:true가 있었지만 GPT reviewer가 계속 실제로 호출됐다). 이
+//    섹션이 그 회귀를 고정한다.
+// ---------------------------------------------------------------------------
+function baseTaskRegistryPathConfigFields(projectId: string): Record<string, unknown> {
+  return {
+    projectId,
+    projectName: projectId,
+    targetProjectRoot: ".",
+    statePath: "project-state.json",
+    taskRegistryPath: "task-registry.json",
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: { allowedReadPrefixes: ["fixture/"], allowedWritePrefixes: ["fixture/"], allowedCommands: [] },
+  };
+}
+
+function scenarioRequiresHumanReviewAbsentIsUndefined(): void {
+  const dir = makeTempDir("autodev-adapter-loader-rhr-absent-");
+  writeJson(dir, "task-registry.json", [VALID_FIXTURE_TASK]);
+  const configPath = writeJson(dir, "manifest.json", baseTaskRegistryPathConfigFields("rhr-absent-project"));
+  writeText(dir, "project-state.json", "{}\n");
+  const manifest = loadProjectAdapter(configPath);
+  check(
+    "Z) requiresHumanReview가 없는 task → manifest.taskRegistry[0].requiresHumanReview === undefined(backward compatible, 기본 false와 동일)",
+    manifest.taskRegistry[0].requiresHumanReview === undefined
+  );
+}
+
+function scenarioRequiresHumanReviewValidPassesThrough(): void {
+  const dir = makeTempDir("autodev-adapter-loader-rhr-valid-");
+  writeJson(dir, "task-registry.json", [{ ...VALID_FIXTURE_TASK, requiresHumanReview: true }]);
+  const configPath = writeJson(dir, "manifest.json", baseTaskRegistryPathConfigFields("rhr-valid-project"));
+  writeText(dir, "project-state.json", "{}\n");
+  const manifest = loadProjectAdapter(configPath);
+  check(
+    "Z) requiresHumanReview:true인 외부 task-registry.json → loader가 반환한 taskRegistry[0].requiresHumanReview에 그대로 존재함(핵심 회귀 — RevenueOS에서 이 값이 실제로 드롭됐었음)",
+    manifest.taskRegistry[0].requiresHumanReview === true
+  );
+
+  const dir2 = makeTempDir("autodev-adapter-loader-rhr-false-");
+  writeJson(dir2, "task-registry.json", [{ ...VALID_FIXTURE_TASK, requiresHumanReview: false }]);
+  const configPath2 = writeJson(dir2, "manifest.json", baseTaskRegistryPathConfigFields("rhr-false-project"));
+  writeText(dir2, "project-state.json", "{}\n");
+  const manifest2 = loadProjectAdapter(configPath2);
+  check("Z) requiresHumanReview:false도 명시적으로 그대로 passthrough됨", manifest2.taskRegistry[0].requiresHumanReview === false);
+}
+
+function scenarioRequiresHumanReviewInvalidShapeFailsFast(): void {
+  const badValues: unknown[] = ["true", 1, [true], null];
+  for (let i = 0; i < badValues.length; i++) {
+    const dir = makeTempDir(`autodev-adapter-loader-rhr-bad-${i}-`);
+    writeJson(dir, "task-registry.json", [{ ...VALID_FIXTURE_TASK, requiresHumanReview: badValues[i] }]);
+    const configPath = writeJson(dir, "manifest.json", baseTaskRegistryPathConfigFields(`rhr-bad-project-${i}`));
+    writeText(dir, "project-state.json", "{}\n");
+    let threw = false;
+    try {
+      loadProjectAdapter(configPath);
+    } catch {
+      threw = true;
+    }
+    check(`Z) requiresHumanReview가 boolean이 아니면(${JSON.stringify(badValues[i])}) 즉시 실패(fail-closed)`, threw);
+  }
+}
+
+// [E2E] loader가 반환한 taskRegistry[].requiresHumanReview가 실제 runAutodevOnce()에서
+// GPT reviewer 호출을 생략하고(0 calls) Human Final Review Gate로 직행시키는지 —
+// manifest.humanFinalReviewPolicy 없이도(§ 위 Y와 달리 project-wide opt-in이 전혀 없다).
+// 정확히 RevenueOS Task 2.5가 실제로 겪은 data path(loadProjectAdapter → runAutodevOnce)를
+// 그대로 재현한다.
+async function scenarioRequiresHumanReviewVisibleToRunAutodevOnce(): Promise<void> {
+  const dir = makeTempDir("autodev-adapter-loader-rhr-e2e-");
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+  spawnSync("git", ["config", "user.email", "autodev-test@example.com"], { cwd: dir });
+  spawnSync("git", ["config", "user.name", "AutoDev Test"], { cwd: dir });
+  writeText(dir, ".gitkeep", "");
+
+  const rhrTask = { ...VALID_FIXTURE_TASK, requiresHumanReview: true };
+  writeJson(dir, "task-registry.json", [rhrTask]);
+  writeJson(dir, "project-state.json", {
+    currentPhase: 1,
+    gitCheckpoint: "test",
+    currentTask: null,
+    reviewCycle: 0,
+    lastClaudeResult: null,
+    lastGptDecision: null,
+    status: "READY",
+    claudeLimitWaitCount: 0,
+    deferredHumanTasks: [],
+    completedTasks: [],
+  });
+  const statePath = join(dir, "project-state.json");
+  const configPath = writeJson(dir, "manifest.json", {
+    projectId: "rhr-e2e-project",
+    projectName: "RHR E2E Project",
+    targetProjectRoot: ".",
+    statePath: "project-state.json",
+    taskRegistryPath: "task-registry.json",
+    developerInstructions: "dev",
+    reviewInstructions: "review",
+    reviewScopeDirs: ["fixture/"],
+    executionPolicy: {
+      allowedReadPrefixes: ["fixture/"],
+      allowedWritePrefixes: ["fixture/"],
+      allowedCommands: deriveAllowedCommandsFromRequiredTests([{ taskId: rhrTask.id, requiredTests: rhrTask.requiredTests }]),
+    },
+    // 의도적으로 humanFinalReviewPolicy를 지정하지 않는다 — task 자신의
+    // requiresHumanReview:true만으로 동일 gate가 발동함을 증명한다.
+  });
+  spawnSync("git", ["add", "-A"], { cwd: dir });
+  spawnSync("git", ["commit", "-q", "-m", "init"], { cwd: dir });
+
+  const manifest = loadProjectAdapter(configPath);
+  check("Z) [E2E] loader 결과에 requiresHumanReview:true가 존재함(runAutodevOnce에 넘기기 전 사전조건)", manifest.taskRegistry[0].requiresHumanReview === true);
+  check("Z) [E2E] humanFinalReviewPolicy는 지정하지 않았으므로 undefined(프로젝트 전체 opt-in과 무관함을 증명)", manifest.humanFinalReviewPolicy === undefined);
+
+  let reviewerCalls = 0;
+  const countingReviewer = async (): Promise<GptReviewerReturn> => {
+    reviewerCalls += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨(테스트 실패 신호)", nextTask: null };
+  };
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    mkdirSync(join(dir, "fixture"), { recursive: true });
+    writeText(join(dir, "fixture"), "marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["fixture/marker.txt"], tests: [{ name: "fixture:test", pass: true }], rawOutput: "" };
+  };
+  const firstResult = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: countingReviewer } });
+  check(
+    "Z) [E2E] loader→runAutodevOnce data path: requiresHumanReview:true(정책 opt-in 없이) → outcome=RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW",
+    firstResult.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW"
+  );
+  check("Z) [E2E] GPT reviewer 호출 0회(핵심 회귀 — RevenueOS에서 이 값이 실제로 2회 이상 호출됐었음)", reviewerCalls === 0);
+
+  const approval = approveHumanFinalReview(statePath, rhrTask.id);
+  check("Z) [E2E] approveHumanFinalReview ok=true", approval.ok === true);
+  const result = await runAutodevOnce({ manifest });
+  check("Z) [E2E] 사람 APPROVE 후 resume outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("Z) [E2E] 승인 후에도 GPT reviewer 호출 0회 유지", reviewerCalls === 0);
+}
+
 async function main(): Promise<void> {
   try {
     scenarioMissingAdapterPathFailsFast();
@@ -827,6 +975,11 @@ async function main(): Promise<void> {
     scenarioHumanFinalReviewPolicyInvalidEnabledFailsFast();
     scenarioHumanFinalReviewPolicyInvalidShapeFailsClosed();
     await scenarioHumanFinalReviewPolicyVisibleToRunAutodevOnce();
+
+    scenarioRequiresHumanReviewAbsentIsUndefined();
+    scenarioRequiresHumanReviewValidPassesThrough();
+    scenarioRequiresHumanReviewInvalidShapeFailsFast();
+    await scenarioRequiresHumanReviewVisibleToRunAutodevOnce();
   } finally {
     for (const dir of tempDirs) {
       try {

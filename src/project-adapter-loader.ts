@@ -235,6 +235,12 @@ function buildTaskDefinitionFromData(raw: unknown, index: number, projectLabel: 
   if (raw.isHumanGate !== undefined && typeof raw.isHumanGate !== "boolean") {
     throw new Error(`Invalid project config(${projectLabel}): taskRegistry[${index}](${id}).isHumanGate가 boolean이 아닙니다.`);
   }
+  // AutoDev Core Maintenance(2026-09-03) — § task-registry.ts TaskDefinition.requiresHumanReview.
+  // isHumanGate와 동일한 optional-boolean 패턴(지정하지 않으면 필드 자체가 없음 — 기존 project
+  // config와 100% 하위 호환).
+  if (raw.requiresHumanReview !== undefined && typeof raw.requiresHumanReview !== "boolean") {
+    throw new Error(`Invalid project config(${projectLabel}): taskRegistry[${index}](${id}).requiresHumanReview가 boolean이 아닙니다.`);
+  }
   return {
     id,
     phase: raw.phase,
@@ -245,6 +251,7 @@ function buildTaskDefinitionFromData(raw: unknown, index: number, projectLabel: 
     allowedPathPrefixes: raw.allowedPathPrefixes,
     prohibitedOperations: raw.prohibitedOperations,
     ...(raw.isHumanGate !== undefined ? { isHumanGate: raw.isHumanGate as boolean } : {}),
+    ...(raw.requiresHumanReview !== undefined ? { requiresHumanReview: raw.requiresHumanReview as boolean } : {}),
   };
 }
 
