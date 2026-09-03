@@ -2840,6 +2840,7 @@ function scenarioFlattenPhaseTaskPlansRejectsEmptyOrMissingEntries(): void {
     reqIds: ["REQ-001"],
     securityConsiderations: [],
     completionGate: "g",
+    requiresHumanReview: false,
   };
   let threwForEmpty = false;
   try {

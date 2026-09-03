@@ -558,6 +558,169 @@ function scenarioRealCliRejectsDuplicateApproval(): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// V) AutoDev Core Maintenance(2026-09-03) — final-review-approve/final-review-reject
+//    서브커맨드(approveHumanFinalReview()/rejectHumanFinalReview()를 실제로 호출하는 유일한
+//    production entrypoint, § project-control-cli.ts 상단 주석) — 실제 컴파일된 CLI를
+//    child process로 실행해 project-state.json을 실제로 읽고 쓰는지 검증한다. 승인/거부 둘 다
+//    project lock을 건드리지 않으므로(§ approveHumanFinalReview/rejectHumanFinalReview 자체가
+//    runAutodevOnce()를 호출하지 않음, autodev.ts 참고) 위 approve 섹션과 달리 project lock
+//    선점이 필요 없다.
+// ---------------------------------------------------------------------------
+function waitingHumanFinalReviewState(taskId: string, overrides: Partial<CoreState> = {}): CoreState {
+  return {
+    currentTask: `${taskId} prompt`,
+    reviewCycle: 1,
+    lastClaudeResult: null,
+    lastGptDecision: { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "정상", nextTask: null },
+    status: "WAITING_HUMAN",
+    claudeLimitWaitCount: 0,
+    deferredHumanTasks: [],
+    completedTasks: [],
+    gitCheckpoint: "",
+    currentPhase: 1,
+    humanFinalReview: { taskId, reviewCycle: 1, status: "PENDING", requestedAt: new Date().toISOString() },
+    ...overrides,
+  };
+}
+
+function runFinalReviewCli(fixture: CliFixture, command: "final-review-approve" | "final-review-reject", args: string[]): CliRunResult {
+  const res = spawnSync("node", [CLI_PATH, command, "--project", fixture.adapterPath, ...args], { encoding: "utf-8" });
+  return { status: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+
+function scenarioRealCliFinalReviewApproveHappyPath(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v1", waitingHumanFinalReviewState(taskId));
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) approve happy path: exit code=0", result.status === 0);
+    check("V) approve happy path: 출력에 APPROVED 문구 포함", result.stdout.includes("APPROVED"));
+
+    const stateAfter = readFixtureState(fixture);
+    check("V) approve happy path: gate.status='APPROVED'로 실제 전이됨", stateAfter.humanFinalReview?.status === "APPROVED");
+    check(
+      "V) approve happy path: status는 여전히 WAITING_HUMAN(즉시 checkpoint되지 않음 — 다음 정상 실행이 처리)",
+      (stateAfter.status as unknown as string) === "WAITING_HUMAN"
+    );
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectHappyPath(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v2", waitingHumanFinalReviewState(taskId));
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-reject", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) reject happy path: exit code=0", result.status === 0);
+    check("V) reject happy path: 출력에 REJECTED 문구 포함", result.stdout.includes("REJECTED"));
+
+    const stateAfter = readFixtureState(fixture);
+    check("V) reject happy path: gate.status='REJECTED'로 실제 전이됨", stateAfter.humanFinalReview?.status === "REJECTED");
+    check(
+      "V) reject happy path: completedTasks에 taskId가 기록되지 않음(commit/complete 없음)",
+      !stateAfter.completedTasks.includes(taskId)
+    );
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectsWrongTaskId(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v3", waitingHumanFinalReviewState(taskId));
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-approve", ["--task", "WRONG_TASK", "--approved-by", "qa-operator"]);
+    check("V) 잘못된 taskId: exit code != 0", result.status !== 0);
+    check("V) 잘못된 taskId: 출력에 TASK_MISMATCH 포함", result.stdout.includes("TASK_MISMATCH"));
+
+    const stateAfter = readFixtureState(fixture);
+    check("V) 잘못된 taskId 시도 후에도 gate는 여전히 PENDING(상태 변경 없음)", stateAfter.humanFinalReview?.status === "PENDING");
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectsStaleReviewCycle(): void {
+  const taskId = "T1";
+  // gate는 reviewCycle=1을 가리키지만 project-state 자체의 reviewCycle은 2로 전진했다 —
+  // 다른 개발 cycle의 오래된 승인을 stale로 거부해야 한다(사용자 조건 3).
+  const fixture = makeCliFixture("real-cli-project-v4", waitingHumanFinalReviewState(taskId, { reviewCycle: 2 }));
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) stale reviewCycle: exit code != 0", result.status !== 0);
+    check("V) stale reviewCycle: 출력에 STALE_REVIEW_CYCLE 포함", result.stdout.includes("STALE_REVIEW_CYCLE"));
+
+    const stateAfter = readFixtureState(fixture);
+    check("V) stale reviewCycle 시도 후에도 gate는 여전히 PENDING", stateAfter.humanFinalReview?.status === "PENDING");
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectsAlreadyCompletedTask(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v5", waitingHumanFinalReviewState(taskId, { completedTasks: [taskId] }));
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) 이미 완료된 task: exit code != 0", result.status !== 0);
+    check("V) 이미 완료된 task: 출력에 TASK_ALREADY_COMPLETED 포함", result.stdout.includes("TASK_ALREADY_COMPLETED"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectsWhenNoPendingGate(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture(
+    "real-cli-project-v6",
+    waitingHumanFinalReviewState(taskId, { humanFinalReview: undefined })
+  );
+  try {
+    const result = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) gate 자체가 없음: exit code != 0", result.status !== 0);
+    check("V) gate 자체가 없음: 출력에 NO_PENDING_HUMAN_FINAL_REVIEW 포함", result.stdout.includes("NO_PENDING_HUMAN_FINAL_REVIEW"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRejectsDuplicateApprove(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v7", waitingHumanFinalReviewState(taskId));
+  try {
+    const first = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) 중복 승인 방지: 첫 번째 승인 exit code=0", first.status === 0);
+
+    // 사람이 실수로 버튼을 두 번 누른 상황 — gate가 이미 APPROVED로 소비되어(PENDING이 아님)
+    // 두 번째 시도는 거부되어야 한다(사용자 조건 3 — stale/중복 승인 거부).
+    const second = runFinalReviewCli(fixture, "final-review-approve", ["--task", taskId, "--approved-by", "qa-operator"]);
+    check("V) 중복 승인 방지: 두 번째(중복) 승인 exit code != 0", second.status !== 0);
+    check("V) 중복 승인 방지: 출력에 NO_PENDING_HUMAN_FINAL_REVIEW 포함", second.stdout.includes("NO_PENDING_HUMAN_FINAL_REVIEW"));
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
+function scenarioRealCliFinalReviewRequiresTaskAndApprovedBy(): void {
+  const taskId = "T1";
+  const fixture = makeCliFixture("real-cli-project-v8", waitingHumanFinalReviewState(taskId));
+  try {
+    const missingTask = spawnSync("node", [CLI_PATH, "final-review-approve", "--project", fixture.adapterPath, "--approved-by", "qa-operator"], {
+      encoding: "utf-8",
+    });
+    check("V) --task 누락: exit code != 0(usage 오류)", missingTask.status !== 0);
+
+    const missingApprovedBy = spawnSync("node", [CLI_PATH, "final-review-approve", "--project", fixture.adapterPath, "--task", taskId], {
+      encoding: "utf-8",
+    });
+    check("V) --approved-by 누락: exit code != 0(usage 오류)", missingApprovedBy.status !== 0);
+  } finally {
+    cleanupCliFixture(fixture);
+  }
+}
+
 // U) 기존 pause/resume/status/stop 서브커맨드가 approve 추가 이후에도 실제 child process로
 // 정상 동작한다(회귀 없음) — status는 상태를 바꾸지 않으므로 골라서 확인한다.
 function scenarioRealCliExistingStatusSubcommandStillWorks(): void {
@@ -590,6 +753,15 @@ async function main(): Promise<void> {
   scenarioRealCliRejectsExpiredApproval();
   scenarioRealCliRejectsDuplicateApproval();
   scenarioRealCliExistingStatusSubcommandStillWorks();
+
+  scenarioRealCliFinalReviewApproveHappyPath();
+  scenarioRealCliFinalReviewRejectHappyPath();
+  scenarioRealCliFinalReviewRejectsWrongTaskId();
+  scenarioRealCliFinalReviewRejectsStaleReviewCycle();
+  scenarioRealCliFinalReviewRejectsAlreadyCompletedTask();
+  scenarioRealCliFinalReviewRejectsWhenNoPendingGate();
+  scenarioRealCliFinalReviewRejectsDuplicateApprove();
+  scenarioRealCliFinalReviewRequiresTaskAndApprovedBy();
 
   console.log("\n=== project-control-cli 테스트 결과 ===");
   for (const r of results) console.log(r);

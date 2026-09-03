@@ -2009,6 +2009,8 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     const orchestratorResult = await runOrchestrator(taskDef.prompt, {
       statePath,
       allowedPathPrefixes: taskDef.allowedPathPrefixes,
+      // AutoDev Core Maintenance(2026-09-03) — § orchestrator.ts OrchestratorDeps.requiresHumanReview.
+      requiresHumanReview: taskDef.requiresHumanReview,
       claudeRunner: defaultClaudeRunner,
       projectContext: reviewContext,
       // Phase C Task C2 — deps.gptReviewer를 명시적으로 지정하지 않는 한(테스트가 흔히 그렇게
@@ -2247,7 +2249,7 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
   const agentAdvisory = [...(preAdvisory ?? []), ...(postAdvisory ?? [])];
   const agentAdvisoryField = agentAdvisory.length > 0 ? { agentAdvisory } : {};
 
-  if (!isResumingApprovedCheckpoint && isHumanFinalReviewEnabled(manifest)) {
+  if (!isResumingApprovedCheckpoint && (isHumanFinalReviewEnabled(manifest) || taskDef.requiresHumanReview === true)) {
     // Minimal HUMAN_FINAL_REVIEW Runtime Checkpoint Gate — project-agnostic opt-in(§
     // project-manifest.ts ProjectManifest.humanFinalReviewPolicy/isHumanFinalReviewEnabled).
     // 이 project가 manifest.humanFinalReviewPolicy.enabled===true로 명시적으로 opt-in한
@@ -2255,6 +2257,14 @@ export async function runAutodevOnce(opts: AutodevRunOptions): Promise<AutodevRu
     // opt-in하지 않은 project(기본값, 기존 project 전부 해당)는 이 조건이 항상 false이므로
     // 곧바로 아래 기존 checkpoint 코드로 진행해 기존 AutoDev 동작(Reviewer PASS → 즉시
     // checkpoint)을 100% 그대로 유지한다.
+    //
+    // AutoDev Core Maintenance(2026-09-03) — taskDef.requiresHumanReview===true인
+    // task는 project-wide humanFinalReviewPolicy opt-in 여부와 무관하게 이 동일한
+    // gate로 들어온다(task 자신이 "required tests만으로는 완료를 검증할 수 없다"고
+    // 명시적으로 선언했으므로). isHumanGate/manifest.humanFinalReviewPolicy의 기존
+    // 의미와 동작은 전혀 바뀌지 않는다 — 이 조건은 순수 OR로 진입 조건만 넓힐 뿐, 아래
+    // 로직/HumanFinalReviewGate 타입/decideNextAction()의 RESUME_APPROVED_CHECKPOINT
+    // 재사용 경로는 완전히 동일하다(두 트리거 모두 같은 gate 인프라를 공유).
     //
     // reviewer가 방금 APPROVED(finalState.status==="APPROVED")했더라도, 사람이 명시적으로
     // APPROVE하기 전까지는 checkpoint(git commit)를 진행하지 않는다 — Reviewer PASS는 자동

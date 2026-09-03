@@ -20,6 +20,7 @@ import { selectDefaultEventStore } from "./event-store";
 import { isApprovalExpired } from "./approval";
 import { performLocalHumanApproval } from "./local-human-approval";
 import { isCheckpointBlockedMarker } from "./human-gate-policy";
+import { approveHumanFinalReview, rejectHumanFinalReview } from "./autodev";
 
 // Genuine Human Gate Local Approval CLI Entrypoint(2026-08-31) — local-human-approval.ts는
 // 이미 승인 검증/실행 로직(performLocalHumanApproval)과 그 테스트를 갖고 있었지만, 그
@@ -257,6 +258,15 @@ function usageAndExit(): never {
       "      genuine Human Gate(예: CHECKPOINT_SCOPE_VIOLATION)의 이미 존재하는 durable pending",
       "      approval을 승인합니다 — maintenance의 resume과는 완전히 다른 명령입니다. 새 approval을",
       "      만들지 않으며, 이미 존재하는 정확한 approval-id/task가 현재 상태와 일치할 때만 승인됩니다.",
+      "  node dist/project-control-cli.js final-review-approve --project <adapterPath> --task <taskId> --approved-by <name>",
+      "  node dist/project-control-cli.js final-review-reject --project <adapterPath> --task <taskId> --approved-by <name>",
+      "      Human Final Review Gate(project-manifest.ts humanFinalReviewPolicy 또는",
+      "      task-registry.ts TaskDefinition.requiresHumanReview로 진입한 WAITING_HUMAN)를",
+      "      승인/거부합니다. taskId/reviewCycle이 현재 대기 중인 gate와 정확히 일치할 때만",
+      "      승인됩니다(stale/다른 task 승인은 거부) — 승인해도 즉시 checkpoint되지 않고, 다음",
+      "      정상 실행 주기에서 decideNextAction()이 Developer/Reviewer를 재실행하지 않고",
+      "      이미 만들어진 diff를 그대로 checkpoint합니다. 거부하면 이 task는 절대 checkpoint되지",
+      "      않으며 코드 변경은 working tree에 그대로 남습니다.",
     ].join("\n")
   );
   process.exit(1);
@@ -360,6 +370,60 @@ async function main(): Promise<void> {
         console.log(`[project-control] Resume이 안전 재확인(Git/Project Lock/Remote Git Safety)에서 보류됨(BLOCKED) — reason=${result.outcome.reason}`);
         console.log(
           "[project-control] project-state.json은 READY로 전환되었습니다 — 다음 정상 실행(run.ts)이 이 task를 다시 안전하게 시도할 수 있습니다."
+        );
+      }
+      try {
+        const finalState = loadState(manifest.statePath);
+        console.log(`[project-control] 최종 project status=${finalState.status}`);
+      } catch (e) {
+        console.log(`[project-control] 최종 project status 확인 불가(${e instanceof Error ? e.message : String(e)})`);
+      }
+      return;
+    }
+    case "final-review-approve":
+    case "final-review-reject": {
+      // AutoDev Core Maintenance(2026-09-03) — approveHumanFinalReview()/
+      // rejectHumanFinalReview()(autodev.ts)는 존재했지만 어떤 CLI/Telegram/Dashboard도
+      // 이를 호출하지 않았다(그 함수들의 원래 docstring이 "호출부는 이 Task 범위 밖"이라고
+      // 명시) — 즉 Human Final Review Gate가 한 번 열리면 실제로 승인/거부할 방법이 이
+      // 저장소 어디에도 없었다. approve 서브커맨드와 동일한 설계 원칙을 그대로 따른다: 새
+      // approval subsystem을 만들지 않고 이미 있는 함수 두 개를 그대로 호출할 뿐이며, 이
+      // CLI 실행 자체가 사람의 명시적 action이다(둘째 확인 UI 없음). taskId가 정확히
+      // 일치해야 하고("현재 WAITING_HUMAN이면 무조건 승인" 금지, approve 서브커맨드와 동일한
+      // 원칙), 실제 project/gate 매칭·staleness(reviewCycle)·중복 승인 방지는 모두
+      // approveHumanFinalReview()/rejectHumanFinalReview() 자신의 기존 가드가 담당한다(이
+      // 파일은 그 판정을 복제하지 않는다).
+      const taskId = parseArg(rest, "--task");
+      const approvedBy = parseArg(rest, "--approved-by");
+      if (!taskId || !approvedBy) {
+        console.error(
+          `[project-control] ${command}에는 --task <taskId>, --approved-by <name>이 모두 필요합니다(단순 '현재 WAITING_HUMAN이면 승인'은 지원하지 않습니다).`
+        );
+        usageAndExit();
+      }
+
+      const manifest = loadProjectAdapter(adapterPath);
+      const isApprove = command === "final-review-approve";
+      console.log(
+        `[project-control] Human Final Review ${isApprove ? "APPROVE" : "REJECT"} 요청 — project=${manifest.projectId}, task=${taskId}, approvedBy=${approvedBy}`
+      );
+      const result = isApprove ? approveHumanFinalReview(manifest.statePath, taskId) : rejectHumanFinalReview(manifest.statePath, taskId);
+
+      if (!result.ok) {
+        console.log(`[project-control] Human Final Review ${isApprove ? "승인" : "거부"} 실패(fail-closed) — reason=${result.reason}`);
+        console.log("[project-control] 어떤 상태도 변경되지 않았습니다.");
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log(`[project-control] Human Final Review ${isApprove ? "APPROVED" : "REJECTED"} 처리됨.`);
+      if (isApprove) {
+        console.log(
+          "[project-control] 아직 checkpoint되지 않았습니다 — 다음 정상 실행 주기(Supervisor/run.ts)에서 decideNextAction()이 이 승인을 인식해 Developer/Reviewer를 재실행하지 않고 이미 만들어진 diff를 그대로 checkpoint합니다."
+        );
+      } else {
+        console.log(
+          "[project-control] 이 task는 checkpoint되지 않습니다 — 코드 변경은 working tree에 그대로 남아 있으며, 사람이 직접 조치해야 합니다(예: 코드를 직접 수정 후 새로 재시도, 또는 그대로 보존)."
         );
       }
       try {

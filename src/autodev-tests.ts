@@ -8,7 +8,7 @@ import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
-import type { GptReviewerReturn } from "./orchestrator";
+import type { GptReviewerReturn, OrchestratorDeps } from "./orchestrator";
 import { MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
 import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
@@ -1265,6 +1265,192 @@ async function scenarioHumanFinalReviewRejectKeepsCheckpointBlocked(): Promise<v
   const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
   check("HFR reject: commit이 생성되지 않음(init 1건만)", log.split("\n").length === 1);
   check("HFR reject: developer가 만든 변경이 working tree에 그대로 보존됨", existsSync(join(repo, "proj", "hfr-reject-marker.txt")));
+}
+
+// ---------------------------------------------------------------------------
+// F2) AutoDev Core Maintenance(2026-09-03, RevenueOS Task 2.5 MAX_GPT_CALLS_EXCEEDED
+//    근본원인 대응) — task-registry.ts TaskDefinition.requiresHumanReview가 (a) required
+//    tests 통과(LOCAL GREEN) 이후 GPT reviewer 호출을 완전히 생략하고, (b) project-wide
+//    manifest.humanFinalReviewPolicy opt-in과 무관하게 동일한 Human Final Review Gate로
+//    직행하며, (c) 승인 후에는 Developer/Reviewer를 재실행하지 않고 이미 만들어진 diff를
+//    그대로 checkpoint하고, (d) 거부하면 절대 commit되지 않고 재실행을 반복해도 무한
+//    루프 없이 매번 STOP되며, (e) Security Gate(Secret Scanner)는 reviewer 생략과 무관하게
+//    항상 그대로 적용됨을 검증한다. 위 E) 섹션의 기존 humanFinalReviewPolicy 시나리오는
+//    전혀 건드리지 않는다 — 아래 fixture manifest는 그 policy를 지정하지 않는다(task
+//    자신의 requiresHumanReview:true만으로 동일 gate가 발동함을 증명하기 위함).
+// ---------------------------------------------------------------------------
+const REQUIRES_HUMAN_REVIEW_FIXTURE_REGISTRY: TaskDefinition[] = PLANNER_FIXTURE_REGISTRY.map((t) =>
+  t.id === "P1.2" ? { ...t, requiresHumanReview: true } : t
+);
+
+function buildPlannerManifestWithRequiresHumanReviewTask(root: string, statePath: string): ProjectManifest {
+  return { ...buildPlannerManifest(root, statePath), taskRegistry: REQUIRES_HUMAN_REVIEW_FIXTURE_REGISTRY };
+}
+
+/** GPT reviewer 호출 횟수를 세는 fake — "호출되면 안 되는" 시나리오에서 0회임을 직접
+ *  증명한다(사용자 조건 5). */
+function countingPassReviewer(): { reviewer: NonNullable<OrchestratorDeps["gptReviewer"]>; callCount: () => number } {
+  let calls = 0;
+  const reviewer: NonNullable<OrchestratorDeps["gptReviewer"]> = async () => {
+    calls += 1;
+    return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "호출되면 안 됨(테스트 실패 신호)", nextTask: null };
+  };
+  return { reviewer, callCount: () => calls };
+}
+
+async function scenarioRequiresHumanReviewSkipsReviewerAndEntersFinalReviewGate(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithRequiresHumanReviewTask(repo, statePath);
+  const { reviewer, callCount } = countingPassReviewer();
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/rhr-test1-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/rhr-test1-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  const result = await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: reviewer } });
+
+  check("RHR Test1: outcome=RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW", result.outcome === "RAN_TASK_AWAITING_HUMAN_FINAL_REVIEW");
+  check("RHR Test1: checkpoint 시도 자체가 없음(undefined)", result.checkpoint === undefined);
+  check("RHR Test1: GPT reviewer 호출 0회(사용자 조건 5)", callCount() === 0);
+  check("RHR Test1: Developer는 정확히 1회만 호출됨", claudeCalls === 1);
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("RHR Test1: status='WAITING_HUMAN'", state.status === "WAITING_HUMAN");
+  check("RHR Test1: humanFinalReview.status='PENDING'", state.humanFinalReview?.status === "PENDING");
+  check("RHR Test1: humanFinalReview.taskId='P1.2'", state.humanFinalReview?.taskId === "P1.2");
+  check("RHR Test1: completedTasks 변화 없음(next task 이동 없음)", !state.completedTasks.includes("P1.2"));
+  check("RHR Test1: manifest.humanFinalReviewPolicy가 없어도 이 gate가 발동함(task 단독 트리거)", manifest.humanFinalReviewPolicy === undefined);
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("RHR Test1: checkpoint count=0(init 1건만)", log.split("\n").length === 1);
+}
+
+async function scenarioRequiresHumanReviewApprovalCommitsWithoutRerunningDeveloperOrReviewer(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithRequiresHumanReviewTask(repo, statePath);
+  const { reviewer, callCount } = countingPassReviewer();
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/rhr-test2-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/rhr-test2-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: reviewer } });
+  const approval = approveHumanFinalReview(statePath, "P1.2");
+  check("RHR Test2: approveHumanFinalReview ok=true", approval.ok === true);
+
+  // resume에는 orchestratorDeps를 다시 넘기지 않는다 — RESUME_APPROVED_CHECKPOINT 경로가
+  // Developer/Reviewer를 재호출하지 않는다는 것을 "fake를 넘겨도 안 불림"이 아니라 "fake가
+  // 없어도 정상 동작"으로 증명한다(이 경로가 실수로 재호출한다면 fake가 없어 실제 Claude
+  // CLI/GPT 호출을 시도하다가 테스트가 실패/timeout으로 드러난다 — HFR Test3과 동일한 관례).
+  const result = await runAutodevOnce({ manifest });
+
+  check("RHR Test2: outcome=RAN_TASK_APPROVED_AND_CHECKPOINTED", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("RHR Test2: checkpoint.ok=true", result.checkpoint?.ok === true);
+  check("RHR Test2: 승인 후에도 GPT reviewer 호출 0회 유지(사용자 조건 5)", callCount() === 0);
+  check("RHR Test2: 승인 후에도 Developer가 추가 호출되지 않음(최초 1회 유지)", claudeCalls === 1);
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("RHR Test2: completedTasks에 P1.2 기록됨", state.completedTasks.includes("P1.2"));
+  check("RHR Test2: gitCheckpoint가 실제 commit hash로 갱신됨", state.gitCheckpoint === result.checkpoint?.commitHash);
+}
+
+async function scenarioRequiresHumanReviewRejectPreventsCommitAndNoInfiniteLoop(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithRequiresHumanReviewTask(repo, statePath);
+  const { reviewer, callCount } = countingPassReviewer();
+
+  let claudeCalls = 0;
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    claudeCalls += 1;
+    writeRepoFile(repo, "proj/rhr-reject-marker.txt", "marker\n");
+    return { success: true, summary: "테스트", changedFiles: ["proj/rhr-reject-marker.txt"], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: reviewer } });
+  const rejection = rejectHumanFinalReview(statePath, "P1.2");
+  check("RHR reject: rejectHumanFinalReview ok=true", rejection.ok === true);
+
+  // REJECT 후 여러 번 재실행해도 무한 루프 없이 매번 동일하게 STOP되고, 추가 Developer/
+  // Reviewer 호출이나 checkpoint가 절대 발생하지 않아야 한다(사용자 조건 4).
+  for (let i = 0; i < 3; i += 1) {
+    const rerun = await runAutodevOnce({ manifest });
+    check(`RHR reject: REJECT 후 ${i + 1}회차 재실행도 outcome=STOPPED(무한 루프 없음)`, rerun.outcome === "STOPPED");
+  }
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("RHR reject: gate.status='REJECTED'", state.humanFinalReview?.status === "REJECTED");
+  check("RHR reject: completedTasks에 P1.2가 기록되지 않음(commit/complete 없음)", !state.completedTasks.includes("P1.2"));
+  check("RHR reject: 3회 반복 재실행에도 Developer가 추가 호출되지 않음(최초 1회 유지)", claudeCalls === 1);
+  check("RHR reject: 3회 반복 재실행에도 GPT reviewer는 여전히 0회", callCount() === 0);
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("RHR reject: commit이 생성되지 않음(init 1건만)", log.split("\n").length === 1);
+  check("RHR reject: developer가 만든 변경이 working tree에 그대로 보존됨", existsSync(join(repo, "proj", "rhr-reject-marker.txt")));
+}
+
+async function scenarioRequiresHumanReviewApprovalStillEnforcesSecretScannerGate(): Promise<void> {
+  const repo = makeTempGitRepo();
+  const statePath = makeTempStateFile(repo);
+  const manifest = buildPlannerManifestWithRequiresHumanReviewTask(repo, statePath);
+  const { reviewer, callCount } = countingPassReviewer();
+
+  const RAW_SECRET = "sk-abcdefghijklmnopqrstuvwx";
+  const claudeRunner = async (): Promise<ClaudeResult> => {
+    writeRepoFile(repo, "proj/rhr-secret-marker.txt", `const key = '${RAW_SECRET}';\n`);
+    return {
+      success: true,
+      summary: "테스트: secret이 포함된 diff",
+      changedFiles: ["proj/rhr-secret-marker.txt"],
+      tests: [{ name: "proj:check", pass: true }],
+      rawOutput: "",
+    };
+  };
+
+  await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer: reviewer } });
+  check("RHR Security Gate: 이 시점까지 GPT reviewer 0회 호출(생략됨)", callCount() === 0);
+
+  const approval = approveHumanFinalReview(statePath, "P1.2");
+  check("RHR Security Gate: approveHumanFinalReview ok=true", approval.ok === true);
+
+  // 사람이 승인해도, GPT reviewer가 생략된 것과 무관하게 Secret Scanner Gate(checkpoint.ts,
+  // Core hard rule — 어떤 policy/옵션도 받지 않아 우회 불가)는 항상 그대로 실행된다(사용자
+  // 조건 2 — requiresHumanReview는 reviewer만 조건부 skip할 뿐 다른 Core Gate를 우회하지
+  // 않는다).
+  const result = await runAutodevOnce({ manifest });
+
+  check("RHR Security Gate: outcome이 정상 완료(RAN_TASK_APPROVED_AND_CHECKPOINTED)가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
+  check("RHR Security Gate: checkpoint.ok가 true가 아님(Secret Scanner BLOCK)", result.checkpoint?.ok !== true);
+
+  const state = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
+  check("RHR Security Gate: completedTasks에 P1.2가 기록되지 않음(secret이 있는 채로 완료 처리되지 않음)", !state.completedTasks.includes("P1.2"));
+
+  const log = (spawnSync("git", ["log", "--oneline"], { cwd: repo, encoding: "utf-8" }).stdout || "").trim();
+  check("RHR Security Gate: product commit이 생성되지 않음(init 1건만, secret이 커밋되지 않음)", log.split("\n").length === 1);
+}
+
+function scenarioRequiresHumanReviewFalseOrAbsentBehavesIdenticallyToBaseline(): void {
+  // 사용자 조건 6(회귀 없음) — requiresHumanReview가 false/absent인 task는
+  // decideNextAction() 판정에서 이 필드가 전혀 존재하지 않았을 때와 동일해야 한다. 이미
+  // PLANNER_FIXTURE_REGISTRY(전 항목 requiresHumanReview 없음)로 이 파일의 A)/B) 섹션
+  // 전체가 그 사실을 실행 단위로 계속 증명하고 있으므로, 여기서는 명시적으로 false를 지정한
+  // 경우도 absent와 100% 동일하게 취급되는지 단위 수준으로 한 번 더 확인한다.
+  const withFalse: TaskDefinition = { ...PLANNER_FIXTURE_REGISTRY[1], requiresHumanReview: false };
+  const registryWithExplicitFalse = PLANNER_FIXTURE_REGISTRY.map((t) => (t.id === "P1.2" ? withFalse : t));
+  const state = baseState({ status: "READY", completedTasks: ["P1.1"] });
+  const decision = decideNextAction(state, registryWithExplicitFalse);
+  check(
+    "RHR 회귀: requiresHumanReview=false 명시 task도 absent와 동일하게 RUN_TASK 선택됨",
+    decision.kind === "RUN_TASK" && decision.task.id === "P1.2"
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -3484,6 +3670,12 @@ async function main(): Promise<void> {
     await scenarioHumanFinalReviewApproveRejectsWrongTaskId();
     await scenarioHumanFinalReviewCheckpointExactlyOnceOnRepeatedResume();
     await scenarioHumanFinalReviewRejectKeepsCheckpointBlocked();
+
+    await scenarioRequiresHumanReviewSkipsReviewerAndEntersFinalReviewGate();
+    await scenarioRequiresHumanReviewApprovalCommitsWithoutRerunningDeveloperOrReviewer();
+    await scenarioRequiresHumanReviewRejectPreventsCommitAndNoInfiniteLoop();
+    await scenarioRequiresHumanReviewApprovalStillEnforcesSecretScannerGate();
+    scenarioRequiresHumanReviewFalseOrAbsentBehavesIdenticallyToBaseline();
   } finally {
     for (const dir of tempDirs) {
       try {

@@ -159,6 +159,14 @@ export interface OrchestratorDeps {
   /** GPT reviewer에게 전달할 프로젝트 맥락(ProjectManifest로부터 조립됨) — 지정하지 않으면
    *  gpt-reviewer.ts의 범용 기본값을 쓴다. */
   projectContext?: ReviewProjectContext;
+  /** AutoDev Core Maintenance(2026-09-03) — task-registry.ts
+   *  TaskDefinition.requiresHumanReview를 그대로 넘긴다(autodev.ts). true면 required
+   *  tests 통과(LOCAL GREEN) 이후 GPT reviewer 호출을 생략하고 synthesize된 PASS
+   *  decision으로 곧바로 진행한다 — Security Gate/Dependency Scanner/required tests 등
+   *  다른 어떤 Core Gate도 우회하지 않는다(그 게이트들은 이 파일 밖, checkpoint.ts에서
+   *  전혀 무관하게 그대로 실행된다). 지정하지 않으면(기본 false/undefined) 기존 동작과
+   *  100% 동일 — 항상 실제 gptReviewer()를 호출한다. */
+  requiresHumanReview?: boolean;
   /** Phase C Task C2 — 이 run 전용 SafeExecutorContext. deps.gptReviewer를 직접 지정하지
    *  않았을 때만 쓰인다 — 기본 real GPT reviewer(selectDefaultGptReviewer)가 이 context로
    *  rules 파일/실제 git 변경을 읽어, 다른 project run의 configureSafeExecutor() 호출에
@@ -667,6 +675,15 @@ export async function runOrchestrator(
     // 위)/MAX_REVIEW_CYCLES/durable retry가 이미 무한 루프를 막는다.
     const requiredTestsFailed = hasFailedRequiredTest(claudeResult.tests);
     const skipReviewerLocalNotGreen = requiredTestsFailed;
+    // AutoDev Core Maintenance(2026-09-03) — requiresHumanReview:true인 task는 LOCAL
+    // GREEN(required tests 통과) 이후 GPT reviewer 호출 자체를 생략하고 사람의 최종 검토
+    // (Human Final Review Gate, § autodev.ts)로 곧바로 진행한다. required tests가 여전히
+    // 실패했다면 위 skipReviewerLocalNotGreen 분기가 항상 먼저 적용되므로(REVISE 강제),
+    // 이 분기는 "이미 LOCAL GREEN"인 경우에만 도달한다 — deterministic required tests를
+    // 우회하지 않는다. Security Gate/Dependency Scanner 등 다른 어떤 Core Gate도 이
+    // 분기가 우회하지 않는다 — 이 파일은 GPT reviewer 호출 여부만 결정할 뿐, checkpoint.ts의
+    // 나머지 Gate는 전혀 건드리지 않고 그대로 실행된다.
+    const skipReviewerForHumanReview = !requiredTestsFailed && deps.requiresHumanReview === true;
 
     setStatus("WAITING_GPT_REVIEW");
     let gptResult: GptReviewerReturn;
@@ -682,6 +699,18 @@ export async function runOrchestrator(
         severity: { critical: 0, high: 0, medium: 0 },
         feedback:
           "AutoDev — required test가 실패해 local GREEN이 아니므로 Reviewer를 호출하지 않았습니다(§ P0-5 정책 — local GREEN 이전 Reviewer network call 금지). required test가 여전히 실패해 REVISE로 처리합니다.",
+        nextTask: null,
+        requestAttempted: false,
+      };
+    } else if (skipReviewerForHumanReview) {
+      log("Reviewer 호출 생략 — task.requiresHumanReview=true, required test 통과(LOCAL GREEN) — 사람의 최종 검토(Human Final Review)로 직행", {
+        reviewCycle: state.reviewCycle,
+      });
+      gptResult = {
+        decision: "PASS",
+        severity: { critical: 0, high: 0, medium: 0 },
+        feedback:
+          "AutoDev — 이 task는 requiresHumanReview:true로 선언되어 GPT reviewer를 호출하지 않고 사람의 최종 검토(Human Final Review)로 직행합니다. Security Gate/Dependency Scanner/required tests 등 다른 Core Gate는 checkpoint 진행 시 동일하게 그대로 적용됩니다.",
         nextTask: null,
         requestAttempted: false,
       };

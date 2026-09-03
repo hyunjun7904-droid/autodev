@@ -65,6 +65,20 @@ export interface TaskDefinition {
    *  Executor/Secret Scanner/Dependency Scanner 같은 Core Gate를 대체하지 않는 순수 참고
    *  의견이다. */
   needsSecurityReview?: boolean;
+
+  // AutoDev Core Maintenance(2026-09-03) — required tests만으로는 완료를 기계적으로
+  // 검증할 수 없어 사람이 diff를 직접 검토해야만 완료로 인정할 수 있는 task를 위한
+  // deterministic 신호. isHumanGate(위, "이 task가 끝나면 배포만 남는다")와는 무관한 별개
+  // 개념이다 — task 작성자(spec-planner LLM 출력의 구조화된 필드, § spec-planner.ts
+  // PlannerRawTask.requiresHumanReview)가 명시적으로 선언하며, LLM이 prompt 자유 텍스트를
+  // 다시 해석해서 정하지 않는다(위 needsPlanning 등과 동일한 원칙). optional이며 지정하지
+  // 않으면 false와 100% 동일하게 취급되어 기존 동작에 어떤 영향도 없다(additive-only).
+  /** true면 orchestrator가 required tests 통과(LOCAL GREEN) 이후 GPT reviewer 호출을
+   *  생략하고 곧바로 Human Final Review Gate(사람의 명시적 승인 후에만 checkpoint)로
+   *  직행한다 — Security Gate/Dependency Scanner/required tests 등 다른 어떤 Core Gate도
+   *  우회하지 않는다(§ orchestrator.ts/checkpoint.ts, 이 필드는 reviewer 호출 여부에만
+   *  관여한다). */
+  requiresHumanReview?: boolean;
 }
 
 /** AutoDev 레벨 plan marker — state.status에 기록되는, OrchestratorStatus enum 밖의 값들. */

@@ -298,6 +298,10 @@ export interface PlannerRawTask {
   reqIds: string[];
   securityConsiderations: string[];
   completionGate: string;
+  /** AutoDev Core Maintenance(2026-09-03) — § task-registry.ts TaskDefinition.requiresHumanReview
+   *  주석 참고. LLM이 completionGate 자유 텍스트를 다시 해석해서 유도하지 않는다 — Core가
+   *  이 필드를 그대로 TaskDefinition.requiresHumanReview로 전달한다. */
+  requiresHumanReview: boolean;
 }
 
 export interface PlannerRawExecutionPolicy {
@@ -1247,6 +1251,7 @@ const PHASE_TASK_ITEM_KEYS = [
   "reqIds",
   "securityConsiderations",
   "completionGate",
+  "requiresHumanReview",
 ] as const;
 // 검증을 통과해 Core가 taskId를 부여한 뒤(§ PlannerRawTask)의 key 집합 — LLM이 만드는 wire
 // 형식(PHASE_TASK_ITEM_KEYS, sequence/dependsOnSequenceInPhase 기반)과는 다르다. 오직
@@ -1265,6 +1270,7 @@ const PLANNER_RAW_TASK_KEYS = [
   "reqIds",
   "securityConsiderations",
   "completionGate",
+  "requiresHumanReview",
 ] as const;
 
 export function validatePhaseTaskRawOutput(
@@ -1331,6 +1337,7 @@ export function validatePhaseTaskRawOutput(
     reqIds: string[];
     securityConsiderations: string[];
     completionGate: string;
+    requiresHumanReview: boolean;
   }
   const validItems: Item[] = [];
   const seenSequences = new Set<number>();
@@ -1390,6 +1397,9 @@ export function validatePhaseTaskRawOutput(
       reqIds: isStringArray(tObj.reqIds) ? tObj.reqIds : [],
       securityConsiderations: isStringArray(tObj.securityConsiderations) ? tObj.securityConsiderations : [],
       completionGate: isNonEmptyString(tObj.completionGate) ? tObj.completionGate : "",
+      // AutoDev Core Maintenance(2026-09-03) — 지정하지 않거나 boolean이 아니면 기존 동작과
+      // 100% 동일한 false로 방어적 기본값 처리(§ 다른 필드와 동일한 관례).
+      requiresHumanReview: typeof tObj.requiresHumanReview === "boolean" ? tObj.requiresHumanReview : false,
     });
   });
 
@@ -1494,6 +1504,7 @@ export function validatePhaseTaskRawOutput(
     reqIds: item.reqIds,
     securityConsiderations: item.securityConsiderations,
     completionGate: item.completionGate,
+    requiresHumanReview: item.requiresHumanReview,
   }));
   return { ok: true, value };
 }
@@ -1533,7 +1544,8 @@ export function buildPhaseTaskPrompt(
       '    "title": string, "objective": string, "scope": ["dir/ 또는 exact/file"], "constraints": string[],',
       '    "dependsOn": string[](다른 phase의 이미 확정된 taskId만, 위 목록에서 선택), "dependsOnSequenceInPhase": number[](같은 응답 안의 다른 task의 sequence만),',
       '    "expectedModules": string[], "requiredTests": [{"name":string,"command":string,"args":string[],"cwd":"root"}],',
-      '    "acceptanceCriteria": string[], "reqIds": string[], "securityConsiderations": string[], "completionGate": string}] }',
+      '    "acceptanceCriteria": string[], "reqIds": string[], "securityConsiderations": string[], "completionGate": string,',
+      '    "requiresHumanReview": boolean}] }',
     ].join("\n"),
     [
       "# Rules",
@@ -1541,6 +1553,7 @@ export function buildPhaseTaskPrompt(
       "- taskId를 직접 만들지 마세요 — sequence만 지정하면 Core가 taskId를 부여합니다.",
       "- Deferred/Out-of-scope 항목을 참조하지 마세요.",
       "- executionPolicy는 이미 STAGE 1에서 확정됐습니다 — 여기서 다시 만들지 마세요.",
+      "- requiresHumanReview: required tests(자동화된 테스트)만으로는 완료 여부를 기계적으로 검증할 수 없어 사람이 diff를 직접 검토해야만 이 task를 완료로 인정할 수 있는 경우에만 true로 지정하세요(예: 자동 테스트로는 판단할 수 없는 보안/신뢰 경계 설계 판단이 필요한 task). completionGate에 '사람이 검토해야 한다'는 취지를 자유 텍스트로만 적지 마세요 — 이 boolean 필드로 명시하세요. required tests로 검증 가능한 일반 task는 생략하세요(기본값 false).",
     ].join("\n"),
   ].join("\n\n");
 }
@@ -2097,6 +2110,7 @@ function buildTaskRegistry(raw: PlannerRawOutput): TaskDefinition[] {
       requiredTests: t.requiredTests,
       allowedPathPrefixes: t.scope,
       prohibitedOperations: [...t.constraints, ...t.securityConsiderations],
+      ...(t.requiresHumanReview ? { requiresHumanReview: true } : {}),
     };
   });
 }
@@ -2459,7 +2473,8 @@ function isValidPhaseTaskPlansShape(v: unknown): v is Record<string, PlannerRawT
         isStringArray(t.acceptanceCriteria) &&
         isStringArray(t.reqIds) &&
         isStringArray(t.securityConsiderations) &&
-        typeof t.completionGate === "string"
+        typeof t.completionGate === "string" &&
+        typeof t.requiresHumanReview === "boolean"
       );
     });
   });
