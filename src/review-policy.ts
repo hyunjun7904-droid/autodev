@@ -35,7 +35,22 @@ export interface ReviewDecisionInput {
  *   1) scopeViolations가 있으면 무조건 BLOCK.
  *   2) (아직 BLOCK이 아니고) severity.critical>0 또는 high>0인데 decision=PASS면 REVISE.
  *   3) (아직 BLOCK이 아니고) required test가 실패했는데 decision=PASS면 REVISE.
- * REVISE/HUMAN_REQUIRED/BLOCK으로 이미 판정된 경우는 그대로 유지한다(더 완화하지 않는다).
+ *   4) (아직 BLOCK이 아니고) decision=REVISE인데 critical/high가 전혀 없고 required test도
+ *      실패하지 않았다면 PASS로 완화한다(§ 아래 주석).
+ * HUMAN_REQUIRED/BLOCK으로 이미 판정된 경우는 그대로 유지한다(더 완화하지 않는다) —
+ * HUMAN_REQUIRED는 severity와 무관하게 "사람 판단이 필요하다"는 명시적 신호이므로 자동으로
+ * PASS로 다운그레이드하지 않는다.
+ *
+ * AutoDev Efficiency 개선(2026-09-04, RevenueOS 실측) — RevenueOS 실제 REVISE 판정
+ * 56건(리뷰어가 실제로 호출된 것만) 중 33건(59%)이 severity critical=0/high=0(주로 medium
+ * 이하 스타일/의견성 지적)이었는데도 REVISE로 되돌려졌다. `.claude/CLAUDE.md`/이 저장소가
+ * 이미 다른 곳(checkpoint.ts 최종 판정 등)에서 따르는 원칙 — "최종 판정은 리뷰어의 의견이
+ * 아니라 실측(required test) 기준"을 REVISE 루프 자체에도 일관되게 적용한 것이다. severity가
+ * critical/high를 전혀 지적하지 않았다는 것은 이미 리뷰어 자신의 판정이므로, 그 상태에서
+ * decision만 REVISE로 남기는 건 "완벽하지 않으면 되돌린다"는 별도의(문서화되지 않은) 기준을
+ * 몰래 적용하는 것과 같다. medium 이하 지적은 사라지지 않는다 — reviewer의 severity/reason은
+ * 이 함수 호출 이후에도 호출부가 그대로 로그/이벤트/checkpoint 기록에 남긴다(§ 요구사항 —
+ * "기록만 하고 통과", 별도 상태 필드를 새로 추가하지 않고 기존 기록 경로를 그대로 쓴다).
  */
 export function applyReviewDecisionPolicy(input: ReviewDecisionInput, requiredTestsFailed: boolean): GptDecision {
   let decision = input.decision;
@@ -47,6 +62,9 @@ export function applyReviewDecisionPolicy(input: ReviewDecisionInput, requiredTe
   }
   if (decision === "PASS" && requiredTestsFailed) {
     decision = "REVISE";
+  }
+  if (decision === "REVISE" && input.severity.critical === 0 && input.severity.high === 0 && !requiredTestsFailed) {
+    decision = "PASS";
   }
   return decision;
 }

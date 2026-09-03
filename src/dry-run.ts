@@ -100,9 +100,13 @@ async function scenarioMaxReviewCycles(statePath: string): Promise<void> {
       rawOutput: `${task}:${attempt}`,
     };
   };
+  // severity high:1 명시 — critical/high가 전혀 없는 REVISE(medium 이하)는 AutoDev
+  // Efficiency 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 즉시 PASS로
+  // 완화하므로, 이 시나리오("REVISE가 절대 수렴하지 않는다")를 검증하려면 실제로 REVISE를
+  // 유지시키는 severity가 필요하다.
   const alwaysRevise = async (): Promise<GptReviewResult> => ({
     decision: "REVISE",
-    severity: { critical: 0, high: 0, medium: 1 },
+    severity: { critical: 0, high: 1, medium: 0 },
     feedback: "[FAKE] 항상 REVISE(무한루프 방지 테스트 전용)",
     nextTask: "재시도",
   });
@@ -147,9 +151,10 @@ async function scenarioMaxGptCalls(statePath: string): Promise<void> {
     claudeCalls += 1;
     return { success: true, summary: `attempt ${attempt}`, changedFiles: [], tests: [], rawOutput: `${task}:${attempt}` };
   };
+  // severity high:1 명시 — § scenarioMaxReviewCycles의 alwaysRevise와 동일한 이유.
   const alwaysRevise = async (): Promise<GptReviewResult> => ({
     decision: "REVISE",
-    severity: { critical: 0, high: 0, medium: 1 },
+    severity: { critical: 0, high: 1, medium: 0 },
     feedback: "[FAKE] MAX_GPT_CALLS 테스트 전용",
     nextTask: "재시도",
   });
@@ -158,8 +163,9 @@ async function scenarioMaxGptCalls(statePath: string): Promise<void> {
     gptReviewer: alwaysRevise,
     statePath,
   });
-  // MAX_REVIEW_CYCLES(5)가 MAX_GPT_CALLS(10)보다 먼저 걸리므로, 실제로는 5회에서 멈춘다 —
-  // 이 자체가 "GPT 호출이 MAX_GPT_CALLS를 절대 넘지 않는다"는 것의 증거다.
+  // MAX_REVIEW_CYCLES(§ policy.ts)가 MAX_GPT_CALLS보다 먼저 걸리므로, 실제로는
+  // MAX_REVIEW_CYCLES회에서 멈춘다 — 이 자체가 "GPT 호출이 MAX_GPT_CALLS를 절대 넘지
+  // 않는다"는 것의 증거다.
   check(
     `GPT 호출 상한: 실제 호출 수가 MAX_GPT_CALLS(${MAX_GPT_CALLS})를 절대 넘지 않음`,
     claudeCalls <= MAX_GPT_CALLS

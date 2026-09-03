@@ -369,10 +369,13 @@ function scenarioK_ledgerMappingIncludesReviewModeAndPayloadChars(): void {
 }
 
 // ---------------------------------------------------------------------------
-// L) MAX_REVIEW_CYCLES/Critical·High override 정책은 이번 Task로 변경되지 않음(#23/#24).
+// L) Critical·High override 정책은 이번 Task(#23/#24, reviewMode 필드 추가)로 변경되지
+//    않음. MAX_REVIEW_CYCLES 값 자체는 AutoDev Efficiency 개선(2026-09-04)으로 5→3으로
+//    낮아졌다(§ policy.ts 상단 주석, RevenueOS 실측 — PASS는 전부 4회 이내 수렴했고
+//    5회차에서 통과한 사례가 0건이었다) — 이 값은 여기서 재확인만 한다.
 // ---------------------------------------------------------------------------
 function scenarioL_maxReviewCyclesAndSeverityPolicyUnchanged(): void {
-  check("L) MAX_REVIEW_CYCLES는 그대로 5", MAX_REVIEW_CYCLES === 5);
+  check("L) MAX_REVIEW_CYCLES는 3(2026-09-04 Efficiency 개선 반영)", MAX_REVIEW_CYCLES === 3);
   const decision = applyReviewDecisionPolicy(
     { decision: "PASS", severity: { critical: 1, high: 0, medium: 0 }, scopeViolations: [] },
     false

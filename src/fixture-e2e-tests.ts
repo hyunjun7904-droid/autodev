@@ -203,9 +203,13 @@ function makeF1FixtureReviewer(root: string): (result: ClaudeResult, reviewCycle
     }
     const hasNegativeTest = /add\(\s*-\d+\s*,\s*-\d+\s*\)/.test(testFileContent);
     if (!hasNegativeTest) {
+      // severity high:1 명시 — critical/high가 전혀 없는 REVISE(medium 이하)는 AutoDev
+      // Efficiency 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 즉시
+      // PASS로 완화하므로, 이 E2E 시나리오("REVISE 피드백이 실제로 다음 Claude 라운드에
+      // 전달돼 코드가 실제로 고쳐진다")가 검증하려는 REVISE→fix 루프 자체가 발동하지 않는다.
       return {
         decision: "REVISE",
-        severity: { critical: 0, high: 0, medium: 1 },
+        severity: { critical: 0, high: 1, medium: 0 },
         feedback: "음수 입력 테스트가 없음 — add()가 음수도 정확히 처리하는지 검증하는 테스트를 추가하세요.",
         nextTask: null,
       };

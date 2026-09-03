@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { runAutodevOnce, runPreDevelopmentAdvisory, runPostDevelopmentAdvisory } from "./autodev";
-import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
+import { runOrchestrator, MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT, MAX_GPT_CALLS } from "./orchestrator";
+import { MAX_REVIEW_CYCLES } from "./policy";
 import type { ProjectManifest } from "./project-manifest";
 import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
@@ -373,9 +374,11 @@ async function scenarioReviseOnceThenApprove(): Promise<void> {
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
 
   let reviewCalls = 0;
+  // severity high:1 명시 — § scenarioReviseCycleEventsRecordedInOrder와 동일한 이유(0/0/0이면
+  // AutoDev Efficiency 개선이 REVISE를 즉시 PASS로 완화해 재작업 자체가 트리거되지 않는다).
   const gptReviewer = async (): Promise<GptReviewerReturn> => {
     reviewCalls += 1;
-    if (reviewCalls === 1) return { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: "수정 필요", nextTask: null };
+    if (reviewCalls === 1) return { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "수정 필요", nextTask: null };
     return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "이제 문제 없음", nextTask: null };
   };
 
@@ -440,12 +443,14 @@ async function scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman(): Promise<
   const statePath = makeTempStateFile(repo);
   const manifest = buildManifest(repo, statePath, [taskDef]);
   const { runner: claudeRunner, callCount } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
-  // 처음 MAX_REVIEW_CYCLES(5)회는 REVISE로 소진시켜 durable wait 경로를 실제로 타게 하고,
-  // 그 이후(reviewCycle이 리셋되어 다시 시작된 6번째 developer 호출)부터는 PASS로 전환해 이
-  // task가 실제로 수렴/완료될 수 있음을 함께 증명한다.
+  // 처음 MAX_REVIEW_CYCLES(2026-09-04부터 3, § policy.ts)회는 REVISE로 소진시켜 durable wait
+  // 경로를 실제로 타게 하고, 그 이후(reviewCycle이 리셋되어 다시 시작된 MAX_REVIEW_CYCLES+1번째
+  // developer 호출)부터는 PASS로 전환해 이 task가 실제로 수렴/완료될 수 있음을 함께 증명한다.
+  // REVISE 응답에 severity high:1을 명시 — 0/0/0이면 AutoDev Efficiency 개선(§
+  // review-policy.ts)이 REVISE를 즉시 PASS로 완화해 durable wait 경로 자체를 타지 않는다.
   const gptReviewer = async (): Promise<GptReviewerReturn> =>
-    callCount() <= 5
-      ? { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: "계속 REVISE", nextTask: null }
+    callCount() <= MAX_REVIEW_CYCLES
+      ? { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "계속 REVISE", nextTask: null }
       : { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "이제 통과", nextTask: null };
 
   const result = await runAutodevOnce({
@@ -454,7 +459,7 @@ async function scenarioMaxCycleExhaustionDurableRetryNotWaitingHuman(): Promise<
   });
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
 
-  check("max cycle 소진: developer가 5회를 넘어 계속 재시도됨(하드 컷오프 아님)", callCount() > 5);
+  check(`max cycle 소진: developer가 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})를 넘어 계속 재시도됨(하드 컷오프 아님)`, callCount() > MAX_REVIEW_CYCLES);
   check("max cycle 소진: 결국 수렴하면 checkpoint까지 완료됨(사람 승인 없이)", result.outcome === "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   // checkpoint 성공 후 state.status는(autodev.ts) 다음 task가 있으면 "READY"로, 이 fixture처럼
   // task가 이거 하나뿐이면(getNextTask가 null) PLAN_MARKERS.PROJECT_COMPLETE로 설정된다 —
@@ -507,9 +512,10 @@ async function scenarioMaxCycleExhaustionWithDeterministicRepeatStaysTechnicalBl
   });
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
 
+  const expectedDeterministicRepeatCallCount = MAX_REVIEW_CYCLES * (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1);
   check(
-    "결정론적 반복: developer 호출이 bounded됨(exhaustion마다 5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=30, 무한 반복 아님)",
-    callCount() === 30
+    `결정론적 반복: developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=${expectedDeterministicRepeatCallCount}, 무한 반복 아님)`,
+    callCount() === expectedDeterministicRepeatCallCount
   );
   check("결정론적 반복: outcome이 APPROVED_AND_CHECKPOINTED가 아님", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   check(
@@ -630,9 +636,14 @@ async function scenarioReviseCycleEventsRecordedInOrder(): Promise<void> {
   const manifest = buildManifest(repo, statePath, [taskDef]);
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
   let reviewCalls = 0;
+  // REVISE 응답에 severity high:1을 명시 — critical/high가 전혀 없으면 AutoDev Efficiency
+  // 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 REVISE를 즉시 PASS로
+  // 완화하므로, 이 테스트가 검증하려는 "REVISE 2회 후 승인" 이벤트 순서 자체가 발생하지
+  // 않는다. MAX_REVIEW_CYCLES가 3으로 낮아졌으므로(§ policy.ts) REVISE 2회 + PASS 1회 =
+  // 총 3 cycle로 정확히 새 예산 안에 맞춘다.
   const gptReviewer = async (): Promise<GptReviewerReturn> => {
     reviewCalls += 1;
-    if (reviewCalls <= 2) return { decision: "REVISE", severity: { critical: 0, high: 0, medium: 0 }, feedback: `수정 필요 ${reviewCalls}`, nextTask: null };
+    if (reviewCalls <= 2) return { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: `수정 필요 ${reviewCalls}`, nextTask: null };
     return { decision: "PASS", severity: { critical: 0, high: 0, medium: 0 }, feedback: "이제 문제 없음", nextTask: null };
   };
   const events = createInMemoryEventStore();
@@ -659,30 +670,40 @@ async function scenarioMaxCycleExhaustedRecordsAuditEvents(): Promise<void> {
   const statePath = makeTempStateFile(repo);
   const manifest = buildManifest(repo, statePath, [taskDef]);
   const { runner: claudeRunner } = fakeClaudeRunnerWriting(repo, "proj/marker.txt");
-  const gptReviewer = fakeReviewer({ decision: "REVISE", feedback: "계속 REVISE" });
+  // severity high:1 명시 — critical/high가 전혀 없으면 AutoDev Efficiency 개선(2026-09-04,
+  // § review-policy.ts applyReviewDecisionPolicy)이 REVISE를 즉시 PASS로 완화해 이 시나리오
+  // (REVISE가 절대 수렴하지 않고 결국 MAX_GPT_CALLS로 terminal BLOCKED) 자체가 발동하지 않는다.
+  const gptReviewer = fakeReviewer({ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "계속 REVISE" });
   const events = createInMemoryEventStore();
 
   // AutoDev Efficiency / Review Stagnation Hardening(2026-08-28) — 이 fake reviewer는 항상
   // REVISE만 반환하므로, REVIEW_CYCLE_EXHAUSTED는 이제 durable wait-then-retry로 계속
   // 반복된다(사람에게 넘기지 않음). 이 run이 실제로 끝나는 지점은 비용 안전장치 MAX_GPT_CALLS
-  // (10, orchestrator.ts)다 — reviewCycle이 MAX_REVIEW_CYCLES(5)마다 리셋되며 durable wait을
-  // 2번 거친 뒤(gptCallCount 5, 10) 11번째 review 시도에서 gptCallCount>10으로 terminal
-  // 기술적 BLOCKED가 된다(§ BLOCKER 3 재하드닝, 독립 최종 감사 2026-08-30 — 이전에는 여기서
-  // genuine WAITING_HUMAN이었으나, "cap을 넘긴 뒤 terminal technical BLOCKED, Human Gate=0"
-  // 요구사항에 따라 blockOnDurableWaitRetryExhausted와 동일한 원칙으로 바뀌었다). sleep을
-  // 즉시 반환하도록 주입해 실제 대기 없이 테스트한다.
+  // (10, orchestrator.ts — 이 값은 이번 Efficiency 개선에서 바뀌지 않았다)다 — reviewCycle이
+  // MAX_REVIEW_CYCLES(2026-09-04부터 3, § policy.ts)마다 리셋되며 durable wait을
+  // floor(MAX_GPT_CALLS/MAX_REVIEW_CYCLES)번 거친 뒤 다음 review 시도에서 gptCallCount>10으로
+  // terminal 기술적 BLOCKED가 된다(§ BLOCKER 3 재하드닝, 독립 최종 감사 2026-08-30 — 이전에는
+  // 여기서 genuine WAITING_HUMAN이었으나, "cap을 넘긴 뒤 terminal technical BLOCKED, Human
+  // Gate=0" 요구사항에 따라 blockOnDurableWaitRetryExhausted와 동일한 원칙으로 바뀌었다).
+  // REVIEW_REVISE 총횟수는 MAX_REVIEW_CYCLES와 무관하게 항상 MAX_GPT_CALLS(gptCallCount는
+  // reviewCycle 리셋과 무관하게 매 호출마다 누적되므로)다. sleep을 즉시 반환하도록 주입해 실제
+  // 대기 없이 테스트한다.
   await runAutodevOnce({ manifest, orchestratorDeps: { claudeRunner, gptReviewer, sleep: async () => {}, now: () => Date.now() }, events });
 
+  const expectedExhaustedCount = Math.floor(MAX_GPT_CALLS / MAX_REVIEW_CYCLES);
   const exhaustedEvents = events.query({ eventType: "REVIEW_CYCLE_EXHAUSTED" }).events;
   const exhausted = exhaustedEvents[0];
   check("event 기록(cycle 소진): REVIEW_CYCLE_EXHAUSTED event가 audit 카테고리로 기록됨", exhausted?.categories.includes("audit") === true);
-  check("event 기록: reviseCycle=5가 정확히 담김", exhausted?.reviseCycle === 5);
+  check(`event 기록: reviseCycle=${MAX_REVIEW_CYCLES}이 정확히 담김`, exhausted?.reviseCycle === MAX_REVIEW_CYCLES);
   check(
     "event 기록: humanInterventionRequired=false(더 이상 Human Gate가 아님, 2026-08-28 정책 수정)",
     exhausted?.humanInterventionRequired === false
   );
-  check("event 기록: REVIEW_CYCLE_EXHAUSTED가 2회(사람에게 넘기지 않고 durable하게 재시도했으므로) 기록됨", exhaustedEvents.length === 2);
-  check("event 기록: REVIEW_REVISE가 10회(두 번의 5-cycle 예산) 기록됨", events.query({ eventType: "REVIEW_REVISE" }).events.length === 10);
+  check(
+    `event 기록: REVIEW_CYCLE_EXHAUSTED가 ${expectedExhaustedCount}회(사람에게 넘기지 않고 durable하게 재시도했으므로) 기록됨`,
+    exhaustedEvents.length === expectedExhaustedCount
+  );
+  check(`event 기록: REVIEW_REVISE가 MAX_GPT_CALLS(${MAX_GPT_CALLS})회 기록됨`, events.query({ eventType: "REVIEW_REVISE" }).events.length === MAX_GPT_CALLS);
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
   check("event 기록: 결국 MAX_GPT_CALLS(비용 안전장치)로 terminal 기술적 BLOCKED에 도달", finalState.status === "BLOCKED");
   check(

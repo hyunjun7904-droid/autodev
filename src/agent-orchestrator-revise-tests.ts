@@ -106,8 +106,15 @@ async function scenarioFirstPassApproved(): Promise<void> {
 // ---------------------------------------------------------------------------
 async function scenarioReviseOnceThenApprove(): Promise<void> {
   const plan = routeTask(req());
+  // severity를 high:1로 명시 — severity가 critical/high 없이 0/0/0이면 AutoDev Efficiency
+  // 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 REVISE를 즉시
+  // PASS로 완화하므로, 이 시나리오("진짜 REVISE 1회를 거쳐 재작업 후 승인")를 검증하려면
+  // 실제로 REVISE를 유지시키는 severity가 필요하다.
   const { deps, developerCalls, reviewerCalls } = makeReviseTrackedDeps({
-    reviewerResponses: [{ decision: "REVISE", feedback: "[FAKE] 에러 핸들링이 빠졌습니다." }, { decision: "PASS" }],
+    reviewerResponses: [
+      { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "[FAKE] 에러 핸들링이 빠졌습니다." },
+      { decision: "PASS" },
+    ],
   });
   const result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, deps);
 
@@ -130,16 +137,23 @@ async function scenarioReviseOnceThenApprove(): Promise<void> {
 // ---------------------------------------------------------------------------
 async function scenarioMultipleRevisesWithinMaxCycle(): Promise<void> {
   const plan = routeTask(req());
-  // MAX_REVIEW_CYCLES=5: cycle 1~3은 REVISE, cycle 4에 PASS.
+  // MAX_REVIEW_CYCLES=3(2026-09-04 Efficiency 개선, § policy.ts): cycle 1~2는 REVISE,
+  // cycle 3에 PASS — 예산(3) 안에서 끝나는 것을 검증한다. REVISE 응답은 severity high:1을
+  // 명시해 applyReviewDecisionPolicy의 severity 기반 자동 완화(REVISE→PASS, severity
+  // 0/0/0일 때만 적용)에 걸리지 않고 실제로 REVISE 상태를 유지하게 한다.
   const { deps, developerCalls, reviewerCalls } = makeReviseTrackedDeps({
-    reviewerResponses: [{ decision: "REVISE" }, { decision: "REVISE" }, { decision: "REVISE" }, { decision: "PASS" }],
+    reviewerResponses: [
+      { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 } },
+      { decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 } },
+      { decision: "PASS" },
+    ],
   });
   const result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, deps);
 
-  check("여러 REVISE: max cycle(5) 미만에서 정상 승인됨(overallStatus=COMPLETED)", result.overallStatus === "COMPLETED");
-  check("여러 REVISE: developer가 정확히 4회 호출됨", developerCalls.length === 4);
-  check("여러 REVISE: reviewer가 정확히 4회 호출됨", reviewerCalls.length === 4);
-  check("여러 REVISE: MAX_REVIEW_CYCLES(5) 미만으로 끝남", developerCalls.length < MAX_REVIEW_CYCLES);
+  check("여러 REVISE: max cycle(3) 이내에서 정상 승인됨(overallStatus=COMPLETED)", result.overallStatus === "COMPLETED");
+  check("여러 REVISE: developer가 정확히 3회 호출됨", developerCalls.length === 3);
+  check("여러 REVISE: reviewer가 정확히 3회 호출됨", reviewerCalls.length === 3);
+  check("여러 REVISE: MAX_REVIEW_CYCLES(3) 이내로 끝남", developerCalls.length <= MAX_REVIEW_CYCLES);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +260,10 @@ async function scenarioHandoffMinimalFeedbackContent(): Promise<void> {
 // ---------------------------------------------------------------------------
 async function scenarioNoUnrelatedContextResent(): Promise<void> {
   const plan = routeTask(req());
+  // severity high:1 명시 — 0/0/0이면 AutoDev Efficiency 개선(§ review-policy.ts)이 REVISE를
+  // 즉시 PASS로 완화해 이 시나리오(REVISE handoff 내용 검증)가 발동하지 않는다.
   const { deps, developerCalls } = makeReviseTrackedDeps({
-    reviewerResponses: [{ decision: "REVISE", feedback: "수정 필요" }],
+    reviewerResponses: [{ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 }, feedback: "수정 필요" }],
   });
   await executeRoutingPlan(
     plan,
@@ -267,8 +283,9 @@ async function scenarioNoUnrelatedContextResent(): Promise<void> {
 // ---------------------------------------------------------------------------
 async function scenarioQaNotReCalledDuringRevise(): Promise<void> {
   const plan = routeTask(req({ hasFixedRequiredTests: false })); // developer,qa,reviewer 플랜.
+  // severity high:1 명시 — § scenarioNoUnrelatedContextResent와 동일한 이유.
   const { deps, developerCalls, readOnlyCalls } = makeReviseTrackedDeps({
-    reviewerResponses: [{ decision: "REVISE" }, { decision: "PASS" }],
+    reviewerResponses: [{ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 } }, { decision: "PASS" }],
   });
   const result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, deps);
 
@@ -308,8 +325,10 @@ async function scenarioHighRiskGateStillHolds(): Promise<void> {
 // ---------------------------------------------------------------------------
 async function scenarioDeveloperReviseFailureStopsLoop(): Promise<void> {
   const plan = routeTask(req());
+  // severity high:1 명시 — § scenarioNoUnrelatedContextResent와 동일한 이유(REVISE가
+  // 자동 PASS로 완화되면 재시도 자체가 트리거되지 않아 이 시나리오가 검증되지 않는다).
   const { deps, developerCalls, reviewerCalls } = makeReviseTrackedDeps({
-    reviewerResponses: [{ decision: "REVISE" }],
+    reviewerResponses: [{ decision: "REVISE", severity: { critical: 0, high: 1, medium: 0 } }],
     developerResponses: [undefined, { success: false, errorCode: "NON_ZERO_EXIT" as never }],
   });
   const result = await executeRoutingPlan(plan, execInput(), CORE_AGENT_REGISTRY, deps);

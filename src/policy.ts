@@ -21,7 +21,14 @@ const DEV_AUTO_ALLOWABLE: ReadonlySet<DevAutoAction> = new Set([
   "phase_progression",
 ]);
 
-export const MAX_REVIEW_CYCLES = 5;
+// AutoDev Efficiency 개선(2026-09-04, RevenueOS 실측) — RevenueOS 실제 REVISE→PASS 수렴
+// 이력(logs/events.jsonl) 분석 결과, PASS가 나온 13건 전부 reviewCycle 1~4 안에서
+// 수렴했고(1회:7건, 2회:3건, 3회:2건, 4회:1건) 5회차에서 통과한 사례는 0건이었다. 반면 예산을
+// 소진한 케이스(task 1.2/2.1/2.4/2.5)는 예외 없이 "새 예산으로 재시작"한 뒤에야 풀렸다 —
+// 즉 4~5회차 REVISE는 실측상 거의 전량 낭비였다. 3으로 낮춰도 관측된 수렴 분포를 놓치지
+// 않는다(4회차 1건만 새 예산 재시도로 넘어가며, 이는 기존에도 예산 소진 시 자동으로 발생하는
+// 경로다).
+export const MAX_REVIEW_CYCLES = 3;
 
 export function requiresHumanApproval(action: ActionType): boolean {
   return ALWAYS_HUMAN.has(action as HighRiskAction);

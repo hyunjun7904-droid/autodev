@@ -251,13 +251,16 @@ async function scenarioOrchestratorDoubleCountingAcrossReviseCycles(): Promise<v
     { inputTokens: 3000, outputTokens: 300, totalTokens: 3300 },
   ];
   let gptCall = 0;
+  // REVISE 응답에 severity high:1 명시 — critical/high가 전혀 없으면 AutoDev Efficiency
+  // 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 REVISE를 즉시 PASS로
+  // 완화해 이 시나리오가 의도한 3-cycle 시퀀스(REVISE, REVISE, PASS)가 발생하지 않는다.
   const gptReviewer = async (): Promise<GptReviewerReturn> => {
     const usage = gptUsage[gptCall];
     const isLast = gptCall === 2;
     gptCall += 1;
     return {
       decision: isLast ? "PASS" : "REVISE",
-      severity: { critical: 0, high: 0, medium: 0 },
+      severity: isLast ? { critical: 0, high: 0, medium: 0 } : { critical: 0, high: 1, medium: 0 },
       feedback: isLast ? "이제 문제 없음" : `REVISE ${gptCall}`,
       nextTask: null,
       model: { provider: "openai", name: "gpt-5.6-2026-02-01" },
@@ -343,13 +346,15 @@ async function scenarioOrchestratorRecordsUsageLedgerEntries(): Promise<void> {
     { inputTokens: 2000, outputTokens: 200, totalTokens: 2200 },
   ];
   let gptCall = 0;
+  // REVISE 응답에 severity high:1 명시 — § scenarioOrchestratorDoubleCountingAcrossReviseCycles
+  // 와 동일한 이유(0/0/0이면 AutoDev Efficiency 개선이 즉시 PASS로 완화한다).
   const gptReviewer = async (): Promise<GptReviewerReturn> => {
     const usage = gptUsage[gptCall];
     const isLast = gptCall === 1;
     gptCall += 1;
     return {
       decision: isLast ? "PASS" : "REVISE",
-      severity: { critical: 0, high: 0, medium: 0 },
+      severity: isLast ? { critical: 0, high: 0, medium: 0 } : { critical: 0, high: 1, medium: 0 },
       feedback: isLast ? "이제 문제 없음" : "REVISE 1",
       nextTask: null,
       model: { provider: "openai", name: "gpt-5.6-2026-02-01" },

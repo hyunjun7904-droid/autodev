@@ -9,7 +9,8 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn, OrchestratorDeps } from "./orchestrator";
-import { MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
+import { MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT, MAX_GPT_CALLS } from "./orchestrator";
+import { MAX_REVIEW_CYCLES } from "./policy";
 import { createInMemoryEventStore } from "./event-store";
 import { classifyEventForNotification } from "./notification";
 import type { ProblemMemoryStore, ProblemMemoryEntry } from "./problem-memory";
@@ -570,9 +571,13 @@ async function scenarioRunAutodevOnceNotApprovedSkipsCheckpoint(): Promise<void>
     claudeCalls += 1;
     return { success: true, summary: "테스트: 항상 REVISE 대상", changedFiles: [], tests: [{ name: "proj:check", pass: true }], rawOutput: "" };
   };
+  // severity high:1 명시 — critical/high가 전혀 없는 REVISE(medium 이하)는 AutoDev
+  // Efficiency 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 즉시 PASS로
+  // 완화하므로, 이 시나리오("REVISE가 절대 수렴하지 않는다")를 검증하려면 실제로 REVISE를
+  // 유지시키는 severity가 필요하다.
   const alwaysRevise = async (): Promise<GptReviewerReturn> => ({
     decision: "REVISE",
-    severity: { critical: 0, high: 0, medium: 1 },
+    severity: { critical: 0, high: 1, medium: 0 },
     feedback: "테스트: 항상 REVISE(무한루프 방지 확인용)",
     nextTask: "다시 시도",
   });
@@ -858,8 +863,8 @@ async function scenarioReviewStagnationBudgetPersistsAcrossRestart(): Promise<vo
   });
 
   check(
-    "P1-1) 재시작(fresh runAutodevOnce 호출) 직후 예산이 0으로 리셋되지 않고 단 5회(MAX_REVIEW_CYCLES) 재시도 후 즉시 BLOCKED",
-    claudeCalls === 5
+    `P1-1) 재시작(fresh runAutodevOnce 호출) 직후 예산이 0으로 리셋되지 않고 단 MAX_REVIEW_CYCLES(${MAX_REVIEW_CYCLES})회 재시도 후 즉시 BLOCKED`,
+    claudeCalls === MAX_REVIEW_CYCLES
   );
   check("P1-1) outcome이 APPROVED_AND_CHECKPOINTED가 아님(수렴하지 않았으므로)", result.outcome !== "RAN_TASK_APPROVED_AND_CHECKPOINTED");
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;
@@ -1103,9 +1108,13 @@ async function scenarioHumanFinalReviewReviewerNotApprovedNeverEntersGate(): Pro
     tests: [{ name: "proj:check", pass: true }],
     rawOutput: "",
   });
+  // severity를 high:1로 명시 — critical/high가 전혀 없는 REVISE(medium 이하)는 AutoDev
+  // Efficiency 개선(2026-09-04, § review-policy.ts applyReviewDecisionPolicy)이 즉시
+  // PASS로 완화하므로, 이 시나리오("REVISE가 절대 수렴하지 않고 결국 기술적 BLOCKED로
+  // 끝난다")를 검증하려면 실제로 REVISE를 유지시키는 severity가 필요하다.
   const alwaysRevise = async (): Promise<GptReviewerReturn> => ({
     decision: "REVISE",
-    severity: { critical: 0, high: 0, medium: 1 },
+    severity: { critical: 0, high: 1, medium: 0 },
     feedback: "테스트: 항상 REVISE(HUMAN_FINAL_REVIEW 진입 방지 확인용)",
     nextTask: "다시 시도",
   });
@@ -3100,10 +3109,11 @@ async function scenarioRunAutodevOnceDeterministicReviewCycleExhaustionEscalates
   // blockOnDurableWaitRetryExhausted) — 대신 durable wait이 MAX_DURABLE_PROVIDER_WAIT_
   // RETRY_COUNT(5)회까지 기술적으로 반복된 뒤 terminal 기술적 BLOCKED로 수렴한다(genuine
   // Human Gate 0을 유지하면서도 무한 반복은 아니다).
+  const expectedEarlyEscalationCallCount = MAX_REVIEW_CYCLES * (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1);
   check("결정론적 반복 조기 승격: outcome=RAN_TASK_NOT_APPROVED", result.outcome === "RAN_TASK_NOT_APPROVED");
   check(
-    "결정론적 반복 조기 승격: developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES=5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=30, 무제한 아님)",
-    claudeCallCount === 30
+    `결정론적 반복 조기 승격: developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=${expectedEarlyEscalationCallCount}, 무제한 아님)`,
+    claudeCallCount === expectedEarlyEscalationCallCount
   );
   const all = events.query().events;
   const finalState = JSON.parse(readFileSync(statePath, "utf-8")) as ProjectState;

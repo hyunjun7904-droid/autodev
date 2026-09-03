@@ -10,6 +10,8 @@ import type { ProjectExecutionPolicy } from "./project-policy";
 import type { TaskDefinition } from "./task-registry";
 import type { ProjectState, ClaudeResult } from "./types";
 import type { GptReviewerReturn } from "./orchestrator";
+import { MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT } from "./orchestrator";
+import { MAX_REVIEW_CYCLES } from "./policy";
 import {
   debugComputeLockFilePath,
   resolveCanonicalProjectPath,
@@ -288,8 +290,9 @@ async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetr
     callCount += 1;
     calls.push(task);
     // 매 호출마다 완전히 동일하게 실패한다(다양한 이유가 아니라 같은 이유) — durable wait
-    // 상한(5회 exhaustion, 매 exhaustion마다 MAX_REVIEW_CYCLES=5 round)을 넘어서는 호출은
-    // 절대 일어나지 않아야 한다(terminal 기술적 BLOCKED로 이미 전환했으므로).
+    // 상한(MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT회 exhaustion, 매 exhaustion마다
+    // MAX_REVIEW_CYCLES round, § policy.ts — 2026-09-04 Efficiency 개선으로 5→3)을 넘어서는
+    // 호출은 절대 일어나지 않아야 한다(terminal 기술적 BLOCKED로 이미 전환했으므로).
     return { success: true, summary: "테스트: required test 항상 동일하게 실패", changedFiles: [], tests: [{ name: "proj:check", pass: false }], rawOutput: "" };
   };
 
@@ -302,9 +305,10 @@ async function scenarioIdenticalRequiredTestFailureEscalatesInsteadOfDurableRetr
     "F) T1이 첫 번째 runOnce 호출(=단일 orchestrator() 실행) 안에서 terminal 기술적 BLOCKED로 수렴함(RAN_TASK_NOT_APPROVED)",
     result.iterations[0].result.outcome === "RAN_TASK_NOT_APPROVED" && result.iterations[0].result.taskId === "T1"
   );
+  const expectedBoundedCallCount = MAX_REVIEW_CYCLES * (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT + 1);
   check(
-    "F) developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES=5 round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회, 무한 반복 아님)",
-    callCount === 30 && calls.every((c) => c === "Task1 prompt")
+    `F) developer 호출이 bounded됨(exhaustion마다 MAX_REVIEW_CYCLES round × (MAX_DURABLE_PROVIDER_WAIT_RETRY_COUNT+1)회=${expectedBoundedCallCount}, 무한 반복 아님)`,
+    callCount === expectedBoundedCallCount && calls.every((c) => c === "Task1 prompt")
   );
   check(
     "F) terminal 기술적 BLOCKED이므로 continuous-runner 자신도 재시도하지 않고 즉시 STOP(T2/T3 시도 안 함, 단 1회 iteration)",
